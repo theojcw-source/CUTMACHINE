@@ -1,0 +1,28 @@
+# Local toolchain and dependencies
+.tools/
+
+# CMake build trees
+build/
+cmake-build-*/
+CMakeUserPresets.json
+
+# CMake in-source artefacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Apple and compiler artefacts
+.DS_Store
+*.dSYM/
+*.o
+*.a
+*.dylib
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
