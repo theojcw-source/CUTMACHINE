@@ -45,3 +45,11 @@ venv/
 *~
 .vscode/
 .idea/
+
+# Raw/test media (camera footage, not source-controlled)
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.mxf
+*.MXF
