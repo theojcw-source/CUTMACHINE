@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Cache Homebrew downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/Library/Caches/Homebrew
           key: brew-macos-build-${{ hashFiles('Brewfile') }}
@@ -24,7 +24,7 @@ jobs:
         run: brew bundle --file=Brewfile
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-macos-build-${{ github.sha }}
