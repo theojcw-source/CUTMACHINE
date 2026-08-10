@@ -20,6 +20,23 @@ compile_commands.json
 *.a
 *.dylib
 
+# CTest and profiling artefacts
+Testing/
+DartConfiguration.tcl
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+
+# Runtime and tooling logs
+*.log
+
+# Python tooling (harnesses, scripts)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
 # Editor files
 *.swp
 *.swo

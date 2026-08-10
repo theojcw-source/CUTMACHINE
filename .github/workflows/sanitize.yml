@@ -1,0 +1,55 @@
+name: sanitize
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  asan-ubsan-build:
+    runs-on: macos-14
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-macos-sanitize-${{ hashFiles('Brewfile') }}
+          restore-keys: |
+            brew-macos-sanitize-
+
+      - name: Install dependencies
+        run: brew bundle --file=Brewfile
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-macos-sanitize-${{ github.sha }}
+          restore-keys: |
+            ccache-macos-sanitize-
+
+      # Compile-only for now. ASan/UBSan only catch anything once the
+      # instrumented binary actually runs, and cutmachine's only entry
+      # point today is an AppKit app that opens a real media file and
+      # blocks on a window/run loop — there's no headless path and no
+      # test media checked into the repo to drive one. This job at
+      # least guarantees the codebase keeps building clean with both
+      # sanitizers on. Once a headless entry point exists (e.g. the
+      # CLI work in progress), add a run step here that decodes a
+      # small/synthetic clip through it.
+      - name: Configure with ASan+UBSan
+        run: |
+          cmake -S . -B build-sanitize \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_OBJCXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build-sanitize --parallel

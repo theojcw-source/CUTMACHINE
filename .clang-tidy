@@ -1,0 +1,29 @@
+# Focused on correctness (bugprone/clang-analyzer) and a handful of
+# well-behaved readability/performance checks. Deliberately leaves out
+# cppcoreguidelines and most modernize checks: this code interops with a
+# C API (FFmpeg) and Apple frameworks, so raw pointers, pointer arithmetic
+# and C-style buffers are normal here, not bugs to flag.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  clang-analyzer-*,
+  performance-*,
+  -performance-avoid-endl,
+  portability-*,
+  readability-braces-around-statements,
+  readability-container-size-empty,
+  readability-delete-null-pointer,
+  readability-else-after-return,
+  readability-implicit-bool-conversion,
+  readability-inconsistent-declaration-parameter-name,
+  readability-misplaced-array-index,
+  readability-redundant-control-flow,
+  readability-redundant-smartptr-get,
+  readability-simplify-boolean-expr,
+  readability-static-accessed-through-instance
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*/src/.*'
+FormatStyle: file
