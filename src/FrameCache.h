@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Ulid.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <list>
@@ -11,7 +13,7 @@ struct AVFrame;
 
 class FrameCache {
 public:
-    using SourceId = uint64_t;
+    using SourceId = Ulid;
 
     struct PrefetchWindow {
         size_t ahead = 0;
@@ -25,15 +27,16 @@ public:
     FrameCache(const FrameCache&) = delete;
     FrameCache& operator=(const FrameCache&) = delete;
 
-    bool Put(SourceId sourceId, int64_t frameIndex, const AVFrame* frame);
-    AVFrame* GetExact(SourceId sourceId, int64_t frameIndex);
-    AVFrame* GetNearest(SourceId sourceId, int64_t frameIndex,
+    bool Put(const SourceId& sourceId, int64_t frameIndex,
+             const AVFrame* frame);
+    AVFrame* GetExact(const SourceId& sourceId, int64_t frameIndex);
+    AVFrame* GetNearest(const SourceId& sourceId, int64_t frameIndex,
                         int64_t& outFrameIndex);
-    bool Contains(SourceId sourceId, int64_t frameIndex) const;
-    bool TouchFrame(SourceId sourceId, int64_t frameIndex);
-    void RegisterSource(SourceId sourceId);
-    void UnregisterSource(SourceId sourceId);
-    PrefetchWindow WindowForSource(SourceId sourceId) const;
+    bool Contains(const SourceId& sourceId, int64_t frameIndex) const;
+    bool TouchFrame(const SourceId& sourceId, int64_t frameIndex);
+    void RegisterSource(const SourceId& sourceId);
+    void UnregisterSource(const SourceId& sourceId);
+    PrefetchWindow WindowForSource(const SourceId& sourceId) const;
 
     size_t ByteBudget() const;
     size_t TotalBytes() const;
@@ -45,8 +48,8 @@ private:
         int64_t frameIndex;
 
         bool operator<(const Key& other) const {
-            return sourceId < other.sourceId ||
-                   (sourceId == other.sourceId && frameIndex < other.frameIndex);
+            return sourceId < other.sourceId || (sourceId == other.sourceId &&
+                                                 frameIndex < other.frameIndex);
         }
     };
 

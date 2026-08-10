@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import io
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any
+
+from sidecar.binary import ApplyResult, CutmachineBinary
+from sidecar.eval import A1, CASES, operations_equal
+from sidecar.planner import (
+    AnthropicPlanner,
+    OllamaPlanner,
+    Plan,
+    Planner,
+    PlannerError,
+)
+from sidecar.repl import run_turn
+from sidecar.schema import PLANNER_RESPONSE_SCHEMA
+
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURE = Path(__file__).with_name("eval-document.json")
+BINARY = ROOT / "build" / "cutmachine"
+
+
+class FakeResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode()
+
+
+class RecordingOpener:
+    def __init__(self, response: dict[str, Any]) -> None:
+        self.response = response
+        self.request: Any = None
+        self.timeout: float | None = None
+
+    def __call__(self, request: Any, timeout: float) -> FakeResponse:
+        self.request = request
+        self.timeout = timeout
+        return FakeResponse(self.response)
+
+    @property
+    def body(self) -> dict[str, Any]:
+        return json.loads(self.request.data)
+
+
+def remove_plan() -> dict[str, Any]:
+    return {
+        "operation": {
+            "type": "RemoveClip", "clip_id": A1, "exact_timeline": [],
+        },
+        "refusal": None,
+    }
+
+
+class PlannerProtocolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not BINARY.exists():
+            raise unittest.SkipTest("build/cutmachine is not available")
+        cls.timeline = CutmachineBinary(BINARY).describe(FIXTURE)
+
+    def test_ollama_receives_shared_schema_in_format(self) -> None:
+        opener = RecordingOpener({
+            "message": {"content": json.dumps(remove_plan())},
+        })
+        planner = OllamaPlanner(model="test-model", opener=opener)
+        plan = planner.plan(self.timeline, "Supprime A1")
+        self.assertEqual(plan.operation, remove_plan()["operation"])
+        self.assertEqual(opener.body["format"], PLANNER_RESPONSE_SCHEMA)
+        self.assertFalse(opener.body["stream"])
+        self.assertEqual(opener.body["options"]["temperature"], 0)
+        self.assertTrue(opener.request.full_url.endswith("/api/chat"))
+
+    def test_shared_schema_uses_no_unsupported_composition_keywords(self) -> None:
+        encoded = json.dumps(PLANNER_RESPONSE_SCHEMA)
+        self.assertNotIn('"oneOf"', encoded)
+        self.assertNotIn('"anyOf"', encoded)
+        self.assertNotIn('"allOf"', encoded)
+
+    def test_anthropic_receives_same_schema_as_tool_input(self) -> None:
+        opener = RecordingOpener({
+            "content": [{
+                "type": "tool_use",
+                "name": AnthropicPlanner.TOOL_NAME,
+                "input": remove_plan(),
+            }],
+        })
+        planner = AnthropicPlanner(
+            model="test-model", api_key="test-key", opener=opener)
+        plan = planner.plan(self.timeline, "Supprime A1")
+        self.assertEqual(plan.operation, remove_plan()["operation"])
+        tool = opener.body["tools"][0]
+        self.assertEqual(tool["input_schema"], PLANNER_RESPONSE_SCHEMA)
+        self.assertTrue(tool["strict"])
+        self.assertEqual(
+            opener.body["tool_choice"],
+            {"type": "tool", "name": AnthropicPlanner.TOOL_NAME})
+        self.assertTrue(opener.request.full_url.endswith("/v1/messages"))
+
+    def test_refusal_is_supported_by_both_response_shapes(self) -> None:
+        refusal = {
+            "operation": None,
+            "refusal": {"reason": "Deux opérations seraient nécessaires."},
+        }
+        ollama = OllamaPlanner(opener=RecordingOpener({
+            "message": {"content": json.dumps(refusal)}}))
+        anthropic = AnthropicPlanner(api_key="x", opener=RecordingOpener({
+            "content": [{"type": "tool_use", "name": AnthropicPlanner.TOOL_NAME,
+                         "input": refusal}]}))
+        self.assertEqual(
+            ollama.plan(self.timeline, "demande composée").refusal,
+            refusal["refusal"]["reason"])
+        self.assertEqual(
+            anthropic.plan(self.timeline, "demande composée").refusal,
+            refusal["refusal"]["reason"])
+
+    def test_unknown_model_ulid_is_rejected_before_binary(self) -> None:
+        invalid = remove_plan()
+        invalid["operation"]["clip_id"] = "01K49999999999999999999999"
+        planner = OllamaPlanner(opener=RecordingOpener({
+            "message": {"content": json.dumps(invalid)}}))
+        with self.assertRaisesRegex(PlannerError, "absent from the view"):
+            planner.plan(self.timeline, "Supprime un clip inexistant")
+
+    def test_older_ollama_missing_nullable_field_is_tolerated(self) -> None:
+        response = remove_plan()["operation"]
+        planner = OllamaPlanner(opener=RecordingOpener({
+            "message": {"content": json.dumps({"operation": response})}}))
+        self.assertEqual(
+            planner.plan(self.timeline, "Supprime A1").operation, response)
+
+    def test_backend_union_fields_are_normalized_to_canonical_operation(self) -> None:
+        operation = {
+            "type": "RemoveClip",
+            "clip_id": A1,
+            "edge": "Head",
+            "delta": {"value": 99, "rate": 25},
+            "track_id": "irrelevant",
+        }
+        planner = AnthropicPlanner(api_key="x", opener=RecordingOpener({
+            "content": [{"type": "tool_use", "name": AnthropicPlanner.TOOL_NAME,
+                         "input": {"operation": operation,
+                                   "refusal": {"reason": "irrelevant"}}}]}))
+        self.assertEqual(
+            planner.plan(self.timeline, "Supprime A1").operation,
+            remove_plan()["operation"],
+        )
+
+
+class BinaryIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if not BINARY.exists():
+            self.skipTest("build/cutmachine is not available")
+        self.directory = tempfile.TemporaryDirectory()
+        self.document = Path(self.directory.name) / "document.json"
+        shutil.copyfile(FIXTURE, self.document)
+        self.binary = CutmachineBinary(BINARY)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_describe_and_named_refusal(self) -> None:
+        timeline = self.binary.describe(self.document)
+        self.assertEqual(timeline["tracks"][0]["items"][0]["alias"], "A1")
+        before = self.document.read_bytes()
+        result = self.binary.apply_operation(self.document, {
+            "type": "RemoveClip",
+            "clip_id": "01K49999999999999999999999",
+            "exact_timeline": [],
+        })
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "UnknownClip")
+        self.assertEqual(self.document.read_bytes(), before)
+
+    def test_reordered_operation_is_serialized_canonically(self) -> None:
+        # JSON object order has no semantics, while the existing C++ operation
+        # reader consumes its canonical serializer order.
+        operation = {
+            "exact_clip": None,
+            "delta": {"rate": 25, "value": -1},
+            "edge": "Tail",
+            "clip_id": A1,
+            "type": "TrimClip",
+        }
+        result = self.binary.apply_operation(self.document, operation)
+        self.assertTrue(result.ok, f"{result.error}: {result.detail}")
+
+
+class FakePlanner(Planner):
+    def __init__(self) -> None:
+        self.errors: list[dict[str, Any] | None] = []
+
+    @property
+    def backend_name(self) -> str:
+        return "fake"
+
+    def plan(self, timeline: dict[str, Any], instruction: str,
+             previous_error: dict[str, Any] | None = None) -> Plan:
+        self.errors.append(previous_error)
+        return Plan(operation=remove_plan()["operation"])
+
+
+class FakeBinary:
+    def __init__(self) -> None:
+        self.apply_count = 0
+
+    def describe(self, document: Path) -> dict[str, Any]:
+        return {"sources": [], "tracks": [], "duration": {"frames": 0,
+                                                               "seconds": 0.0}}
+
+    def apply_operation(self, document: Path,
+                        operation: dict[str, Any]) -> ApplyResult:
+        self.apply_count += 1
+        if self.apply_count == 1:
+            return ApplyResult(False, error="Overlap", detail="test overlap")
+        return ApplyResult(True, doc_hash="abc123")
+
+
+class ReplTests(unittest.TestCase):
+    def test_one_retry_includes_named_binary_error(self) -> None:
+        planner = FakePlanner()
+        binary = FakeBinary()
+        answers = iter(("o", "o"))
+        output: list[str] = []
+        run_turn(planner, binary, Path("unused.json"), "supprime A1",
+                 input_fn=lambda _: next(answers), print_fn=output.append)
+        self.assertEqual(binary.apply_count, 2)
+        self.assertIsNone(planner.errors[0])
+        self.assertEqual(planner.errors[1]["error"], "Overlap")
+        self.assertIn("abc123", output[-1])
+
+
+class EvaluationTests(unittest.TestCase):
+    def test_corpus_has_exactly_fifteen_cases(self) -> None:
+        self.assertEqual(len(CASES), 15)
+
+    def test_semantic_comparison_accepts_equivalent_timebase(self) -> None:
+        expected = CASES[4].expected
+        actual = json.loads(json.dumps(expected))
+        actual["delta"] = {"value": -20, "rate": 50}
+        self.assertTrue(operations_equal(actual, expected))
+
+    def test_all_expected_operations_are_accepted_on_fresh_documents(self) -> None:
+        if not BINARY.exists():
+            self.skipTest("build/cutmachine is not available")
+        binary = CutmachineBinary(BINARY)
+        with tempfile.TemporaryDirectory() as directory:
+            for index, case in enumerate(CASES):
+                document = Path(directory) / f"case-{index}.json"
+                shutil.copyfile(FIXTURE, document)
+                result = binary.apply_operation(document, case.expected)
+                self.assertTrue(
+                    result.ok,
+                    f"invalid oracle for case {index + 1}: "
+                    f"{result.error}: {result.detail}",
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

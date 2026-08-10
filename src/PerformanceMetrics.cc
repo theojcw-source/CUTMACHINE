@@ -1,17 +1,16 @@
 #include "PerformanceMetrics.h"
 
 #include <algorithm>
-#include <cmath>
 #include <vector>
 
 namespace {
 
-double Percentile(const std::vector<double>& sorted, double percentile) {
+int64_t Percentile(const std::vector<int64_t>& sorted, size_t percent) {
     if (sorted.empty()) {
-        return 0.0;
+        return 0;
     }
-    const size_t rank = std::max<size_t>(
-        1, static_cast<size_t>(std::ceil(percentile * sorted.size())));
+    const size_t rank =
+        std::max<size_t>(1, (percent * sorted.size() + 99) / 100);
     return sorted[std::min(rank - 1, sorted.size() - 1)];
 }
 
@@ -27,10 +26,11 @@ void PerformanceMetrics::RecordRequest(bool cacheHit) {
     }
 }
 
-void PerformanceMetrics::RecordDelivery(double milliseconds, bool cacheHit) {
+void PerformanceMetrics::RecordDelivery(int64_t microseconds, bool cacheHit) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto& samples = cacheHit ? hitDeliveryMilliseconds_ : missDeliveryMilliseconds_;
-    samples.push_back(milliseconds);
+    auto& samples =
+        cacheHit ? hitDeliveryMicroseconds_ : missDeliveryMicroseconds_;
+    samples.push_back(microseconds);
     if (samples.size() > kWindowSize) {
         samples.pop_front();
     }
@@ -49,29 +49,29 @@ void PerformanceMetrics::FrameFinished() {
 }
 
 PerformanceMetrics::Snapshot PerformanceMetrics::GetSnapshot() const {
-    std::vector<double> sortedHits;
-    std::vector<double> sortedMisses;
+    std::vector<int64_t> sortedHits;
+    std::vector<int64_t> sortedMisses;
     Snapshot snapshot;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        sortedHits.assign(hitDeliveryMilliseconds_.begin(),
-                          hitDeliveryMilliseconds_.end());
-        sortedMisses.assign(missDeliveryMilliseconds_.begin(),
-                            missDeliveryMilliseconds_.end());
+        sortedHits.assign(hitDeliveryMicroseconds_.begin(),
+                          hitDeliveryMicroseconds_.end());
+        sortedMisses.assign(missDeliveryMicroseconds_.begin(),
+                            missDeliveryMicroseconds_.end());
         snapshot.hitDeliverySamples = sortedHits.size();
         snapshot.missDeliverySamples = sortedMisses.size();
-        snapshot.hitRate = cacheHits_.empty()
-            ? 0.0
-            : static_cast<double>(hitCount_) / cacheHits_.size();
+        snapshot.hitRate = cacheHits_.empty() ? 0.0
+                                              : static_cast<double>(hitCount_) /
+                                                    cacheHits_.size();
     }
     std::sort(sortedHits.begin(), sortedHits.end());
     std::sort(sortedMisses.begin(), sortedMisses.end());
-    snapshot.hitP50Ms = Percentile(sortedHits, 0.50);
-    snapshot.hitP95Ms = Percentile(sortedHits, 0.95);
-    snapshot.hitP99Ms = Percentile(sortedHits, 0.99);
-    snapshot.missP50Ms = Percentile(sortedMisses, 0.50);
-    snapshot.missP95Ms = Percentile(sortedMisses, 0.95);
-    snapshot.missP99Ms = Percentile(sortedMisses, 0.99);
+    snapshot.hitP50Us = Percentile(sortedHits, 50);
+    snapshot.hitP95Us = Percentile(sortedHits, 95);
+    snapshot.hitP99Us = Percentile(sortedHits, 99);
+    snapshot.missP50Us = Percentile(sortedMisses, 50);
+    snapshot.missP95Us = Percentile(sortedMisses, 95);
+    snapshot.missP99Us = Percentile(sortedMisses, 99);
     snapshot.drops = drops_.load(std::memory_order_relaxed);
     snapshot.framesInFlight = framesInFlight_.load(std::memory_order_relaxed);
     return snapshot;

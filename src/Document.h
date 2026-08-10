@@ -1,0 +1,59 @@
+#pragma once
+
+#include "RationalTime.h"
+#include "Ulid.h"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+struct MediaRate {
+    int32_t num = 0;
+    int32_t den = 1;
+};
+
+struct DocumentSource {
+    Ulid id = GenerateUlid();
+    std::string path;
+    MediaRate rate;
+    RationalTime duration;
+};
+
+struct DocumentClip {
+    Ulid id = GenerateUlid();
+    Ulid source_id;
+    RationalTime source_in;
+    RationalTime duration;
+    RationalTime timeline_in;
+};
+
+struct DocumentTrack {
+    Ulid id = GenerateUlid();
+    std::string kind;
+    int32_t index = 0;
+    std::vector<DocumentClip> clips;
+};
+
+class Document {
+public:
+    int32_t version = 1;
+    std::vector<DocumentSource> sources;
+    std::vector<DocumentTrack> tracks;
+
+    static bool Load(const std::string& path, Document& output,
+                     std::string& error);
+    static bool LoadFromString(const std::string& json, Document& output,
+                               std::string& error);
+    bool Save(const std::string& path, std::string& error) const;
+    std::string SaveToString() const;
+    bool Validate(std::string& error) const;
+
+    const DocumentSource* FindSource(const Ulid& id) const;
+    DocumentSource* FindSource(const Ulid& id);
+    const DocumentTrack* FindTrack(const Ulid& id) const;
+    DocumentTrack* FindTrack(const Ulid& id);
+    const DocumentClip* FindClip(const Ulid& id) const;
+    DocumentClip* FindClip(const Ulid& id);
+    const DocumentTrack* FindTrackForClip(const Ulid& clipId) const;
+    DocumentTrack* FindTrackForClip(const Ulid& clipId);
+};
