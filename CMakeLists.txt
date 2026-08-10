@@ -19,12 +19,14 @@ configure_file(src/shader.metal "${SHADER_RUNTIME_PATH}" COPYONLY)
 add_library(cutmachine_model
     src/Cli.cc
     src/Document.cc
+    src/Ingest.cc
     src/EditLog.cc
     src/Operations.cc
     src/Timeline.cc
     src/Ulid.cc
 )
 target_include_directories(cutmachine_model PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(cutmachine_model PUBLIC PkgConfig::FFMPEG)
 
 add_executable(cutmachine
     src/main.mm
@@ -65,6 +67,18 @@ if(BUILD_TESTING)
     add_executable(cutmachine_cli_tests tests/cli_tests.cc)
     target_link_libraries(cutmachine_cli_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_cli_tests COMMAND cutmachine_cli_tests)
+
+    get_target_property(_ffmpeg_includes PkgConfig::FFMPEG
+                        INTERFACE_INCLUDE_DIRECTORIES)
+    list(GET _ffmpeg_includes 0 _ffmpeg_include)
+    get_filename_component(_ffmpeg_prefix "${_ffmpeg_include}" DIRECTORY)
+    find_program(FFMPEG_EXECUTABLE NAMES ffmpeg
+                 HINTS "${_ffmpeg_prefix}/bin" REQUIRED)
+    add_executable(cutmachine_ingest_tests tests/ingest_tests.cc)
+    target_link_libraries(cutmachine_ingest_tests PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_ingest_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_ingest_tests COMMAND cutmachine_ingest_tests)
 
     add_test(
         NAME cutmachine_sidecar_tests

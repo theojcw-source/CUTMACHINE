@@ -121,6 +121,24 @@ int main() {
         std::filesystem::remove(second);
     });
 
+    Test("version 1 documents migrate to the version 2 library", [] {
+        const std::string json =
+            "{\"version\":1,\"sources\":[{\"id\":"
+            "\"01K90000000000000000000001\",\"path\":\"legacy.mov\","
+            "\"rate\":{\"num\":25,\"den\":1},\"duration\":"
+            "{\"value\":100,\"rate\":25}}],\"tracks\":[]}";
+        Document document;
+        std::string error;
+        Check(Document::LoadFromString(json, document, error),
+              "version 1 must load: " + error);
+        Check(document.version == 2, "version 1 must migrate in memory");
+        Check(document.library.size() == 1,
+              "the legacy source must remain visible in the library");
+        Check(document.library[0].id == document.sources[0].id &&
+                  !document.library[0].metadata_complete,
+              "migration must preserve identity without inventing metadata");
+    });
+
     Test("timeline resolution", [] {
         const Document document = ValidDocument();
         Timeline timeline(document);

@@ -65,6 +65,22 @@ def remove_plan() -> dict[str, Any]:
     }
 
 
+def trim_plan(
+    edge: str, action: str, amount: int, unit: str = "Frames"
+) -> dict[str, Any]:
+    return {
+        "operation": {
+            "type": "TrimClip",
+            "clip_id": A1,
+            "edge": edge,
+            "trim_action": action,
+            "trim_amount": {"value": amount, "unit": unit},
+            "exact_clip": None,
+        },
+        "refusal": None,
+    }
+
+
 class PlannerProtocolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -147,7 +163,8 @@ class PlannerProtocolTests(unittest.TestCase):
             "type": "RemoveClip",
             "clip_id": A1,
             "edge": "Head",
-            "delta": {"value": 99, "rate": 25},
+            "trim_action": "Extend",
+            "trim_amount": {"value": 99, "unit": "Frames"},
             "track_id": "irrelevant",
         }
         planner = AnthropicPlanner(api_key="x", opener=RecordingOpener({
@@ -158,6 +175,103 @@ class PlannerProtocolTests(unittest.TestCase):
             planner.plan(self.timeline, "Supprime A1").operation,
             remove_plan()["operation"],
         )
+
+    def test_trim_intent_is_converted_to_internal_delta_sign(self) -> None:
+        expectations = (
+            ("Head", "Shorten", 10),
+            ("Head", "Extend", -10),
+            ("Tail", "Shorten", -10),
+            ("Tail", "Extend", 10),
+        )
+        for edge, action, expected_delta in expectations:
+            with self.subTest(edge=edge, action=action):
+                planner = OllamaPlanner(opener=RecordingOpener({
+                    "message": {"content": json.dumps(
+                        trim_plan(edge, action, 10))},
+                }))
+                operation = planner.plan(self.timeline, "trim").operation
+                self.assertIsNotNone(operation)
+                self.assertEqual(
+                    operation["delta"],
+                    {"value": expected_delta, "rate": 25},
+                )
+
+    def test_explicit_trim_language_controls_sign_timebase_and_type(self) -> None:
+        response = trim_plan("Head", "Shorten", 99)
+        response["operation"]["type"] = "InsertClip"
+        planner = OllamaPlanner(opener=RecordingOpener({
+            "message": {"content": json.dumps(response)},
+        }))
+        operation = planner.plan(
+            self.timeline, "Récupère 2 secondes avant le début actuel de A1."
+        ).operation
+        self.assertEqual(operation, {
+            "type": "TrimClip",
+            "clip_id": A1,
+            "edge": "Head",
+            "delta": {"value": -50, "rate": 25},
+            "exact_clip": None,
+        })
+
+        shorten = planner.plan(
+            self.timeline, "Coupe les 10 premières images de A1."
+        ).operation
+        self.assertEqual(shorten["edge"], "Head")
+        self.assertEqual(shorten["delta"], {"value": 10, "rate": 25})
+
+    def test_explicit_timeline_frame_is_absolute(self) -> None:
+        operation = {
+            "type": "InsertClip",
+            "track_id": self.timeline["tracks"][0]["id"],
+            "source_id": self.timeline["sources"][1]["id"],
+            "source_in": {"value": 50, "rate": 25},
+            "duration": {"value": 10, "rate": 25},
+            "timeline_in": {"value": 75, "rate": 25},
+        }
+        planner = OllamaPlanner(opener=RecordingOpener({
+            "message": {"content": json.dumps({
+                "operation": operation, "refusal": None})},
+        }))
+        normalized = planner.plan(
+            self.timeline,
+            "Dans le trou après A1, à l'image 50, place 10 images.",
+        ).operation
+        self.assertEqual(normalized["timeline_in"], {"value": 50, "rate": 25})
+
+    def test_ordinal_entities_override_model_ulids(self) -> None:
+        wrong_clip = remove_plan()
+        wrong_clip["operation"]["clip_id"] = next(
+            item["id"] for item in self.timeline["tracks"][1]["items"]
+            if item["type"] == "clip")
+        remove = OllamaPlanner(opener=RecordingOpener({
+            "message": {"content": json.dumps(wrong_clip)},
+        })).plan(
+            self.timeline, "Enlève le deuxième clip de la piste vidéo 1."
+        ).operation
+        primary_clips = [
+            item for item in self.timeline["tracks"][0]["items"]
+            if item["type"] == "clip"]
+        self.assertEqual(remove["clip_id"], primary_clips[1]["id"])
+
+        insert = {
+            "type": "InsertClip",
+            "track_id": self.timeline["tracks"][1]["id"],
+            "source_id": self.timeline["sources"][1]["id"],
+            "source_in": {"value": 300, "rate": 25},
+            "duration": {"value": 20, "rate": 25},
+            "timeline_in": {"value": 1, "rate": 25},
+        }
+        normalized = OllamaPlanner(opener=RecordingOpener({
+            "message": {"content": json.dumps({
+                "operation": insert, "refusal": None})},
+        })).plan(
+            self.timeline,
+            "Ajoute à la fin de la piste vidéo 1 vingt images de "
+            "interview.mov depuis l'image source 300.",
+        ).operation
+        self.assertEqual(normalized["track_id"], self.timeline["tracks"][0]["id"])
+        self.assertEqual(normalized["source_id"], self.timeline["sources"][0]["id"])
+        self.assertEqual(normalized["timeline_in"], {"value": 150, "rate": 25})
 
 
 class BinaryIntegrationTests(unittest.TestCase):

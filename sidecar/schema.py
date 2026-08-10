@@ -25,6 +25,16 @@ RATIONAL_TIME_SCHEMA = _time()
 NONNEGATIVE_TIME_SCHEMA = _time(minimum=0)
 POSITIVE_TIME_SCHEMA = _time(minimum=1)
 
+POSITIVE_QUANTITY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "value": {"type": "integer"},
+        "unit": {"enum": ["Frames", "Seconds"]},
+    },
+    "required": ["value", "unit"],
+}
+
 EXACT_TIMELINE_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -73,10 +83,14 @@ TRIM_CLIP_SCHEMA: dict[str, Any] = {
         "type": {"const": "TrimClip"},
         "clip_id": {"type": "string"},
         "edge": {"enum": ["Head", "Tail"]},
-        "delta": RATIONAL_TIME_SCHEMA,
+        "trim_action": {"enum": ["Shorten", "Extend"]},
+        "trim_amount": POSITIVE_QUANTITY_SCHEMA,
         "exact_clip": {"type": "null"},
     },
-    "required": ["type", "clip_id", "edge", "delta", "exact_clip"],
+    "required": [
+        "type", "clip_id", "edge", "trim_action", "trim_amount",
+        "exact_clip",
+    ],
 }
 
 # Common subset accepted by Ollama structured decoding and Anthropic strict
@@ -96,7 +110,8 @@ OPERATION_SCHEMA: dict[str, Any] = {
         "clip_id": {"type": "string"},
         "exact_timeline": {"type": "array"},
         "edge": {"enum": ["Head", "Tail"]},
-        "delta": RATIONAL_TIME_SCHEMA,
+        "trim_action": {"enum": ["Shorten", "Extend"]},
+        "trim_amount": POSITIVE_QUANTITY_SCHEMA,
         "exact_clip": {"type": "null"},
     },
     # Requiring the union is deliberate: conditional `required` needs schema
@@ -104,8 +119,8 @@ OPERATION_SCHEMA: dict[str, Any] = {
     # fields irrelevant to the selected discriminator.
     "required": [
         "type", "track_id", "source_id", "source_in", "duration",
-        "timeline_in", "clip_id", "exact_timeline", "edge", "delta",
-        "exact_clip",
+        "timeline_in", "clip_id", "exact_timeline", "edge", "trim_action",
+        "trim_amount", "exact_clip",
     ],
 }
 

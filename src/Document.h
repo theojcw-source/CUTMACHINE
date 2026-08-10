@@ -19,6 +19,26 @@ struct DocumentSource {
     RationalTime duration;
 };
 
+struct LibraryMedia {
+    Ulid id = GenerateUlid();
+    std::string path;
+    std::string filename;
+    std::string codec;
+    int32_t width = 0;
+    int32_t height = 0;
+    MediaRate rate;
+    RationalTime duration;
+    std::string orientation;
+    bool has_audio = false;
+    int32_t audio_rate = 0;
+    int32_t audio_channels = 0;
+
+    // Version-1 sources do not contain technical metadata. They are promoted
+    // to the library on load without fabricating values; a later ingest of the
+    // same path replaces the incomplete entry with probed metadata.
+    bool metadata_complete = true;
+};
+
 struct DocumentClip {
     Ulid id = GenerateUlid();
     Ulid source_id;
@@ -36,7 +56,8 @@ struct DocumentTrack {
 
 class Document {
 public:
-    int32_t version = 1;
+    int32_t version = 2;
+    std::vector<LibraryMedia> library;
     std::vector<DocumentSource> sources;
     std::vector<DocumentTrack> tracks;
 
@@ -50,6 +71,8 @@ public:
 
     const DocumentSource* FindSource(const Ulid& id) const;
     DocumentSource* FindSource(const Ulid& id);
+    const LibraryMedia* FindLibraryMedia(const Ulid& id) const;
+    LibraryMedia* FindLibraryMedia(const Ulid& id);
     const DocumentTrack* FindTrack(const Ulid& id) const;
     DocumentTrack* FindTrack(const Ulid& id);
     const DocumentClip* FindClip(const Ulid& id) const;

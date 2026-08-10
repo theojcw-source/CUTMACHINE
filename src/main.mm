@@ -18,6 +18,7 @@ extern "C" {
 #include "DecodeWorker.h"
 #include "Document.h"
 #include "FrameCache.h"
+#include "Ingest.h"
 #include "PerformanceMetrics.h"
 #include "Renderer.h"
 #include "Timeline.h"
@@ -386,13 +387,24 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if ((argc == 4 || argc == 5) &&
+        std::string(argv[1]) == "--ingest" &&
+        (argc == 4 || std::string(argv[4]) == "--recursive")) {
+        std::string output;
+        const int result =
+            IngestCommand(argv[2], argv[3], argc == 5, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
     if (argc != 2 || (argc >= 2 && argv[1][0] == '-')) {
         std::fprintf(
             stderr,
             "Usage: %s /path/to/timeline.json\n"
             "       %s --describe /path/to/timeline.json\n"
-            "       %s --apply-op /path/to/timeline.json '<op.json>'\n",
-            argv[0], argv[0], argv[0]);
+            "       %s --apply-op /path/to/timeline.json '<op.json>'\n"
+            "       %s --ingest /path/to/timeline.json /path/to/media "
+            "[--recursive]\n",
+            argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 

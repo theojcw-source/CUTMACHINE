@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <set>
@@ -312,6 +313,20 @@ const JsonValue& Require(const JsonValue& object, const std::string& key,
     return found->second;
 }
 
+const JsonValue* Optional(const JsonValue& object, const std::string& key,
+                          JsonValue::Type type, const std::string& context) {
+    if (object.type != JsonValue::Type::Object) {
+        throw std::runtime_error(context + " must be an object");
+    }
+    const auto found = object.object.find(key);
+    if (found == object.object.end()) return nullptr;
+    if (found->second.type != type) {
+        throw std::runtime_error(context + "." + key +
+                                 " has the wrong JSON type");
+    }
+    return &found->second;
+}
+
 int32_t Int32(const JsonValue& object, const std::string& key,
               const std::string& context) {
     const int64_t value =
@@ -408,6 +423,57 @@ bool Document::LoadFromString(const std::string& json, Document& output,
         const JsonValue root = JsonParser(json).Parse();
         Document parsed;
         parsed.version = Int32(root, "version", "document");
+        if (parsed.version != 1 && parsed.version != 2) {
+            throw std::runtime_error("unsupported document version " +
+                                     std::to_string(parsed.version));
+        }
+
+        if (parsed.version == 2) {
+            const JsonValue& library =
+                Require(root, "library", JsonValue::Type::Array, "document");
+            for (size_t index = 0; index < library.array.size(); ++index) {
+                const JsonValue& item = library.array[index];
+                const std::string context =
+                    "library[" + std::to_string(index) + "]";
+                LibraryMedia media;
+                media.id =
+                    Require(item, "id", JsonValue::Type::String, context).string;
+                media.path =
+                    Require(item, "path", JsonValue::Type::String, context)
+                        .string;
+                media.filename =
+                    Require(item, "filename", JsonValue::Type::String, context)
+                        .string;
+                const JsonValue* codec =
+                    Optional(item, "codec", JsonValue::Type::String, context);
+                if (!codec) {
+                    media.metadata_complete = false;
+                } else {
+                    media.codec = codec->string;
+                    media.width = Int32(item, "width", context);
+                    media.height = Int32(item, "height", context);
+                    media.orientation =
+                        Require(item, "orientation", JsonValue::Type::String,
+                                context)
+                            .string;
+                    media.has_audio =
+                        Require(item, "has_audio", JsonValue::Type::Boolean,
+                                context)
+                            .boolean;
+                    if (media.has_audio) {
+                        media.audio_rate = Int32(item, "audio_rate", context);
+                        media.audio_channels = Int32(item, "audio_channels", context);
+                    }
+                }
+                const JsonValue& rate = Require(item, "rate", JsonValue::Type::Object, context);
+                media.rate = {Int32(rate, "num", context + ".rate"),
+                              Int32(rate, "den", context + ".rate")};
+                media.duration = ParseTime(
+                    Require(item, "duration", JsonValue::Type::Object, context),
+                    context + ".duration");
+                parsed.library.push_back(std::move(media));
+            }
+        }
 
         const JsonValue& sources =
             Require(root, "sources", JsonValue::Type::Array, "document");
@@ -428,6 +494,21 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                 Require(item, "duration", JsonValue::Type::Object, context),
                 context + ".duration");
             parsed.sources.push_back(std::move(source));
+        }
+
+        if (parsed.version == 1) {
+            parsed.version = 2;
+            for (const DocumentSource& source : parsed.sources) {
+                LibraryMedia media;
+                media.id = source.id;
+                media.path = source.path;
+                media.filename =
+                    std::filesystem::path(source.path).filename().string();
+                media.rate = source.rate;
+                media.duration = source.duration;
+                media.metadata_complete = false;
+                parsed.library.push_back(std::move(media));
+            }
         }
 
         const JsonValue& tracks =
@@ -506,7 +587,33 @@ bool Document::Save(const std::string& path, std::string& error) const {
 
 std::string Document::SaveToString() const {
     std::ostringstream output;
-    output << "{\n  \"version\": " << version << ",\n  \"sources\": [";
+    output << "{\n  \"version\": " << version << ",\n  \"library\": [";
+    for (size_t index = 0; index < library.size(); ++index) {
+        const LibraryMedia& media = library[index];
+        output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(media.id) << "\",\"path\":\"" << Escape(media.path)
+               << "\",\"filename\":\"" << Escape(media.filename) << "\"";
+        if (media.metadata_complete) {
+            output << ",\"codec\":\"" << Escape(media.codec)
+                   << "\",\"width\":" << media.width
+                   << ",\"height\":" << media.height;
+        }
+        output << ",\"rate\":{\"num\":" << media.rate.num
+               << ",\"den\":" << media.rate.den << "},\"duration\":";
+        WriteTime(output, media.duration);
+        if (media.metadata_complete) {
+            output << ",\"orientation\":\"" << Escape(media.orientation)
+                   << "\",\"has_audio\":"
+                   << (media.has_audio ? "true" : "false");
+            if (media.has_audio) {
+                output << ",\"audio_rate\":" << media.audio_rate
+                       << ",\"audio_channels\":" << media.audio_channels;
+            }
+        }
+        output << "}";
+    }
+    if (!library.empty()) output << '\n';
+    output << "  ],\n  \"sources\": [";
     for (size_t index = 0; index < sources.size(); ++index) {
         const DocumentSource& source = sources[index];
         output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
@@ -545,12 +652,48 @@ std::string Document::SaveToString() const {
 }
 
 bool Document::Validate(std::string& error) const {
-    if (version != 1) {
+    if (version != 2) {
         error = "unsupported document version " + std::to_string(version);
         return false;
     }
 
     std::set<Ulid> ids;
+    std::set<Ulid> libraryIds;
+    for (size_t index = 0; index < library.size(); ++index) {
+        const LibraryMedia& media = library[index];
+        const std::string context = "library media " + std::to_string(index);
+        if (!IsValidUlid(media.id)) {
+            error = context + " has invalid ULID '" + media.id + "'";
+            return false;
+        }
+        if (!libraryIds.insert(media.id).second) {
+            error = "duplicate library ID '" + media.id + "'";
+            return false;
+        }
+        if (media.path.empty() || media.filename.empty()) {
+            error = context + " has an empty path or filename";
+            return false;
+        }
+        if (media.rate.num <= 0 || media.rate.den <= 0 ||
+            media.duration.rate <= 0 || media.duration.value <= 0) {
+            error = context + " has an invalid rate or duration";
+            return false;
+        }
+        if (media.metadata_complete) {
+            if (media.codec.empty() || media.width <= 0 || media.height <= 0 ||
+                (media.orientation != "landscape" &&
+                 media.orientation != "portrait" &&
+                 media.orientation != "square")) {
+                error = context + " has invalid video metadata";
+                return false;
+            }
+            if (media.has_audio &&
+                (media.audio_rate <= 0 || media.audio_channels <= 0)) {
+                error = context + " has invalid audio metadata";
+                return false;
+            }
+        }
+    }
     std::set<Ulid> sourceIds;
     for (size_t index = 0; index < sources.size(); ++index) {
         const DocumentSource& source = sources[index];
@@ -576,6 +719,11 @@ bool Document::Validate(std::string& error) const {
                     "') has a zero or negative duration";
             return false;
         }
+    }
+    // A mounted source deliberately shares its media ULID. Library-only IDs,
+    // however, must remain globally distinct from tracks and clips.
+    for (const Ulid& libraryId : libraryIds) {
+        if (sourceIds.find(libraryId) == sourceIds.end()) ids.insert(libraryId);
     }
 
     std::set<int32_t> trackIndices;
@@ -664,6 +812,20 @@ const DocumentSource* Document::FindSource(const Ulid& id) const {
 DocumentSource* Document::FindSource(const Ulid& id) {
     for (DocumentSource& source : sources) {
         if (source.id == id) return &source;
+    }
+    return nullptr;
+}
+
+const LibraryMedia* Document::FindLibraryMedia(const Ulid& id) const {
+    for (const LibraryMedia& media : library) {
+        if (media.id == id) return &media;
+    }
+    return nullptr;
+}
+
+LibraryMedia* Document::FindLibraryMedia(const Ulid& id) {
+    for (LibraryMedia& media : library) {
+        if (media.id == id) return &media;
     }
     return nullptr;
 }

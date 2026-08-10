@@ -66,9 +66,24 @@ décodage média :
 ./build/cutmachine --describe ./example-timeline.json
 ./build/cutmachine --apply-op ./example-timeline.json \
   '{"type":"TrimClip","clip_id":"01K00000000000000000000003","edge":"Tail","delta":{"value":-1,"rate":25},"exact_clip":null}'
+./build/cutmachine --ingest ./example-timeline.json ./rushes --recursive
 ```
 
-`--describe` écrit uniquement la vue JSON condensée sur stdout. `--apply-op`
+`--describe` écrit uniquement la vue JSON condensée sur stdout, avec les blocs
+distincts `timeline` et `library`. Les médias de bibliothèque ont des alias
+`M1`, `M2`, etc. et restent disponibles lorsqu'ils sont montés (`in_use:true`).
+`--ingest` ne lit que les en-têtes FFmpeg, conserve les cadences rationnelles
+exactes et déduit l'orientation après application de la display matrix. Les
+fichiers non vidéo ou corrompus sont rapportés dans `errors` sans faire échouer
+le lot ; l'identité idempotente est le chemin absolu résolu.
+
+Le schéma courant du document est la version 2 et ajoute `library` à côté de
+`sources`. Une version 1 reste lisible : ses sources sont promues en entrées de
+bibliothèque avec les seules métadonnées historiques connues, puis enrichies
+si leurs fichiers sont ingérés. Bibliothèque et source partagent l'ULID du
+média ; l'ingest seul ne monte jamais de clip.
+
+`--apply-op`
 réutilise le format canonique de `SerializeOperation`, remplace le document de
 façon transactionnelle et conserve le journal dans le fichier compagnon
 `<document>.editlog.json`. En cas de refus, ni le document ni ce journal ne sont
@@ -95,6 +110,13 @@ python3 -m sidecar.repl ./example-timeline.json
 Le sidecar charge aussi automatiquement le fichier `.env` à la racine du
 projet, sans remplacer une variable déjà exportée par le shell. Ce fichier est
 ignoré par Git.
+
+Le planner demande au modèle une intention de trim (`Shorten` ou `Extend`) et
+une quantité positive en frames ou secondes ; le signe et le timebase du
+`TrimClip` sont calculés localement. Les références explicites de piste, de
+clip, d'alias et de nom de source sont également résolues depuis la vue avant
+validation. Un ULID proposé par le modèle n'est utilisé qu'en fallback lorsque
+la formulation ne fournit pas une résolution déterministe unique.
 
 Variables optionnelles : `CUTMACHINE_BINARY`, `CUTMACHINE_OLLAMA_URL`,
 `CUTMACHINE_ANTHROPIC_URL`, `CUTMACHINE_OLLAMA_MODEL` et
