@@ -11,6 +11,7 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavformat
     libavcodec
     libavutil
+    libswresample
 )
 
 set(SHADER_RUNTIME_PATH "${CMAKE_CURRENT_BINARY_DIR}/shader.metal")
@@ -19,15 +20,19 @@ configure_file(src/shader.metal "${SHADER_RUNTIME_PATH}" COPYONLY)
 add_library(cutmachine_model
     src/Cli.cc
     src/Document.cc
+    src/Ingest.cc
     src/EditLog.cc
     src/Operations.cc
     src/Timeline.cc
+    src/TimelineView.cc
     src/Ulid.cc
 )
 target_include_directories(cutmachine_model PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(cutmachine_model PUBLIC PkgConfig::FFMPEG)
 
 add_executable(cutmachine
     src/main.mm
+    src/AudioPlayback.mm
     src/DecodeWorker.cc
     src/FrameCache.cc
     src/PerformanceMetrics.cc
@@ -45,6 +50,7 @@ target_compile_definitions(cutmachine PRIVATE
 target_link_libraries(cutmachine PRIVATE
     PkgConfig::FFMPEG
     "-framework AppKit"
+    "-framework AVFAudio"
     "-framework Foundation"
     "-framework Metal"
     "-framework QuartzCore"
@@ -62,9 +68,47 @@ if(BUILD_TESTING)
     target_link_libraries(cutmachine_edit_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_edit_tests COMMAND cutmachine_edit_tests)
 
+    add_executable(cutmachine_timeline_view_tests
+                   tests/timeline_view_tests.cc)
+    target_link_libraries(cutmachine_timeline_view_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_timeline_view_tests
+             COMMAND cutmachine_timeline_view_tests)
+
     add_executable(cutmachine_cli_tests tests/cli_tests.cc)
     target_link_libraries(cutmachine_cli_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_cli_tests COMMAND cutmachine_cli_tests)
+
+    get_target_property(_ffmpeg_includes PkgConfig::FFMPEG
+                        INTERFACE_INCLUDE_DIRECTORIES)
+    list(GET _ffmpeg_includes 0 _ffmpeg_include)
+    get_filename_component(_ffmpeg_prefix "${_ffmpeg_include}" DIRECTORY)
+    find_program(FFMPEG_EXECUTABLE NAMES ffmpeg
+                 HINTS "${_ffmpeg_prefix}/bin" REQUIRED)
+    add_executable(cutmachine_ingest_tests tests/ingest_tests.cc)
+    target_link_libraries(cutmachine_ingest_tests PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_ingest_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_ingest_tests COMMAND cutmachine_ingest_tests)
+
+    add_executable(cutmachine_audio_playback_tests
+        tests/audio_playback_tests.mm
+        src/AudioPlayback.mm
+    )
+    target_compile_options(cutmachine_audio_playback_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+    )
+    target_compile_definitions(cutmachine_audio_playback_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}"
+    )
+    target_link_libraries(cutmachine_audio_playback_tests PRIVATE
+        cutmachine_model
+        PkgConfig::FFMPEG
+        "-framework AVFAudio"
+        "-framework Foundation"
+    )
+    add_test(NAME cutmachine_audio_playback_tests
+             COMMAND cutmachine_audio_playback_tests)
 
     add_test(
         NAME cutmachine_sidecar_tests

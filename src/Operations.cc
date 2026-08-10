@@ -21,6 +21,10 @@ ExactClipTimes TimesOf(const DocumentClip& clip) {
     return {clip.source_in, clip.duration, clip.timeline_in};
 }
 
+RationalTime PhaseOf(const DocumentClip& clip) {
+    return clip.timeline_in.sub(clip.source_in);
+}
+
 std::vector<ExactTimelinePosition> PositionsAfter(const DocumentTrack& track,
                                                   size_t first) {
     std::vector<ExactTimelinePosition> positions;
@@ -280,8 +284,880 @@ bool ApplyTrim(Document& candidate, TrimClipOperation& operation,
     return true;
 }
 
+bool ApplyMove(Document& candidate, MoveClipOperation& operation,
+               Operation& inverse, EditError& error, std::string& message) {
+    DocumentTrack* sourceTrack = candidate.FindTrackForClip(operation.clip_id);
+    if (!sourceTrack) {
+        Fail(EditError::UnknownClip,
+             "unknown clip_id '" + operation.clip_id + "'", error, message);
+        return false;
+    }
+    DocumentTrack* targetTrack = candidate.FindTrack(operation.track_id);
+    if (!targetTrack) {
+        Fail(EditError::UnknownTrack,
+             "unknown track_id '" + operation.track_id + "'", error, message);
+        return false;
+    }
+    if (sourceTrack->kind != targetTrack->kind) {
+        Fail(EditError::InvalidOperation,
+             "cannot move a clip between tracks of different kinds", error,
+             message);
+        return false;
+    }
+    if (operation.timeline_in.rate <= 0 || operation.timeline_in.value < 0) {
+        Fail(EditError::InvalidTimelineIn,
+             "move timeline_in must be non-negative with a positive rate",
+             error, message);
+        return false;
+    }
+
+    const auto snapshotTracks = [&](const std::vector<Ulid>& trackIds) {
+        std::vector<ExactTrackState> snapshots;
+        for (const Ulid& trackId : trackIds) {
+            if (std::any_of(snapshots.begin(), snapshots.end(),
+                            [&](const ExactTrackState& state) {
+                                return state.track_id == trackId;
+                            }))
+                continue;
+            const DocumentTrack* track = candidate.FindTrack(trackId);
+            if (track) snapshots.push_back({track->id, track->clips});
+        }
+        return snapshots;
+    };
+
+    if (!operation.exact_track_result.empty()) {
+        const Ulid currentTrackId = sourceTrack->id;
+        const RationalTime currentTimelineIn =
+            candidate.FindClip(operation.clip_id)->timeline_in;
+        std::vector<Ulid> affected;
+        for (const ExactTrackState& state : operation.exact_track_result)
+            affected.push_back(state.track_id);
+        const std::vector<ExactTrackState> before = snapshotTracks(affected);
+        if (before.size() != operation.exact_track_result.size()) {
+            Fail(EditError::UnknownTrack,
+                 "exact move state references an unknown track", error,
+                 message);
+            return false;
+        }
+        for (const ExactTrackState& state : operation.exact_track_result) {
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        }
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = MoveClipOperation{operation.clip_id, currentTrackId,
+                                    currentTimelineIn, before};
+        return true;
+    }
+
+    const Ulid sourceTrackId = sourceTrack->id;
+    const std::vector<ExactTrackState> before =
+        snapshotTracks({sourceTrackId, operation.track_id});
+    const auto found = std::find_if(
+        sourceTrack->clips.begin(), sourceTrack->clips.end(),
+        [&](const DocumentClip& clip) { return clip.id == operation.clip_id; });
+    const DocumentClip original = *found;
+    sourceTrack->clips.erase(found);
+
+    // Removing a clip cannot invalidate the tracks vector, but reacquiring the
+    // destination avoids retaining a clip-vector-dependent pointer across the
+    // erase and keeps same-track moves straightforward.
+    targetTrack = candidate.FindTrack(operation.track_id);
+    DocumentClip moved = original;
+    moved.timeline_in = operation.timeline_in;
+    const RationalTime movedEnd = moved.timeline_in.add(moved.duration);
+    std::vector<DocumentClip> overwritten;
+    overwritten.reserve(targetTrack->clips.size() + 2);
+    for (const DocumentClip& existing : targetTrack->clips) {
+        const RationalTime existingEnd =
+            existing.timeline_in.add(existing.duration);
+        if (existingEnd <= moved.timeline_in ||
+            existing.timeline_in >= movedEnd) {
+            overwritten.push_back(existing);
+            continue;
+        }
+
+        const bool keepLeft = existing.timeline_in < moved.timeline_in;
+        const bool keepRight = existingEnd > movedEnd;
+        if (keepLeft) {
+            DocumentClip left = existing;
+            left.duration = moved.timeline_in.sub(existing.timeline_in);
+            overwritten.push_back(std::move(left));
+        }
+        if (keepRight) {
+            DocumentClip right = existing;
+            if (keepLeft) {
+                do {
+                    right.id = GenerateUlid();
+                } while (candidate.FindClip(right.id));
+            }
+            const RationalTime sourceOffset =
+                movedEnd.sub(existing.timeline_in);
+            right.source_in = existing.source_in.add(sourceOffset);
+            right.duration = existingEnd.sub(movedEnd);
+            right.timeline_in = movedEnd;
+            overwritten.push_back(std::move(right));
+        }
+    }
+    overwritten.push_back(std::move(moved));
+    std::stable_sort(overwritten.begin(), overwritten.end(),
+                     [](const DocumentClip& left, const DocumentClip& right) {
+                         return left.timeline_in < right.timeline_in;
+                     });
+    targetTrack->clips = std::move(overwritten);
+    if (!ValidateResult(candidate, error, message)) return false;
+
+    operation.exact_track_result =
+        snapshotTracks({sourceTrackId, operation.track_id});
+    inverse = MoveClipOperation{operation.clip_id, sourceTrackId,
+                                original.timeline_in, before};
+    return true;
+}
+
+bool ApplyMoveLinked(Document& candidate, MoveLinkedClipsOperation& operation,
+                     Operation& inverse, EditError& error,
+                     std::string& message) {
+    const auto snapshots = [&](const std::vector<Ulid>& ids) {
+        std::vector<ExactTrackState> result;
+        for (const Ulid& id : ids) {
+            if (std::any_of(result.begin(), result.end(),
+                            [&](const ExactTrackState& state) {
+                                return state.track_id == id;
+                            }))
+                continue;
+            const DocumentTrack* track = candidate.FindTrack(id);
+            if (track) result.push_back({id, track->clips});
+        }
+        return result;
+    };
+    if (!operation.exact_track_result.empty()) {
+        std::vector<Ulid> ids;
+        for (const ExactTrackState& state : operation.exact_track_result)
+            ids.push_back(state.track_id);
+        const std::vector<ExactTrackState> before = snapshots(ids);
+        if (before.size() != operation.exact_track_result.size()) {
+            Fail(EditError::UnknownTrack,
+                 "exact linked move references an unknown track", error,
+                 message);
+            return false;
+        }
+        for (const ExactTrackState& state : operation.exact_track_result)
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = MoveLinkedClipsOperation{operation.link_group_id,
+                                           operation.moves, before};
+        return true;
+    }
+    if (operation.moves.size() < 2 || operation.link_group_id.empty()) {
+        Fail(EditError::InvalidOperation,
+             "MoveLinkedClips requires at least two linked members", error,
+             message);
+        return false;
+    }
+    std::vector<Ulid> affectedTracks;
+    std::vector<LinkedClipMove> inverseMoves;
+    std::vector<Ulid> seenClips;
+    for (const LinkedClipMove& move : operation.moves) {
+        const DocumentClip* clip = candidate.FindClip(move.clip_id);
+        const DocumentTrack* source = candidate.FindTrackForClip(move.clip_id);
+        const DocumentTrack* target = candidate.FindTrack(move.track_id);
+        if (!clip || !source || !target) {
+            Fail(!target ? EditError::UnknownTrack : EditError::UnknownClip,
+                 "linked move references an unknown clip or track", error,
+                 message);
+            return false;
+        }
+        if (clip->link_group_id != operation.link_group_id ||
+            std::find(seenClips.begin(), seenClips.end(), clip->id) !=
+                seenClips.end()) {
+            Fail(EditError::InvalidOperation,
+                 "linked move members must be unique and share link_group_id",
+                 error, message);
+            return false;
+        }
+        seenClips.push_back(clip->id);
+        affectedTracks.push_back(source->id);
+        affectedTracks.push_back(target->id);
+        inverseMoves.push_back({clip->id, source->id, clip->timeline_in});
+    }
+    const std::vector<ExactTrackState> before = snapshots(affectedTracks);
+    for (const LinkedClipMove& move : operation.moves) {
+        MoveClipOperation single{
+            move.clip_id, move.track_id, move.timeline_in, {}};
+        Operation ignored = RemoveClipOperation{};
+        if (!ApplyMove(candidate, single, ignored, error, message))
+            return false;
+    }
+    operation.exact_track_result = snapshots(affectedTracks);
+    inverse = MoveLinkedClipsOperation{operation.link_group_id,
+                                       std::move(inverseMoves), before};
+    return true;
+}
+
+bool ApplyTrimLinked(Document& candidate, TrimLinkedClipsOperation& operation,
+                     Operation& inverse, EditError& error,
+                     std::string& message) {
+    const auto snapshots = [&](const std::vector<Ulid>& ids) {
+        std::vector<ExactTrackState> result;
+        for (const Ulid& id : ids) {
+            if (std::any_of(result.begin(), result.end(),
+                            [&](const ExactTrackState& state) {
+                                return state.track_id == id;
+                            }))
+                continue;
+            const DocumentTrack* track = candidate.FindTrack(id);
+            if (track) result.push_back({id, track->clips});
+        }
+        return result;
+    };
+    if (!operation.exact_track_result.empty()) {
+        std::vector<Ulid> ids;
+        for (const ExactTrackState& state : operation.exact_track_result)
+            ids.push_back(state.track_id);
+        const std::vector<ExactTrackState> before = snapshots(ids);
+        if (before.size() != operation.exact_track_result.size()) {
+            Fail(EditError::UnknownTrack,
+                 "exact linked trim references an unknown track", error,
+                 message);
+            return false;
+        }
+        for (const ExactTrackState& state : operation.exact_track_result)
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = TrimLinkedClipsOperation{operation.link_group_id,
+                                           operation.trims, before};
+        return true;
+    }
+    if (operation.trims.size() < 2 || operation.link_group_id.empty()) {
+        Fail(EditError::InvalidOperation,
+             "TrimLinkedClips requires at least two linked members", error,
+             message);
+        return false;
+    }
+    std::vector<Ulid> trackIds;
+    std::vector<Ulid> seen;
+    for (const LinkedClipTrim& trim : operation.trims) {
+        const DocumentClip* clip = candidate.FindClip(trim.clip_id);
+        const DocumentTrack* track = candidate.FindTrackForClip(trim.clip_id);
+        if (!clip || !track || clip->link_group_id != operation.link_group_id ||
+            std::find(seen.begin(), seen.end(), trim.clip_id) != seen.end()) {
+            Fail(EditError::InvalidOperation,
+                 "linked trim members must be unique and share link_group_id",
+                 error, message);
+            return false;
+        }
+        seen.push_back(trim.clip_id);
+        trackIds.push_back(track->id);
+    }
+    const std::vector<ExactTrackState> before = snapshots(trackIds);
+    for (const LinkedClipTrim& trim : operation.trims) {
+        TrimClipOperation single{trim.clip_id, trim.edge, trim.delta,
+                                 std::nullopt};
+        Operation ignored = RemoveClipOperation{};
+        if (!ApplyTrim(candidate, single, ignored, error, message))
+            return false;
+    }
+    operation.exact_track_result = snapshots(trackIds);
+    inverse = TrimLinkedClipsOperation{operation.link_group_id, operation.trims,
+                                       before};
+    return true;
+}
+
+bool ApplyRemoveLinked(Document& candidate,
+                       RemoveLinkedClipsOperation& operation,
+                       Operation& inverse, EditError& error,
+                       std::string& message) {
+    const auto snapshots = [&](const std::vector<Ulid>& ids) {
+        std::vector<ExactTrackState> result;
+        for (const Ulid& id : ids) {
+            if (std::any_of(result.begin(), result.end(),
+                            [&](const ExactTrackState& state) {
+                                return state.track_id == id;
+                            }))
+                continue;
+            const DocumentTrack* track = candidate.FindTrack(id);
+            if (track) result.push_back({id, track->clips});
+        }
+        return result;
+    };
+    if (!operation.exact_track_result.empty()) {
+        std::vector<Ulid> ids;
+        for (const ExactTrackState& state : operation.exact_track_result)
+            ids.push_back(state.track_id);
+        const std::vector<ExactTrackState> before = snapshots(ids);
+        if (before.size() != operation.exact_track_result.size()) {
+            Fail(EditError::UnknownTrack,
+                 "exact linked remove references an unknown track", error,
+                 message);
+            return false;
+        }
+        for (const ExactTrackState& state : operation.exact_track_result)
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = RemoveLinkedClipsOperation{operation.link_group_id,
+                                             operation.clip_ids, before};
+        return true;
+    }
+    if (operation.clip_ids.size() < 2 || operation.link_group_id.empty()) {
+        Fail(EditError::InvalidOperation,
+             "RemoveLinkedClips requires at least two linked members", error,
+             message);
+        return false;
+    }
+    std::vector<Ulid> trackIds;
+    std::vector<Ulid> seen;
+    for (const Ulid& id : operation.clip_ids) {
+        const DocumentClip* clip = candidate.FindClip(id);
+        const DocumentTrack* track = candidate.FindTrackForClip(id);
+        if (!clip || !track || clip->link_group_id != operation.link_group_id ||
+            std::find(seen.begin(), seen.end(), id) != seen.end()) {
+            Fail(EditError::InvalidOperation,
+                 "linked remove members must be unique and share link_group_id",
+                 error, message);
+            return false;
+        }
+        seen.push_back(id);
+        trackIds.push_back(track->id);
+    }
+    const std::vector<ExactTrackState> before = snapshots(trackIds);
+    for (const Ulid& id : operation.clip_ids) {
+        RemoveClipOperation single{id, {}};
+        Operation ignored = RemoveClipOperation{};
+        if (!ApplyRemove(candidate, single, ignored, error, message))
+            return false;
+    }
+    operation.exact_track_result = snapshots(trackIds);
+    inverse = RemoveLinkedClipsOperation{operation.link_group_id,
+                                         operation.clip_ids, before};
+    return true;
+}
+
+bool ApplyDeleteGap(Document& candidate, DeleteGapOperation& operation,
+                    Operation& inverse, EditError& error,
+                    std::string& message) {
+    DocumentTrack* track = candidate.FindTrack(operation.track_id);
+    if (!track) {
+        Fail(EditError::UnknownTrack,
+             "unknown track_id '" + operation.track_id + "'", error, message);
+        return false;
+    }
+    const ExactTrackState before{track->id, track->clips};
+    if (!operation.exact_track_result.empty()) {
+        if (operation.exact_track_result.size() != 1 ||
+            operation.exact_track_result[0].track_id != track->id) {
+            Fail(EditError::InvalidOperation,
+                 "exact gap state must contain its destination track", error,
+                 message);
+            return false;
+        }
+        track->clips = operation.exact_track_result[0].clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = DeleteGapOperation{operation.track_id,
+                                     operation.gap_start,
+                                     operation.gap_duration,
+                                     {before}};
+        return true;
+    }
+    if (operation.gap_start.rate <= 0 || operation.gap_start.value < 0 ||
+        operation.gap_duration.rate <= 0 || operation.gap_duration.value <= 0) {
+        Fail(EditError::InvalidOperation,
+             "gap start and duration must describe a positive range", error,
+             message);
+        return false;
+    }
+    const RationalTime gapEnd = operation.gap_start.add(operation.gap_duration);
+    bool hasFollowingClip = false;
+    for (const DocumentClip& clip : track->clips) {
+        const RationalTime clipEnd = clip.timeline_in.add(clip.duration);
+        if (clip.timeline_in < gapEnd && clipEnd > operation.gap_start) {
+            Fail(EditError::InvalidOperation,
+                 "DeleteGap range contains clip_id '" + clip.id + "'", error,
+                 message);
+            return false;
+        }
+        if (clip.timeline_in >= gapEnd) hasFollowingClip = true;
+    }
+    if (!hasFollowingClip) {
+        Fail(EditError::InvalidOperation,
+             "DeleteGap requires a following clip to close the gap", error,
+             message);
+        return false;
+    }
+    for (DocumentClip& clip : track->clips) {
+        if (clip.timeline_in >= gapEnd)
+            clip.timeline_in = clip.timeline_in.sub(operation.gap_duration);
+    }
+    if (!ValidateResult(candidate, error, message)) return false;
+    operation.exact_track_result = {{track->id, track->clips}};
+    inverse = DeleteGapOperation{operation.track_id,
+                                 operation.gap_start,
+                                 operation.gap_duration,
+                                 {before}};
+    return true;
+}
+
+bool ApplyDetachAudio(Document& candidate, DetachAudioOperation& operation,
+                      Operation& inverse, EditError& error,
+                      std::string& message) {
+    DocumentTrack* videoTrack =
+        candidate.FindTrackForClip(operation.video_clip_id);
+    DocumentTrack* audioTrack = candidate.FindTrack(operation.audio_track_id);
+    if (!videoTrack) {
+        Fail(EditError::UnknownClip,
+             "unknown video_clip_id '" + operation.video_clip_id + "'", error,
+             message);
+        return false;
+    }
+    if (!audioTrack) {
+        Fail(EditError::UnknownTrack,
+             "unknown audio_track_id '" + operation.audio_track_id + "'", error,
+             message);
+        return false;
+    }
+    const auto snapshots = [&](const std::vector<Ulid>& ids) {
+        std::vector<ExactTrackState> result;
+        for (const Ulid& id : ids) {
+            if (std::any_of(result.begin(), result.end(),
+                            [&](const ExactTrackState& state) {
+                                return state.track_id == id;
+                            }))
+                continue;
+            const DocumentTrack* track = candidate.FindTrack(id);
+            if (track) result.push_back({id, track->clips});
+        }
+        return result;
+    };
+    if (!operation.exact_track_result.empty()) {
+        std::vector<Ulid> ids;
+        for (const ExactTrackState& state : operation.exact_track_result)
+            ids.push_back(state.track_id);
+        const std::vector<ExactTrackState> before = snapshots(ids);
+        if (before.size() != operation.exact_track_result.size()) {
+            Fail(EditError::UnknownTrack,
+                 "exact detach state references an unknown track", error,
+                 message);
+            return false;
+        }
+        for (const ExactTrackState& state : operation.exact_track_result)
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = DetachAudioOperation{operation.video_clip_id,
+                                       operation.audio_track_id,
+                                       operation.audio_clip_id, before};
+        return true;
+    }
+    if (videoTrack->kind != "video" || audioTrack->kind != "audio") {
+        Fail(EditError::InvalidOperation,
+             "DetachAudio requires a video clip and an audio track", error,
+             message);
+        return false;
+    }
+    DocumentClip* videoClip = candidate.FindClip(operation.video_clip_id);
+    if (!videoClip->include_audio) {
+        Fail(EditError::InvalidOperation,
+             "video clip audio is already detached", error, message);
+        return false;
+    }
+    const LibraryMedia* media =
+        candidate.FindLibraryMedia(videoClip->source_id);
+    if (media && media->metadata_complete && !media->has_audio) {
+        Fail(EditError::InvalidOperation, "source media has no audio stream",
+             error, message);
+        return false;
+    }
+    if (operation.audio_clip_id.empty())
+        operation.audio_clip_id = GenerateUlid();
+    if (!IsValidUlid(operation.audio_clip_id) ||
+        candidate.FindClip(operation.audio_clip_id) ||
+        candidate.FindTrack(operation.audio_clip_id) ||
+        candidate.FindSource(operation.audio_clip_id) ||
+        candidate.FindLibraryMedia(operation.audio_clip_id)) {
+        Fail(EditError::DuplicateId,
+             "audio_clip_id is invalid or already exists", error, message);
+        return false;
+    }
+    const std::vector<ExactTrackState> before =
+        snapshots({videoTrack->id, audioTrack->id});
+    const RationalTime detachedEnd =
+        videoClip->timeline_in.add(videoClip->duration);
+    for (const DocumentClip& existing : audioTrack->clips) {
+        if (existing.timeline_in < detachedEnd &&
+            existing.timeline_in.add(existing.duration) >
+                videoClip->timeline_in) {
+            Fail(EditError::Overlap,
+                 "detached audio would overlap clip_id '" + existing.id + "'",
+                 error, message);
+            return false;
+        }
+    }
+    DocumentClip audioClip = *videoClip;
+    audioClip.id = operation.audio_clip_id;
+    videoClip->include_audio = false;
+    videoClip->link_group_id = operation.audio_clip_id;
+    videoClip->sync_anchor_clip_id = videoClip->id;
+    videoClip->sync_reference_delta = {0, 1};
+    audioClip.link_group_id = operation.audio_clip_id;
+    audioClip.sync_anchor_clip_id = videoClip->id;
+    audioClip.sync_reference_delta = {0, 1};
+    audioTrack->clips.push_back(std::move(audioClip));
+    std::stable_sort(audioTrack->clips.begin(), audioTrack->clips.end(),
+                     [](const DocumentClip& left, const DocumentClip& right) {
+                         return left.timeline_in < right.timeline_in;
+                     });
+    if (!ValidateResult(candidate, error, message)) return false;
+    operation.exact_track_result = snapshots({videoTrack->id, audioTrack->id});
+    inverse =
+        DetachAudioOperation{operation.video_clip_id, operation.audio_track_id,
+                             operation.audio_clip_id, before};
+    return true;
+}
+
+bool ApplyAddTrack(Document& candidate, AddTrackOperation& operation,
+                   Operation& inverse, EditError& error, std::string& message) {
+    if (operation.track_id.empty()) operation.track_id = GenerateUlid();
+    if (!IsValidUlid(operation.track_id) ||
+        candidate.FindTrack(operation.track_id) ||
+        candidate.FindClip(operation.track_id) ||
+        candidate.FindSource(operation.track_id) ||
+        candidate.FindLibraryMedia(operation.track_id)) {
+        Fail(EditError::DuplicateId,
+             "track_id is invalid or already exists: '" + operation.track_id +
+                 "'",
+             error, message);
+        return false;
+    }
+    if (operation.kind != "video" && operation.kind != "audio") {
+        Fail(EditError::InvalidOperation,
+             "track kind must be 'video' or 'audio'", error, message);
+        return false;
+    }
+    if (operation.index < 0 ||
+        std::any_of(candidate.tracks.begin(), candidate.tracks.end(),
+                    [&](const DocumentTrack& track) {
+                        return track.index == operation.index;
+                    })) {
+        Fail(EditError::InvalidOperation,
+             "track index must be non-negative and unique", error, message);
+        return false;
+    }
+    candidate.tracks.push_back(
+        {operation.track_id, operation.kind, operation.index, {}});
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = RemoveTrackOperation{operation.track_id};
+    return true;
+}
+
+bool ApplyRemoveTrack(Document& candidate, RemoveTrackOperation& operation,
+                      Operation& inverse, EditError& error,
+                      std::string& message) {
+    const auto found =
+        std::find_if(candidate.tracks.begin(), candidate.tracks.end(),
+                     [&](const DocumentTrack& track) {
+                         return track.id == operation.track_id;
+                     });
+    if (found == candidate.tracks.end()) {
+        Fail(EditError::UnknownTrack,
+             "unknown track_id '" + operation.track_id + "'", error, message);
+        return false;
+    }
+    if (!found->clips.empty()) {
+        Fail(EditError::InvalidOperation, "cannot remove a non-empty track",
+             error, message);
+        return false;
+    }
+    inverse = AddTrackOperation{found->id, found->kind, found->index};
+    candidate.tracks.erase(found);
+    return ValidateResult(candidate, error, message);
+}
+
+bool ApplyAddBin(Document& candidate, AddBinOperation& operation,
+                 Operation& inverse, EditError& error, std::string& message) {
+    if (operation.bin_id.empty()) operation.bin_id = GenerateUlid();
+    if (!IsValidUlid(operation.bin_id) || candidate.FindBin(operation.bin_id) ||
+        candidate.FindTrack(operation.bin_id) ||
+        candidate.FindClip(operation.bin_id) ||
+        candidate.FindSource(operation.bin_id) ||
+        candidate.FindLibraryMedia(operation.bin_id)) {
+        Fail(EditError::DuplicateId,
+             "bin_id is invalid or already exists: '" + operation.bin_id + "'",
+             error, message);
+        return false;
+    }
+    if (operation.name.empty() || operation.name.size() > 128 ||
+        std::any_of(operation.name.begin(), operation.name.end(),
+                    [](unsigned char character) { return character < 0x20; })) {
+        Fail(EditError::InvalidOperation,
+             "bin name must contain between 1 and 128 bytes", error, message);
+        return false;
+    }
+    if (!operation.parent_id.empty() &&
+        !candidate.FindBin(operation.parent_id)) {
+        Fail(EditError::UnknownBin,
+             "unknown parent bin_id '" + operation.parent_id + "'", error,
+             message);
+        return false;
+    }
+    candidate.bins.push_back(
+        {operation.bin_id, operation.name, operation.parent_id});
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = RemoveBinOperation{operation.bin_id, operation.name,
+                                 operation.parent_id};
+    return true;
+}
+
+bool ApplyRemoveBin(Document& candidate, RemoveBinOperation& operation,
+                    Operation& inverse, EditError& error,
+                    std::string& message) {
+    const auto found = std::find_if(
+        candidate.bins.begin(), candidate.bins.end(),
+        [&](const DocumentBin& bin) { return bin.id == operation.bin_id; });
+    if (found == candidate.bins.end()) {
+        Fail(EditError::UnknownBin, "unknown bin_id '" + operation.bin_id + "'",
+             error, message);
+        return false;
+    }
+    if (std::any_of(candidate.library.begin(), candidate.library.end(),
+                    [&](const LibraryMedia& media) {
+                        return media.bin_id == operation.bin_id;
+                    })) {
+        Fail(EditError::InvalidOperation,
+             "cannot remove a bin that still contains media", error, message);
+        return false;
+    }
+    if (std::any_of(candidate.bins.begin(), candidate.bins.end(),
+                    [&](const DocumentBin& bin) {
+                        return bin.parent_id == operation.bin_id;
+                    })) {
+        Fail(EditError::InvalidOperation,
+             "cannot remove a bin that still contains child bins", error,
+             message);
+        return false;
+    }
+    operation.name = found->name;
+    operation.parent_id = found->parent_id;
+    inverse = AddBinOperation{found->id, found->name, found->parent_id};
+    candidate.bins.erase(found);
+    return ValidateResult(candidate, error, message);
+}
+
+bool ApplyRenameBin(Document& candidate, RenameBinOperation& operation,
+                    Operation& inverse, EditError& error,
+                    std::string& message) {
+    DocumentBin* bin = candidate.FindBin(operation.bin_id);
+    if (!bin) {
+        Fail(EditError::UnknownBin, "unknown bin_id '" + operation.bin_id + "'",
+             error, message);
+        return false;
+    }
+    if (operation.name.empty() || operation.name.size() > 128 ||
+        std::any_of(operation.name.begin(), operation.name.end(),
+                    [](unsigned char character) { return character < 0x20; })) {
+        Fail(EditError::InvalidOperation,
+             "bin name must contain between 1 and 128 bytes", error, message);
+        return false;
+    }
+    inverse = RenameBinOperation{bin->id, bin->name};
+    bin->name = operation.name;
+    return ValidateResult(candidate, error, message);
+}
+
+bool ApplySetMediaBin(Document& candidate, SetMediaBinOperation& operation,
+                      Operation& inverse, EditError& error,
+                      std::string& message) {
+    LibraryMedia* media = candidate.FindLibraryMedia(operation.media_id);
+    if (!media) {
+        Fail(EditError::UnknownMedia,
+             "unknown media_id '" + operation.media_id + "'", error, message);
+        return false;
+    }
+    if (!operation.bin_id.empty() && !candidate.FindBin(operation.bin_id)) {
+        Fail(EditError::UnknownBin, "unknown bin_id '" + operation.bin_id + "'",
+             error, message);
+        return false;
+    }
+    inverse = SetMediaBinOperation{operation.media_id, media->bin_id};
+    media->bin_id = operation.bin_id;
+    return ValidateResult(candidate, error, message);
+}
+
+bool ApplySetClipLink(Document& candidate, SetClipLinkOperation& operation,
+                      Operation& inverse, EditError& error,
+                      std::string& message) {
+    DocumentClip* first = candidate.FindClip(operation.first_clip_id);
+    DocumentClip* second = candidate.FindClip(operation.second_clip_id);
+    if (!first || !second || first == second) {
+        Fail(EditError::UnknownClip,
+             "SetClipLink requires two distinct existing clips", error,
+             message);
+        return false;
+    }
+    if ((!operation.first_group_id.empty() &&
+         !IsValidUlid(operation.first_group_id)) ||
+        (!operation.second_group_id.empty() &&
+         !IsValidUlid(operation.second_group_id)) ||
+        (operation.exact_first_result.has_value() !=
+         operation.exact_second_result.has_value())) {
+        Fail(EditError::InvalidOperation,
+             "link group IDs must be empty or valid ULIDs", error, message);
+        return false;
+    }
+    const SetClipLinkOperation::ExactState oldFirst{
+        first->link_group_id, first->sync_anchor_clip_id,
+        first->sync_reference_delta};
+    const SetClipLinkOperation::ExactState oldSecond{
+        second->link_group_id, second->sync_anchor_clip_id,
+        second->sync_reference_delta};
+    inverse =
+        SetClipLinkOperation{first->id,          second->id, oldFirst.group_id,
+                             oldSecond.group_id, oldFirst,   oldSecond};
+    if (operation.exact_first_result) {
+        const auto apply = [](DocumentClip& clip,
+                              const SetClipLinkOperation::ExactState& state) {
+            clip.link_group_id = state.group_id;
+            clip.sync_anchor_clip_id = state.anchor_clip_id;
+            clip.sync_reference_delta = state.reference_delta;
+        };
+        apply(*first, *operation.exact_first_result);
+        apply(*second, *operation.exact_second_result);
+    } else if (operation.first_group_id.empty() &&
+               operation.second_group_id.empty()) {
+        first->link_group_id.clear();
+        first->sync_anchor_clip_id.clear();
+        first->sync_reference_delta = {0, 1};
+        second->link_group_id.clear();
+        second->sync_anchor_clip_id.clear();
+        second->sync_reference_delta = {0, 1};
+    } else {
+        if (operation.first_group_id != operation.second_group_id) {
+            Fail(EditError::InvalidOperation,
+                 "newly linked clips must share one group ID", error, message);
+            return false;
+        }
+        const DocumentTrack* firstTrack = candidate.FindTrackForClip(first->id);
+        DocumentClip* anchor =
+            firstTrack && firstTrack->kind == "video" ? first : second;
+        DocumentClip* member = anchor == first ? second : first;
+        anchor->link_group_id = operation.first_group_id;
+        anchor->sync_anchor_clip_id = anchor->id;
+        anchor->sync_reference_delta = {0, 1};
+        member->link_group_id = operation.first_group_id;
+        member->sync_anchor_clip_id = anchor->id;
+        member->sync_reference_delta = PhaseOf(*member).sub(PhaseOf(*anchor));
+    }
+    operation.exact_first_result = SetClipLinkOperation::ExactState{
+        first->link_group_id, first->sync_anchor_clip_id,
+        first->sync_reference_delta};
+    operation.exact_second_result = SetClipLinkOperation::ExactState{
+        second->link_group_id, second->sync_anchor_clip_id,
+        second->sync_reference_delta};
+    return ValidateResult(candidate, error, message);
+}
+
+bool ApplySplit(Document& candidate, SplitClipOperation& operation,
+                Operation& inverse, EditError& error, std::string& message) {
+    DocumentTrack* track = candidate.FindTrackForClip(operation.clip_id);
+    if (!track) {
+        Fail(EditError::UnknownClip,
+             "unknown clip_id '" + operation.clip_id + "'", error, message);
+        return false;
+    }
+    const auto found = std::find_if(
+        track->clips.begin(), track->clips.end(),
+        [&](const DocumentClip& clip) { return clip.id == operation.clip_id; });
+    const size_t index =
+        static_cast<size_t>(std::distance(track->clips.begin(), found));
+    const DocumentClip original = *found;
+    const RationalTime end = original.timeline_in.add(original.duration);
+    if (operation.timeline_position.rate <= 0 ||
+        operation.timeline_position <= original.timeline_in ||
+        operation.timeline_position >= end) {
+        Fail(EditError::InvalidTimelineIn,
+             "split position must be strictly inside the clip", error, message);
+        return false;
+    }
+    if (operation.right_clip_id.empty())
+        operation.right_clip_id = GenerateUlid();
+    if (!IsValidUlid(operation.right_clip_id) ||
+        candidate.FindClip(operation.right_clip_id) ||
+        candidate.FindSource(operation.right_clip_id) ||
+        candidate.FindTrack(operation.right_clip_id)) {
+        Fail(EditError::DuplicateId,
+             "split right_clip_id is invalid or already exists: '" +
+                 operation.right_clip_id + "'",
+             error, message);
+        return false;
+    }
+
+    const RationalTime leftDuration =
+        operation.timeline_position.sub(original.timeline_in);
+    DocumentClip left = original;
+    left.duration = leftDuration;
+    DocumentClip right{operation.right_clip_id, original.source_id,
+                       original.source_in.add(leftDuration),
+                       original.duration.sub(leftDuration),
+                       operation.timeline_position};
+    right.include_audio = original.include_audio;
+    right.link_group_id = original.link_group_id;
+    right.sync_anchor_clip_id = original.sync_anchor_clip_id;
+    right.sync_reference_delta = original.sync_reference_delta;
+    track->clips[index] = std::move(left);
+    track->clips.insert(
+        track->clips.begin() + static_cast<std::ptrdiff_t>(index + 1),
+        std::move(right));
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = JoinClipOperation{original.id, operation.right_clip_id,
+                                TimesOf(original)};
+    return true;
+}
+
+bool ApplyJoin(Document& candidate, JoinClipOperation& operation,
+               Operation& inverse, EditError& error, std::string& message) {
+    DocumentTrack* track = candidate.FindTrackForClip(operation.left_clip_id);
+    if (!track) {
+        Fail(EditError::UnknownClip,
+             "unknown left_clip_id '" + operation.left_clip_id + "'", error,
+             message);
+        return false;
+    }
+    const auto left = std::find_if(track->clips.begin(), track->clips.end(),
+                                   [&](const DocumentClip& clip) {
+                                       return clip.id == operation.left_clip_id;
+                                   });
+    if (left == track->clips.end() || std::next(left) == track->clips.end() ||
+        std::next(left)->id != operation.right_clip_id) {
+        Fail(EditError::InvalidOperation,
+             "join clips must be adjacent on the same track", error, message);
+        return false;
+    }
+    const DocumentClip right = *std::next(left);
+    if (left->source_id != right.source_id ||
+        left->timeline_in.add(left->duration) != right.timeline_in ||
+        left->source_in.add(left->duration) != right.source_in) {
+        Fail(EditError::InvalidOperation,
+             "join clips are not contiguous pieces of one source", error,
+             message);
+        return false;
+    }
+    const RationalTime splitPosition = right.timeline_in;
+    left->source_in = operation.joined_times.source_in;
+    left->duration = operation.joined_times.duration;
+    left->timeline_in = operation.joined_times.timeline_in;
+    track->clips.erase(std::next(left));
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = SplitClipOperation{operation.left_clip_id, splitPosition,
+                                 operation.right_clip_id};
+    return true;
+}
+
 void WriteTime(std::ostringstream& output, const RationalTime& time) {
     output << "{\"value\":" << time.value << ",\"rate\":" << time.rate << "}";
+}
+
+void WriteString(std::ostringstream& output, const std::string& value) {
+    output << '"';
+    for (const char character : value) {
+        if (character == '"' || character == '\\') output << '\\';
+        output << character;
+    }
+    output << '"';
 }
 
 void WriteExactPositions(std::ostringstream& output,
@@ -293,6 +1169,41 @@ void WriteExactPositions(std::ostringstream& output,
                << "\",\"timeline_in\":";
         WriteTime(output, positions[index].timeline_in);
         output << '}';
+    }
+    output << ']';
+}
+
+void WriteExactTracks(std::ostringstream& output,
+                      const std::vector<ExactTrackState>& tracks) {
+    output << '[';
+    for (size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
+        if (trackIndex) output << ',';
+        output << "{\"track_id\":\"" << tracks[trackIndex].track_id
+               << "\",\"clips\":[";
+        for (size_t clipIndex = 0; clipIndex < tracks[trackIndex].clips.size();
+             ++clipIndex) {
+            if (clipIndex) output << ',';
+            const DocumentClip& clip = tracks[trackIndex].clips[clipIndex];
+            output << "{\"id\":\"" << clip.id << "\",\"source_id\":\""
+                   << clip.source_id << "\",\"source_in\":";
+            WriteTime(output, clip.source_in);
+            output << ",\"duration\":";
+            WriteTime(output, clip.duration);
+            output << ",\"timeline_in\":";
+            WriteTime(output, clip.timeline_in);
+            output << ",\"include_audio\":"
+                   << (clip.include_audio ? "true" : "false");
+            if (!clip.link_group_id.empty())
+                output << ",\"link_group_id\":\"" << clip.link_group_id << "\"";
+            if (!clip.sync_anchor_clip_id.empty()) {
+                output << ",\"sync_anchor_clip_id\":\""
+                       << clip.sync_anchor_clip_id
+                       << "\",\"sync_reference_delta\":";
+                WriteTime(output, clip.sync_reference_delta);
+            }
+            output << '}';
+        }
+        output << "]}";
     }
     output << ']';
 }
@@ -407,6 +1318,52 @@ std::vector<ExactTimelinePosition> ReadExactPositions(Reader& reader) {
     }
 }
 
+std::vector<ExactTrackState> ReadExactTracks(Reader& reader) {
+    std::vector<ExactTrackState> tracks;
+    reader.Expect("[");
+    if (reader.Consume("]")) return tracks;
+    while (true) {
+        ExactTrackState state;
+        reader.Expect("{\"track_id\":");
+        state.track_id = reader.String();
+        reader.Expect(",\"clips\":[");
+        if (!reader.Consume("]")) {
+            while (true) {
+                DocumentClip clip;
+                reader.Expect("{\"id\":");
+                clip.id = reader.String();
+                reader.Expect(",\"source_id\":");
+                clip.source_id = reader.String();
+                reader.Expect(",\"source_in\":");
+                clip.source_in = ReadTime(reader);
+                reader.Expect(",\"duration\":");
+                clip.duration = ReadTime(reader);
+                reader.Expect(",\"timeline_in\":");
+                clip.timeline_in = ReadTime(reader);
+                if (reader.Consume(",\"include_audio\":false"))
+                    clip.include_audio = false;
+                else
+                    reader.Consume(",\"include_audio\":true");
+                if (reader.Consume(",\"link_group_id\":"))
+                    clip.link_group_id = reader.String();
+                if (reader.Consume(",\"sync_anchor_clip_id\":")) {
+                    clip.sync_anchor_clip_id = reader.String();
+                    reader.Expect(",\"sync_reference_delta\":");
+                    clip.sync_reference_delta = ReadTime(reader);
+                }
+                reader.Expect("}");
+                state.clips.push_back(std::move(clip));
+                if (reader.Consume("]")) break;
+                reader.Expect(",");
+            }
+        }
+        reader.Expect("}");
+        tracks.push_back(std::move(state));
+        if (reader.Consume("]")) return tracks;
+        reader.Expect(",");
+    }
+}
+
 }  // namespace
 
 const char* EditErrorName(EditError error) {
@@ -419,6 +1376,10 @@ const char* EditErrorName(EditError error) {
             return "UnknownClip";
         case EditError::UnknownSource:
             return "UnknownSource";
+        case EditError::UnknownBin:
+            return "UnknownBin";
+        case EditError::UnknownMedia:
+            return "UnknownMedia";
         case EditError::InvalidDuration:
             return "InvalidDuration";
         case EditError::InvalidTimelineIn:
@@ -465,6 +1426,61 @@ bool ApplyOperation(Document& document, Operation& operation,
         } else if (auto* trim = std::get_if<TrimClipOperation>(&normalized)) {
             applied =
                 ApplyTrim(candidate, *trim, generatedInverse, error, message);
+        } else if (auto* move = std::get_if<MoveClipOperation>(&normalized)) {
+            applied =
+                ApplyMove(candidate, *move, generatedInverse, error, message);
+        } else if (auto* linkedMove =
+                       std::get_if<MoveLinkedClipsOperation>(&normalized)) {
+            applied = ApplyMoveLinked(candidate, *linkedMove, generatedInverse,
+                                      error, message);
+        } else if (auto* linkedTrim =
+                       std::get_if<TrimLinkedClipsOperation>(&normalized)) {
+            applied = ApplyTrimLinked(candidate, *linkedTrim, generatedInverse,
+                                      error, message);
+        } else if (auto* linkedRemove =
+                       std::get_if<RemoveLinkedClipsOperation>(&normalized)) {
+            applied = ApplyRemoveLinked(candidate, *linkedRemove,
+                                        generatedInverse, error, message);
+        } else if (auto* split = std::get_if<SplitClipOperation>(&normalized)) {
+            applied =
+                ApplySplit(candidate, *split, generatedInverse, error, message);
+        } else if (auto* gap = std::get_if<DeleteGapOperation>(&normalized)) {
+            applied = ApplyDeleteGap(candidate, *gap, generatedInverse, error,
+                                     message);
+        } else if (auto* detach =
+                       std::get_if<DetachAudioOperation>(&normalized)) {
+            applied = ApplyDetachAudio(candidate, *detach, generatedInverse,
+                                       error, message);
+        } else if (auto* addTrack =
+                       std::get_if<AddTrackOperation>(&normalized)) {
+            applied = ApplyAddTrack(candidate, *addTrack, generatedInverse,
+                                    error, message);
+        } else if (auto* removeTrack =
+                       std::get_if<RemoveTrackOperation>(&normalized)) {
+            applied = ApplyRemoveTrack(candidate, *removeTrack,
+                                       generatedInverse, error, message);
+        } else if (auto* addBin = std::get_if<AddBinOperation>(&normalized)) {
+            applied = ApplyAddBin(candidate, *addBin, generatedInverse, error,
+                                  message);
+        } else if (auto* removeBin =
+                       std::get_if<RemoveBinOperation>(&normalized)) {
+            applied = ApplyRemoveBin(candidate, *removeBin, generatedInverse,
+                                     error, message);
+        } else if (auto* renameBin =
+                       std::get_if<RenameBinOperation>(&normalized)) {
+            applied = ApplyRenameBin(candidate, *renameBin, generatedInverse,
+                                     error, message);
+        } else if (auto* setMediaBin =
+                       std::get_if<SetMediaBinOperation>(&normalized)) {
+            applied = ApplySetMediaBin(candidate, *setMediaBin,
+                                       generatedInverse, error, message);
+        } else if (auto* setClipLink =
+                       std::get_if<SetClipLinkOperation>(&normalized)) {
+            applied = ApplySetClipLink(candidate, *setClipLink,
+                                       generatedInverse, error, message);
+        } else if (auto* join = std::get_if<JoinClipOperation>(&normalized)) {
+            applied =
+                ApplyJoin(candidate, *join, generatedInverse, error, message);
         }
         if (!applied) return false;
     } catch (const std::exception& exception) {
@@ -500,26 +1516,164 @@ std::string SerializeOperation(const Operation& operation) {
                << "\",\"exact_timeline\":";
         WriteExactPositions(output, remove->exact_timeline_result);
         output << '}';
-    } else {
-        const auto& trim = std::get<TrimClipOperation>(operation);
-        output << "{\"type\":\"TrimClip\",\"clip_id\":\"" << trim.clip_id
+    } else if (const auto* trim = std::get_if<TrimClipOperation>(&operation)) {
+        output << "{\"type\":\"TrimClip\",\"clip_id\":\"" << trim->clip_id
                << "\",\"edge\":\""
-               << (trim.edge == TrimEdge::Head ? "Head" : "Tail")
+               << (trim->edge == TrimEdge::Head ? "Head" : "Tail")
                << "\",\"delta\":";
-        WriteTime(output, trim.delta);
+        WriteTime(output, trim->delta);
         output << ",\"exact_clip\":";
-        if (!trim.exact_clip_result) {
+        if (!trim->exact_clip_result) {
             output << "null";
         } else {
             output << "{\"source_in\":";
-            WriteTime(output, trim.exact_clip_result->source_in);
+            WriteTime(output, trim->exact_clip_result->source_in);
             output << ",\"duration\":";
-            WriteTime(output, trim.exact_clip_result->duration);
+            WriteTime(output, trim->exact_clip_result->duration);
             output << ",\"timeline_in\":";
-            WriteTime(output, trim.exact_clip_result->timeline_in);
+            WriteTime(output, trim->exact_clip_result->timeline_in);
             output << '}';
         }
         output << '}';
+    } else if (const auto* move = std::get_if<MoveClipOperation>(&operation)) {
+        output << "{\"type\":\"MoveClip\",\"clip_id\":\"" << move->clip_id
+               << "\",\"track_id\":\"" << move->track_id
+               << "\",\"timeline_in\":";
+        WriteTime(output, move->timeline_in);
+        output << ",\"exact_tracks\":";
+        WriteExactTracks(output, move->exact_track_result);
+        output << '}';
+    } else if (const auto* linkedMove =
+                   std::get_if<MoveLinkedClipsOperation>(&operation)) {
+        output << "{\"type\":\"MoveLinkedClips\",\"link_group_id\":\""
+               << linkedMove->link_group_id << "\",\"moves\":[";
+        for (size_t index = 0; index < linkedMove->moves.size(); ++index) {
+            if (index) output << ',';
+            const LinkedClipMove& move = linkedMove->moves[index];
+            output << "{\"clip_id\":\"" << move.clip_id << "\",\"track_id\":\""
+                   << move.track_id << "\",\"timeline_in\":";
+            WriteTime(output, move.timeline_in);
+            output << '}';
+        }
+        output << "],\"exact_tracks\":";
+        WriteExactTracks(output, linkedMove->exact_track_result);
+        output << '}';
+    } else if (const auto* linkedTrim =
+                   std::get_if<TrimLinkedClipsOperation>(&operation)) {
+        output << "{\"type\":\"TrimLinkedClips\",\"link_group_id\":\""
+               << linkedTrim->link_group_id << "\",\"trims\":[";
+        for (size_t index = 0; index < linkedTrim->trims.size(); ++index) {
+            if (index) output << ',';
+            const LinkedClipTrim& trim = linkedTrim->trims[index];
+            output << "{\"clip_id\":\"" << trim.clip_id << "\",\"edge\":\""
+                   << (trim.edge == TrimEdge::Head ? "Head" : "Tail")
+                   << "\",\"delta\":";
+            WriteTime(output, trim.delta);
+            output << '}';
+        }
+        output << "],\"exact_tracks\":";
+        WriteExactTracks(output, linkedTrim->exact_track_result);
+        output << '}';
+    } else if (const auto* linkedRemove =
+                   std::get_if<RemoveLinkedClipsOperation>(&operation)) {
+        output << "{\"type\":\"RemoveLinkedClips\",\"link_group_id\":\""
+               << linkedRemove->link_group_id << "\",\"clip_ids\":[";
+        for (size_t index = 0; index < linkedRemove->clip_ids.size(); ++index) {
+            if (index) output << ',';
+            WriteString(output, linkedRemove->clip_ids[index]);
+        }
+        output << "],\"exact_tracks\":";
+        WriteExactTracks(output, linkedRemove->exact_track_result);
+        output << '}';
+    } else if (const auto* split =
+                   std::get_if<SplitClipOperation>(&operation)) {
+        output << "{\"type\":\"SplitClip\",\"clip_id\":\"" << split->clip_id
+               << "\",\"timeline_position\":";
+        WriteTime(output, split->timeline_position);
+        output << ",\"right_clip_id\":\"" << split->right_clip_id << "\"}";
+    } else if (const auto* gap = std::get_if<DeleteGapOperation>(&operation)) {
+        output << "{\"type\":\"DeleteGap\",\"track_id\":\"" << gap->track_id
+               << "\",\"gap_start\":";
+        WriteTime(output, gap->gap_start);
+        output << ",\"gap_duration\":";
+        WriteTime(output, gap->gap_duration);
+        output << ",\"exact_tracks\":";
+        WriteExactTracks(output, gap->exact_track_result);
+        output << '}';
+    } else if (const auto* detach =
+                   std::get_if<DetachAudioOperation>(&operation)) {
+        output << "{\"type\":\"DetachAudio\",\"video_clip_id\":\""
+               << detach->video_clip_id << "\",\"audio_track_id\":\""
+               << detach->audio_track_id << "\",\"audio_clip_id\":\""
+               << detach->audio_clip_id << "\",\"exact_tracks\":";
+        WriteExactTracks(output, detach->exact_track_result);
+        output << '}';
+    } else if (const auto* addTrack =
+                   std::get_if<AddTrackOperation>(&operation)) {
+        output << "{\"type\":\"AddTrack\",\"track_id\":\"" << addTrack->track_id
+               << "\",\"kind\":\"" << addTrack->kind
+               << "\",\"index\":" << addTrack->index << '}';
+    } else if (const auto* removeTrack =
+                   std::get_if<RemoveTrackOperation>(&operation)) {
+        output << "{\"type\":\"RemoveTrack\",\"track_id\":\""
+               << removeTrack->track_id << "\"}";
+    } else if (const auto* addBin = std::get_if<AddBinOperation>(&operation)) {
+        output << "{\"type\":\"AddBin\",\"bin_id\":\"" << addBin->bin_id
+               << "\",\"name\":";
+        WriteString(output, addBin->name);
+        output << ",\"parent_id\":\"" << addBin->parent_id << "\"";
+        output << '}';
+    } else if (const auto* removeBin =
+                   std::get_if<RemoveBinOperation>(&operation)) {
+        output << "{\"type\":\"RemoveBin\",\"bin_id\":\"" << removeBin->bin_id
+               << "\",\"name\":";
+        WriteString(output, removeBin->name);
+        output << ",\"parent_id\":\"" << removeBin->parent_id << "\"";
+        output << '}';
+    } else if (const auto* renameBin =
+                   std::get_if<RenameBinOperation>(&operation)) {
+        output << "{\"type\":\"RenameBin\",\"bin_id\":\"" << renameBin->bin_id
+               << "\",\"name\":";
+        WriteString(output, renameBin->name);
+        output << '}';
+    } else if (const auto* setMediaBin =
+                   std::get_if<SetMediaBinOperation>(&operation)) {
+        output << "{\"type\":\"SetMediaBin\",\"media_id\":\""
+               << setMediaBin->media_id << "\",\"bin_id\":\""
+               << setMediaBin->bin_id << "\"}";
+    } else if (const auto* setClipLink =
+                   std::get_if<SetClipLinkOperation>(&operation)) {
+        output << "{\"type\":\"SetClipLink\",\"first_clip_id\":\""
+               << setClipLink->first_clip_id << "\",\"second_clip_id\":\""
+               << setClipLink->second_clip_id << "\",\"first_group_id\":\""
+               << setClipLink->first_group_id << "\",\"second_group_id\":\""
+               << setClipLink->second_group_id << "\",\"exact_first\":";
+        const auto writeState = [&](const auto& state) {
+            if (!state) {
+                output << "null";
+                return;
+            }
+            output << "{\"group_id\":\"" << state->group_id
+                   << "\",\"anchor_clip_id\":\"" << state->anchor_clip_id
+                   << "\",\"reference_delta\":";
+            WriteTime(output, state->reference_delta);
+            output << '}';
+        };
+        writeState(setClipLink->exact_first_result);
+        output << ",\"exact_second\":";
+        writeState(setClipLink->exact_second_result);
+        output << '}';
+    } else {
+        const auto& join = std::get<JoinClipOperation>(operation);
+        output << "{\"type\":\"JoinClip\",\"left_clip_id\":\""
+               << join.left_clip_id << "\",\"right_clip_id\":\""
+               << join.right_clip_id << "\",\"joined_times\":{\"source_in\":";
+        WriteTime(output, join.joined_times.source_in);
+        output << ",\"duration\":";
+        WriteTime(output, join.joined_times.duration);
+        output << ",\"timeline_in\":";
+        WriteTime(output, join.joined_times.timeline_in);
+        output << "}}";
     }
     return output.str();
 }
@@ -583,6 +1737,227 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
                 value.exact_clip_result = exact;
             }
             reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "MoveClip") {
+            reader.Expect(",\"clip_id\":");
+            MoveClipOperation value;
+            value.clip_id = reader.String();
+            reader.Expect(",\"track_id\":");
+            value.track_id = reader.String();
+            reader.Expect(",\"timeline_in\":");
+            value.timeline_in = ReadTime(reader);
+            if (!reader.Consume("}")) {
+                reader.Expect(",\"exact_tracks\":");
+                value.exact_track_result = ReadExactTracks(reader);
+                reader.Expect("}");
+            }
+            operation = std::move(value);
+        } else if (type == "MoveLinkedClips") {
+            reader.Expect(",\"link_group_id\":");
+            MoveLinkedClipsOperation value;
+            value.link_group_id = reader.String();
+            reader.Expect(",\"moves\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    LinkedClipMove move;
+                    reader.Expect("{\"clip_id\":");
+                    move.clip_id = reader.String();
+                    reader.Expect(",\"track_id\":");
+                    move.track_id = reader.String();
+                    reader.Expect(",\"timeline_in\":");
+                    move.timeline_in = ReadTime(reader);
+                    reader.Expect("}");
+                    value.moves.push_back(std::move(move));
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "TrimLinkedClips") {
+            reader.Expect(",\"link_group_id\":");
+            TrimLinkedClipsOperation value;
+            value.link_group_id = reader.String();
+            reader.Expect(",\"trims\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    LinkedClipTrim trim;
+                    reader.Expect("{\"clip_id\":");
+                    trim.clip_id = reader.String();
+                    reader.Expect(",\"edge\":");
+                    const std::string edge = reader.String();
+                    if (edge != "Head" && edge != "Tail")
+                        throw std::runtime_error("invalid linked trim edge");
+                    trim.edge =
+                        edge == "Head" ? TrimEdge::Head : TrimEdge::Tail;
+                    reader.Expect(",\"delta\":");
+                    trim.delta = ReadTime(reader);
+                    reader.Expect("}");
+                    value.trims.push_back(std::move(trim));
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "RemoveLinkedClips") {
+            reader.Expect(",\"link_group_id\":");
+            RemoveLinkedClipsOperation value;
+            value.link_group_id = reader.String();
+            reader.Expect(",\"clip_ids\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    value.clip_ids.push_back(reader.String());
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "SplitClip") {
+            reader.Expect(",\"clip_id\":");
+            SplitClipOperation value;
+            value.clip_id = reader.String();
+            reader.Expect(",\"timeline_position\":");
+            value.timeline_position = ReadTime(reader);
+            reader.Expect(",\"right_clip_id\":");
+            value.right_clip_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "DeleteGap") {
+            reader.Expect(",\"track_id\":");
+            DeleteGapOperation value;
+            value.track_id = reader.String();
+            reader.Expect(",\"gap_start\":");
+            value.gap_start = ReadTime(reader);
+            reader.Expect(",\"gap_duration\":");
+            value.gap_duration = ReadTime(reader);
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "DetachAudio") {
+            reader.Expect(",\"video_clip_id\":");
+            DetachAudioOperation value;
+            value.video_clip_id = reader.String();
+            reader.Expect(",\"audio_track_id\":");
+            value.audio_track_id = reader.String();
+            reader.Expect(",\"audio_clip_id\":");
+            value.audio_clip_id = reader.String();
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "AddTrack") {
+            reader.Expect(",\"track_id\":");
+            AddTrackOperation value;
+            value.track_id = reader.String();
+            reader.Expect(",\"kind\":");
+            value.kind = reader.String();
+            reader.Expect(",\"index\":");
+            const int64_t index = reader.Integer();
+            if (index < std::numeric_limits<int32_t>::min() ||
+                index > std::numeric_limits<int32_t>::max())
+                throw std::runtime_error("track index outside int32_t range");
+            value.index = static_cast<int32_t>(index);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "RemoveTrack") {
+            reader.Expect(",\"track_id\":");
+            RemoveTrackOperation value;
+            value.track_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "AddBin") {
+            reader.Expect(",\"bin_id\":");
+            AddBinOperation value;
+            value.bin_id = reader.String();
+            reader.Expect(",\"name\":");
+            value.name = reader.String();
+            if (!reader.Consume("}")) {
+                reader.Expect(",\"parent_id\":");
+                value.parent_id = reader.String();
+                reader.Expect("}");
+            }
+            operation = std::move(value);
+        } else if (type == "RemoveBin") {
+            reader.Expect(",\"bin_id\":");
+            RemoveBinOperation value;
+            value.bin_id = reader.String();
+            reader.Expect(",\"name\":");
+            value.name = reader.String();
+            if (!reader.Consume("}")) {
+                reader.Expect(",\"parent_id\":");
+                value.parent_id = reader.String();
+                reader.Expect("}");
+            }
+            operation = std::move(value);
+        } else if (type == "RenameBin") {
+            reader.Expect(",\"bin_id\":");
+            RenameBinOperation value;
+            value.bin_id = reader.String();
+            reader.Expect(",\"name\":");
+            value.name = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "SetMediaBin") {
+            reader.Expect(",\"media_id\":");
+            SetMediaBinOperation value;
+            value.media_id = reader.String();
+            reader.Expect(",\"bin_id\":");
+            value.bin_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "SetClipLink") {
+            reader.Expect(",\"first_clip_id\":");
+            SetClipLinkOperation value;
+            value.first_clip_id = reader.String();
+            reader.Expect(",\"second_clip_id\":");
+            value.second_clip_id = reader.String();
+            reader.Expect(",\"first_group_id\":");
+            value.first_group_id = reader.String();
+            reader.Expect(",\"second_group_id\":");
+            value.second_group_id = reader.String();
+            if (!reader.Consume("}")) {
+                const auto readState =
+                    [&]() -> std::optional<SetClipLinkOperation::ExactState> {
+                    if (reader.Consume("null")) return std::nullopt;
+                    SetClipLinkOperation::ExactState state;
+                    reader.Expect("{\"group_id\":");
+                    state.group_id = reader.String();
+                    reader.Expect(",\"anchor_clip_id\":");
+                    state.anchor_clip_id = reader.String();
+                    reader.Expect(",\"reference_delta\":");
+                    state.reference_delta = ReadTime(reader);
+                    reader.Expect("}");
+                    return state;
+                };
+                reader.Expect(",\"exact_first\":");
+                value.exact_first_result = readState();
+                reader.Expect(",\"exact_second\":");
+                value.exact_second_result = readState();
+                reader.Expect("}");
+            }
+            operation = std::move(value);
+        } else if (type == "JoinClip") {
+            reader.Expect(",\"left_clip_id\":");
+            JoinClipOperation value;
+            value.left_clip_id = reader.String();
+            reader.Expect(",\"right_clip_id\":");
+            value.right_clip_id = reader.String();
+            reader.Expect(",\"joined_times\":{\"source_in\":");
+            value.joined_times.source_in = ReadTime(reader);
+            reader.Expect(",\"duration\":");
+            value.joined_times.duration = ReadTime(reader);
+            reader.Expect(",\"timeline_in\":");
+            value.joined_times.timeline_in = ReadTime(reader);
+            reader.Expect("}}");
             operation = std::move(value);
         } else {
             throw std::runtime_error("unknown operation type '" + type + "'");

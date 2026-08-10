@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -312,6 +313,20 @@ const JsonValue& Require(const JsonValue& object, const std::string& key,
     return found->second;
 }
 
+const JsonValue* Optional(const JsonValue& object, const std::string& key,
+                          JsonValue::Type type, const std::string& context) {
+    if (object.type != JsonValue::Type::Object) {
+        throw std::runtime_error(context + " must be an object");
+    }
+    const auto found = object.object.find(key);
+    if (found == object.object.end()) return nullptr;
+    if (found->second.type != type) {
+        throw std::runtime_error(context + "." + key +
+                                 " has the wrong JSON type");
+    }
+    return &found->second;
+}
+
 int32_t Int32(const JsonValue& object, const std::string& key,
               const std::string& context) {
     const int64_t value =
@@ -408,6 +423,85 @@ bool Document::LoadFromString(const std::string& json, Document& output,
         const JsonValue root = JsonParser(json).Parse();
         Document parsed;
         parsed.version = Int32(root, "version", "document");
+        if (parsed.version != 1 && parsed.version != 2) {
+            throw std::runtime_error("unsupported document version " +
+                                     std::to_string(parsed.version));
+        }
+
+        if (parsed.version == 2) {
+            const JsonValue& library =
+                Require(root, "library", JsonValue::Type::Array, "document");
+            for (size_t index = 0; index < library.array.size(); ++index) {
+                const JsonValue& item = library.array[index];
+                const std::string context =
+                    "library[" + std::to_string(index) + "]";
+                LibraryMedia media;
+                media.id = Require(item, "id", JsonValue::Type::String, context)
+                               .string;
+                media.path =
+                    Require(item, "path", JsonValue::Type::String, context)
+                        .string;
+                media.filename =
+                    Require(item, "filename", JsonValue::Type::String, context)
+                        .string;
+                if (const JsonValue* bin = Optional(
+                        item, "bin_id", JsonValue::Type::String, context))
+                    media.bin_id = bin->string;
+                const JsonValue* codec =
+                    Optional(item, "codec", JsonValue::Type::String, context);
+                if (!codec) {
+                    media.metadata_complete = false;
+                } else {
+                    media.codec = codec->string;
+                    media.width = Int32(item, "width", context);
+                    media.height = Int32(item, "height", context);
+                    if (Optional(item, "rotation_degrees",
+                                 JsonValue::Type::Number, context))
+                        media.rotation_degrees =
+                            Int32(item, "rotation_degrees", context);
+                    media.orientation =
+                        Require(item, "orientation", JsonValue::Type::String,
+                                context)
+                            .string;
+                    media.has_audio = Require(item, "has_audio",
+                                              JsonValue::Type::Boolean, context)
+                                          .boolean;
+                    if (media.has_audio) {
+                        media.audio_rate = Int32(item, "audio_rate", context);
+                        media.audio_channels =
+                            Int32(item, "audio_channels", context);
+                    }
+                }
+                const JsonValue& rate =
+                    Require(item, "rate", JsonValue::Type::Object, context);
+                media.rate = {Int32(rate, "num", context + ".rate"),
+                              Int32(rate, "den", context + ".rate")};
+                media.duration = ParseTime(
+                    Require(item, "duration", JsonValue::Type::Object, context),
+                    context + ".duration");
+                parsed.library.push_back(std::move(media));
+            }
+            if (const JsonValue* bins = Optional(
+                    root, "bins", JsonValue::Type::Array, "document")) {
+                for (size_t index = 0; index < bins->array.size(); ++index) {
+                    const JsonValue& item = bins->array[index];
+                    const std::string context =
+                        "bins[" + std::to_string(index) + "]";
+                    DocumentBin bin;
+                    bin.id =
+                        Require(item, "id", JsonValue::Type::String, context)
+                            .string;
+                    bin.name =
+                        Require(item, "name", JsonValue::Type::String, context)
+                            .string;
+                    if (const JsonValue* parent =
+                            Optional(item, "parent_id", JsonValue::Type::String,
+                                     context))
+                        bin.parent_id = parent->string;
+                    parsed.bins.push_back(std::move(bin));
+                }
+            }
+        }
 
         const JsonValue& sources =
             Require(root, "sources", JsonValue::Type::Array, "document");
@@ -428,6 +522,21 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                 Require(item, "duration", JsonValue::Type::Object, context),
                 context + ".duration");
             parsed.sources.push_back(std::move(source));
+        }
+
+        if (parsed.version == 1) {
+            parsed.version = 2;
+            for (const DocumentSource& source : parsed.sources) {
+                LibraryMedia media;
+                media.id = source.id;
+                media.path = source.path;
+                media.filename =
+                    std::filesystem::path(source.path).filename().string();
+                media.rate = source.rate;
+                media.duration = source.duration;
+                media.metadata_complete = false;
+                parsed.library.push_back(std::move(media));
+            }
         }
 
         const JsonValue& tracks =
@@ -469,6 +578,23 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     ParseTime(Require(clipValue, "timeline_in",
                                       JsonValue::Type::Object, clipContext),
                               clipContext + ".timeline_in");
+                if (const JsonValue* includeAudio =
+                        Optional(clipValue, "include_audio",
+                                 JsonValue::Type::Boolean, clipContext))
+                    clip.include_audio = includeAudio->boolean;
+                if (const JsonValue* linkGroup =
+                        Optional(clipValue, "link_group_id",
+                                 JsonValue::Type::String, clipContext))
+                    clip.link_group_id = linkGroup->string;
+                if (const JsonValue* anchor =
+                        Optional(clipValue, "sync_anchor_clip_id",
+                                 JsonValue::Type::String, clipContext)) {
+                    clip.sync_anchor_clip_id = anchor->string;
+                    clip.sync_reference_delta =
+                        ParseTime(Require(clipValue, "sync_reference_delta",
+                                          JsonValue::Type::Object, clipContext),
+                                  clipContext + ".sync_reference_delta");
+                }
                 track.clips.push_back(std::move(clip));
             }
             parsed.tracks.push_back(std::move(track));
@@ -506,7 +632,47 @@ bool Document::Save(const std::string& path, std::string& error) const {
 
 std::string Document::SaveToString() const {
     std::ostringstream output;
-    output << "{\n  \"version\": " << version << ",\n  \"sources\": [";
+    output << "{\n  \"version\": " << version << ",\n  \"library\": [";
+    for (size_t index = 0; index < library.size(); ++index) {
+        const LibraryMedia& media = library[index];
+        output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(media.id) << "\",\"path\":\"" << Escape(media.path)
+               << "\",\"filename\":\"" << Escape(media.filename) << "\"";
+        if (!media.bin_id.empty())
+            output << ",\"bin_id\":\"" << Escape(media.bin_id) << "\"";
+        if (media.metadata_complete) {
+            output << ",\"codec\":\"" << Escape(media.codec)
+                   << "\",\"width\":" << media.width
+                   << ",\"height\":" << media.height
+                   << ",\"rotation_degrees\":" << media.rotation_degrees;
+        }
+        output << ",\"rate\":{\"num\":" << media.rate.num
+               << ",\"den\":" << media.rate.den << "},\"duration\":";
+        WriteTime(output, media.duration);
+        if (media.metadata_complete) {
+            output << ",\"orientation\":\"" << Escape(media.orientation)
+                   << "\",\"has_audio\":"
+                   << (media.has_audio ? "true" : "false");
+            if (media.has_audio) {
+                output << ",\"audio_rate\":" << media.audio_rate
+                       << ",\"audio_channels\":" << media.audio_channels;
+            }
+        }
+        output << "}";
+    }
+    if (!library.empty()) output << '\n';
+    output << "  ],\n  \"bins\": [";
+    for (size_t index = 0; index < bins.size(); ++index) {
+        const DocumentBin& bin = bins[index];
+        output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(bin.id) << "\",\"name\":\"" << Escape(bin.name)
+               << "\"";
+        if (!bin.parent_id.empty())
+            output << ",\"parent_id\":\"" << Escape(bin.parent_id) << "\"";
+        output << "}";
+    }
+    if (!bins.empty()) output << '\n';
+    output << "  ],\n  \"sources\": [";
     for (size_t index = 0; index < sources.size(); ++index) {
         const DocumentSource& source = sources[index];
         output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
@@ -534,6 +700,17 @@ std::string Document::SaveToString() const {
             WriteTime(output, clip.duration);
             output << ",\"timeline_in\":";
             WriteTime(output, clip.timeline_in);
+            output << ",\"include_audio\":"
+                   << (clip.include_audio ? "true" : "false");
+            if (!clip.link_group_id.empty())
+                output << ",\"link_group_id\":\"" << Escape(clip.link_group_id)
+                       << "\"";
+            if (!clip.sync_anchor_clip_id.empty()) {
+                output << ",\"sync_anchor_clip_id\":\""
+                       << Escape(clip.sync_anchor_clip_id)
+                       << "\",\"sync_reference_delta\":";
+                WriteTime(output, clip.sync_reference_delta);
+            }
             output << "}";
         }
         if (!track.clips.empty()) output << '\n';
@@ -545,12 +722,85 @@ std::string Document::SaveToString() const {
 }
 
 bool Document::Validate(std::string& error) const {
-    if (version != 1) {
+    if (version != 2) {
         error = "unsupported document version " + std::to_string(version);
         return false;
     }
 
     std::set<Ulid> ids;
+    std::set<Ulid> binIds;
+    for (size_t index = 0; index < bins.size(); ++index) {
+        const DocumentBin& bin = bins[index];
+        const std::string context = "bin " + std::to_string(index);
+        if (!RegisterId(bin.id, context, ids, error)) return false;
+        if (bin.name.empty()) {
+            error = context + " has an empty name";
+            return false;
+        }
+        binIds.insert(bin.id);
+    }
+    for (size_t index = 0; index < bins.size(); ++index) {
+        const DocumentBin& bin = bins[index];
+        if (!bin.parent_id.empty() &&
+            binIds.find(bin.parent_id) == binIds.end()) {
+            error = "bin " + std::to_string(index) +
+                    " references unknown parent_id '" + bin.parent_id + "'";
+            return false;
+        }
+        std::set<Ulid> ancestors;
+        const DocumentBin* cursor = &bin;
+        while (!cursor->parent_id.empty()) {
+            if (!ancestors.insert(cursor->id).second) {
+                error = "bin hierarchy contains a cycle at '" + bin.id + "'";
+                return false;
+            }
+            cursor = FindBin(cursor->parent_id);
+            if (!cursor) break;
+        }
+    }
+    std::set<Ulid> libraryIds;
+    for (size_t index = 0; index < library.size(); ++index) {
+        const LibraryMedia& media = library[index];
+        const std::string context = "library media " + std::to_string(index);
+        if (!IsValidUlid(media.id)) {
+            error = context + " has invalid ULID '" + media.id + "'";
+            return false;
+        }
+        if (!libraryIds.insert(media.id).second) {
+            error = "duplicate library ID '" + media.id + "'";
+            return false;
+        }
+        if (media.path.empty() || media.filename.empty()) {
+            error = context + " has an empty path or filename";
+            return false;
+        }
+        if (!media.bin_id.empty() &&
+            binIds.find(media.bin_id) == binIds.end()) {
+            error =
+                context + " references unknown bin_id '" + media.bin_id + "'";
+            return false;
+        }
+        if (media.rate.num <= 0 || media.rate.den <= 0 ||
+            media.duration.rate <= 0 || media.duration.value <= 0) {
+            error = context + " has an invalid rate or duration";
+            return false;
+        }
+        if (media.metadata_complete) {
+            if (media.codec.empty() || media.width <= 0 || media.height <= 0 ||
+                media.rotation_degrees < -180 || media.rotation_degrees > 180 ||
+                (media.orientation != "landscape" &&
+                 media.orientation != "portrait" &&
+                 media.orientation != "square")) {
+                error = context + " has invalid video metadata";
+                return false;
+            }
+            if (media.has_audio &&
+                (media.audio_rate <= 0 || media.audio_channels <= 0)) {
+                error = context + " has invalid audio metadata";
+                return false;
+            }
+        }
+    }
     std::set<Ulid> sourceIds;
     for (size_t index = 0; index < sources.size(); ++index) {
         const DocumentSource& source = sources[index];
@@ -577,6 +827,16 @@ bool Document::Validate(std::string& error) const {
             return false;
         }
     }
+    // A mounted source deliberately shares its media ULID. Library-only IDs,
+    // however, must remain globally distinct from tracks and clips.
+    for (const Ulid& libraryId : libraryIds) {
+        if (sourceIds.find(libraryId) == sourceIds.end() &&
+            !ids.insert(libraryId).second) {
+            error = "library ID '" + libraryId +
+                    "' collides with another document object";
+            return false;
+        }
+    }
 
     std::set<int32_t> trackIndices;
     for (size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
@@ -594,6 +854,26 @@ bool Document::Validate(std::string& error) const {
             const std::string context =
                 trackContext + " clip " + std::to_string(clipIndex);
             if (!RegisterId(clip.id, context, ids, error)) return false;
+            if (!clip.link_group_id.empty() &&
+                !IsValidUlid(clip.link_group_id)) {
+                error = context + " ('" + clip.id +
+                        "') has invalid link_group_id '" + clip.link_group_id +
+                        "'";
+                return false;
+            }
+            if (!clip.sync_anchor_clip_id.empty() &&
+                (!IsValidUlid(clip.sync_anchor_clip_id) ||
+                 clip.sync_reference_delta.rate <= 0)) {
+                error = context + " ('" + clip.id +
+                        "') has invalid synchronization reference";
+                return false;
+            }
+            if (clip.link_group_id.empty() &&
+                !clip.sync_anchor_clip_id.empty()) {
+                error = context + " ('" + clip.id +
+                        "') has an incomplete link synchronization state";
+                return false;
+            }
             if (sourceIds.find(clip.source_id) == sourceIds.end()) {
                 error = context + " ('" + clip.id +
                         "') references unknown source_id '" + clip.source_id +
@@ -664,6 +944,34 @@ const DocumentSource* Document::FindSource(const Ulid& id) const {
 DocumentSource* Document::FindSource(const Ulid& id) {
     for (DocumentSource& source : sources) {
         if (source.id == id) return &source;
+    }
+    return nullptr;
+}
+
+const LibraryMedia* Document::FindLibraryMedia(const Ulid& id) const {
+    for (const LibraryMedia& media : library) {
+        if (media.id == id) return &media;
+    }
+    return nullptr;
+}
+
+LibraryMedia* Document::FindLibraryMedia(const Ulid& id) {
+    for (LibraryMedia& media : library) {
+        if (media.id == id) return &media;
+    }
+    return nullptr;
+}
+
+const DocumentBin* Document::FindBin(const Ulid& id) const {
+    for (const DocumentBin& bin : bins) {
+        if (bin.id == id) return &bin;
+    }
+    return nullptr;
+}
+
+DocumentBin* Document::FindBin(const Ulid& id) {
+    for (DocumentBin& bin : bins) {
+        if (bin.id == id) return &bin;
     }
     return nullptr;
 }

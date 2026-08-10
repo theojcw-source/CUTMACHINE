@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
+import shutil
+import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -18,6 +23,7 @@ from .planner import (
     Planner,
     PlannerError,
 )
+from .schema import PLANNER_RESPONSE_SCHEMA
 
 
 S1 = "01K40000000000000000000001"
@@ -96,6 +102,171 @@ CASES: tuple[EvalCase, ...] = (
     ),
 )
 
+# Kept outside CASES so the fixed historical corpus remains exactly 15 cases.
+REFERENCE_CASE = EvalCase(
+    "Raccourcis le premier plan de 2 secondes.", _trim(A1, "Tail", -50))
+
+
+class _ReplayResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "_ReplayResponse":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class TraceOpener:
+    """Capture the actual HTTP request and response without changing parsing."""
+
+    def __init__(self) -> None:
+        self.request_url: str | None = None
+        self.request_payload: dict[str, Any] | None = None
+        self.response_text: str | None = None
+
+    def reset(self) -> None:
+        self.request_url = None
+        self.request_payload = None
+        self.response_text = None
+
+    def __call__(self, request: Any, timeout: float) -> _ReplayResponse:
+        self.request_url = request.full_url
+        try:
+            self.request_payload = json.loads(request.data)
+        except (TypeError, json.JSONDecodeError):
+            self.request_payload = None
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            self.response_text = body.decode("utf-8", errors="replace")
+            raise urllib.error.HTTPError(
+                exc.url, exc.code, exc.msg, exc.headers, io.BytesIO(body)) from exc
+        self.response_text = body.decode("utf-8", errors="replace")
+        return _ReplayResponse(body)
+
+
+def _raw_model_output(backend: str, response_text: str | None) -> Any:
+    if response_text is None:
+        return None
+    try:
+        response = json.loads(response_text)
+    except json.JSONDecodeError:
+        return response_text
+    if backend == "ollama":
+        try:
+            return response["message"]["content"]
+        except (KeyError, TypeError):
+            return response
+    blocks = response.get("content", []) if isinstance(response, dict) else []
+    for block in blocks if isinstance(blocks, list) else []:
+        if (isinstance(block, dict) and block.get("type") == "tool_use" and
+                block.get("name") == AnthropicPlanner.TOOL_NAME):
+            return block.get("input")
+    return response
+
+
+def _raw_operation(raw_output: Any) -> tuple[dict[str, Any] | None, bool]:
+    value = raw_output
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None, False
+    if not isinstance(value, dict):
+        return None, False
+    operation = value.get("operation")
+    return (operation if isinstance(operation, dict) else None,
+            operation is None and value.get("refusal") is not None)
+
+
+def _classify_failure(
+    raw_output: Any, actual: Any, expected: dict[str, Any], error: str | None,
+    timeline: dict[str, Any],
+) -> tuple[str, str, list[str]]:
+    raw_operation, raw_refusal = _raw_operation(raw_output)
+    if raw_refusal or (isinstance(actual, dict) and "refusal" in actual):
+        return "D", "refus injustifié", []
+    operation = (
+        actual if isinstance(actual, dict) and "type" in actual
+        else raw_operation
+    )
+    if operation is None:
+        detail = error or "sortie structurée inexploitable"
+        return "D", detail, []
+    if operation.get("type") != expected.get("type"):
+        return "A", (
+            f"type {operation.get('type')!r} au lieu de {expected.get('type')!r}"
+        ), []
+
+    secondary: list[str] = []
+    operation_type = expected["type"]
+    id_fields = {
+        "RemoveClip": ("clip_id",),
+        "TrimClip": ("clip_id",),
+        "InsertClip": ("track_id", "source_id"),
+    }[operation_type]
+    bad_ids = [field for field in id_fields
+               if operation.get(field) != expected.get(field)]
+    temporal_fields = {
+        "RemoveClip": (),
+        "TrimClip": ("delta",),
+        "InsertClip": ("source_in", "duration", "timeline_in"),
+    }[operation_type]
+    bad_times = [field for field in temporal_fields
+                 if not _time_equal(operation.get(field), expected.get(field))]
+    if bad_ids:
+        if bad_times:
+            secondary.append("C: valeur temporelle également incorrecte (" +
+                             ", ".join(bad_times) + ")")
+        known_ids = {
+            item.get("id")
+            for collection in (timeline.get("sources", []),
+                               timeline.get("tracks", []))
+            for item in collection if isinstance(item, dict)
+        }
+        known_ids.update(
+            item.get("id")
+            for track in timeline.get("tracks", []) if isinstance(track, dict)
+            for item in track.get("items", []) if isinstance(item, dict)
+        )
+        absent = [field for field in bad_ids
+                  if operation.get(field) not in known_ids]
+        if absent:
+            return "B", "ULID absent de la vue (" + ", ".join(absent) + ")", secondary
+        return "E", "mauvais objet sélectionné (" + ", ".join(bad_ids) + ")", secondary
+    if operation_type == "TrimClip" and operation.get("edge") != expected.get("edge"):
+        if bad_times:
+            secondary.append("C: valeur temporelle également incorrecte (delta)")
+        return "E", "bord de trim incorrect", secondary
+    if bad_times:
+        return "C", "valeur temporelle incorrecte (" + ", ".join(bad_times) + ")", []
+    if error:
+        if "ULID absent" in error:
+            return "B", error, []
+        return "D", error, []
+    return "E", "divergence sémantique non couverte", []
+
+
+def _breakpoint(error: str | None, passed: bool, actual: Any) -> str:
+    if error:
+        if error.startswith("HTTP ") or error.startswith("unable to reach"):
+            return "transport_http"
+        if "malformed JSON" in error or "returned no valid structured" in error:
+            return "decodage_reponse_backend"
+        if "ULID absent from the view" in error:
+            return "validation_locale_ulid_avant_binaire"
+        return "validation_locale_schema_avant_binaire"
+    if isinstance(actual, dict) and "refusal" in actual:
+        return "refus_modele_accepte_localement"
+    return "termine" if passed else "comparaison_semantique_attendu_obtenu"
+
 
 def _time_equal(left: Any, right: Any) -> bool:
     try:
@@ -129,10 +300,21 @@ def operations_equal(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
     return False
 
 
-def evaluate(planner: Planner, timeline: dict[str, Any]) -> tuple[int, int]:
+def evaluate(
+    planner: Planner,
+    timeline: dict[str, Any],
+    cases: tuple[EvalCase, ...],
+    run: int,
+    opener: TraceOpener,
+    records: list[dict[str, Any]],
+    trace_path: Path,
+    trace_document: dict[str, Any],
+) -> tuple[int, int]:
     successes = 0
-    print(f"\nBackend: {planner.backend_name}")
-    for index, case in enumerate(CASES, start=1):
+    print(f"\nBackend: {planner.backend_name}, run {run}")
+    for index, case in enumerate(cases, start=1):
+        opener.reset()
+        error: str | None = None
         try:
             plan: Plan = planner.plan(timeline, case.instruction)
             passed = plan.operation is not None and operations_equal(
@@ -141,23 +323,93 @@ def evaluate(planner: Planner, timeline: dict[str, Any]) -> tuple[int, int]:
                 "refusal": plan.refusal}
         except PlannerError as exc:
             passed = False
+            error = str(exc)
             actual = {"planner_error": str(exc)}
+        raw_output = _raw_model_output(
+            planner.backend_name, opener.response_text)
+        family: str | None = None
+        classification: str | None = None
+        secondary: list[str] = []
+        if not passed:
+            family, classification, secondary = _classify_failure(
+                raw_output, actual, case.expected, error, timeline)
+        request = opener.request_payload or {}
+        records.append({
+            "backend": planner.backend_name,
+            "run": run,
+            "case": index if index <= len(CASES) else "reference",
+            "instruction": case.instruction,
+            "expected_operation": case.expected,
+            "raw_model_output": raw_output,
+            "final_operation_or_refusal": actual,
+            "passed": passed,
+            "breakpoint": _breakpoint(error, passed, actual),
+            "error": error,
+            "failure_family": family,
+            "failure_detail": classification,
+            "secondary_causes": secondary,
+            "http_evidence": {
+                "url": opener.request_url,
+                "format_present": "format" in request,
+                "format": request.get("format"),
+                "input_schema": (
+                    request.get("tools", [{}])[0].get("input_schema")
+                    if isinstance(request.get("tools"), list) and
+                    request.get("tools") else None
+                ),
+            },
+            "raw_http_response": opener.response_text,
+        })
+        trace_path.write_text(
+            json.dumps(trace_document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         successes += int(passed)
         print(f"{index:02d} {'PASS' if passed else 'FAIL'} — {case.instruction}")
         if not passed:
             print("   attendu:", json.dumps(case.expected, ensure_ascii=False))
             print("   obtenu  :", json.dumps(actual, ensure_ascii=False))
-    rate = 100.0 * successes / len(CASES)
-    print(f"Résultat {planner.backend_name}: {successes}/{len(CASES)} ({rate:.1f} %)")
-    return successes, len(CASES)
+    rate = 100.0 * successes / len(cases)
+    print(f"Résultat {planner.backend_name} run {run}: "
+          f"{successes}/{len(cases)} ({rate:.1f} %)")
+    return successes, len(cases)
 
 
-def _planners(name: str, model: str | None) -> list[Planner]:
-    if name == "ollama":
-        return [OllamaPlanner(model=model)]
-    if name == "anthropic":
-        return [AnthropicPlanner(model=model)]
-    return [OllamaPlanner(model=model), AnthropicPlanner(model=model)]
+def _direct_apply_control(
+    binary: CutmachineBinary, document: Path
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory() as directory:
+        for index, case in enumerate(CASES, start=1):
+            copy = Path(directory) / f"case-{index}.json"
+            shutil.copyfile(document, copy)
+            result = binary.apply_operation(copy, case.expected)
+            results.append({
+                "case": index,
+                "accepted": result.ok,
+                "error": result.error,
+                "detail": result.detail,
+            })
+    return results
+
+
+def _request_controls(records: list[dict[str, Any]]) -> dict[str, Any]:
+    ollama = next((record for record in records
+                   if record["backend"] == "ollama"), None)
+    anthropic = next((record for record in records
+                      if record["backend"] == "anthropic"), None)
+    ollama_format = ollama["http_evidence"]["format"] if ollama else None
+    anthropic_schema = (
+        anthropic["http_evidence"]["input_schema"] if anthropic else None)
+    return {
+        "ollama_format_present_in_emitted_http_request": bool(
+            ollama and ollama["http_evidence"]["format_present"]),
+        "ollama_format_equals_shared_schema": ollama_format == PLANNER_RESPONSE_SCHEMA,
+        "anthropic_input_schema_equals_shared_schema": (
+            anthropic_schema == PLANNER_RESPONSE_SCHEMA),
+        "emitted_backend_schemas_strictly_identical": (
+            ollama_format is not None and ollama_format == anthropic_schema),
+    }
 
 
 def main() -> int:
@@ -170,11 +422,50 @@ def main() -> int:
         "--document", type=Path,
         default=Path(__file__).with_name("eval-document.json"))
     parser.add_argument("--binary", help="chemin du binaire cutmachine")
+    parser.add_argument("--ollama-runs", type=int, default=1)
+    parser.add_argument(
+        "--trace", type=Path,
+        default=Path(__file__).resolve().parents[1] / "eval-trace.json")
     args = parser.parse_args()
+    trace: dict[str, Any] = {
+        "document": str(args.document.resolve()),
+        "cases": len(CASES),
+        "reference_case_added_separately": True,
+        "records": [],
+        "controls": {},
+    }
     try:
-        timeline = CutmachineBinary(args.binary).describe(args.document)
-        totals = [evaluate(planner, timeline)
-                  for planner in _planners(args.backend, args.model)]
+        binary = CutmachineBinary(args.binary)
+        timeline = binary.describe(args.document)
+        compact_view = json.dumps(
+            timeline, ensure_ascii=False, separators=(",", ":"))
+        trace["controls"]["describe_view"] = {
+            "utf8_bytes": len(compact_view.encode("utf-8")),
+            "characters": len(compact_view),
+        }
+        trace["controls"]["direct_apply_expected_operations"] = (
+            _direct_apply_control(binary, args.document))
+        cases = CASES + (REFERENCE_CASE,)
+        totals: list[tuple[int, int]] = []
+        if args.backend in {"ollama", "all"}:
+            for run in range(1, args.ollama_runs + 1):
+                opener = TraceOpener()
+                totals.append(evaluate(
+                    OllamaPlanner(model=args.model, opener=opener), timeline,
+                    cases, run, opener, trace["records"], args.trace, trace))
+        if args.backend in {"anthropic", "all"}:
+            opener = TraceOpener()
+            totals.append(evaluate(
+                AnthropicPlanner(model=args.model, opener=opener), timeline,
+                cases, 1, opener, trace["records"], args.trace, trace))
+        trace["controls"].update(_request_controls(trace["records"]))
+        trace["controls"]["ulid_validation_order"] = (
+            "planner local validation before any binary call; eval model path "
+            "does not invoke --apply-op")
+        args.trace.write_text(
+            json.dumps(trace, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     except (BinaryError, PlannerError) as exc:
         print(f"Erreur d'évaluation : {exc}")
         return 1

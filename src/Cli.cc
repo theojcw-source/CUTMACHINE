@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iomanip>
 #include <locale>
+#include <set>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -215,7 +216,7 @@ std::string Describe(const Document& document) {
     const RationalTime duration = timeline.Duration();
     std::ostringstream output;
     output.imbue(std::locale::classic());
-    output << "{\"sources\":[";
+    output << "{\"timeline\":{\"sources\":[";
     for (size_t index = 0; index < document.sources.size(); ++index) {
         if (index) output << ',';
         const DocumentSource& source = document.sources[index];
@@ -268,6 +269,17 @@ std::string Describe(const Document& document) {
             WriteTime(output, clip.timeline_in, timelineRate);
             output << ",\"duration\":";
             WriteTime(output, clip.duration, timelineRate);
+            output << ",\"include_audio\":"
+                   << (clip.include_audio ? "true" : "false");
+            if (!clip.link_group_id.empty())
+                output << ",\"link_group_id\":\""
+                       << EscapeJson(clip.link_group_id) << "\"";
+            if (!clip.sync_anchor_clip_id.empty()) {
+                output << ",\"sync_anchor_clip_id\":\""
+                       << EscapeJson(clip.sync_anchor_clip_id)
+                       << "\",\"sync_reference_delta\":";
+                WriteTime(output, clip.sync_reference_delta, timelineRate);
+            }
             output << '}';
             firstItem = false;
             cursor = clip.timeline_in.add(clip.duration);
@@ -284,7 +296,56 @@ std::string Describe(const Document& document) {
     }
     output << "],\"duration\":";
     WriteTime(output, duration, timelineRate);
-    output << "}\n";
+    output << "},\"library\":[";
+    std::set<Ulid> usedMedia;
+    for (const DocumentTrack& track : document.tracks) {
+        for (const DocumentClip& clip : track.clips) {
+            usedMedia.insert(clip.source_id);
+        }
+    }
+    for (size_t index = 0; index < document.library.size(); ++index) {
+        if (index) output << ',';
+        const LibraryMedia& media = document.library[index];
+        output << "{\"alias\":\"M" << (index + 1) << "\",\"id\":\""
+               << EscapeJson(media.id) << "\",\"path\":\""
+               << EscapeJson(media.path) << "\",\"filename\":\""
+               << EscapeJson(media.filename) << "\"";
+        if (media.metadata_complete) {
+            output << ",\"codec\":\"" << EscapeJson(media.codec)
+                   << "\",\"width\":" << media.width
+                   << ",\"height\":" << media.height
+                   << ",\"rotation_degrees\":" << media.rotation_degrees;
+        }
+        output << ",\"rate\":{\"num\":" << media.rate.num
+               << ",\"den\":" << media.rate.den
+               << "},\"duration\":{\"value\":" << media.duration.value
+               << ",\"rate\":" << media.duration.rate << "}";
+        if (media.metadata_complete) {
+            output << ",\"orientation\":\"" << EscapeJson(media.orientation)
+                   << "\",\"has_audio\":"
+                   << (media.has_audio ? "true" : "false");
+            if (media.has_audio) {
+                output << ",\"audio_rate\":" << media.audio_rate
+                       << ",\"audio_channels\":" << media.audio_channels;
+            }
+        }
+        if (!media.bin_id.empty())
+            output << ",\"bin_id\":\"" << EscapeJson(media.bin_id) << "\"";
+        output << ",\"in_use\":"
+               << (usedMedia.count(media.id) ? "true" : "false") << '}';
+    }
+    output << "],\"bins\":[";
+    for (size_t index = 0; index < document.bins.size(); ++index) {
+        if (index) output << ',';
+        output << "{\"id\":\"" << EscapeJson(document.bins[index].id)
+               << "\",\"name\":\"" << EscapeJson(document.bins[index].name)
+               << "\"";
+        if (!document.bins[index].parent_id.empty())
+            output << ",\"parent_id\":\""
+                   << EscapeJson(document.bins[index].parent_id) << "\"";
+        output << "}";
+    }
+    output << "]}\n";
     return output.str();
 }
 
@@ -303,6 +364,13 @@ std::string CanonicalHash(const std::string& json) {
 
 std::string EditLogPathForDocument(const std::string& documentPath) {
     return documentPath + ".editlog.json";
+}
+
+bool CommitDocumentAndEditLog(const std::string& documentPath,
+                              const Document& document, const EditLog& log,
+                              std::string& message) {
+    return CommitPair(documentPath, document.SaveToString(), log.Serialize(),
+                      message);
 }
 
 int DescribeCommand(const std::string& documentPath, std::string& output) {
@@ -376,8 +444,7 @@ int ApplyOperationCommand(const std::string& documentPath,
     }
 
     const std::string updatedDocument = document.SaveToString();
-    const std::string updatedLog = log.Serialize();
-    if (!CommitPair(documentPath, updatedDocument, updatedLog, message)) {
+    if (!CommitDocumentAndEditLog(documentPath, document, log, message)) {
         output = ErrorJson(EditError::IoError, message);
         return 1;
     }

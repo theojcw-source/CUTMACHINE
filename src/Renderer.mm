@@ -7,6 +7,7 @@ extern "C" {
 #include <libavutil/frame.h>
 }
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 
@@ -15,10 +16,11 @@ struct Renderer::Impl {
     id<MTLCommandQueue> queue = nil;
     CAMetalLayer* layer = nil;
     id<MTLRenderPipelineState> pipeline = nil;
+    id<MTLRenderPipelineState> solidPipeline = nil;
     id<MTLSamplerState> sampler = nil;
-    std::array<std::array<id<MTLTexture>, 3>, 2> planes = {};
-    std::array<int, 2> textureWidths = {0, 0};
-    std::array<int, 2> textureHeights = {0, 0};
+    std::vector<std::array<id<MTLTexture>, 3>> planes;
+    std::vector<int> textureWidths;
+    std::vector<int> textureHeights;
 };
 
 Renderer::Renderer() : impl_(new Impl()) {}
@@ -70,11 +72,44 @@ bool Renderer::Initialize(NSView* view) {
     descriptor.vertexFunction = vertex;
     descriptor.fragmentFunction = fragment;
     descriptor.colorAttachments[0].pixelFormat = impl_->layer.pixelFormat;
+    descriptor.colorAttachments[0].blendingEnabled = YES;
+    descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    descriptor.colorAttachments[0].sourceRGBBlendFactor =
+        MTLBlendFactorSourceAlpha;
+    descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    descriptor.colorAttachments[0].destinationRGBBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
+    descriptor.colorAttachments[0].destinationAlphaBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
     impl_->pipeline =
         [impl_->device newRenderPipelineStateWithDescriptor:descriptor
                                                       error:&error];
     if (!impl_->pipeline) {
         std::fprintf(stderr, "Unable to create Metal pipeline: %s\n",
+                     error.localizedDescription.UTF8String);
+        return false;
+    }
+
+    descriptor.vertexFunction = [library newFunctionWithName:@"vertex_solid"];
+    descriptor.fragmentFunction =
+        [library newFunctionWithName:@"fragment_solid"];
+    descriptor.colorAttachments[0].blendingEnabled = YES;
+    descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    descriptor.colorAttachments[0].sourceRGBBlendFactor =
+        MTLBlendFactorSourceAlpha;
+    descriptor.colorAttachments[0].sourceAlphaBlendFactor =
+        MTLBlendFactorSourceAlpha;
+    descriptor.colorAttachments[0].destinationRGBBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
+    descriptor.colorAttachments[0].destinationAlphaBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
+    impl_->solidPipeline =
+        [impl_->device newRenderPipelineStateWithDescriptor:descriptor
+                                                      error:&error];
+    if (!impl_->solidPipeline) {
+        std::fprintf(stderr, "Unable to create solid pipeline: %s\n",
                      error.localizedDescription.UTF8String);
         return false;
     }
@@ -99,24 +134,20 @@ void Renderer::Resize(NSRect bounds) {
         CGSizeMake(bounds.size.width * scale, bounds.size.height * scale);
 }
 
-bool Renderer::RenderFrames(const AVFrame* firstFrame,
-                            const AVFrame* secondFrame, float secondOpacity) {
-    if (!impl_->pipeline || !impl_->queue) {
+bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
+                            const TimelineRenderData& timeline) {
+    if (!impl_->pipeline || !impl_->solidPipeline || !impl_->queue) {
         return false;
     }
 
-    // A hole on the first video track must not prevent another populated
-    // track from being shown. If both tracks are holes, the clear pass below
-    // produces black and does not bind the sampling pipeline.
-    if (!firstFrame && secondFrame) {
-        firstFrame = secondFrame;
-        secondFrame = nullptr;
+    if (impl_->planes.size() < frames.size()) {
+        impl_->planes.resize(frames.size());
+        impl_->textureWidths.resize(frames.size(), 0);
+        impl_->textureHeights.resize(frames.size(), 0);
     }
-
-    const AVFrame* frames[2] = {firstFrame, secondFrame};
-    const int frameCount = secondFrame ? 2 : 1;
-    for (int frameIndex = 0; frameIndex < frameCount; ++frameIndex) {
+    for (size_t frameIndex = 0; frameIndex < frames.size(); ++frameIndex) {
         const AVFrame* frame = frames[frameIndex];
+        if (!frame) continue;
         if (frame->width <= 0 || frame->height <= 0 || !frame->data[0] ||
             !frame->data[1] || !frame->data[2]) {
             std::fprintf(stderr, "Invalid planar AVFrame passed to renderer\n");
@@ -137,9 +168,9 @@ bool Renderer::RenderFrames(const AVFrame* firstFrame,
                 impl_->planes[frameIndex][plane] =
                     [impl_->device newTextureWithDescriptor:textureDescriptor];
                 if (!impl_->planes[frameIndex][plane]) {
-                    std::fprintf(stderr,
-                                 "Unable to allocate Metal frame %d plane %d\n",
-                                 frameIndex, plane);
+                    std::fprintf(
+                        stderr, "Unable to allocate Metal layer %zu plane %d\n",
+                        frameIndex, plane);
                     return false;
                 }
             }
@@ -151,7 +182,7 @@ bool Renderer::RenderFrames(const AVFrame* firstFrame,
             const int planeWidth = plane == 0 ? frame->width : frame->width / 2;
             if (frame->linesize[plane] <= 0) {
                 std::fprintf(stderr,
-                             "Unsupported negative/zero linesize for frame %d "
+                             "Unsupported negative/zero linesize for layer %zu "
                              "plane %d: %d\n",
                              frameIndex, plane, frame->linesize[plane]);
                 return false;
@@ -182,22 +213,105 @@ bool Renderer::RenderFrames(const AVFrame* firstFrame,
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:pass];
-    if (firstFrame) {
+    const double scale = impl_->layer.contentsScale;
+    const double videoHeight =
+        std::clamp(timeline.video_height * scale, 0.0,
+                   static_cast<double>(drawable.texture.height));
+    if (videoHeight > 0.0) {
+        [encoder
+            setViewport:MTLViewport{0.0, 0.0,
+                                    static_cast<double>(drawable.texture.width),
+                                    videoHeight, 0.0, 1.0}];
         [encoder setRenderPipelineState:impl_->pipeline];
-        for (NSUInteger plane = 0; plane < 3; ++plane) {
-            [encoder setFragmentTexture:impl_->planes[0][plane] atIndex:plane];
-            id<MTLTexture> secondTexture =
-                secondFrame ? impl_->planes[1][plane] : impl_->planes[0][plane];
-            [encoder setFragmentTexture:secondTexture atIndex:(plane + 3)];
+        struct PresentationParameters {
+            float left;
+            float top;
+            float width;
+            float height;
+            int32_t quarterTurns;
+            float opacity;
+        } parameters = {};
+        for (size_t frameIndex = 0; frameIndex < frames.size(); ++frameIndex) {
+            const AVFrame* frame = frames[frameIndex];
+            if (!frame) continue;
+            for (NSUInteger plane = 0; plane < 3; ++plane)
+                [encoder setFragmentTexture:impl_->planes[frameIndex][plane]
+                                    atIndex:plane];
+            const int32_t degrees =
+                frameIndex < timeline.video_rotation_degrees.size()
+                    ? timeline.video_rotation_degrees[frameIndex]
+                    : 0;
+            const int32_t turns =
+                static_cast<int32_t>(std::lround(degrees / 90.0));
+            parameters.quarterTurns = ((turns % 4) + 4) % 4;
+            const double displayedWidth =
+                parameters.quarterTurns % 2 ? frame->height : frame->width;
+            const double displayedHeight =
+                parameters.quarterTurns % 2 ? frame->width : frame->height;
+            const double contentAspect = displayedWidth / displayedHeight;
+            const double viewportAspect =
+                static_cast<double>(drawable.texture.width) / videoHeight;
+            parameters.left = parameters.top = 0.0f;
+            parameters.width = parameters.height = 1.0f;
+            if (contentAspect > viewportAspect) {
+                parameters.height =
+                    static_cast<float>(viewportAspect / contentAspect);
+                parameters.top = (1.0f - parameters.height) * 0.5f;
+            } else {
+                parameters.width =
+                    static_cast<float>(contentAspect / viewportAspect);
+                parameters.left = (1.0f - parameters.width) * 0.5f;
+            }
+            parameters.opacity = 1.0f;
+            [encoder setFragmentBytes:&parameters
+                               length:sizeof(parameters)
+                              atIndex:0];
+            [encoder setFragmentSamplerState:impl_->sampler atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                        vertexStart:0
+                        vertexCount:6];
         }
-        struct CompositeParameters {
-            float secondOpacity;
-            uint32_t hasSecondFrame;
-        } parameters = {secondOpacity, secondFrame ? 1u : 0u};
-        [encoder setFragmentBytes:&parameters
-                           length:sizeof(parameters)
-                          atIndex:0];
-        [encoder setFragmentSamplerState:impl_->sampler atIndex:0];
+    }
+
+    [encoder
+        setViewport:MTLViewport{0.0, 0.0,
+                                static_cast<double>(drawable.texture.width),
+                                static_cast<double>(drawable.texture.height),
+                                0.0, 1.0}];
+    [encoder setRenderPipelineState:impl_->solidPipeline];
+    struct SolidParameters {
+        float rect[4];
+        float color[4];
+        float drawableSize[2];
+        float padding[2];
+    } solid;
+    for (const MetalRect& item : timeline.rectangles) {
+        double left = item.x;
+        double top = item.y;
+        double width = item.width;
+        double height = item.height;
+        if (width < 0.0) {
+            left += width;
+            width = -width;
+        }
+        if (height < 0.0) {
+            top += height;
+            height = -height;
+        }
+        if (width <= 0.0 || height <= 0.0) continue;
+        solid.rect[0] = static_cast<float>(left * scale);
+        solid.rect[1] = static_cast<float>(top * scale);
+        solid.rect[2] = static_cast<float>(width * scale);
+        solid.rect[3] = static_cast<float>(height * scale);
+        solid.color[0] = item.red;
+        solid.color[1] = item.green;
+        solid.color[2] = item.blue;
+        solid.color[3] = item.alpha;
+        solid.drawableSize[0] = static_cast<float>(drawable.texture.width);
+        solid.drawableSize[1] = static_cast<float>(drawable.texture.height);
+        solid.padding[0] = solid.padding[1] = 0.0f;
+        [encoder setVertexBytes:&solid length:sizeof(solid) atIndex:0];
+        [encoder setFragmentBytes:&solid length:sizeof(solid) atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle
                     vertexStart:0
                     vertexCount:6];
@@ -206,7 +320,7 @@ bool Renderer::RenderFrames(const AVFrame* firstFrame,
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
 
-    // The spike deliberately has one shared texture set and a synchronous path.
+    // Keep the synchronous path while the cache/renderer boundary is measured.
     [commandBuffer waitUntilCompleted];
     if (commandBuffer.status == MTLCommandBufferStatusError) {
         std::fprintf(stderr, "Metal command failed: %s\n",

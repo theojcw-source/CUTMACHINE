@@ -98,7 +98,11 @@ class CutmachineBinary:
             raise BinaryError(
                 f"{payload.get('error', 'UnknownError')}: "
                 f"{payload.get('detail', '')}")
-        return payload
+        # The CLI now separates the available-media library from the mounted
+        # timeline. Editing planners deliberately keep receiving only the
+        # timeline because this milestone does not add library edit operations.
+        timeline = payload.get("timeline")
+        return timeline if isinstance(timeline, dict) else payload
 
     def apply_operation(
         self, document: str | os.PathLike[str], operation: dict[str, Any]
