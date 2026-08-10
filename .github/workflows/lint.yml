@@ -67,14 +67,14 @@ jobs:
             exit 0
           fi
 
-          # Homebrew's clang-tidy is a different toolchain from the AppleClang
-          # that produced compile_commands.json: it doesn't know where either
-          # the SDK frameworks or its own bundled libc++ headers live unless
-          # told explicitly.
+          # clang-tidy must use one libc++ version consistently. The Apple SDK
+          # contains Xcode's libc++, while clang-tidy comes from Homebrew LLVM;
+          # disable the implicit C++ include paths before selecting LLVM's.
           SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
           LLVM_PREFIX="$(brew --prefix llvm)"
           printf '%s\n' "${files[@]}"
           "${LLVM_PREFIX}/bin/clang-tidy" -p build \
             --extra-arg=-isysroot"${SDK_PATH}" \
+            --extra-arg=-nostdinc++ \
             --extra-arg=-isystem"${LLVM_PREFIX}/include/c++/v1" \
             "${files[@]}"

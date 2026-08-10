@@ -6,6 +6,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace {
 
@@ -22,8 +23,8 @@ private:
 
 }  // namespace
 
-DecodeWorker::DecodeWorker(FrameCache::SourceId sourceId, FrameCache& cache,
-                           PerformanceMetrics& metrics)
+DecodeWorker::DecodeWorker(const FrameCache::SourceId& sourceId,
+                           FrameCache& cache, PerformanceMetrics& metrics)
     : sourceId_(sourceId), cache_(cache), metrics_(metrics) {}
 
 DecodeWorker::~DecodeWorker() {
@@ -78,16 +79,24 @@ void DecodeWorker::RequestFrame(int64_t frameIndex) {
         if (requestGeneration_ > 0 && clamped == requestedFrame_) {
             return;
         }
-        if (previousRequestedFrame_ >= 0 && clamped != previousRequestedFrame_) {
+        if (previousRequestedFrame_ >= 0 &&
+            clamped != previousRequestedFrame_) {
             const int direction = clamped > previousRequestedFrame_ ? 1 : -1;
-            const double elapsedSeconds = hasPreviousRequestTime_
-                ? std::chrono::duration<double>(requestStart - previousRequestAt_).count()
-                : 0.0;
-            const double scrubSpeed = elapsedSeconds > 0.0
-                ? std::abs(static_cast<double>(clamped - previousRequestedFrame_)) /
-                      elapsedSeconds
-                : 0.0;
-            const int requiredSamples = scrubSpeed > source_.FrameRate() ? 1 : 2;
+            const int64_t elapsedMicroseconds =
+                hasPreviousRequestTime_
+                    ? std::chrono::duration_cast<std::chrono::microseconds>(
+                          requestStart - previousRequestAt_)
+                          .count()
+                    : 0;
+            const int64_t frameDelta =
+                std::llabs(clamped - previousRequestedFrame_);
+            const bool fasterThanPlayback =
+                elapsedMicroseconds > 0 &&
+                static_cast<__int128>(frameDelta) * 1000000 *
+                        source_.FrameRateDenominator() >
+                    static_cast<__int128>(elapsedMicroseconds) *
+                        source_.FrameRateNumerator();
+            const int requiredSamples = fasterThanPlayback ? 1 : 2;
             if (direction == candidateDirection_) {
                 ++candidateDirectionSamples_;
             } else {
@@ -108,9 +117,11 @@ void DecodeWorker::RequestFrame(int64_t frameIndex) {
     }
     metrics_.RecordRequest(cacheHit);
     if (cacheHit) {
-        const double milliseconds = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - requestStart).count();
-        metrics_.RecordDelivery(milliseconds, true);
+        const int64_t microseconds =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - requestStart)
+                .count();
+        metrics_.RecordDelivery(microseconds, true);
     }
     wakeup_.notify_one();
 }
@@ -146,31 +157,36 @@ void DecodeWorker::Run() {
             continue;
         }
         if (!requestWasHit) {
-            const double milliseconds = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - requestStart).count();
-            metrics_.RecordDelivery(milliseconds, false);
+            const int64_t microseconds =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - requestStart)
+                    .count();
+            metrics_.RecordDelivery(microseconds, false);
         }
 
-        const FrameCache::PrefetchWindow window = cache_.WindowForSource(sourceId_);
+        const FrameCache::PrefetchWindow window =
+            cache_.WindowForSource(sourceId_);
         const int64_t aheadCount = static_cast<int64_t>(window.ahead);
         const int64_t behindCount = static_cast<int64_t>(window.behind);
         const int64_t lastFrame = FrameCount() - 1;
-        const int64_t behindFirst = direction > 0
-            ? std::max<int64_t>(0, targetFrame - behindCount)
-            : targetFrame + 1;
-        const int64_t behindLast = direction > 0
-            ? targetFrame - 1
-            : std::min<int64_t>(lastFrame, targetFrame + behindCount);
+        const int64_t behindFirst =
+            direction > 0 ? std::max<int64_t>(0, targetFrame - behindCount)
+                          : targetFrame + 1;
+        const int64_t behindLast =
+            direction > 0
+                ? targetFrame - 1
+                : std::min<int64_t>(lastFrame, targetFrame + behindCount);
         if (!FillAscending(behindFirst, behindLast, handledGeneration)) {
             continue;
         }
 
-        const int64_t aheadFirst = direction > 0
-            ? targetFrame + 1
-            : std::max<int64_t>(0, targetFrame - aheadCount);
-        const int64_t aheadLast = direction > 0
-            ? std::min<int64_t>(lastFrame, targetFrame + aheadCount)
-            : targetFrame - 1;
+        const int64_t aheadFirst =
+            direction > 0 ? targetFrame + 1
+                          : std::max<int64_t>(0, targetFrame - aheadCount);
+        const int64_t aheadLast =
+            direction > 0
+                ? std::min<int64_t>(lastFrame, targetFrame + aheadCount)
+                : targetFrame - 1;
         if (direction > 0) {
             FillAscending(aheadFirst, aheadLast, handledGeneration);
         } else {
@@ -262,7 +278,8 @@ bool DecodeWorker::FillReverseAhead(int64_t firstFrame, int64_t lastFrame,
         }
 
         int64_t chunkEnd = lastFrame;
-        while (chunkEnd >= firstFrame && cache_.TouchFrame(sourceId_, chunkEnd)) {
+        while (chunkEnd >= firstFrame &&
+               cache_.TouchFrame(sourceId_, chunkEnd)) {
             --chunkEnd;
         }
         bool speculative = false;
@@ -279,7 +296,8 @@ bool DecodeWorker::FillReverseAhead(int64_t firstFrame, int64_t lastFrame,
             }
             speculative = true;
         }
-        const int64_t chunkStart = std::max<int64_t>(0, chunkEnd - kChunkSize + 1);
+        const int64_t chunkStart =
+            std::max<int64_t>(0, chunkEnd - kChunkSize + 1);
 
         const AVFrame* decoded = nullptr;
         int64_t pts = 0;
@@ -331,4 +349,9 @@ bool DecodeWorker::IsStopping() {
 int DecodeWorker::Width() const { return source_.Width(); }
 int DecodeWorker::Height() const { return source_.Height(); }
 int64_t DecodeWorker::FrameCount() const { return source_.FrameCount(); }
-double DecodeWorker::FrameRate() const { return source_.FrameRate(); }
+int32_t DecodeWorker::FrameRateNumerator() const {
+    return source_.FrameRateNumerator();
+}
+int32_t DecodeWorker::FrameRateDenominator() const {
+    return source_.FrameRateDenominator();
+}

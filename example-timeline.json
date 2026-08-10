@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "sources": [
+    {"id":"01K00000000000000000000001","path":"C8022.MP4","rate":{"num":25,"den":1},"duration":{"value":168,"rate":25}}
+  ],
+  "tracks": [
+    {"id":"01K00000000000000000000002","kind":"video","index":0,"clips":[
+      {"id":"01K00000000000000000000003","source_id":"01K00000000000000000000001","source_in":{"value":0,"rate":25},"duration":{"value":12,"rate":25},"timeline_in":{"value":0,"rate":25}},
+      {"id":"01K00000000000000000000004","source_id":"01K00000000000000000000001","source_in":{"value":120,"rate":25},"duration":{"value":12,"rate":25},"timeline_in":{"value":12,"rate":25}}
+    ]}
+  ]
+}

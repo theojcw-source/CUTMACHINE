@@ -13,7 +13,7 @@
 
 class DecodeWorker {
 public:
-    DecodeWorker(FrameCache::SourceId sourceId, FrameCache& cache,
+    DecodeWorker(const FrameCache::SourceId& sourceId, FrameCache& cache,
                  PerformanceMetrics& metrics);
     ~DecodeWorker();
 
@@ -28,7 +28,8 @@ public:
     int Width() const;
     int Height() const;
     int64_t FrameCount() const;
-    double FrameRate() const;
+    int32_t FrameRateNumerator() const;
+    int32_t FrameRateDenominator() const;
 
 private:
     void Run();

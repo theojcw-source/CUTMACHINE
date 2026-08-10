@@ -1,5 +1,7 @@
 # Local toolchain and dependencies
 .tools/
+.firecrawl/
+.env
 
 # CMake build trees
 build/
