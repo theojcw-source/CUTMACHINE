@@ -7,14 +7,35 @@ on:
 jobs:
   cmake-build:
     runs-on: macos-14
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-macos-build-${{ hashFiles('Brewfile') }}
+          restore-keys: |
+            brew-macos-build-
+
       - name: Install dependencies
-        run: brew install ffmpeg pkg-config cmake
+        run: brew bundle --file=Brewfile
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-macos-build-${{ github.sha }}
+          restore-keys: |
+            ccache-macos-build-
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: cmake --build build --parallel

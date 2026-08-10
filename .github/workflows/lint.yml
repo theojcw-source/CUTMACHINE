@@ -37,8 +37,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-macos-lint-${{ hashFiles('Brewfile') }}
+          restore-keys: |
+            brew-macos-lint-
+
       - name: Install dependencies
-        run: brew install ffmpeg pkg-config cmake llvm
+        run: |
+          brew bundle --file=Brewfile
+          brew install llvm
 
       - name: Configure (with compile_commands.json)
         run: cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
