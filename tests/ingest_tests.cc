@@ -1,6 +1,7 @@
 #include "Cli.h"
 #include "Document.h"
 #include "Ingest.h"
+#include "Operations.h"
 #include "Ulid.h"
 
 #include <cstdlib>
@@ -24,8 +25,10 @@ void Check(bool condition, const std::string& message) {
 std::string Quote(const std::filesystem::path& path) {
     std::string result = "'";
     for (char character : path.string()) {
-        if (character == '\'') result += "'\\''";
-        else result += character;
+        if (character == '\'')
+            result += "'\\''";
+        else
+            result += character;
     }
     return result + "'";
 }
@@ -54,10 +57,12 @@ int main() {
           "empty document saves: " + error);
 
     const std::string generate =
-        Quote(FFMPEG_EXECUTABLE) + " -hide_banner -loglevel error "
+        Quote(FFMPEG_EXECUTABLE) +
+        " -hide_banner -loglevel error "
         "-f lavfi -i 'color=c=black:s=64x32:r=30000/1001:d=1.001' "
         "-f lavfi -i 'sine=frequency=1000:sample_rate=48000:duration=1.001' "
-        "-c:v mpeg4 -c:a aac -shortest " + Quote(rawPath);
+        "-c:v mpeg4 -c:a aac -shortest " +
+        Quote(rawPath);
     Check(std::system(generate.c_str()) == 0,
           "FFmpeg must generate the media fixture");
     const std::string rotate =
@@ -72,8 +77,7 @@ int main() {
         text << "not media\n";
     }
     {
-        std::ofstream corrupt(mediaDirectory / "corrupt.mp4",
-                              std::ios::binary);
+        std::ofstream corrupt(mediaDirectory / "corrupt.mp4", std::ios::binary);
         corrupt << "broken mp4";
     }
 
@@ -100,9 +104,30 @@ int main() {
               "stored dimensions remain the coded dimensions");
         Check(media.orientation == "portrait",
               "display-matrix rotation controls orientation");
+        Check(std::abs(media.rotation_degrees) == 90,
+              "display-matrix rotation is retained for presentation");
         Check(media.has_audio && media.audio_rate == 48000 &&
                   media.audio_channels == 1,
               "audio header metadata is extracted");
+        const DocumentSource* source = ingested.FindSource(media.id);
+        Check(source && source->rate.num == media.rate.num &&
+                  source->rate.den == media.rate.den &&
+                  source->duration == media.duration,
+              "ingest creates a source with the same stable media ULID");
+        ingested.tracks.push_back(
+            {"01K82000000000000000000001", "video", 0, {}});
+        Operation insert = InsertClipOperation{ingested.tracks[0].id,
+                                               media.id,
+                                               {0, media.duration.rate},
+                                               media.duration,
+                                               {0, media.duration.rate},
+                                               {},
+                                               {}};
+        Operation inverse = RemoveClipOperation{};
+        EditError editError = EditError::None;
+        std::string editMessage;
+        Check(ApplyOperation(ingested, insert, inverse, editError, editMessage),
+              "an ingested media can be inserted directly: " + editMessage);
     }
 
     const std::string beforeSecondIngest = Read(documentPath);

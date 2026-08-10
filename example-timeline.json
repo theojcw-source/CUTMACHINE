@@ -1,12 +1,33 @@
 {
-  "version": 1,
+  "version": 2,
+  "library": [
+    {"id":"01K00000000000000000000001","path":"C8022.MP4","filename":"C8022.MP4","bin_id":"01KZP5HMZ6ATPZ0RGVV6YMB34J","rate":{"num":25,"den":1},"duration":{"value":168,"rate":25}}
+  ],
+  "bins": [
+    {"id":"01KZP5HMZ6ATPZ0RGVV6YMB34J","name":"1_rushes"}
+  ],
   "sources": [
     {"id":"01K00000000000000000000001","path":"C8022.MP4","rate":{"num":25,"den":1},"duration":{"value":168,"rate":25}}
   ],
   "tracks": [
     {"id":"01K00000000000000000000002","kind":"video","index":0,"clips":[
-      {"id":"01K00000000000000000000003","source_id":"01K00000000000000000000001","source_in":{"value":0,"rate":25},"duration":{"value":12,"rate":25},"timeline_in":{"value":0,"rate":25}},
-      {"id":"01K00000000000000000000004","source_id":"01K00000000000000000000001","source_in":{"value":120,"rate":25},"duration":{"value":12,"rate":25},"timeline_in":{"value":12,"rate":25}}
-    ]}
+      {"id":"01KZNZQCJSBKN94PZ67HQD54A6","source_id":"01K00000000000000000000001","source_in":{"value":89,"rate":25},"duration":{"value":11,"rate":25},"timeline_in":{"value":163,"rate":25},"include_audio":false,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XR9","sync_anchor_clip_id":"01KZNZQCJSBKN94PZ67HQD54A6","sync_reference_delta":{"value":0,"rate":1}}
+    ]},
+    {"id":"01KZP24NHGCDW0PFTX01W9AJS2","kind":"video","index":1,"clips":[
+      {"id":"01K00000000000000000000003","source_id":"01K00000000000000000000001","source_in":{"value":0,"rate":25},"duration":{"value":27,"rate":25},"timeline_in":{"value":0,"rate":25},"include_audio":false,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XRA","sync_anchor_clip_id":"01K00000000000000000000003","sync_reference_delta":{"value":0,"rate":1}},
+      {"id":"01KZP0CCXEGFEMVRSBS5RNB0NV","source_id":"01K00000000000000000000001","source_in":{"value":20,"rate":25},"duration":{"value":15,"rate":25},"timeline_in":{"value":27,"rate":25},"include_audio":false,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XR6","sync_anchor_clip_id":"01KZP0CCXEGFEMVRSBS5RNB0NV","sync_reference_delta":{"value":0,"rate":1}},
+      {"id":"01KZP4WE5C3RBV23VP6QPXCJXJ","source_id":"01K00000000000000000000001","source_in":{"value":35,"rate":25},"duration":{"value":7,"rate":25},"timeline_in":{"value":42,"rate":25},"include_audio":false,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XR7","sync_anchor_clip_id":"01KZP4WE5C3RBV23VP6QPXCJXJ","sync_reference_delta":{"value":0,"rate":1}},
+      {"id":"01K00000000000000000000004","source_id":"01K00000000000000000000001","source_in":{"value":114,"rate":25},"duration":{"value":41,"rate":25},"timeline_in":{"value":49,"rate":25},"include_audio":false,"link_group_id":"01KZP4WMMRTSB2AZ7ASQZV8AX7","sync_anchor_clip_id":"01K00000000000000000000004","sync_reference_delta":{"value":0,"rate":1}},
+      {"id":"01KZP4WEYCZKTMQZWSTJT7JKW8","source_id":"01K00000000000000000000001","source_in":{"value":42,"rate":25},"duration":{"value":8,"rate":25},"timeline_in":{"value":90,"rate":25},"include_audio":false,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XR8","sync_anchor_clip_id":"01KZP4WEYCZKTMQZWSTJT7JKW8","sync_reference_delta":{"value":0,"rate":1}}
+    ]},
+    {"id":"01KZP2TMVHPETKQ51ZQ8FMWXC0","kind":"audio","index":2,"clips":[
+      {"id":"01KZP5HDB6NVAS8DFZZYYA5XRA","source_id":"01K00000000000000000000001","source_in":{"value":0,"rate":25},"duration":{"value":27,"rate":25},"timeline_in":{"value":0,"rate":25},"include_audio":true,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XRA","sync_anchor_clip_id":"01K00000000000000000000003","sync_reference_delta":{"value":0,"rate":25}},
+      {"id":"01KZP5HDB6NVAS8DFZZYYA5XR6","source_id":"01K00000000000000000000001","source_in":{"value":20,"rate":25},"duration":{"value":15,"rate":25},"timeline_in":{"value":27,"rate":25},"include_audio":true,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XR6","sync_anchor_clip_id":"01KZP0CCXEGFEMVRSBS5RNB0NV","sync_reference_delta":{"value":0,"rate":25}},
+      {"id":"01KZP5HDB6NVAS8DFZZYYA5XR7","source_id":"01K00000000000000000000001","source_in":{"value":35,"rate":25},"duration":{"value":7,"rate":25},"timeline_in":{"value":42,"rate":25},"include_audio":true,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XR7","sync_anchor_clip_id":"01KZP4WE5C3RBV23VP6QPXCJXJ","sync_reference_delta":{"value":0,"rate":25}},
+      {"id":"01KZP4WMMRTSB2AZ7ASQZV8AX7","source_id":"01K00000000000000000000001","source_in":{"value":114,"rate":25},"duration":{"value":41,"rate":25},"timeline_in":{"value":49,"rate":25},"include_audio":true,"link_group_id":"01KZP4WMMRTSB2AZ7ASQZV8AX7","sync_anchor_clip_id":"01K00000000000000000000004","sync_reference_delta":{"value":0,"rate":25}},
+      {"id":"01KZP5HDB6NVAS8DFZZYYA5XR8","source_id":"01K00000000000000000000001","source_in":{"value":42,"rate":25},"duration":{"value":8,"rate":25},"timeline_in":{"value":90,"rate":25},"include_audio":true,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XR8","sync_anchor_clip_id":"01KZP4WEYCZKTMQZWSTJT7JKW8","sync_reference_delta":{"value":0,"rate":25}},
+      {"id":"01KZP5HDB6NVAS8DFZZYYA5XR9","source_id":"01K00000000000000000000001","source_in":{"value":89,"rate":25},"duration":{"value":11,"rate":25},"timeline_in":{"value":163,"rate":25},"include_audio":true,"link_group_id":"01KZP5HDB6NVAS8DFZZYYA5XR9","sync_anchor_clip_id":"01KZNZQCJSBKN94PZ67HQD54A6","sync_reference_delta":{"value":0,"rate":25}}
+    ]},
+    {"id":"01KZP4W7XXYCK7KAG6AJ8HX705","kind":"audio","index":3,"clips":[    ]}
   ]
 }

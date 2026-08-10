@@ -14,6 +14,8 @@ enum class EditError {
     UnknownTrack,
     UnknownClip,
     UnknownSource,
+    UnknownBin,
+    UnknownMedia,
     InvalidDuration,
     InvalidTimelineIn,
     SourceOutOfBounds,
@@ -66,8 +68,140 @@ struct TrimClipOperation {
     std::optional<ExactClipTimes> exact_clip_result;
 };
 
+struct ExactTrackState {
+    Ulid track_id;
+    std::vector<DocumentClip> clips;
+};
+
+struct MoveClipOperation {
+    Ulid clip_id;
+    Ulid track_id;
+    RationalTime timeline_in;
+
+    // Empty for a new move. ApplyOperation records the exact resulting tracks
+    // so redo retains IDs created by an overwrite split. Inverse operations
+    // carry the corresponding exact pre-move tracks.
+    std::vector<ExactTrackState> exact_track_result;
+};
+
+struct LinkedClipMove {
+    Ulid clip_id;
+    Ulid track_id;
+    RationalTime timeline_in;
+};
+
+struct MoveLinkedClipsOperation {
+    Ulid link_group_id;
+    std::vector<LinkedClipMove> moves;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
+struct LinkedClipTrim {
+    Ulid clip_id;
+    TrimEdge edge = TrimEdge::Head;
+    RationalTime delta;
+};
+
+// One trim gesture over linked A/V is one event-log entry. Exact track
+// snapshots make redo/undo deterministic and guarantee all-or-nothing apply.
+struct TrimLinkedClipsOperation {
+    Ulid link_group_id;
+    std::vector<LinkedClipTrim> trims;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
+struct RemoveLinkedClipsOperation {
+    Ulid link_group_id;
+    std::vector<Ulid> clip_ids;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
+struct DeleteGapOperation {
+    Ulid track_id;
+    RationalTime gap_start;
+    RationalTime gap_duration;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
+struct DetachAudioOperation {
+    Ulid video_clip_id;
+    Ulid audio_track_id;
+    Ulid audio_clip_id;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
+struct AddTrackOperation {
+    Ulid track_id;
+    std::string kind = "video";
+    int32_t index = -1;
+};
+
+struct RemoveTrackOperation {
+    Ulid track_id;
+};
+
+struct AddBinOperation {
+    Ulid bin_id;
+    std::string name;
+    Ulid parent_id;
+};
+
+struct RemoveBinOperation {
+    Ulid bin_id;
+    // Filled for the inverse/redo path so the stable ID and name survive.
+    std::string name;
+    Ulid parent_id;
+};
+
+struct RenameBinOperation {
+    Ulid bin_id;
+    std::string name;
+};
+
+struct SetMediaBinOperation {
+    Ulid media_id;
+    // Empty assigns the media to the project root.
+    Ulid bin_id;
+};
+
+struct SetClipLinkOperation {
+    Ulid first_clip_id;
+    Ulid second_clip_id;
+    Ulid first_group_id;
+    Ulid second_group_id;
+    struct ExactState {
+        Ulid group_id;
+        Ulid anchor_clip_id;
+        RationalTime reference_delta{0, 1};
+    };
+    std::optional<ExactState> exact_first_result;
+    std::optional<ExactState> exact_second_result;
+};
+
+struct SplitClipOperation {
+    Ulid clip_id;
+    RationalTime timeline_position;
+
+    // Generated on first application and retained for redo identity.
+    Ulid right_clip_id;
+};
+
+// JoinClip is the exact inverse stored by the event log for SplitClip. Keeping
+// it explicit makes persisted undo/redo deterministic across timebases.
+struct JoinClipOperation {
+    Ulid left_clip_id;
+    Ulid right_clip_id;
+    ExactClipTimes joined_times;
+};
+
 using Operation =
-    std::variant<InsertClipOperation, RemoveClipOperation, TrimClipOperation>;
+    std::variant<InsertClipOperation, RemoveClipOperation, TrimClipOperation,
+                 MoveClipOperation, DeleteGapOperation, DetachAudioOperation,
+                 MoveLinkedClipsOperation, TrimLinkedClipsOperation,
+                 RemoveLinkedClipsOperation, AddTrackOperation,
+                 RemoveTrackOperation, SplitClipOperation, JoinClipOperation,
+                 AddBinOperation, RemoveBinOperation, RenameBinOperation,
+                 SetMediaBinOperation, SetClipLinkOperation>;
 
 // On success, operation is enriched with generated IDs and exact redo state.
 // Both document and operation remain unchanged on failure.

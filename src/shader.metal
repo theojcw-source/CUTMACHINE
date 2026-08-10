@@ -45,26 +45,76 @@ float3 sampleBT709(float2 uv,
     return clamp(rgb, 0.0, 1.0);
 }
 
-struct CompositeParameters {
-    float secondOpacity;
-    uint hasSecondFrame;
+struct PresentationParameters {
+    float left;
+    float top;
+    float width;
+    float height;
+    int quarterTurns;
+    float opacity;
 };
 
-fragment float4 fragment_main(VertexOut in [[stage_in]],
-                              texture2d<float> yFirst [[texture(0)]],
-                              texture2d<float> uFirst [[texture(1)]],
-                              texture2d<float> vFirst [[texture(2)]],
-                              texture2d<float> ySecond [[texture(3)]],
-                              texture2d<float> uSecond [[texture(4)]],
-                              texture2d<float> vSecond [[texture(5)]],
-                              sampler planeSampler [[sampler(0)]],
-                              constant CompositeParameters& parameters [[buffer(0)]]) {
-    const float3 first = sampleBT709(in.uv, yFirst, uFirst, vFirst, planeSampler);
-    if (parameters.hasSecondFrame == 0) {
-        return float4(first, 1.0);
+bool presentationUV(float2 outputUV, float left, float top, float width,
+                    float height, int quarterTurns, thread float2& codedUV) {
+    if (outputUV.x < left || outputUV.x > left + width ||
+        outputUV.y < top || outputUV.y > top + height)
+        return false;
+    const float2 displayUV =
+        (outputUV - float2(left, top)) / float2(width, height);
+    switch (quarterTurns) {
+        case 1: codedUV = float2(1.0 - displayUV.y, displayUV.x); break;
+        case 2: codedUV = float2(1.0 - displayUV.x,
+                                 1.0 - displayUV.y); break;
+        case 3: codedUV = float2(displayUV.y, 1.0 - displayUV.x); break;
+        default: codedUV = displayUV; break;
     }
-    const float3 second = sampleBT709(in.uv, ySecond, uSecond, vSecond,
-                                      planeSampler);
-    return float4(mix(first, second, clamp(parameters.secondOpacity, 0.0, 1.0)),
-                  1.0);
+    return true;
+}
+
+fragment float4 fragment_main(VertexOut in [[stage_in]],
+                              texture2d<float> yTexture [[texture(0)]],
+                              texture2d<float> uTexture [[texture(1)]],
+                              texture2d<float> vTexture [[texture(2)]],
+                              sampler planeSampler [[sampler(0)]],
+                              constant PresentationParameters& parameters [[buffer(0)]]) {
+    float2 codedUV;
+    if (!presentationUV(in.uv, parameters.left, parameters.top,
+                        parameters.width, parameters.height,
+                        parameters.quarterTurns, codedUV))
+        return float4(0.0);
+    const float3 color = sampleBT709(codedUV, yTexture, uTexture, vTexture,
+                                     planeSampler);
+    return float4(color, clamp(parameters.opacity, 0.0, 1.0));
+}
+
+struct SolidParameters {
+    float4 rect;
+    float4 color;
+    float2 drawableSize;
+    float2 padding;
+};
+
+struct SolidVertexOut {
+    float4 position [[position]];
+};
+
+vertex SolidVertexOut vertex_solid(
+    uint vertexId [[vertex_id]],
+    constant SolidParameters& parameters [[buffer(0)]]) {
+    const float2 corners[6] = {
+        float2(0.0, 0.0), float2(1.0, 0.0), float2(1.0, 1.0),
+        float2(0.0, 0.0), float2(1.0, 1.0), float2(0.0, 1.0),
+    };
+    const float2 pixel = parameters.rect.xy +
+                         corners[vertexId] * parameters.rect.zw;
+    const float2 ndc = float2(pixel.x / parameters.drawableSize.x * 2.0 - 1.0,
+                              1.0 - pixel.y / parameters.drawableSize.y * 2.0);
+    SolidVertexOut out;
+    out.position = float4(ndc, 0.0, 1.0);
+    return out;
+}
+
+fragment float4 fragment_solid(
+    constant SolidParameters& parameters [[buffer(0)]]) {
+    return parameters.color;
 }

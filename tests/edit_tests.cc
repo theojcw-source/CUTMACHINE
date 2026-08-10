@@ -380,6 +380,119 @@ int main() {
         std::filesystem::remove(path);
     });
 
+    Test("bins create and classify media through reversible operations", [] {
+        Document document = EditDocument();
+        LibraryMedia media;
+        media.id = document.sources[0].id;
+        media.path = "A.MP4";
+        media.filename = "A.MP4";
+        media.codec = "h264";
+        media.width = 1920;
+        media.height = 1080;
+        media.rate = {25, 1};
+        media.duration = {1000, 25};
+        media.orientation = "landscape";
+        document.library.push_back(media);
+        const std::string initial = document.SaveToString();
+        EditLog log;
+        const Ulid binId = "01K80000000000000000000001";
+        Check(Apply(log, document, AddBinOperation{binId, "Rushes \"A\""},
+                    "add bin"),
+              "bin creation succeeds");
+        Check(Apply(log, document,
+                    SetMediaBinOperation{document.library[0].id, binId},
+                    "assign media bin"),
+              "media assignment succeeds");
+        Check(document.bins.size() == 1 && document.library[0].bin_id == binId,
+              "bin and media assignment are stored in the document");
+        const std::string serialized = log.Serialize();
+        EditLog parsed;
+        EditError error = EditError::None;
+        std::string message;
+        Check(EditLog::Deserialize(serialized, parsed, error, message) &&
+                  parsed.Serialize() == serialized,
+              "bin operations round-trip in the event log: " + message);
+        Check(log.Undo(document, error, message) &&
+                  document.library[0].bin_id.empty(),
+              "undo restores media to the project root");
+        Check(log.Undo(document, error, message) && document.bins.empty() &&
+                  document.SaveToString() == initial,
+              "second undo removes the empty bin byte-exactly");
+        Check(log.Redo(document, error, message) &&
+                  log.Redo(document, error, message) &&
+                  document.library[0].bin_id == binId,
+              "redo recreates the same bin ULID and assignment");
+    });
+
+    Test("nested bins preserve hierarchy and reject destructive removal", [] {
+        Document document = EditDocument();
+        LibraryMedia media;
+        media.id = document.sources[0].id;
+        media.path = "A.MP4";
+        media.filename = "A.MP4";
+        media.codec = "h264";
+        media.width = 1920;
+        media.height = 1080;
+        media.rate = {25, 1};
+        media.duration = {1000, 25};
+        media.orientation = "landscape";
+        document.library.push_back(media);
+        EditLog log;
+        const Ulid parent = "01K81000000000000000000001";
+        const Ulid child = "01K81000000000000000000002";
+        Check(Apply(log, document, AddBinOperation{parent, "Rushes", ""},
+                    "add parent bin"),
+              "top-level bin creation succeeds");
+        Check(Apply(log, document, AddBinOperation{child, "Interview", parent},
+                    "add child bin"),
+              "child bin creation succeeds");
+        Check(document.FindBin(child) &&
+                  document.FindBin(child)->parent_id == parent,
+              "child retains its exact parent ULID");
+
+        const std::string childJson =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(childJson, parsed, error, message) &&
+                  SerializeOperation(parsed) == childJson,
+              "nested AddBin JSON round-trips canonically");
+
+        Check(
+            Apply(log, document, RenameBinOperation{child, "Interview selects"},
+                  "rename child bin"),
+            "bin rename succeeds through the event log");
+        const std::string renameJson =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Check(DeserializeOperation(renameJson, parsed, error, message) &&
+                  SerializeOperation(parsed) == renameJson,
+              "RenameBin JSON round-trips canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.FindBin(child)->name == "Interview",
+              "rename undo restores the original name");
+
+        ExpectRejected(document, RemoveBinOperation{parent, "", ""},
+                       EditError::InvalidOperation, "remove bin with child");
+        Check(Apply(log, document, SetMediaBinOperation{media.id, child},
+                    "classify in child"),
+              "media can be placed in a nested bin");
+        ExpectRejected(document, RemoveBinOperation{child, "", ""},
+                       EditError::InvalidOperation,
+                       "remove non-empty child bin");
+
+        Document loaded;
+        Check(Document::LoadFromString(document.SaveToString(), loaded,
+                                       message) &&
+                  loaded.FindBin(child) &&
+                  loaded.FindBin(child)->parent_id == parent,
+              "document JSON preserves the bin hierarchy");
+
+        Document cyclic = document;
+        cyclic.FindBin(parent)->parent_id = child;
+        Check(!cyclic.Validate(message), "bin hierarchy cycles are rejected");
+    });
+
     Test("empty undo/redo and redo clearing", [] {
         Document document = EditDocument();
         const std::string original = document.SaveToString();

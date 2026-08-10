@@ -38,13 +38,27 @@ std::string EscapeJson(const std::string& input) {
     std::ostringstream output;
     for (const unsigned char character : input) {
         switch (character) {
-            case '"': output << "\\\""; break;
-            case '\\': output << "\\\\"; break;
-            case '\b': output << "\\b"; break;
-            case '\f': output << "\\f"; break;
-            case '\n': output << "\\n"; break;
-            case '\r': output << "\\r"; break;
-            case '\t': output << "\\t"; break;
+            case '"':
+                output << "\\\"";
+                break;
+            case '\\':
+                output << "\\\\";
+                break;
+            case '\b':
+                output << "\\b";
+                break;
+            case '\f':
+                output << "\\f";
+                break;
+            case '\n':
+                output << "\\n";
+                break;
+            case '\r':
+                output << "\\r";
+                break;
+            case '\t':
+                output << "\\t";
+                break;
             default:
                 if (character < 0x20) {
                     const char digits[] = "0123456789abcdef";
@@ -71,8 +85,8 @@ std::filesystem::path Resolved(const std::filesystem::path& path,
     return std::filesystem::weakly_canonical(absolute, error);
 }
 
-bool Probe(const std::filesystem::path& absolutePath, LibraryMedia& media,
-           std::string& reason) {
+bool ProbeImpl(const std::filesystem::path& absolutePath, LibraryMedia& media,
+               std::string& reason) {
     AVFormatContext* rawContext = nullptr;
     int result = avformat_open_input(&rawContext, absolutePath.c_str(), nullptr,
                                      nullptr);
@@ -138,15 +152,17 @@ bool Probe(const std::filesystem::path& absolutePath, LibraryMedia& media,
         displayMatrixSize = matrixSideData->size;
     }
 #else
-    displayMatrix = av_stream_get_side_data(
-        video, AV_PKT_DATA_DISPLAYMATRIX, &displayMatrixSize);
+    displayMatrix = av_stream_get_side_data(video, AV_PKT_DATA_DISPLAYMATRIX,
+                                            &displayMatrixSize);
 #endif
     if (displayMatrix && displayMatrixSize >= 9 * sizeof(int32_t)) {
         const double value = av_display_rotation_get(
             reinterpret_cast<const int32_t*>(displayMatrix));
         if (!std::isnan(value)) rotation = value;
     }
-    const double radians = rotation * 3.14159265358979323846 / 180.0;
+    media.rotation_degrees = static_cast<int32_t>(std::lround(rotation));
+    const double radians =
+        media.rotation_degrees * 3.14159265358979323846 / 180.0;
     const double displayedWidth =
         std::abs(parameters->width * std::cos(radians)) +
         std::abs(parameters->height * std::sin(radians));
@@ -163,8 +179,8 @@ bool Probe(const std::filesystem::path& absolutePath, LibraryMedia& media,
     if (std::abs(displayedWidth - displayedHeight) <= scale * 1e-9) {
         media.orientation = "square";
     } else {
-        media.orientation = displayedWidth > displayedHeight ? "landscape"
-                                                             : "portrait";
+        media.orientation =
+            displayedWidth > displayedHeight ? "landscape" : "portrait";
     }
 
     const int audioIndex = av_find_best_stream(
@@ -190,21 +206,43 @@ bool CollectFiles(const std::filesystem::path& directory, bool recursive,
     }
     const auto options = std::filesystem::directory_options::none;
     if (recursive) {
-        std::filesystem::recursive_directory_iterator iterator(directory, options,
-                                                               error), end;
-        if (error) { reason = error.message(); return false; }
+        std::filesystem::recursive_directory_iterator iterator(directory,
+                                                               options, error),
+            end;
+        if (error) {
+            reason = error.message();
+            return false;
+        }
         for (; iterator != end; iterator.increment(error)) {
-            if (error) { reason = error.message(); return false; }
-            if (iterator->is_regular_file(error)) files.push_back(iterator->path());
-            if (error) { reason = error.message(); return false; }
+            if (error) {
+                reason = error.message();
+                return false;
+            }
+            if (iterator->is_regular_file(error))
+                files.push_back(iterator->path());
+            if (error) {
+                reason = error.message();
+                return false;
+            }
         }
     } else {
-        std::filesystem::directory_iterator iterator(directory, options, error), end;
-        if (error) { reason = error.message(); return false; }
+        std::filesystem::directory_iterator iterator(directory, options, error),
+            end;
+        if (error) {
+            reason = error.message();
+            return false;
+        }
         for (; iterator != end; iterator.increment(error)) {
-            if (error) { reason = error.message(); return false; }
-            if (iterator->is_regular_file(error)) files.push_back(iterator->path());
-            if (error) { reason = error.message(); return false; }
+            if (error) {
+                reason = error.message();
+                return false;
+            }
+            if (iterator->is_regular_file(error))
+                files.push_back(iterator->path());
+            if (error) {
+                reason = error.message();
+                return false;
+            }
         }
     }
     std::sort(files.begin(), files.end());
@@ -214,9 +252,8 @@ bool CollectFiles(const std::filesystem::path& directory, bool recursive,
 std::string ResultJson(bool ok, size_t added, size_t skipped,
                        const std::vector<IngestError>& errors) {
     std::ostringstream output;
-    output << "{\"ok\":" << (ok ? "true" : "false")
-           << ",\"added\":" << added << ",\"skipped\":" << skipped
-           << ",\"errors\":[";
+    output << "{\"ok\":" << (ok ? "true" : "false") << ",\"added\":" << added
+           << ",\"skipped\":" << skipped << ",\"errors\":[";
     for (size_t index = 0; index < errors.size(); ++index) {
         if (index) output << ',';
         output << "{\"file\":\"" << EscapeJson(errors[index].file)
@@ -232,7 +269,10 @@ bool AtomicSave(const Document& document, const std::filesystem::path& path,
     const std::filesystem::path temporary =
         path.string() + ".cutmachine-" + GenerateUlid() + ".tmp";
     std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
-    if (!stream) { reason = "unable to create temporary document"; return false; }
+    if (!stream) {
+        reason = "unable to create temporary document";
+        return false;
+    }
     stream << document.SaveToString();
     stream.close();
     if (!stream) {
@@ -254,6 +294,12 @@ bool AtomicSave(const Document& document, const std::filesystem::path& path,
 
 }  // namespace
 
+bool ProbeMediaMetadata(const std::string& path, LibraryMedia& media,
+                        std::string& reason) {
+    av_log_set_level(AV_LOG_ERROR);
+    return ProbeImpl(std::filesystem::path(path), media, reason);
+}
+
 int IngestCommand(const std::string& documentPath,
                   const std::string& directoryPath, bool recursive,
                   std::string& output) {
@@ -269,15 +315,14 @@ int IngestCommand(const std::string& documentPath,
     const std::filesystem::path resolvedDocument =
         Resolved(documentPath, pathError);
     if (pathError) {
-        output = ResultJson(false, 0, 0,
-                            {{documentPath, pathError.message()}});
+        output = ResultJson(false, 0, 0, {{documentPath, pathError.message()}});
         return 1;
     }
     const std::filesystem::path resolvedDirectory =
         Resolved(directoryPath, pathError);
     if (pathError) {
-        output = ResultJson(false, 0, 0,
-                            {{directoryPath, pathError.message()}});
+        output =
+            ResultJson(false, 0, 0, {{directoryPath, pathError.message()}});
         return 1;
     }
     std::vector<std::filesystem::path> files;
@@ -290,7 +335,8 @@ int IngestCommand(const std::string& documentPath,
     for (size_t index = 0; index < document.library.size(); ++index) {
         const LibraryMedia& media = document.library[index];
         std::filesystem::path stored(media.path);
-        if (stored.is_relative()) stored = resolvedDocument.parent_path() / stored;
+        if (stored.is_relative())
+            stored = resolvedDocument.parent_path() / stored;
         std::error_code error;
         const std::filesystem::path resolved = Resolved(stored, error);
         if (!error) knownPaths.emplace(resolved.string(), index);
@@ -317,12 +363,18 @@ int IngestCommand(const std::string& documentPath,
                 enriched.id = existing.id;
                 enriched.path = existing.path;
                 enriched.filename = absolute.filename().string();
-                if (Probe(absolute, enriched, reason)) {
+                if (ProbeMediaMetadata(absolute.string(), enriched, reason)) {
                     existing = std::move(enriched);
                     changed = true;
                 } else {
                     errors.push_back({absolute.filename().string(), reason});
                 }
+            }
+            if (existing.metadata_complete &&
+                !document.FindSource(existing.id)) {
+                document.sources.push_back({existing.id, existing.path,
+                                            existing.rate, existing.duration});
+                changed = true;
             }
             continue;
         }
@@ -334,12 +386,17 @@ int IngestCommand(const std::string& documentPath,
                          .lexically_normal()
                          .string();
         if (error) media.path = absolute.string();
-        if (!Probe(absolute, media, reason)) {
+        if (!ProbeMediaMetadata(absolute.string(), media, reason)) {
             ++skipped;
             errors.push_back({media.filename, reason});
             continue;
         }
         document.library.push_back(std::move(media));
+        const LibraryMedia& addedMedia = document.library.back();
+        if (!document.FindSource(addedMedia.id)) {
+            document.sources.push_back({addedMedia.id, addedMedia.path,
+                                        addedMedia.rate, addedMedia.duration});
+        }
         knownPaths.emplace(absolute.string(), document.library.size() - 1);
         ++added;
         changed = true;

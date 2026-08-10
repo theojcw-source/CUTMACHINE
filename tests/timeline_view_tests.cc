@@ -1,0 +1,860 @@
+#include "TimelineView.h"
+
+#include <algorithm>
+#include <functional>
+#include <iostream>
+#include <string>
+#include <variant>
+
+namespace {
+
+int failures = 0;
+
+void Check(bool condition, const std::string& message) {
+    if (!condition) {
+        ++failures;
+        std::cerr << "FAIL: " << message << '\n';
+    }
+}
+
+template <typename Function>
+void Test(const std::string& name, Function function) {
+    const int before = failures;
+    try {
+        function();
+        if (before == failures) std::cout << "PASS: " << name << '\n';
+    } catch (const std::exception& exception) {
+        ++failures;
+        std::cerr << "FAIL: " << name << ": " << exception.what() << '\n';
+    }
+}
+
+Document Fixture() {
+    Document document;
+    document.sources = {
+        {"01KT0000000000000000000001", "source.mov", {10, 1}, {100, 10}},
+    };
+    document.tracks = {
+        {"01KT0000000000000000000002",
+         "video",
+         0,
+         {{"01KT0000000000000000000003",
+           "01KT0000000000000000000001",
+           {10, 10},
+           {20, 10},
+           {10, 10}},
+          {"01KT0000000000000000000004",
+           "01KT0000000000000000000001",
+           {40, 10},
+           {10, 10},
+           {40, 10}}}},
+    };
+    return document;
+}
+
+TimelineViewport Viewport() {
+    TimelineViewport viewport;
+    viewport.view_start = {0, 10};
+    viewport.pixels_per_second = 100.0;
+    viewport.track_height = 40.0;
+    viewport.header_width = 50.0;
+    return viewport;
+}
+
+uint64_t Hash(const std::string& bytes) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (const unsigned char byte : bytes) {
+        hash ^= byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+}  // namespace
+
+int main() {
+    Test("time and pixels invert at frame boundaries", [] {
+        const struct Case {
+            int32_t rate;
+            int64_t frameStep;
+        } cases[] = {{24, 1}, {25, 1}, {30000, 1001}};
+        const double zooms[] = {4.0, 37.5, 100.0, 1333.0, 4000.0};
+        for (const Case value : cases) {
+            for (double zoom : zooms) {
+                TimelineViewport viewport;
+                viewport.view_start = {value.frameStep * 7, value.rate};
+                viewport.pixels_per_second = zoom;
+                viewport.header_width = 71.0;
+                for (int64_t frame = -5; frame <= 50; ++frame) {
+                    const RationalTime time{frame * value.frameStep,
+                                            value.rate};
+                    const RationalTime roundTrip =
+                        viewport.XToTime(viewport.TimeToX(time), value.rate);
+                    Check(roundTrip == time,
+                          "round trip must preserve frame at every zoom");
+                }
+            }
+        }
+    });
+
+    Test("playhead quantizes exactly to frames or audio samples", [] {
+        const MediaRate ntsc{30000, 1001};
+        Check(QuantizePlayheadPosition({1500, 30000}, PlayheadResolution::Frame,
+                                       ntsc) == RationalTime{1001, 30000},
+              "NTSC position below half-frame rounds to the first frame");
+        Check(QuantizePlayheadPosition({1502, 30000}, PlayheadResolution::Frame,
+                                       ntsc) == RationalTime{2002, 30000},
+              "NTSC position above half-frame rounds to the second frame");
+        Check(QuantizePlayheadPosition({1, 96000}, PlayheadResolution::Sample,
+                                       ntsc) == RationalTime{1, 48000},
+              "half an audio sample rounds explicitly away from zero");
+        Check(QuantizePlayheadPosition({1, 192000}, PlayheadResolution::Sample,
+                                       ntsc) == RationalTime{0, 48000},
+              "sub-half-sample position rounds to sample zero");
+    });
+
+    Test("hit test resolves clips, holes and six-point edges", [] {
+        const Document document = Fixture();
+        const TimelineViewport viewport = Viewport();
+        const double trackY = kTimelineRulerHeight + 20.0;
+        const auto inside =
+            HitTestTimeline(document, viewport, 200.0, trackY, 700.0);
+        Check(inside && inside->clip_id == document.tracks[0].clips[0].id &&
+                  inside->edge == TimelineHitEdge::None,
+              "clip body returns its ULID");
+        Check(!HitTestTimeline(document, viewport, 375.0, trackY, 700.0),
+              "gap returns no clip");
+        const auto head =
+            HitTestTimeline(document, viewport, 154.0, trackY, 700.0);
+        Check(head && head->edge == TimelineHitEdge::Head,
+              "point within six points of head returns head edge");
+        const auto tail =
+            HitTestTimeline(document, viewport, 346.0, trackY, 700.0);
+        Check(tail && tail->edge == TimelineHitEdge::Tail,
+              "point within six points of tail returns tail edge");
+    });
+
+    Test("bounded gaps are selectable but trailing space is not", [] {
+        Document document = Fixture();
+        TimelineViewport viewport = Viewport();
+        const double trackY = kTimelineRulerHeight + 20.0;
+        const auto gap =
+            HitTestTimelineGap(document, viewport, 375.0, trackY, 700.0, 10);
+        Check(gap && gap->track_id == document.tracks[0].id &&
+                  gap->start == RationalTime{30, 10} &&
+                  gap->duration == RationalTime{10, 10},
+              "clicking the bounded hole resolves its exact range");
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        interaction.PointerDown(375.0, trackY, 700.0, 10);
+        Check(interaction.SelectedGap() && interaction.SelectedClipId().empty(),
+              "pointer interaction selects the gap instead of a clip");
+        interaction.PointerDown(600.0, trackY, 700.0, 10);
+        Check(!interaction.SelectedGap(),
+              "unbounded space after the last clip is not a deletable gap");
+    });
+
+    Test("lasso selects every intersecting clip rectangle", [] {
+        Document document = Fixture();
+        TimelineViewport viewport = Viewport();
+        const double top = kTimelineRulerHeight + 5.0;
+        const double bottom =
+            kTimelineRulerHeight + viewport.track_height - 5.0;
+        const auto selected = LassoHitTestTimeline(document, viewport, 140.0,
+                                                   top, 460.0, bottom, 700.0);
+        Check(selected.size() == 2 &&
+                  selected[0] == document.tracks[0].clips[0].id &&
+                  selected[1] == document.tracks[0].clips[1].id,
+              "lasso intersection returns both clip ULIDs in display order");
+        Check(LassoHitTestTimeline(document, viewport, 360.0, top, 440.0,
+                                   bottom, 700.0)
+                  .empty(),
+              "lasso confined to a gap selects no clip");
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        interaction.SelectClips(selected);
+        Check(interaction.SelectedClipIds().size() == 2 &&
+                  interaction.SelectedClipId().empty(),
+              "multi-selection has no accidental single edit target");
+        const auto rectangles =
+            VisibleTimelineClips(document, viewport, 700.0,
+                                 interaction.SelectedClipIds(), std::nullopt);
+        Check(std::count_if(rectangles.begin(), rectangles.end(),
+                            [](const TimelineClipRect& clip) {
+                                return clip.selected;
+                            }) == 2,
+              "every lasso member receives selected rendering");
+    });
+
+    Test("deleting a gap closes one track atomically and undo restores bytes",
+         [] {
+             Document document = Fixture();
+             const std::string initial = document.SaveToString();
+             EditLog log;
+             EditError error = EditError::None;
+             std::string message;
+             Operation operation = DeleteGapOperation{
+                 document.tracks[0].id, {30, 10}, {10, 10}, {}};
+             Check(log.Apply(document, std::move(operation), error, message),
+                   "gap deletion applies: " + message);
+             Check(log.AppliedCount() == 1 &&
+                       document.tracks[0].clips[0].timeline_in ==
+                           RationalTime{10, 10} &&
+                       document.tracks[0].clips[1].timeline_in ==
+                           RationalTime{30, 10},
+                   "all following clips shift left by the exact gap duration");
+             const std::string json =
+                 SerializeOperation(log.AppliedEntries().back().op);
+             Operation parsed = RemoveClipOperation{};
+             Check(DeserializeOperation(json, parsed, error, message) &&
+                       SerializeOperation(parsed) == json,
+                   "DeleteGap JSON round-trips canonically");
+             Check(log.Undo(document, error, message),
+                   "gap deletion undo succeeds: " + message);
+             Check(document.SaveToString() == initial,
+                   "undo restores the canonical document byte for byte");
+             Check(log.Redo(document, error, message) &&
+                       document.tracks[0].clips[1].timeline_in ==
+                           RationalTime{30, 10},
+                   "redo closes the same gap exactly");
+         });
+
+    Test("a gap deletion crossing a clip is rejected without mutation", [] {
+        Document document = Fixture();
+        const std::string initial = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Operation operation =
+            DeleteGapOperation{document.tracks[0].id, {20, 10}, {10, 10}, {}};
+        Check(!log.Apply(document, std::move(operation), error, message) &&
+                  error == EditError::InvalidOperation,
+              "range intersecting a clip is rejected");
+        Check(log.AppliedCount() == 0 && document.SaveToString() == initial,
+              "rejected deletion leaves document bytes and event log intact");
+    });
+
+    Test("adding a video track is atomic, stable and exactly reversible", [] {
+        Document document = Fixture();
+        const std::string initial = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Operation operation = AddTrackOperation{"", "video", 1};
+        Check(log.Apply(document, std::move(operation), error, message),
+              "track creation applies: " + message);
+        Check(document.tracks.size() == 2 &&
+                  document.tracks[1].kind == "video" &&
+                  document.tracks[1].index == 1 &&
+                  IsValidUlid(document.tracks[1].id),
+              "new video layer has a stable generated identity");
+        const Ulid addedId = document.tracks[1].id;
+        const std::string json =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(json, parsed, error, message) &&
+                  SerializeOperation(parsed) == json,
+              "AddTrack JSON round-trips canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == initial,
+              "track creation undo restores exact document bytes");
+        Check(log.Redo(document, error, message) &&
+                  document.tracks.back().id == addedId,
+              "redo retains the generated track ULID");
+    });
+
+    Test("detached audio becomes an independent exact timeline clip", [] {
+        Document document = Fixture();
+        document.tracks.push_back(
+            {"01KT0000000000000000000005", "audio", 1, {}});
+        const std::string initial = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const Ulid videoId = document.tracks[0].clips[0].id;
+        Operation detach =
+            DetachAudioOperation{videoId, document.tracks[1].id, "", {}};
+        Check(log.Apply(document, std::move(detach), error, message),
+              "audio detach applies: " + message);
+        Check(!document.tracks[0].clips[0].include_audio &&
+                  document.tracks[1].clips.size() == 1,
+              "video contribution is muted and audio rectangle is created");
+        const DocumentClip audio = document.tracks[1].clips[0];
+        Check(IsValidUlid(audio.id) && audio.id != videoId &&
+                  audio.source_id == document.tracks[0].clips[0].source_id &&
+                  audio.source_in == document.tracks[0].clips[0].source_in &&
+                  audio.duration == document.tracks[0].clips[0].duration &&
+                  audio.timeline_in == document.tracks[0].clips[0].timeline_in,
+              "detached clip retains exact source and timeline timing");
+        Check(audio.link_group_id == audio.id &&
+                  document.tracks[0].clips[0].link_group_id == audio.id,
+              "detached image and audio share a stable link group");
+        const std::vector<Ulid> linked =
+            ExpandLinkedClipSelection(document, {videoId});
+        Check(linked.size() == 2 && std::find(linked.begin(), linked.end(),
+                                              audio.id) != linked.end(),
+              "linked selection expands from video to its audio clip");
+        const auto rectangles = VisibleTimelineClips(
+            document, Viewport(), 700.0, linked, std::nullopt);
+        Check(std::count_if(rectangles.begin(), rectangles.end(),
+                            [](const TimelineClipRect& rectangle) {
+                                return rectangle.audio;
+                            }) == 1,
+              "audio rectangles carry their distinct semantic render role");
+        const std::string json =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(json, parsed, error, message) &&
+                  SerializeOperation(parsed) == json,
+              "DetachAudio JSON round-trips canonically");
+
+        Operation sampleOffset =
+            MoveClipOperation{audio.id,
+                              document.tracks[1].id,
+                              audio.timeline_in.add({1, 48000}),
+                              {}};
+        Check(log.Apply(document, std::move(sampleOffset), error, message) &&
+                  ClipSyncDrift(document, audio.id) == RationalTime{1, 48000},
+              "sub-frame drift remains exact at audio-sample resolution");
+        Check(log.Undo(document, error, message) &&
+                  ClipSyncDrift(document, audio.id) == RationalTime{0, 1},
+              "sample offset undo restores zero drift");
+        Operation headTrim =
+            TrimClipOperation{audio.id, TrimEdge::Head, {1, 10}, std::nullopt};
+        Check(log.Apply(document, std::move(headTrim), error, message) &&
+                  ClipSyncDrift(document, audio.id) == RationalTime{0, 1},
+              "head trim changes source and timeline equally without false "
+              "drift");
+        Check(log.Undo(document, error, message),
+              "head trim sync test undo succeeds");
+
+        Operation move =
+            MoveClipOperation{audio.id, document.tracks[1].id, {50, 10}, {}};
+        Check(log.Apply(document, std::move(move), error, message),
+              "detached audio moves independently: " + message);
+        Check(
+            document.tracks[1].clips[0].timeline_in == RationalTime{50, 10} &&
+                document.tracks[0].clips[0].timeline_in == RationalTime{10, 10},
+            "moving audio leaves video timing unchanged");
+        Check(log.Undo(document, error, message), "audio move undo succeeds");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == initial,
+              "detach undo restores exact document bytes");
+        Check(log.Redo(document, error, message) &&
+                  document.tracks[1].clips[0].id == audio.id,
+              "detach redo retains the generated audio ULID");
+        Operation unlink = SetClipLinkOperation{videoId, audio.id, "", ""};
+        Check(
+            log.Apply(document, std::move(unlink), error, message) &&
+                document.FindClip(videoId)->link_group_id.empty() &&
+                document.FindClip(audio.id)->link_group_id.empty(),
+            "linked selection can be atomically removed without editing times");
+        const std::string unlinkJson =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Check(DeserializeOperation(unlinkJson, parsed, error, message) &&
+                  SerializeOperation(parsed) == unlinkJson,
+              "SetClipLink JSON round-trips canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.FindClip(videoId)->link_group_id == audio.id &&
+                  document.FindClip(audio.id)->link_group_id == audio.id,
+              "link toggle undo restores the exact shared group");
+    });
+
+    Test("linked selection moves video and audio atomically", [] {
+        Document document = Fixture();
+        document.tracks.push_back(
+            {"01KT0000000000000000000005", "audio", 1, {}});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const Ulid videoId = document.tracks[0].clips[0].id;
+        Operation detach = DetachAudioOperation{
+            videoId, document.tracks[1].id, "01KT0000000000000000000006", {}};
+        Check(log.Apply(document, std::move(detach), error, message),
+              "linked fixture detach applies: " + message);
+        const Ulid audioId = document.tracks[1].clips[0].id;
+        const std::string beforeMove = document.SaveToString();
+        TimelineViewport viewport = Viewport();
+        TimelineInteraction interaction(document, log, viewport);
+        const double y = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(200.0, y, 700.0, 10);
+        interaction.PointerDrag(250.0, y, 700.0);
+        Check(interaction.SelectedClipIds().size() == 2 &&
+                  interaction.MovePreview() &&
+                  interaction.MovePreview()->linked_moves.size() == 2 &&
+                  interaction.MovePreview()->valid,
+              "linked drag previews both members as one valid candidate");
+        const auto pending = interaction.PendingOperation();
+        Check(pending &&
+                  std::holds_alternative<MoveLinkedClipsOperation>(*pending),
+              "linked drag emits the dedicated atomic operation");
+        Check(interaction.PointerUp(error, message),
+              "linked pointer-up applies: " + message);
+        Check(document.FindClip(videoId)->timeline_in == RationalTime{15, 10} &&
+                  document.FindClip(audioId)->timeline_in ==
+                      RationalTime{15, 10} &&
+                  ClipSyncDrift(document, audioId) == RationalTime{0, 1},
+              "video and audio receive the same exact delta without drift");
+        const std::string operationJson =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(operationJson, parsed, error, message) &&
+                  SerializeOperation(parsed) == operationJson,
+              "MoveLinkedClips JSON round-trips canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == beforeMove,
+              "one undo restores the pre-move document byte-exactly");
+    });
+
+    Test("invalid linked move emits nothing and sync drift is exact", [] {
+        Document document = Fixture();
+        document.tracks.push_back(
+            {"01KT0000000000000000000005", "audio", 1, {}});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const Ulid videoId = document.tracks[0].clips[0].id;
+        Operation detach = DetachAudioOperation{
+            videoId, document.tracks[1].id, "01KT0000000000000000000006", {}};
+        Check(log.Apply(document, std::move(detach), error, message),
+              "invalid fixture detach applies");
+        const Ulid audioId = document.tracks[1].clips[0].id;
+        Operation offset =
+            MoveClipOperation{audioId, document.tracks[1].id, {0, 10}, {}};
+        Check(log.Apply(document, std::move(offset), error, message),
+              "independent audio offset applies");
+        Check(ClipSyncDrift(document, audioId) == RationalTime{-10, 10},
+              "audio drift reports its exact signed phase difference");
+        TimelineViewport viewport = Viewport();
+        viewport.pixels_per_second = 50.0;
+        TimelineInteraction independent(document, log, viewport);
+        independent.SetLinkedSelectionEnabled(false);
+        const double audioY =
+            kTimelineRulerHeight + viewport.track_height + 20.0;
+        independent.PointerDown(75.0, audioY, 700.0, 10);
+        independent.PointerDrag(120.0, audioY, 700.0);
+        Check(independent.MovePreview() &&
+                  independent.MovePreview()->timeline_in ==
+                      RationalTime{10, 10} &&
+                  independent.SnapGuideTime() == RationalTime{10, 10},
+              "independent audio snaps exactly back to its sync reference");
+        independent.CancelDrag();
+        const std::string beforeInvalid = document.SaveToString();
+        const size_t logCount = log.AppliedCount();
+        TimelineInteraction interaction(document, log, viewport);
+        const double y = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(125.0, y, 700.0, 10);
+        interaction.PointerDrag(50.0, y, 700.0);
+        Check(interaction.MovePreview() && !interaction.MovePreview()->valid,
+              "partner crossing timeline zero invalidates the whole preview");
+        Check(!interaction.PointerUp(error, message) &&
+                  document.SaveToString() == beforeInvalid &&
+                  log.AppliedCount() == logCount,
+              "invalid linked drop emits nothing and preserves exact bytes");
+    });
+
+    Test("linked trim previews and commits one atomic operation", [] {
+        Document document = Fixture();
+        document.tracks.push_back(
+            {"01KT0000000000000000000005", "audio", 1, {}});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const Ulid videoId = document.tracks[0].clips[0].id;
+        Operation detach = DetachAudioOperation{
+            videoId, document.tracks[1].id, "01KT0000000000000000000006", {}};
+        Check(log.Apply(document, std::move(detach), error, message),
+              "linked trim fixture detaches audio");
+        const Ulid audioId = document.tracks[1].clips[0].id;
+        const std::string beforeTrim = document.SaveToString();
+        TimelineViewport viewport = Viewport();
+        TimelineInteraction interaction(document, log, viewport);
+        const double videoY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(150.0, videoY, 700.0, 10);
+        interaction.PointerDrag(200.0, videoY, 700.0);
+        const auto pending = interaction.PendingOperation();
+        Check(interaction.TrimPreview() &&
+                  interaction.TrimPreview()->linked_times.size() == 2 &&
+                  interaction.TrimPreview()->valid,
+              "linked trim previews both A/V rectangles");
+        Check(pending &&
+                  std::holds_alternative<TrimLinkedClipsOperation>(*pending),
+              "linked edge drag emits TrimLinkedClips");
+        Check(interaction.PointerUp(error, message),
+              "linked trim commits: " + message);
+        Check(document.FindClip(videoId)->timeline_in == RationalTime{15, 10} &&
+                  document.FindClip(audioId)->timeline_in ==
+                      RationalTime{15, 10} &&
+                  ClipSyncDrift(document, audioId) == RationalTime{0, 1},
+              "linked head trim applies the same exact delta without drift");
+        const std::string json =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(json, parsed, error, message) &&
+                  SerializeOperation(parsed) == json,
+              "TrimLinkedClips JSON round-trips canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == beforeTrim,
+              "one undo restores the pre-trim document bytes");
+    });
+
+    Test("invalid linked trim emits nothing byte-identically", [] {
+        Document document = Fixture();
+        document.tracks.push_back(
+            {"01KT0000000000000000000005", "audio", 1, {}});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Operation detach = DetachAudioOperation{document.tracks[0].clips[0].id,
+                                                document.tracks[1].id,
+                                                "01KT0000000000000000000006",
+                                                {}};
+        Check(log.Apply(document, std::move(detach), error, message),
+              "invalid linked trim fixture detaches audio");
+        document.tracks[1].clips[0].duration = {2, 10};
+        const std::string before = document.SaveToString();
+        const size_t logCount = log.AppliedCount();
+        TimelineViewport viewport = Viewport();
+        TimelineInteraction interaction(document, log, viewport);
+        const double videoY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(150.0, videoY, 700.0, 10);
+        interaction.PointerDrag(180.0, videoY, 700.0);
+        Check(interaction.TrimPreview() && !interaction.TrimPreview()->valid,
+              "one constrained linked member marks the whole preview invalid");
+        Check(!interaction.PointerUp(error, message) &&
+                  document.SaveToString() == before &&
+                  log.AppliedCount() == logCount,
+              "invalid linked trim emits no event and changes no bytes");
+    });
+
+    Test("linked delete is atomic and reversible", [] {
+        Document document = Fixture();
+        document.tracks.push_back(
+            {"01KT0000000000000000000005", "audio", 1, {}});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const Ulid videoId = document.tracks[0].clips[0].id;
+        Operation detach = DetachAudioOperation{
+            videoId, document.tracks[1].id, "01KT0000000000000000000006", {}};
+        Check(log.Apply(document, std::move(detach), error, message),
+              "linked delete fixture detaches audio");
+        const Ulid audioId = document.tracks[1].clips[0].id;
+        const Ulid group = document.FindClip(videoId)->link_group_id;
+        const std::string before = document.SaveToString();
+        Operation remove =
+            RemoveLinkedClipsOperation{group, {videoId, audioId}, {}};
+        Check(log.Apply(document, std::move(remove), error, message) &&
+                  !document.FindClip(videoId) && !document.FindClip(audioId),
+              "linked delete removes both members in one event");
+        const std::string json =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(json, parsed, error, message) &&
+                  SerializeOperation(parsed) == json,
+              "RemoveLinkedClips JSON round-trips canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "linked delete undo restores exact document bytes");
+    });
+
+    Test("pan, cursor-centered zoom and fit preserve navigation invariants",
+         [] {
+             TimelineViewport viewport = Viewport();
+             const double anchorX = 425.0;
+             const RationalTime before = viewport.XToTime(anchorX, 1000);
+             viewport.ZoomAroundX(anchorX, 2.0, 1000);
+             Check(viewport.XToTime(anchorX, 1000) == before,
+                   "zoom keeps the cursor time anchored");
+             const RationalTime start = viewport.view_start;
+             viewport.ScrollByPixels(100.0, 1000);
+             Check(viewport.view_start > start,
+                   "positive pan advances the visible start");
+             viewport.FitDuration({200, 10}, 1000.0);
+             Check(viewport.view_start == RationalTime{0, 10},
+                   "fit starts at timeline zero");
+             Check(viewport.TimeToX({200, 10}) <= 1000.0,
+                   "fit keeps the timeline end visible");
+         });
+
+    Test("simulated trim emits the canonical operation and undo restores hash",
+         [] {
+             Document document = Fixture();
+             const uint64_t initialHash = Hash(document.SaveToString());
+             TimelineViewport viewport = Viewport();
+             EditLog log;
+             TimelineInteraction interaction(document, log, viewport);
+             const double trackY = kTimelineRulerHeight + 20.0;
+             interaction.PointerDown(350.0, trackY, 700.0, 10);
+             interaction.PointerDrag(300.0, trackY, 700.0);
+             const auto pending = interaction.PendingOperation();
+             Check(
+                 pending && std::holds_alternative<TrimClipOperation>(*pending),
+                 "drag creates a TrimClip operation");
+             if (pending) {
+                 const auto& trim = std::get<TrimClipOperation>(*pending);
+                 Check(trim.clip_id == document.tracks[0].clips[0].id &&
+                           trim.edge == TrimEdge::Tail &&
+                           trim.delta == RationalTime{-5, 10},
+                       "tail drag has the expected exact delta");
+             }
+             EditError error = EditError::None;
+             std::string message;
+             Check(interaction.PointerUp(error, message),
+                   "valid drag applies through the edit log: " + message);
+             Check(log.AppliedCount() == 1,
+                   "one mouse gesture emits exactly one operation");
+             Check(document.tracks[0].clips[0].duration == RationalTime{15, 10},
+                   "document contains the trim result");
+             Check(log.Undo(document, error, message),
+                   "trim undo succeeds: " + message);
+             Check(Hash(document.SaveToString()) == initialHash,
+                   "undo restores the initial canonical document hash");
+         });
+
+    Test("clip body drag moves atomically across tracks and undo restores hash",
+         [] {
+             Document document = Fixture();
+             document.tracks.push_back(
+                 {"01KT0000000000000000000005", "video", 1, {}});
+             const std::string initial = document.SaveToString();
+             TimelineViewport viewport = Viewport();
+             EditLog log;
+             TimelineInteraction interaction(document, log, viewport);
+             const double firstTrackY = kTimelineRulerHeight + 20.0;
+             const double secondTrackY =
+                 kTimelineRulerHeight + viewport.track_height + 20.0;
+             interaction.PointerDown(200.0, firstTrackY, 700.0, 10);
+             interaction.PointerDrag(250.0, secondTrackY, 700.0);
+             Check(
+                 interaction.MovePreview() && interaction.MovePreview()->valid,
+                 "cross-track move preview is valid");
+             const auto pending = interaction.PendingOperation();
+             Check(
+                 pending && std::holds_alternative<MoveClipOperation>(*pending),
+                 "body drag emits MoveClip");
+             if (pending) {
+                 const auto& move = std::get<MoveClipOperation>(*pending);
+                 Check(move.track_id == document.tracks[1].id &&
+                           move.timeline_in == RationalTime{15, 10},
+                       "move carries exact destination track and time");
+                 const std::string json = SerializeOperation(*pending);
+                 Operation parsed = RemoveClipOperation{};
+                 EditError parseError = EditError::None;
+                 std::string parseMessage;
+                 Check(DeserializeOperation(json, parsed, parseError,
+                                            parseMessage) &&
+                           SerializeOperation(parsed) == json,
+                       "MoveClip JSON round-trips canonically");
+             }
+             EditError error = EditError::None;
+             std::string message;
+             Check(interaction.PointerUp(error, message),
+                   "move applies through one edit-log entry: " + message);
+             Check(log.AppliedCount() == 1 &&
+                       document.tracks[0].clips.size() == 1 &&
+                       document.tracks[1].clips.size() == 1,
+                   "one event transfers the clip between tracks");
+             Check(log.Undo(document, error, message),
+                   "move undo succeeds: " + message);
+             Check(document.SaveToString() == initial,
+                   "move undo restores canonical document bytes");
+         });
+
+    Test("overlapping clip move overwrites covered clips atomically", [] {
+        Document document = Fixture();
+        const std::string initial = document.SaveToString();
+        TimelineViewport viewport = Viewport();
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        const double trackY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(200.0, trackY, 700.0, 10);
+        interaction.PointerDrag(500.0, trackY, 700.0);
+        Check(interaction.MovePreview() && interaction.MovePreview()->valid,
+              "overlap is accepted as an overwrite preview");
+        EditError error = EditError::None;
+        std::string message;
+        Check(interaction.PointerUp(error, message) && log.AppliedCount() == 1,
+              "overwrite emits one atomic move event");
+        Check(
+            document.tracks[0].clips.size() == 1 &&
+                document.tracks[0].clips[0].id ==
+                    "01KT0000000000000000000003" &&
+                document.tracks[0].clips[0].timeline_in == RationalTime{40, 10},
+            "fully covered destination clip is removed");
+        Check(log.Undo(document, error, message), "overwrite undo succeeds");
+        Check(document.SaveToString() == initial,
+              "overwrite undo restores document bytes");
+    });
+
+    Test("overwrite through a longer clip preserves both survivors", [] {
+        Document document = Fixture();
+        document.tracks.push_back({"01KT0000000000000000000005",
+                                   "video",
+                                   1,
+                                   {{"01KT0000000000000000000006",
+                                     "01KT0000000000000000000001",
+                                     {40, 10},
+                                     {50, 10},
+                                     {30, 10}}}});
+        const std::string initial = document.SaveToString();
+        TimelineViewport viewport = Viewport();
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        const double firstTrackY = kTimelineRulerHeight + 20.0;
+        const double secondTrackY =
+            kTimelineRulerHeight + viewport.track_height + 20.0;
+        interaction.PointerDown(200.0, firstTrackY, 900.0, 10);
+        interaction.PointerDrag(600.0, secondTrackY, 900.0);
+        EditError error = EditError::None;
+        std::string message;
+        Check(interaction.PointerUp(error, message),
+              "spanning overwrite applies: " + message);
+        const auto& clips = document.tracks[1].clips;
+        Check(clips.size() == 3,
+              "spanning destination becomes left, moved and right clips");
+        Check(clips[0].id == "01KT0000000000000000000006" &&
+                  clips[0].timeline_in == RationalTime{30, 10} &&
+                  clips[0].duration == RationalTime{20, 10},
+              "left survivor retains its ULID");
+        Check(clips[1].id == "01KT0000000000000000000003" &&
+                  clips[1].timeline_in == RationalTime{50, 10},
+              "moved clip occupies the overwrite interval");
+        const Ulid rightSurvivorId = clips[2].id;
+        Check(rightSurvivorId != clips[0].id && IsValidUlid(rightSurvivorId) &&
+                  clips[2].source_in == RationalTime{80, 10} &&
+                  clips[2].timeline_in == RationalTime{70, 10} &&
+                  clips[2].duration == RationalTime{10, 10},
+              "right survivor gets an exact stable identity and source range");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == initial,
+              "spanning overwrite undo restores exact bytes");
+        Check(log.Redo(document, error, message),
+              "spanning overwrite redo succeeds");
+        Check(document.tracks[1].clips[2].id == rightSurvivorId,
+              "redo retains the right survivor ULID");
+    });
+
+    Test("split clip is atomic, stable and exactly reversible", [] {
+        Document document = Fixture();
+        const std::string initial = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(log.Apply(document,
+                        SplitClipOperation{
+                            document.tracks[0].clips[0].id, {20, 10}, {}},
+                        error, message),
+              "split applies: " + message);
+        const Ulid rightId =
+            std::get<SplitClipOperation>(log.AppliedEntries().back().op)
+                .right_clip_id;
+        Check(IsValidUlid(rightId), "split generates a stable right ULID");
+        Check(document.tracks[0].clips.size() == 3,
+              "split adds one clip without ripple");
+        const DocumentClip& left = document.tracks[0].clips[0];
+        const DocumentClip& right = document.tracks[0].clips[1];
+        Check(left.duration == RationalTime{10, 10} && right.id == rightId &&
+                  right.source_in == RationalTime{20, 10} &&
+                  right.duration == RationalTime{10, 10} &&
+                  right.timeline_in == RationalTime{20, 10},
+              "split preserves exact source and timeline continuity");
+        const std::string operationJson =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(operationJson, parsed, error, message) &&
+                  SerializeOperation(parsed) == operationJson,
+              "SplitClip JSON round-trips canonically");
+        Check(log.Undo(document, error, message), "split undo succeeds");
+        Check(document.SaveToString() == initial,
+              "split undo restores document bytes");
+        Check(log.Redo(document, error, message), "split redo succeeds");
+        Check(document.tracks[0].clips[1].id == rightId,
+              "split redo retains the generated right ULID");
+    });
+
+    Test("split at a clip boundary is rejected atomically", [] {
+        Document document = Fixture();
+        const std::string initial = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(!log.Apply(document,
+                         SplitClipOperation{
+                             document.tracks[0].clips[0].id, {10, 10}, {}},
+                         error, message) &&
+                  error == EditError::InvalidTimelineIn,
+              "cut on head is rejected");
+        Check(log.AppliedCount() == 0 && document.SaveToString() == initial,
+              "rejected cut leaves bytes and event log unchanged");
+    });
+
+    Test("trim drag is clamped before duration can cross zero", [] {
+        Document document = Fixture();
+        const std::string initial = document.SaveToString();
+        TimelineViewport viewport = Viewport();
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        const double trackY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(150.0, trackY, 700.0, 10);
+        interaction.PointerDrag(400.0, trackY, 700.0);
+        Check(interaction.TrimPreview() && interaction.TrimPreview()->valid &&
+                  interaction.TrimPreview()->times.duration ==
+                      RationalTime{1, 10},
+              "preview stops at one timebase tick of duration");
+        EditError error = EditError::None;
+        std::string message;
+        Check(interaction.PointerUp(error, message),
+              "release applies the constrained trim");
+        Check(log.AppliedCount() == 1 &&
+                  document.tracks[0].clips[0].duration == RationalTime{1, 10},
+              "constrained trim emits one valid event");
+        Check(log.Undo(document, error, message), "constrained trim undoes");
+        Check(document.SaveToString() == initial,
+              "undo restores bytes after constrained trim");
+    });
+
+    Test("magnetism snaps a trim to the neighboring cut", [] {
+        Document document = Fixture();
+        TimelineViewport viewport = Viewport();
+        viewport.pixels_per_second = 50.0;
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        const double trackY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(200.0, trackY, 700.0, 10);
+        interaction.PointerDrag(243.0, trackY, 700.0);
+        Check(interaction.TrimPreview() && interaction.TrimPreview()->valid &&
+                  interaction.TrimPreview()->times.duration ==
+                      RationalTime{30, 10},
+              "tail snaps exactly to the next clip start");
+        Check(interaction.SnapGuideTime() &&
+                  *interaction.SnapGuideTime() == RationalTime{40, 10},
+              "snap exposes an exact guide time for rendering");
+        EditError error = EditError::None;
+        std::string message;
+        Check(interaction.PointerUp(error, message), "snapped trim applies");
+        Check(document.tracks[0].clips[0].duration == RationalTime{30, 10},
+              "document receives the snapped duration");
+    });
+
+    Test("tail trim cannot pass the source media end", [] {
+        Document document = Fixture();
+        document.tracks[0].clips.erase(document.tracks[0].clips.begin() + 1);
+        TimelineViewport viewport = Viewport();
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        const double trackY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(350.0, trackY, 2200.0, 10);
+        interaction.PointerDrag(2000.0, trackY, 2200.0);
+        Check(interaction.TrimPreview() && interaction.TrimPreview()->valid &&
+                  interaction.TrimPreview()->times.duration ==
+                      RationalTime{90, 10},
+              "preview stops exactly at source duration");
+        Check(interaction.TrimPreview()->times.source_in.add(
+                  interaction.TrimPreview()->times.duration) ==
+                  document.sources[0].duration,
+              "preview source range ends at the media boundary");
+    });
+
+    return failures == 0 ? 0 : 1;
+}

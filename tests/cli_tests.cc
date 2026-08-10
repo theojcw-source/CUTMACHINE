@@ -98,6 +98,18 @@ int main() {
           "sidecar edit log loads: " + detail);
     Check(log.AppliedCount() == 1, "valid apply-op increments edit log");
 
+    const Operation addBin =
+        AddBinOperation{"01K30000000000000000000009", "Rushes CLI"};
+    Check(ApplyOperationCommand(path.string(), SerializeOperation(addBin),
+                                result) == 0,
+          "CLI creates a persistent bin through the same operation path");
+    std::string withBinDescription;
+    Check(DescribeCommand(path.string(), withBinDescription) == 0 &&
+              withBinDescription.find("\"name\":\"Rushes CLI\"") !=
+                  std::string::npos,
+          "describe exposes bins created by apply-op");
+    const std::string afterBin = Read(path);
+
     const std::string logBeforeRejection =
         Read(EditLogPathForDocument(path.string()));
     const Operation rejected =
@@ -107,7 +119,7 @@ int main() {
           "refused apply-op returns status 1");
     Check(result.find("\"error\":\"UnknownClip\"") != std::string::npos,
           "refused apply-op returns the exact operation error name");
-    Check(Read(path) == after,
+    Check(Read(path) == afterBin,
           "refused apply-op leaves document byte-identical");
     Check(Read(EditLogPathForDocument(path.string())) == logBeforeRejection,
           "refused apply-op leaves edit log byte-identical");
@@ -116,7 +128,7 @@ int main() {
           "malformed operation returns status 1");
     Check(result.find("\"error\":\"ParseError\"") != std::string::npos,
           "malformed operation returns ParseError");
-    Check(Read(path) == after,
+    Check(Read(path) == afterBin,
           "malformed operation leaves document byte-identical");
 
     std::filesystem::remove_all(directory);
