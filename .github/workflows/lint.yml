@@ -1,0 +1,35 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  clang-format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: |
+          find src -type f \( -name '*.cc' -o -name '*.h' -o -name '*.mm' \) \
+            -print0 | xargs -0 clang-format --dry-run --Werror -style=file
+
+  clang-tidy:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install ffmpeg pkg-config cmake llvm
+
+      - name: Configure (with compile_commands.json)
+        run: cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Run clang-tidy
+        run: |
+          find src -type f \( -name '*.cc' -o -name '*.mm' \) -print0 \
+            | xargs -0 "$(brew --prefix llvm)/bin/clang-tidy" -p build

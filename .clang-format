@@ -1,0 +1,15 @@
+# Matches the style already used under src/: Google base, 4-space indent,
+# 80-column limit, left-aligned pointers, access modifiers outdented to
+# column 0. IncludeBlocks is left as Preserve so the manually ordered
+# extern "C" FFmpeg include block isn't reshuffled.
+BasedOnStyle: Google
+
+IndentWidth: 4
+ColumnLimit: 80
+AccessModifierOffset: -4
+
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+IncludeBlocks: Preserve
+SortIncludes: true
