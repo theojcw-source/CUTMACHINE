@@ -89,8 +89,8 @@ KeyframeResult KeyframeTrack::Add(Keyframe keyframe) {
         return {KeyframeError::DuplicateId};
     }
 
-    const auto insertion = std::lower_bound(keyframes_.begin(), keyframes_.end(),
-                                            keyframe, TimeLessKeyframe);
+    const auto insertion = std::lower_bound(
+        keyframes_.begin(), keyframes_.end(), keyframe, TimeLessKeyframe);
     if (insertion != keyframes_.end() && insertion->time == keyframe.time) {
         return {KeyframeError::DuplicateTime};
     }
@@ -99,10 +99,9 @@ KeyframeResult KeyframeTrack::Add(Keyframe keyframe) {
 }
 
 KeyframeResult KeyframeTrack::Remove(const Ulid& id) {
-    const auto found = std::find_if(keyframes_.begin(), keyframes_.end(),
-                                    [&](const Keyframe& keyframe) {
-                                        return keyframe.id == id;
-                                    });
+    const auto found = std::find_if(
+        keyframes_.begin(), keyframes_.end(),
+        [&](const Keyframe& keyframe) { return keyframe.id == id; });
     if (found == keyframes_.end()) {
         return {KeyframeError::NotFound};
     }
@@ -113,10 +112,9 @@ KeyframeResult KeyframeTrack::Remove(const Ulid& id) {
 KeyframeResult KeyframeTrack::Update(const Ulid& id, RationalTime time,
                                      double value,
                                      KeyframeInterpolation interpolation) {
-    const auto found = std::find_if(keyframes_.begin(), keyframes_.end(),
-                                    [&](const Keyframe& keyframe) {
-                                        return keyframe.id == id;
-                                    });
+    const auto found = std::find_if(
+        keyframes_.begin(), keyframes_.end(),
+        [&](const Keyframe& keyframe) { return keyframe.id == id; });
     if (found == keyframes_.end()) {
         return {KeyframeError::NotFound};
     }
@@ -135,8 +133,8 @@ KeyframeResult KeyframeTrack::Update(const Ulid& id, RationalTime time,
 
     // Validation precedes mutation, making a rejected update atomic.
     keyframes_.erase(found);
-    const auto insertion = std::lower_bound(keyframes_.begin(), keyframes_.end(),
-                                            replacement, TimeLessKeyframe);
+    const auto insertion = std::lower_bound(
+        keyframes_.begin(), keyframes_.end(), replacement, TimeLessKeyframe);
     keyframes_.insert(insertion, std::move(replacement));
     return {};
 }
@@ -149,8 +147,8 @@ KeyframeEvaluation KeyframeTrack::Evaluate(RationalTime time) const {
         return {KeyframeError::EmptyTrack, 0.0};
     }
 
-    const auto right = std::lower_bound(keyframes_.begin(), keyframes_.end(),
-                                        time, TimeLess);
+    const auto right =
+        std::lower_bound(keyframes_.begin(), keyframes_.end(), time, TimeLess);
     if (right == keyframes_.begin()) {
         return {KeyframeError::None, right->value};
     }

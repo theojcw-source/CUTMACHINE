@@ -1,7 +1,7 @@
 # Repo export for AI review
 
 - Root: `/Volumes/code/CUTMACHINE`
-- Generated: 2026-08-11 22:36 UTC
+- Generated: 2026-08-11 22:39 UTC
 - File list source: git ls-files (honours .gitignore)
 - Included: 91 files, ~1380 KB
 - Skipped: 12 files (see manifest at the end)
@@ -5585,8 +5585,7 @@ YuvCodeParameters BuildYuvCodeParameters(int bitDepth, bool fullRange) {
     const uint32_t maximumCode =
         bitDepth == 16 ? 65535u : ((1u << bitDepth) - 1u);
     YuvCodeParameters result;
-    result.sample_scale =
-        bitDepth > 8 ? 65535.0f / maximumCode : 1.0f;
+    result.sample_scale = bitDepth > 8 ? 65535.0f / maximumCode : 1.0f;
     if (fullRange) {
         result.chroma_offset =
             static_cast<float>(1u << (bitDepth - 1)) / maximumCode;
@@ -5595,27 +5594,21 @@ YuvCodeParameters BuildYuvCodeParameters(int bitDepth, bool fullRange) {
     const uint32_t shift = static_cast<uint32_t>(bitDepth - 8);
     result.y_offset = static_cast<float>(16u << shift) / maximumCode;
     result.y_scale = static_cast<float>(maximumCode) / (219u << shift);
-    result.chroma_offset =
-        static_cast<float>(128u << shift) / maximumCode;
-    result.chroma_scale =
-        static_cast<float>(maximumCode) / (224u << shift);
+    result.chroma_offset = static_cast<float>(128u << shift) / maximumCode;
+    result.chroma_scale = static_cast<float>(maximumCode) / (224u << shift);
     return result;
 }
 
 YuvMatrixParameters BuildYuvMatrixParameters(bool bt2020NonConstant) {
-    if (bt2020NonConstant)
-        return {1.4746f, -0.164553f, -0.571353f, 1.8814f};
+    if (bt2020NonConstant) return {1.4746f, -0.164553f, -0.571353f, 1.8814f};
     return {};
 }
 
 double DecodeSonySLog3(double signal) {
     constexpr double breakpoint = 171.2102946929 / 1023.0;
     if (signal >= breakpoint)
-        return std::pow(10.0, (signal * 1023.0 - 420.0) / 261.5) *
-                   0.19 -
-               0.01;
-    return (signal * 1023.0 - 95.0) * 0.01125 /
-           (171.2102946929 - 95.0);
+        return std::pow(10.0, (signal * 1023.0 - 420.0) / 261.5) * 0.19 - 0.01;
+    return (signal * 1023.0 - 95.0) * 0.01125 / (171.2102946929 - 95.0);
 }
 
 double EncodeAcesCct(double linearAp1) {
@@ -5665,17 +5658,15 @@ RgbColor Multiply(RgbColor value, const double matrix[3][3]) {
 
 double DecodeRec709(double signal) {
     const double positive = std::max(signal, 0.0);
-    return positive >= 0.081
-               ? std::pow((positive + 0.099) / 1.099, 1.0 / 0.45)
-               : positive / 4.5;
+    return positive >= 0.081 ? std::pow((positive + 0.099) / 1.099, 1.0 / 0.45)
+                             : positive / 4.5;
 }
 
 double EncodeRec709(double linear) {
     linear = std::max(linear, 0.0);
-    return std::clamp(linear >= 0.018
-                          ? 1.099 * std::pow(linear, 0.45) - 0.099
-                          : 4.5 * linear,
-                      0.0, 1.0);
+    return std::clamp(
+        linear >= 0.018 ? 1.099 * std::pow(linear, 0.45) - 0.099 : 4.5 * linear,
+        0.0, 1.0);
 }
 
 RgbColor DecodeTransfer(RgbColor value, const std::string& transfer) {
@@ -5769,18 +5760,18 @@ RgbColor TransformColorForOutput(const ColorManagementSettings& settings,
         return {std::clamp(signal.red, 0.0, 1.0),
                 std::clamp(signal.green, 0.0, 1.0),
                 std::clamp(signal.blue, 0.0, 1.0)};
-    RgbColor output = Ap1ToOutput(
-        SourceToAp1(DecodeTransfer(signal, settings.input_transfer),
-                    settings.input_gamut),
-        settings.output_gamut);
+    RgbColor output =
+        Ap1ToOutput(SourceToAp1(DecodeTransfer(signal, settings.input_transfer),
+                                settings.input_gamut),
+                    settings.output_gamut);
     if (settings.output_transfer == "hlg") {
         const double scale = HlgSceneReflectionScale();
-        return {std::clamp(EncodeHlg(std::max(0.0, output.red) * scale), 0.0,
-                           1.0),
-                std::clamp(EncodeHlg(std::max(0.0, output.green) * scale), 0.0,
-                           1.0),
-                std::clamp(EncodeHlg(std::max(0.0, output.blue) * scale), 0.0,
-                           1.0)};
+        return {
+            std::clamp(EncodeHlg(std::max(0.0, output.red) * scale), 0.0, 1.0),
+            std::clamp(EncodeHlg(std::max(0.0, output.green) * scale), 0.0,
+                       1.0),
+            std::clamp(EncodeHlg(std::max(0.0, output.blue) * scale), 0.0,
+                       1.0)};
     }
     return {EncodeRec709(output.red), EncodeRec709(output.green),
             EncodeRec709(output.blue)};
@@ -10295,8 +10286,8 @@ KeyframeResult KeyframeTrack::Add(Keyframe keyframe) {
         return {KeyframeError::DuplicateId};
     }
 
-    const auto insertion = std::lower_bound(keyframes_.begin(), keyframes_.end(),
-                                            keyframe, TimeLessKeyframe);
+    const auto insertion = std::lower_bound(
+        keyframes_.begin(), keyframes_.end(), keyframe, TimeLessKeyframe);
     if (insertion != keyframes_.end() && insertion->time == keyframe.time) {
         return {KeyframeError::DuplicateTime};
     }
@@ -10305,10 +10296,9 @@ KeyframeResult KeyframeTrack::Add(Keyframe keyframe) {
 }
 
 KeyframeResult KeyframeTrack::Remove(const Ulid& id) {
-    const auto found = std::find_if(keyframes_.begin(), keyframes_.end(),
-                                    [&](const Keyframe& keyframe) {
-                                        return keyframe.id == id;
-                                    });
+    const auto found = std::find_if(
+        keyframes_.begin(), keyframes_.end(),
+        [&](const Keyframe& keyframe) { return keyframe.id == id; });
     if (found == keyframes_.end()) {
         return {KeyframeError::NotFound};
     }
@@ -10319,10 +10309,9 @@ KeyframeResult KeyframeTrack::Remove(const Ulid& id) {
 KeyframeResult KeyframeTrack::Update(const Ulid& id, RationalTime time,
                                      double value,
                                      KeyframeInterpolation interpolation) {
-    const auto found = std::find_if(keyframes_.begin(), keyframes_.end(),
-                                    [&](const Keyframe& keyframe) {
-                                        return keyframe.id == id;
-                                    });
+    const auto found = std::find_if(
+        keyframes_.begin(), keyframes_.end(),
+        [&](const Keyframe& keyframe) { return keyframe.id == id; });
     if (found == keyframes_.end()) {
         return {KeyframeError::NotFound};
     }
@@ -10341,8 +10330,8 @@ KeyframeResult KeyframeTrack::Update(const Ulid& id, RationalTime time,
 
     // Validation precedes mutation, making a rejected update atomic.
     keyframes_.erase(found);
-    const auto insertion = std::lower_bound(keyframes_.begin(), keyframes_.end(),
-                                            replacement, TimeLessKeyframe);
+    const auto insertion = std::lower_bound(
+        keyframes_.begin(), keyframes_.end(), replacement, TimeLessKeyframe);
     keyframes_.insert(insertion, std::move(replacement));
     return {};
 }
@@ -10355,8 +10344,8 @@ KeyframeEvaluation KeyframeTrack::Evaluate(RationalTime time) const {
         return {KeyframeError::EmptyTrack, 0.0};
     }
 
-    const auto right = std::lower_bound(keyframes_.begin(), keyframes_.end(),
-                                        time, TimeLess);
+    const auto right =
+        std::lower_bound(keyframes_.begin(), keyframes_.end(), time, TimeLess);
     if (right == keyframes_.begin()) {
         return {KeyframeError::None, right->value};
     }
@@ -12719,12 +12708,12 @@ bool ApplyAddTrack(Document& candidate, AddTrackOperation& operation,
              "track kind must be 'video' or 'audio'", error, message);
         return false;
     }
-    if (operation.index < 0 ||
-        std::any_of(
-            candidate.sequence.tracks.begin(), candidate.sequence.tracks.end(),
-            [&](const DocumentTrack& track) {
-                return track.index == operation.index;
-            })) {
+    if (operation.index < 0 || std::any_of(candidate.sequence.tracks.begin(),
+                                           candidate.sequence.tracks.end(),
+                                           [&](const DocumentTrack& track) {
+                                               return track.index ==
+                                                      operation.index;
+                                           })) {
         Fail(EditError::InvalidOperation,
              "track index must be non-negative and unique", error, message);
         return false;
@@ -22888,8 +22877,7 @@ int main() {
         Check(media.width == 64 && media.height == 32,
               "stored dimensions remain the coded dimensions");
         Check(!media.pixel_format.empty() && !media.color_range.empty() &&
-                  !media.color_space.empty() &&
-                  !media.color_transfer.empty() &&
+                  !media.color_space.empty() && !media.color_transfer.empty() &&
                   !media.color_primaries.empty(),
               "pixel format and color signalling flow through ingest");
         Check(media.orientation == "portrait",
@@ -22983,15 +22971,15 @@ const Ulid kThird = "01K00000000000000000000003";
 
 int main() {
     KeyframeTrack track;
-    Check(static_cast<bool>(track.Add({kSecond, {48, 48}, 10.0,
-                                       KeyframeInterpolation::Linear})),
-          "add second keyframe");
     Check(static_cast<bool>(track.Add(
-              {kFirst, {0, 24}, 0.0, KeyframeInterpolation::Linear})),
+              {kSecond, {48, 48}, 10.0, KeyframeInterpolation::Linear})),
+          "add second keyframe");
+    Check(static_cast<bool>(
+              track.Add({kFirst, {0, 24}, 0.0, KeyframeInterpolation::Linear})),
           "add earlier keyframe out of order");
-    Check(track.keyframes()[0].id == kFirst &&
-              track.keyframes()[1].id == kSecond,
-          "track order is exact time order, independent of insertion order");
+    Check(
+        track.keyframes()[0].id == kFirst && track.keyframes()[1].id == kSecond,
+        "track order is exact time order, independent of insertion order");
 
     const KeyframeEvaluation midpoint = track.Evaluate({12, 24});
     Check(midpoint && midpoint.value == 5.0,
@@ -23012,22 +23000,20 @@ int main() {
         track.Add({kThird, {1, 1}, 20.0, KeyframeInterpolation::Linear});
     Check(duplicateTime.error == KeyframeError::DuplicateTime,
           "equivalent rational times collide exactly");
-    Check(static_cast<bool>(track.Add(
-              {kThird, {2, 1}, 20.0, KeyframeInterpolation::Linear})),
+    Check(static_cast<bool>(
+              track.Add({kThird, {2, 1}, 20.0, KeyframeInterpolation::Linear})),
           "add a distinct third keyframe");
     Check(track.Add({kThird, {3, 1}, 30.0, KeyframeInterpolation::Linear})
                   .error == KeyframeError::DuplicateId,
           "stable IDs must be unique");
 
     const std::size_t sizeBeforeRejectedUpdate = track.size();
-    Check(track.Update(kThird, {1, 1}, 99.0,
-                       KeyframeInterpolation::Linear)
-                  .error == KeyframeError::DuplicateTime &&
+    Check(track.Update(kThird, {1, 1}, 99.0, KeyframeInterpolation::Linear)
+                      .error == KeyframeError::DuplicateTime &&
               track.size() == sizeBeforeRejectedUpdate &&
               track.keyframes().back().time == RationalTime{2, 1},
           "rejected updates leave the track unchanged");
-    Check(track.Update(kThird, {3, 1},
-                       std::numeric_limits<double>::infinity(),
+    Check(track.Update(kThird, {3, 1}, std::numeric_limits<double>::infinity(),
                        KeyframeInterpolation::Linear)
                   .error == KeyframeError::NonFiniteValue,
           "non-finite parameter values are rejected");
@@ -23044,16 +23030,16 @@ int main() {
 
     Check(KeyframeTrack::CanonicalValueString(-0.0) == "0",
           "negative zero has one canonical spelling");
-    Check(KeyframeTrack::CanonicalValueString(0.1) ==
-              "0.10000000000000001",
+    Check(KeyframeTrack::CanonicalValueString(0.1) == "0.10000000000000001",
           "canonical values use deterministic round-trippable precision");
 
     KeyframeTrack empty;
     Check(empty.Evaluate({0, 24}).error == KeyframeError::EmptyTrack,
           "empty evaluation returns a named error");
-    Check(empty.Add({"bad", {0, 24}, 1.0, KeyframeInterpolation::Linear})
-                  .error == KeyframeError::InvalidId,
-          "invalid persistent IDs are rejected");
+    Check(
+        empty.Add({"bad", {0, 24}, 1.0, KeyframeInterpolation::Linear}).error ==
+            KeyframeError::InvalidId,
+        "invalid persistent IDs are rejected");
 
     if (failures == 0) {
         std::cout << "PASS: keyframe core\n";

@@ -103,8 +103,7 @@ int main() {
         Check(media.width == 64 && media.height == 32,
               "stored dimensions remain the coded dimensions");
         Check(!media.pixel_format.empty() && !media.color_range.empty() &&
-                  !media.color_space.empty() &&
-                  !media.color_transfer.empty() &&
+                  !media.color_space.empty() && !media.color_transfer.empty() &&
                   !media.color_primaries.empty(),
               "pixel format and color signalling flow through ingest");
         Check(media.orientation == "portrait",

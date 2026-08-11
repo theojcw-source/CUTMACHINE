@@ -24,15 +24,15 @@ const Ulid kThird = "01K00000000000000000000003";
 
 int main() {
     KeyframeTrack track;
-    Check(static_cast<bool>(track.Add({kSecond, {48, 48}, 10.0,
-                                       KeyframeInterpolation::Linear})),
-          "add second keyframe");
     Check(static_cast<bool>(track.Add(
-              {kFirst, {0, 24}, 0.0, KeyframeInterpolation::Linear})),
+              {kSecond, {48, 48}, 10.0, KeyframeInterpolation::Linear})),
+          "add second keyframe");
+    Check(static_cast<bool>(
+              track.Add({kFirst, {0, 24}, 0.0, KeyframeInterpolation::Linear})),
           "add earlier keyframe out of order");
-    Check(track.keyframes()[0].id == kFirst &&
-              track.keyframes()[1].id == kSecond,
-          "track order is exact time order, independent of insertion order");
+    Check(
+        track.keyframes()[0].id == kFirst && track.keyframes()[1].id == kSecond,
+        "track order is exact time order, independent of insertion order");
 
     const KeyframeEvaluation midpoint = track.Evaluate({12, 24});
     Check(midpoint && midpoint.value == 5.0,
@@ -53,22 +53,20 @@ int main() {
         track.Add({kThird, {1, 1}, 20.0, KeyframeInterpolation::Linear});
     Check(duplicateTime.error == KeyframeError::DuplicateTime,
           "equivalent rational times collide exactly");
-    Check(static_cast<bool>(track.Add(
-              {kThird, {2, 1}, 20.0, KeyframeInterpolation::Linear})),
+    Check(static_cast<bool>(
+              track.Add({kThird, {2, 1}, 20.0, KeyframeInterpolation::Linear})),
           "add a distinct third keyframe");
     Check(track.Add({kThird, {3, 1}, 30.0, KeyframeInterpolation::Linear})
                   .error == KeyframeError::DuplicateId,
           "stable IDs must be unique");
 
     const std::size_t sizeBeforeRejectedUpdate = track.size();
-    Check(track.Update(kThird, {1, 1}, 99.0,
-                       KeyframeInterpolation::Linear)
-                  .error == KeyframeError::DuplicateTime &&
+    Check(track.Update(kThird, {1, 1}, 99.0, KeyframeInterpolation::Linear)
+                      .error == KeyframeError::DuplicateTime &&
               track.size() == sizeBeforeRejectedUpdate &&
               track.keyframes().back().time == RationalTime{2, 1},
           "rejected updates leave the track unchanged");
-    Check(track.Update(kThird, {3, 1},
-                       std::numeric_limits<double>::infinity(),
+    Check(track.Update(kThird, {3, 1}, std::numeric_limits<double>::infinity(),
                        KeyframeInterpolation::Linear)
                   .error == KeyframeError::NonFiniteValue,
           "non-finite parameter values are rejected");
@@ -85,16 +83,16 @@ int main() {
 
     Check(KeyframeTrack::CanonicalValueString(-0.0) == "0",
           "negative zero has one canonical spelling");
-    Check(KeyframeTrack::CanonicalValueString(0.1) ==
-              "0.10000000000000001",
+    Check(KeyframeTrack::CanonicalValueString(0.1) == "0.10000000000000001",
           "canonical values use deterministic round-trippable precision");
 
     KeyframeTrack empty;
     Check(empty.Evaluate({0, 24}).error == KeyframeError::EmptyTrack,
           "empty evaluation returns a named error");
-    Check(empty.Add({"bad", {0, 24}, 1.0, KeyframeInterpolation::Linear})
-                  .error == KeyframeError::InvalidId,
-          "invalid persistent IDs are rejected");
+    Check(
+        empty.Add({"bad", {0, 24}, 1.0, KeyframeInterpolation::Linear}).error ==
+            KeyframeError::InvalidId,
+        "invalid persistent IDs are rejected");
 
     if (failures == 0) {
         std::cout << "PASS: keyframe core\n";

@@ -13,8 +13,7 @@ YuvCodeParameters BuildYuvCodeParameters(int bitDepth, bool fullRange) {
     const uint32_t maximumCode =
         bitDepth == 16 ? 65535u : ((1u << bitDepth) - 1u);
     YuvCodeParameters result;
-    result.sample_scale =
-        bitDepth > 8 ? 65535.0f / maximumCode : 1.0f;
+    result.sample_scale = bitDepth > 8 ? 65535.0f / maximumCode : 1.0f;
     if (fullRange) {
         result.chroma_offset =
             static_cast<float>(1u << (bitDepth - 1)) / maximumCode;
@@ -23,27 +22,21 @@ YuvCodeParameters BuildYuvCodeParameters(int bitDepth, bool fullRange) {
     const uint32_t shift = static_cast<uint32_t>(bitDepth - 8);
     result.y_offset = static_cast<float>(16u << shift) / maximumCode;
     result.y_scale = static_cast<float>(maximumCode) / (219u << shift);
-    result.chroma_offset =
-        static_cast<float>(128u << shift) / maximumCode;
-    result.chroma_scale =
-        static_cast<float>(maximumCode) / (224u << shift);
+    result.chroma_offset = static_cast<float>(128u << shift) / maximumCode;
+    result.chroma_scale = static_cast<float>(maximumCode) / (224u << shift);
     return result;
 }
 
 YuvMatrixParameters BuildYuvMatrixParameters(bool bt2020NonConstant) {
-    if (bt2020NonConstant)
-        return {1.4746f, -0.164553f, -0.571353f, 1.8814f};
+    if (bt2020NonConstant) return {1.4746f, -0.164553f, -0.571353f, 1.8814f};
     return {};
 }
 
 double DecodeSonySLog3(double signal) {
     constexpr double breakpoint = 171.2102946929 / 1023.0;
     if (signal >= breakpoint)
-        return std::pow(10.0, (signal * 1023.0 - 420.0) / 261.5) *
-                   0.19 -
-               0.01;
-    return (signal * 1023.0 - 95.0) * 0.01125 /
-           (171.2102946929 - 95.0);
+        return std::pow(10.0, (signal * 1023.0 - 420.0) / 261.5) * 0.19 - 0.01;
+    return (signal * 1023.0 - 95.0) * 0.01125 / (171.2102946929 - 95.0);
 }
 
 double EncodeAcesCct(double linearAp1) {
@@ -93,17 +86,15 @@ RgbColor Multiply(RgbColor value, const double matrix[3][3]) {
 
 double DecodeRec709(double signal) {
     const double positive = std::max(signal, 0.0);
-    return positive >= 0.081
-               ? std::pow((positive + 0.099) / 1.099, 1.0 / 0.45)
-               : positive / 4.5;
+    return positive >= 0.081 ? std::pow((positive + 0.099) / 1.099, 1.0 / 0.45)
+                             : positive / 4.5;
 }
 
 double EncodeRec709(double linear) {
     linear = std::max(linear, 0.0);
-    return std::clamp(linear >= 0.018
-                          ? 1.099 * std::pow(linear, 0.45) - 0.099
-                          : 4.5 * linear,
-                      0.0, 1.0);
+    return std::clamp(
+        linear >= 0.018 ? 1.099 * std::pow(linear, 0.45) - 0.099 : 4.5 * linear,
+        0.0, 1.0);
 }
 
 RgbColor DecodeTransfer(RgbColor value, const std::string& transfer) {
@@ -197,18 +188,18 @@ RgbColor TransformColorForOutput(const ColorManagementSettings& settings,
         return {std::clamp(signal.red, 0.0, 1.0),
                 std::clamp(signal.green, 0.0, 1.0),
                 std::clamp(signal.blue, 0.0, 1.0)};
-    RgbColor output = Ap1ToOutput(
-        SourceToAp1(DecodeTransfer(signal, settings.input_transfer),
-                    settings.input_gamut),
-        settings.output_gamut);
+    RgbColor output =
+        Ap1ToOutput(SourceToAp1(DecodeTransfer(signal, settings.input_transfer),
+                                settings.input_gamut),
+                    settings.output_gamut);
     if (settings.output_transfer == "hlg") {
         const double scale = HlgSceneReflectionScale();
-        return {std::clamp(EncodeHlg(std::max(0.0, output.red) * scale), 0.0,
-                           1.0),
-                std::clamp(EncodeHlg(std::max(0.0, output.green) * scale), 0.0,
-                           1.0),
-                std::clamp(EncodeHlg(std::max(0.0, output.blue) * scale), 0.0,
-                           1.0)};
+        return {
+            std::clamp(EncodeHlg(std::max(0.0, output.red) * scale), 0.0, 1.0),
+            std::clamp(EncodeHlg(std::max(0.0, output.green) * scale), 0.0,
+                       1.0),
+            std::clamp(EncodeHlg(std::max(0.0, output.blue) * scale), 0.0,
+                       1.0)};
     }
     return {EncodeRec709(output.red), EncodeRec709(output.green),
             EncodeRec709(output.blue)};
