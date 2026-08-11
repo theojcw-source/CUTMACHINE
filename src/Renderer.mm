@@ -4,6 +4,7 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -52,6 +53,9 @@ bool Renderer::Initialize(NSView* view) {
     // XR keeps ten useful bits for HLG while remaining usable for SDR projects.
     impl_->layer.pixelFormat = MTLPixelFormatBGRA10_XR;
     impl_->layer.framebufferOnly = YES;
+    // While a splitter is being dragged, keep the last drawable's aspect
+    // instead of letting Core Animation stretch it to intermediate bounds.
+    impl_->layer.contentsGravity = kCAGravityResizeAspect;
     impl_->sdrColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
     impl_->hlgColorSpace =
         CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_HLG);
@@ -162,9 +166,12 @@ void Renderer::Resize(NSRect bounds) {
         return;
     }
     const CGFloat scale = impl_->layer.contentsScale;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     impl_->layer.frame = bounds;
     impl_->layer.drawableSize =
         CGSizeMake(bounds.size.width * scale, bounds.size.height * scale);
+    [CATransaction commit];
 }
 
 bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
@@ -188,15 +195,15 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
         const AVPixFmtDescriptor* pixel = av_pix_fmt_desc_get(pixelFormat);
         if (frame->width <= 0 || frame->height <= 0 || !pixel ||
             pixel->nb_components < 3 ||
-            (pixel->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL |
-                             AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_HWACCEL)) ||
+            (pixel->flags &
+             (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL |
+              AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_HWACCEL)) ||
             pixel->comp[0].plane != 0 || pixel->comp[1].plane != 1 ||
             pixel->comp[2].plane != 2 ||
             pixel->comp[0].depth != pixel->comp[1].depth ||
             pixel->comp[0].depth != pixel->comp[2].depth ||
             pixel->comp[0].depth < 8 || pixel->comp[0].depth > 16 ||
-            !frame->data[0] ||
-            !frame->data[1] || !frame->data[2]) {
+            !frame->data[0] || !frame->data[1] || !frame->data[2]) {
             const char* name = av_get_pix_fmt_name(pixelFormat);
             std::fprintf(stderr,
                          "Unsupported planar AVFrame passed to renderer: %s\n",
@@ -204,12 +211,10 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             return false;
         }
         std::array<int, 3> planeWidths = {
-            frame->width,
-            AV_CEIL_RSHIFT(frame->width, pixel->log2_chroma_w),
+            frame->width, AV_CEIL_RSHIFT(frame->width, pixel->log2_chroma_w),
             AV_CEIL_RSHIFT(frame->width, pixel->log2_chroma_w)};
         std::array<int, 3> planeHeights = {
-            frame->height,
-            AV_CEIL_RSHIFT(frame->height, pixel->log2_chroma_h),
+            frame->height, AV_CEIL_RSHIFT(frame->height, pixel->log2_chroma_h),
             AV_CEIL_RSHIFT(frame->height, pixel->log2_chroma_h)};
         if (impl_->textureWidths[frameIndex] != planeWidths ||
             impl_->textureHeights[frameIndex] != planeHeights ||
@@ -344,14 +349,14 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             timeline.color_management.input_transfer == "sony_slog3"
                 ? 1
                 : (timeline.color_management.input_transfer == "linear" ? 2
-                                                                           : 0);
+                                                                        : 0);
         parameters.useAcescct =
             timeline.color_management.working_gamut == "acescct" ? 1 : 0;
         for (size_t frameIndex = 0; frameIndex < frames.size(); ++frameIndex) {
             const AVFrame* frame = frames[frameIndex];
             if (!frame) continue;
-            const AVPixFmtDescriptor* pixel = av_pix_fmt_desc_get(
-                static_cast<AVPixelFormat>(frame->format));
+            const AVPixFmtDescriptor* pixel =
+                av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
             const int depth = pixel->comp[0].depth;
             bool fullRange = timeline.color_management.input_range == "full";
             if (timeline.color_management.input_range == "auto") {
@@ -380,7 +385,7 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             for (NSUInteger plane = 0; plane < 3; ++plane)
                 [workingEncoder
                     setFragmentTexture:impl_->planes[frameIndex][plane]
-                                atIndex:plane];
+                               atIndex:plane];
             const int32_t degrees =
                 frameIndex < timeline.video_rotation_degrees.size()
                     ? timeline.video_rotation_degrees[frameIndex]
@@ -392,7 +397,6 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
                 parameters.quarterTurns % 2 ? frame->height : frame->width;
             const double displayedHeight =
                 parameters.quarterTurns % 2 ? frame->width : frame->height;
-            const double contentAspect = displayedWidth / displayedHeight;
             const double viewportAspect =
                 static_cast<double>(drawable.texture.width) / videoHeight;
             const double sequenceAspect =
@@ -407,20 +411,31 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             } else {
                 canvasWidth = canvasHeight * sequenceAspect;
             }
-            double contentWidth = canvasWidth;
-            double contentHeight = canvasHeight;
-            if (contentAspect > sequenceAspect) {
-                contentHeight = contentWidth / contentAspect;
+            double contentWidth = 0.0;
+            double contentHeight = 0.0;
+            if (timeline.video_zoom > 0.0) {
+                contentWidth = displayedWidth * timeline.video_zoom;
+                contentHeight = displayedHeight * timeline.video_zoom;
             } else {
-                contentWidth = contentHeight * contentAspect;
+                // Kdenlive-style free resize: derive both dimensions from one
+                // scale so changing only the viewer width can never stretch
+                // or mirror the video content.
+                const double fitScale =
+                    std::min(canvasWidth / displayedWidth,
+                             canvasHeight / displayedHeight);
+                contentWidth = displayedWidth * fitScale;
+                contentHeight = displayedHeight * fitScale;
             }
             parameters.width = static_cast<float>(
                 contentWidth / static_cast<double>(drawable.texture.width));
-            parameters.height =
-                static_cast<float>(contentHeight / videoHeight);
+            parameters.height = static_cast<float>(contentHeight / videoHeight);
             parameters.left = (1.0f - parameters.width) * 0.5f;
             parameters.top = (1.0f - parameters.height) * 0.5f;
-            parameters.opacity = 1.0f;
+            parameters.opacity =
+                frameIndex < timeline.video_opacities.size()
+                    ? std::clamp(timeline.video_opacities[frameIndex], 0.0f,
+                                 1.0f)
+                    : 1.0f;
             [workingEncoder setFragmentBytes:&parameters
                                       length:sizeof(parameters)
                                      atIndex:0];
@@ -445,8 +460,7 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
         int32_t outputTransfer;
         int32_t colorPadding[2];
     } solid = {};
-    solid.colorManagementEnabled =
-        timeline.color_management.enabled ? 1 : 0;
+    solid.colorManagementEnabled = timeline.color_management.enabled ? 1 : 0;
     solid.outputTransfer = hlgOutput ? 1 : 0;
     for (const MetalRect& item : timeline.rectangles) {
         double left = item.x;
@@ -503,8 +517,7 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
     } outputParameters = {
         timeline.color_management.enabled ? 1 : 0,
         timeline.color_management.output_gamut == "rec2020" ? 1 : 0,
-        hlgOutput ? 1 : 0,
-        0};
+        hlgOutput ? 1 : 0, 0};
     [encoder setFragmentTexture:impl_->workingTexture atIndex:0];
     [encoder setFragmentSamplerState:impl_->sampler atIndex:0];
     [encoder setFragmentBytes:&outputParameters

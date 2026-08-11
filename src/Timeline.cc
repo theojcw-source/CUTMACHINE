@@ -29,6 +29,70 @@ std::optional<ResolvedFrame> Timeline::ResolveTrack(
     return ResolveInTrack(*track, position);
 }
 
+ResolvedFrame Timeline::ResolveClipAt(const DocumentClip& clip,
+                                      RationalTime sourceTime) const {
+    const DocumentSource* source = document_.FindSource(clip.source_id);
+    if (!source)
+        throw std::logic_error("validated clip references an unknown source");
+    return {source->id,
+            sourceTime.to_frames(source->rate.num, source->rate.den)};
+}
+
+std::vector<ResolvedLayer> Timeline::ResolveTrackLayers(
+    const Ulid& trackId, RationalTime position) const {
+    if (position.rate <= 0)
+        throw std::invalid_argument("timeline position rate must be positive");
+    const DocumentTrack* track = document_.FindTrack(trackId);
+    if (!track)
+        throw std::invalid_argument("unknown track ID '" + trackId + "'");
+    for (const DocumentTransition& transition :
+         document_.sequence.transitions) {
+        if (transition.track_id != trackId) continue;
+        const DocumentClip* left = document_.FindClip(transition.left_clip_id);
+        const DocumentClip* right =
+            document_.FindClip(transition.right_clip_id);
+        if (!left || !right) continue;
+        const int64_t frames =
+            transition.duration.to_frames(document_.sequence.frame_rate.num,
+                                          document_.sequence.frame_rate.den);
+        int64_t preFrames = 0;
+        int64_t postFrames = 0;
+        if (transition.alignment == TransitionAlignment::Center) {
+            preFrames = frames / 2;
+            postFrames = frames - preFrames;
+        } else if (transition.alignment == TransitionAlignment::StartAtCut) {
+            postFrames = frames;
+        } else {
+            preFrames = frames;
+        }
+        const RationalTime pre{preFrames * document_.sequence.frame_rate.den,
+                               document_.sequence.frame_rate.num};
+        const RationalTime post{postFrames * document_.sequence.frame_rate.den,
+                                document_.sequence.frame_rate.num};
+        const RationalTime cut = right->timeline_in;
+        const RationalTime start = cut.sub(pre);
+        const RationalTime end = cut.add(post);
+        if (position < start || position >= end) continue;
+        const RationalTime fromCut = position.sub(cut);
+        const RationalTime leftTime =
+            left->source_in.add(left->duration).add(fromCut);
+        const RationalTime rightTime = right->source_in.add(fromCut);
+        const long double elapsed =
+            static_cast<long double>(position.sub(start).value) /
+            position.sub(start).rate;
+        const long double total =
+            static_cast<long double>(transition.duration.value) /
+            transition.duration.rate;
+        const float progress = static_cast<float>(
+            std::clamp<long double>(elapsed / total, 0.0L, 1.0L));
+        return {{ResolveClipAt(*left, leftTime), 1.0f},
+                {ResolveClipAt(*right, rightTime), progress}};
+    }
+    const std::optional<ResolvedFrame> frame = ResolveInTrack(*track, position);
+    return frame ? std::vector<ResolvedLayer>{{*frame, 1.0f}}
+                 : std::vector<ResolvedLayer>{};
+}
+
 std::optional<ResolvedFrame> Timeline::ResolveInTrack(
     const DocumentTrack& track, RationalTime position) const {
     // upper_bound finds the last clip whose start is <= position. Validation
@@ -46,15 +110,8 @@ std::optional<ResolvedFrame> Timeline::ResolveInTrack(
     if (offset.value < 0 || offset >= clip.duration) {
         return std::nullopt;
     }
-    const DocumentSource* source = document_.FindSource(clip.source_id);
-    if (!source) {
-        throw std::logic_error("validated clip references an unknown source");
-    }
     const RationalTime sourceTime = clip.source_in.add(offset);
-    return ResolvedFrame{
-        source->id,
-        sourceTime.to_frames(source->rate.num, source->rate.den),
-    };
+    return ResolveClipAt(clip, sourceTime);
 }
 
 RationalTime Timeline::Duration() const {

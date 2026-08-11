@@ -1,4 +1,6 @@
 #include "Document.h"
+#include "EditLog.h"
+#include "Project.h"
 #include "ProjectRecovery.h"
 #include "Ulid.h"
 
@@ -85,7 +87,8 @@ int main() {
               "write autosave: " + error);
         Check(Read(project) == projectBefore,
               "autosave must not mutate the authoritative project");
-        const fs::path autosave = ProjectRecovery::AutosavePath(project.string());
+        const fs::path autosave =
+            ProjectRecovery::AutosavePath(project.string());
         Check(Read(autosave) == working.SaveToString(),
               "autosave must contain canonical document JSON");
 
@@ -120,6 +123,32 @@ int main() {
               "failed load must leave output unchanged");
     });
 
+    Test("autosave preserves the complete multi-timeline project", [] {
+        TemporaryDirectory directory;
+        const fs::path path = directory.path() / "multi.cut.json";
+        Project saved("Saved project");
+        ProjectEditLog projectLog;
+        EditError editError = EditError::None;
+        std::string error;
+        Check(projectLog.Apply(saved,
+                               ProjectOperation{AddProjectTimelineOperation{
+                                   "Alternate", 1080, 1920, {25, 1}}},
+                               editError, error),
+              "add alternate timeline: " + error);
+        Check(saved.Save(path.string(), error), "save project: " + error);
+        Project working = saved;
+        working.name = "Recovered project";
+        working.active_timeline_id = working.timelines.back().id;
+        Check(ProjectRecovery::WriteAutosave(path.string(), working, error),
+              "write project autosave: " + error);
+
+        Project recovered("Sentinel");
+        Check(ProjectRecovery::LoadAutosave(path.string(), recovered, error),
+              "load project autosave: " + error);
+        Check(recovered.SaveToString() == working.SaveToString(),
+              "project recovery retains every timeline and active identity");
+    });
+
     Test("inspection distinguishes stale and newer autosaves", [] {
         TemporaryDirectory directory;
         const fs::path project = directory.path() / "edit.json";
@@ -128,8 +157,8 @@ int main() {
         std::string error;
         Check(ValidDocument("Saved").Save(project.string(), error),
               "save project: " + error);
-        Check(ProjectRecovery::WriteAutosave(
-                  project.string(), ValidDocument("Working"), error),
+        Check(ProjectRecovery::WriteAutosave(project.string(),
+                                             ValidDocument("Working"), error),
               "write autosave: " + error);
 
         const auto base = fs::file_time_type::clock::now();
@@ -159,8 +188,8 @@ int main() {
         Check(ValidDocument("Saved").Save(project.string(), error),
               "save project: " + error);
         const std::string projectBefore = Read(project);
-        Check(ProjectRecovery::WriteAutosave(
-                  project.string(), ValidDocument("Working"), error),
+        Check(ProjectRecovery::WriteAutosave(project.string(),
+                                             ValidDocument("Working"), error),
               "write autosave: " + error);
         Check(ProjectRecovery::DiscardAutosave(project.string(), error),
               "discard autosave: " + error);
@@ -210,14 +239,14 @@ int main() {
         std::string error;
         Check(ProjectRecovery::AutosavePath("").empty(),
               "empty project has no derived autosave path");
-        Check(!ProjectRecovery::WriteAutosave(
-                  "", ValidDocument("Working"), error),
+        Check(!ProjectRecovery::WriteAutosave("", ValidDocument("Working"),
+                                              error),
               "write must reject empty project path");
         Check(!ProjectRecovery::DiscardAutosave("", error),
               "discard must reject empty project path");
-        Check(ProjectRecovery::Inspect("").state ==
-                  ProjectRecoveryState::Invalid,
-              "inspection must reject empty project path");
+        Check(
+            ProjectRecovery::Inspect("").state == ProjectRecoveryState::Invalid,
+            "inspection must reject empty project path");
     });
 
     if (failures != 0) {

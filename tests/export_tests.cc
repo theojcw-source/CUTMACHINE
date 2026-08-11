@@ -1,5 +1,5 @@
-#include "Document.h"
 #include "Cli.h"
+#include "Document.h"
 #include "Export.h"
 #include "Ulid.h"
 
@@ -62,13 +62,30 @@ Document Fixture(const std::string& mediaPath) {
         {"01K40000000000000000000002",
          "video",
          0,
-         {{"01K40000000000000000000003", sourceId, {0, 25}, {10, 25},
-           {5, 25}, true}}},
+         {{"01K40000000000000000000003",
+           sourceId,
+           {0, 25},
+           {10, 25},
+           {5, 25},
+           false}}},
         {"01K40000000000000000000004",
          "video",
          1,
-         {{"01K40000000000000000000005", sourceId, {10, 25}, {5, 25},
-           {10, 25}, false}}},
+         {{"01K40000000000000000000005",
+           sourceId,
+           {10, 25},
+           {5, 25},
+           {10, 25},
+           false}}},
+        {"01K40000000000000000000006",
+         "audio",
+         2,
+         {{"01K40000000000000000000007",
+           sourceId,
+           {0, 25},
+           {10, 25},
+           {5, 25},
+           true}}},
     };
     return document;
 }
@@ -104,8 +121,9 @@ int main() {
     settings.frame_rate = {25, 1};
     settings.ffmpeg_path = FFMPEG_EXECUTABLE;
     ExportPlan plan;
-    Check(Exporter::BuildPlan(document, project.string(), settings, plan, error),
-          "export plan builds: " + error);
+    Check(
+        Exporter::BuildPlan(document, project.string(), settings, plan, error),
+        "export plan builds: " + error);
     Check(plan.total_frames == 15,
           "timeline duration is converted to an exact frame count");
     Check(plan.filter_graph.find("overlay=") != std::string::npos &&
@@ -115,19 +133,52 @@ int main() {
               std::string::npos,
           "clip placement remains rational in the filter graph");
 
+    Document transitionDocument = Fixture(media.string());
+    DocumentClip incoming{"01K40000000000000000000008",
+                          transitionDocument.sources[0].id,
+                          {10, 25},
+                          {5, 25},
+                          {15, 25},
+                          false};
+    transitionDocument.sequence.tracks[0].clips.push_back(incoming);
+    transitionDocument.sequence.transitions = {{
+        "01K40000000000000000000009",
+        transitionDocument.sequence.tracks[0].id,
+        transitionDocument.sequence.tracks[0].clips[0].id,
+        incoming.id,
+        "cross_dissolve",
+        {4, 25},
+        TransitionAlignment::Center,
+    }};
+    ExportPlan transitionPlan;
+    Check(Exporter::BuildPlan(transitionDocument, project.string(), settings,
+                              transitionPlan, error) &&
+              transitionPlan.filter_graph.find(
+                  "fade=t=in:st=0:d=(4/25):alpha=1") != std::string::npos &&
+              transitionPlan.filter_graph.find(
+                  "setpts=PTS-STARTPTS+(13/25)/TB") != std::string::npos,
+          "export extends video handles and applies the same cross dissolve");
+
+    Document legacyFlagOnly = Fixture(media.string());
+    legacyFlagOnly.sequence.tracks.pop_back();
+    legacyFlagOnly.sequence.tracks[0].clips[0].include_audio = true;
+    ExportPlan silentPlan;
+    Check(Exporter::BuildPlan(legacyFlagOnly, project.string(), settings,
+                              silentPlan, error) &&
+              silentPlan.filter_graph.find("amix=") == std::string::npos,
+          "video tracks never contribute embedded audio to export");
+
     Check(Exporter::Presets().size() == 4,
           "the export UI is backed by the core preset catalog");
     const ExportSettings master = Exporter::SettingsForPreset(
         ExportPresetId::HevcMaster, destination.string(), 3840, 2160,
         {30000, 1001});
     Check(master.width == 3840 && master.height == 2160 &&
-              master.frame_rate.num == 30000 &&
-              master.frame_rate.den == 1001 &&
+              master.frame_rate.num == 30000 && master.frame_rate.den == 1001 &&
               master.encoder == ExportEncoder::HevcSoftware,
           "master preset follows source geometry and selects x265");
     const ExportSettings web = Exporter::SettingsForPreset(
-        ExportPresetId::HevcWeb1080, destination.string(), 3840, 2160,
-        {25, 1});
+        ExportPresetId::HevcWeb1080, destination.string(), 3840, 2160, {25, 1});
     Check(web.width == 1920 && web.height == 1080 &&
               web.video_bitrate == 20000000,
           "web preset fixes its delivery resolution and bitrate");
@@ -162,7 +213,8 @@ int main() {
             const AVCodecParameters* parameters =
                 format->streams[index]->codecpar;
             foundHevc = foundHevc || parameters->codec_id == AV_CODEC_ID_HEVC;
-            foundAudio = foundAudio || parameters->codec_type == AVMEDIA_TYPE_AUDIO;
+            foundAudio =
+                foundAudio || parameters->codec_type == AVMEDIA_TYPE_AUDIO;
         }
         Check(foundHevc, "export contains an HEVC video stream");
         Check(foundAudio, "export contains an audio stream");

@@ -4,6 +4,7 @@
 #include "EditLog.h"
 #include "Export.h"
 #include "Operations.h"
+#include "Project.h"
 #include "Timeline.h"
 #include "Ulid.h"
 
@@ -14,6 +15,7 @@
 #include <fstream>
 #include <iomanip>
 #include <locale>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -113,67 +115,76 @@ bool Rename(const std::filesystem::path& from, const std::filesystem::path& to,
     return false;
 }
 
-// Commits document and edit log as one recoverable pair. All validation and
-// serialization happen before this function creates any file.
+struct CommitArtifact {
+    std::filesystem::path path;
+    std::string contents;
+    std::filesystem::path temporary;
+    std::filesystem::path backup;
+    bool existed = false;
+    bool backed_up = false;
+    bool committed = false;
+};
+
+// Commits all canonical state files as one recoverable set. Every byte is
+// prepared before an existing destination is moved.
+bool CommitArtifacts(std::vector<CommitArtifact> artifacts,
+                     std::string& message) {
+    const std::string nonce = ".cutmachine-" + GenerateUlid();
+    const auto cleanupTemporary = [&] {
+        for (const CommitArtifact& artifact : artifacts)
+            RemoveIfPresent(artifact.temporary);
+    };
+    const auto rollback = [&] {
+        std::string ignored;
+        for (auto item = artifacts.rbegin(); item != artifacts.rend(); ++item) {
+            if (item->committed) RemoveIfPresent(item->path);
+            if (item->backed_up) Rename(item->backup, item->path, ignored);
+        }
+        cleanupTemporary();
+    };
+    for (CommitArtifact& artifact : artifacts) {
+        artifact.temporary = artifact.path.string() + nonce + ".tmp";
+        artifact.backup = artifact.path.string() + nonce + ".bak";
+        std::error_code existsError;
+        artifact.existed = std::filesystem::exists(artifact.path, existsError);
+        if (existsError) {
+            message = "unable to inspect '" + artifact.path.string() +
+                      "': " + existsError.message();
+            cleanupTemporary();
+            return false;
+        }
+        if (!WriteFile(artifact.temporary, artifact.contents, message)) {
+            cleanupTemporary();
+            return false;
+        }
+    }
+    for (CommitArtifact& artifact : artifacts) {
+        if (artifact.existed) {
+            if (!Rename(artifact.path, artifact.backup, message)) {
+                rollback();
+                return false;
+            }
+            artifact.backed_up = true;
+        }
+    }
+    for (CommitArtifact& artifact : artifacts) {
+        if (!Rename(artifact.temporary, artifact.path, message)) {
+            rollback();
+            return false;
+        }
+        artifact.committed = true;
+    }
+    for (const CommitArtifact& artifact : artifacts)
+        if (artifact.backed_up) RemoveIfPresent(artifact.backup);
+    return true;
+}
+
 bool CommitPair(const std::string& documentPath,
                 const std::string& documentJson, const std::string& logJson,
                 std::string& message) {
-    const std::filesystem::path document(documentPath);
-    const std::filesystem::path log(EditLogPathForDocument(documentPath));
-    const std::string nonce = ".cutmachine-" + GenerateUlid();
-    const std::filesystem::path documentTemp =
-        document.string() + nonce + ".tmp";
-    const std::filesystem::path logTemp = log.string() + nonce + ".tmp";
-    const std::filesystem::path documentBackup =
-        document.string() + nonce + ".bak";
-    const std::filesystem::path logBackup = log.string() + nonce + ".bak";
-
-    if (!WriteFile(documentTemp, documentJson, message)) return false;
-    if (!WriteFile(logTemp, logJson, message)) {
-        RemoveIfPresent(documentTemp);
-        return false;
-    }
-
-    std::error_code existsError;
-    const bool hadLog = std::filesystem::exists(log, existsError);
-    if (existsError) {
-        message = "unable to inspect edit log '" + log.string() +
-                  "': " + existsError.message();
-        RemoveIfPresent(documentTemp);
-        RemoveIfPresent(logTemp);
-        return false;
-    }
-
-    if (!Rename(document, documentBackup, message)) {
-        RemoveIfPresent(documentTemp);
-        RemoveIfPresent(logTemp);
-        return false;
-    }
-    if (hadLog && !Rename(log, logBackup, message)) {
-        std::string ignored;
-        Rename(documentBackup, document, ignored);
-        RemoveIfPresent(documentTemp);
-        RemoveIfPresent(logTemp);
-        return false;
-    }
-    if (!Rename(documentTemp, document, message)) {
-        std::string ignored;
-        if (hadLog) Rename(logBackup, log, ignored);
-        Rename(documentBackup, document, ignored);
-        RemoveIfPresent(logTemp);
-        return false;
-    }
-    if (!Rename(logTemp, log, message)) {
-        std::string ignored;
-        RemoveIfPresent(document);
-        Rename(documentBackup, document, ignored);
-        if (hadLog) Rename(logBackup, log, ignored);
-        return false;
-    }
-
-    RemoveIfPresent(documentBackup);
-    if (hadLog) RemoveIfPresent(logBackup);
-    return true;
+    return CommitArtifacts({{documentPath, documentJson},
+                            {EditLogPathForDocument(documentPath), logJson}},
+                           message);
 }
 
 std::string DecimalSeconds(const RationalTime& time) {
@@ -216,11 +227,10 @@ std::string Describe(const Document& document) {
     const RationalTime duration = timeline.Duration();
     std::ostringstream output;
     output.imbue(std::locale::classic());
-    output << "{\"sequence\":{\"id\":\""
-           << EscapeJson(document.sequence.id) << "\",\"name\":\""
-           << EscapeJson(document.sequence.name) << "\",\"width\":"
-           << document.sequence.width << ",\"height\":"
-           << document.sequence.height << ",\"frame_rate\":\""
+    output << "{\"sequence\":{\"id\":\"" << EscapeJson(document.sequence.id)
+           << "\",\"name\":\"" << EscapeJson(document.sequence.name)
+           << "\",\"width\":" << document.sequence.width
+           << ",\"height\":" << document.sequence.height << ",\"frame_rate\":\""
            << document.sequence.frame_rate.num << '/'
            << document.sequence.frame_rate.den
            << "\"},\"timeline\":{\"sources\":[";
@@ -238,7 +248,8 @@ std::string Describe(const Document& document) {
     output << "],\"tracks\":[";
 
     std::vector<const DocumentTrack*> tracks;
-    for (const DocumentTrack& track : document.sequence.tracks) tracks.push_back(&track);
+    for (const DocumentTrack& track : document.sequence.tracks)
+        tracks.push_back(&track);
     std::stable_sort(tracks.begin(), tracks.end(),
                      [](const DocumentTrack* left, const DocumentTrack* right) {
                          return left->index < right->index;
@@ -322,12 +333,9 @@ std::string Describe(const Document& document) {
                    << "\",\"width\":" << media.width
                    << ",\"height\":" << media.height
                    << ",\"rotation_degrees\":" << media.rotation_degrees
-                   << ",\"pixel_format\":\""
-                   << EscapeJson(media.pixel_format)
-                   << "\",\"color_range\":\""
-                   << EscapeJson(media.color_range)
-                   << "\",\"color_space\":\""
-                   << EscapeJson(media.color_space)
+                   << ",\"pixel_format\":\"" << EscapeJson(media.pixel_format)
+                   << "\",\"color_range\":\"" << EscapeJson(media.color_range)
+                   << "\",\"color_space\":\"" << EscapeJson(media.color_space)
                    << "\",\"color_transfer\":\""
                    << EscapeJson(media.color_transfer)
                    << "\",\"color_primaries\":\""
@@ -371,8 +379,7 @@ std::string Describe(const Document& document) {
                << EscapeJson(marker.name) << "\",\"time\":";
         WriteTime(output, marker.time, timelineRate);
         output << ",\"color\":\"" << EscapeJson(marker.color)
-               << "\",\"category\":\"" << EscapeJson(marker.category)
-               << "\"}";
+               << "\",\"category\":\"" << EscapeJson(marker.category) << "\"}";
     }
     output << "]}\n";
     return output.str();
@@ -395,6 +402,10 @@ std::string EditLogPathForDocument(const std::string& documentPath) {
     return documentPath + ".editlog.json";
 }
 
+std::string ProjectEditLogPathForProject(const std::string& projectPath) {
+    return projectPath + ".project-editlog.json";
+}
+
 bool CommitDocumentAndEditLog(const std::string& documentPath,
                               const Document& document, const EditLog& log,
                               std::string& message) {
@@ -402,17 +413,46 @@ bool CommitDocumentAndEditLog(const std::string& documentPath,
                       message);
 }
 
+bool CommitProjectAndEditLog(const std::string& projectPath,
+                             const Project& project, const EditLog& log,
+                             std::string& message) {
+    std::string validationError;
+    if (!project.Validate(validationError)) {
+        message = validationError;
+        return false;
+    }
+    return CommitPair(projectPath, project.SaveToString(), log.Serialize(),
+                      message);
+}
+
+bool CommitProjectAndLogs(const std::string& projectPath,
+                          const Project& project, const EditLog& timelineLog,
+                          const ProjectEditLog& projectLog,
+                          std::string& message) {
+    std::string validationError;
+    if (!project.Validate(validationError)) {
+        message = validationError;
+        return false;
+    }
+    return CommitArtifacts(
+        {{projectPath, project.SaveToString()},
+         {EditLogPathForDocument(projectPath), timelineLog.Serialize()},
+         {ProjectEditLogPathForProject(projectPath), projectLog.Serialize()}},
+        message);
+}
+
 int ExportCommand(const std::string& documentPath,
                   const ExportSettings& settings,
                   const ExportProgressCallback& progress,
                   const std::atomic_bool* cancel, std::string& output) {
-    Document document;
+    Project project;
     std::string error;
-    if (!Document::Load(documentPath, document, error)) {
+    if (!Project::Load(documentPath, project, error)) {
         output = "{\"ok\":false,\"error\":\"InvalidDocument\",\"detail\":\"" +
                  EscapeJson(error) + "\"}\n";
         return 1;
     }
+    Document document = project.MakeActiveDocument();
     ExportPlan plan;
     if (!Exporter::BuildPlan(document, documentPath, settings, plan, error)) {
         output = "{\"ok\":false,\"error\":\"InvalidExport\",\"detail\":\"" +
@@ -429,8 +469,7 @@ int ExportCommand(const std::string& documentPath,
              "\",\"width\":" + std::to_string(settings.width) +
              ",\"height\":" + std::to_string(settings.height) +
              ",\"frames\":" + std::to_string(plan.total_frames) +
-             ",\"path\":\"" + EscapeJson(plan.settings.output_path) +
-             "\"}\n";
+             ",\"path\":\"" + EscapeJson(plan.settings.output_path) + "\"}\n";
     return 0;
 }
 
@@ -441,11 +480,12 @@ int DescribeCommand(const std::string& documentPath, std::string& output) {
         output = ErrorJson(EditError::IoError, message);
         return 1;
     }
-    Document document;
-    if (!Document::LoadFromString(json, document, message)) {
+    Project project;
+    if (!Project::LoadFromString(json, project, message)) {
         output = ErrorJson(EditError::ParseError, message);
         return 1;
     }
+    Document document = project.MakeActiveDocument();
     try {
         output = Describe(document);
         return 0;
@@ -471,11 +511,12 @@ int ApplyOperationCommand(const std::string& documentPath,
         output = ErrorJson(EditError::IoError, message);
         return 1;
     }
-    Document document;
-    if (!Document::LoadFromString(documentJson, document, message)) {
+    Project project;
+    if (!Project::LoadFromString(documentJson, project, message)) {
         output = ErrorJson(EditError::ParseError, message);
         return 1;
     }
+    Document document = project.MakeActiveDocument();
 
     EditLog log;
     const std::string logPath = EditLogPathForDocument(documentPath);
@@ -505,11 +546,117 @@ int ApplyOperationCommand(const std::string& documentPath,
     }
 
     const std::string updatedDocument = document.SaveToString();
-    if (!CommitDocumentAndEditLog(documentPath, document, log, message)) {
+    if (!project.CommitActiveDocument(document, message) ||
+        !CommitProjectAndEditLog(documentPath, project, log, message)) {
         output = ErrorJson(EditError::IoError, message);
         return 1;
     }
     output = "{\"ok\":true,\"doc_hash\":\"" + CanonicalHash(updatedDocument) +
              "\"}\n";
     return 0;
+}
+
+namespace {
+
+bool LoadOptionalTimelineLog(const std::string& projectPath, EditLog& log,
+                             EditError& error, std::string& message) {
+    const std::string path = EditLogPathForDocument(projectPath);
+    std::error_code existsError;
+    const bool exists = std::filesystem::exists(path, existsError);
+    if (existsError) {
+        error = EditError::IoError;
+        message = "unable to inspect edit log '" + path +
+                  "': " + existsError.message();
+        return false;
+    }
+    if (!exists) return true;
+    std::string json;
+    return ReadFile(path, json, message) &&
+           EditLog::Deserialize(json, log, error, message);
+}
+
+bool LoadOptionalProjectLog(const std::string& projectPath, ProjectEditLog& log,
+                            EditError& error, std::string& message) {
+    const std::string path = ProjectEditLogPathForProject(projectPath);
+    std::error_code existsError;
+    const bool exists = std::filesystem::exists(path, existsError);
+    if (existsError) {
+        error = EditError::IoError;
+        message = "unable to inspect project edit log '" + path +
+                  "': " + existsError.message();
+        return false;
+    }
+    if (!exists) return true;
+    std::string json;
+    return ReadFile(path, json, message) &&
+           ProjectEditLog::Deserialize(json, log, error, message);
+}
+
+int MutateProjectLogCommand(const std::string& projectPath,
+                            const std::optional<ProjectOperation>& operation,
+                            bool redo, std::string& output) {
+    std::string json;
+    std::string message;
+    EditError error = EditError::None;
+    if (!ReadFile(projectPath, json, message)) {
+        output = ErrorJson(EditError::IoError, message);
+        return 1;
+    }
+    Project project;
+    if (!Project::LoadFromString(json, project, message)) {
+        output = ErrorJson(EditError::ParseError, message);
+        return 1;
+    }
+    EditLog timelineLog;
+    ProjectEditLog projectLog;
+    if (!LoadOptionalTimelineLog(projectPath, timelineLog, error, message) ||
+        !LoadOptionalProjectLog(projectPath, projectLog, error, message)) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+    bool changed = false;
+    if (operation)
+        changed = projectLog.Apply(project, *operation, error, message);
+    else if (redo)
+        changed = projectLog.Redo(project, error, message);
+    else
+        changed = projectLog.Undo(project, error, message);
+    if (!changed) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+    if (!CommitProjectAndLogs(projectPath, project, timelineLog, projectLog,
+                              message)) {
+        output = ErrorJson(EditError::IoError, message);
+        return 1;
+    }
+    output = "{\"ok\":true,\"project_hash\":\"" +
+             CanonicalHash(project.SaveToString()) + "\"}\n";
+    return 0;
+}
+
+}  // namespace
+
+int ApplyProjectOperationCommand(const std::string& projectPath,
+                                 const std::string& operationJson,
+                                 std::string& output) {
+    ProjectOperation operation = AddProjectTimelineOperation{};
+    EditError error = EditError::None;
+    std::string message;
+    if (!DeserializeProjectOperation(operationJson, operation, error,
+                                     message)) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+    return MutateProjectLogCommand(projectPath, operation, false, output);
+}
+
+int UndoProjectOperationCommand(const std::string& projectPath,
+                                std::string& output) {
+    return MutateProjectLogCommand(projectPath, std::nullopt, false, output);
+}
+
+int RedoProjectOperationCommand(const std::string& projectPath,
+                                std::string& output) {
+    return MutateProjectLogCommand(projectPath, std::nullopt, true, output);
 }

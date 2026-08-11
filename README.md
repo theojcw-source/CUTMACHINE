@@ -66,6 +66,18 @@ Un drag de bord ne modifie pas le document pendant le geste. Il construit un
 aperçu, valide un `TrimClipOperation` sur une copie, puis émet au plus une
 opération via `EditLog::Apply` au relâchement. Un aperçu invalide est rouge et
 n'émet rien. `Cmd+Z` et `Cmd+Shift+Z` utilisent le même journal que le CLI.
+`Shift` pendant le drag active le ripple trim : le bord est retaillé et tous
+les clips aval des pistes en sync lock suivent le raccord. `Cmd` active le roll
+edit sur deux clips contigus : la coupe se déplace, mais la fin du programme ne
+change pas. L'outil Slip (`Y`) glisse le contenu source sous un rectangle dont
+la position et la durée timeline restent fixes ; le geste est borné par le
+début et la fin du rush. Les variantes liées appliquent le même delta exact aux
+rectangles image et audio séparés ; chacune est journalisée comme une seule
+opération annulable.
+`Cmd+C` copie la sélection et `Cmd+V` la colle en overwrite au playhead ;
+`Option`-glisser duplique directement vers la position visée. Une sélection
+liée recrée des clips image/audio séparés avec un nouveau groupe de liaison,
+dans une unique `PasteClipsOperation` annulable.
 Le corps d'un clip est déplaçable horizontalement ou vers une autre piste de
 même type. `MoveClipOperation` conserve l'ULID, les temps source et la durée ;
 une destination incompatible refuse le drop. Un chevauchement effectue un
@@ -98,9 +110,11 @@ active et que le clip suivant possède un audio lié, la fermeture du trou
 décale ensemble les pistes image et audio de la même durée exacte.
 
 La palette en haut à gauche expose les outils Sélection (`V`), Main (`H`),
-Zoom (`Z`, avec `Option` pour dézoomer) et Lame (`C` ou `B`). La lame affiche
+Zoom (`Z`, avec `Option` pour dézoomer), Lame (`C` ou `B`) et Slip (`Y`). La lame affiche
 la future coupe en rouge et un clic dans un clip crée deux segments contigus,
-avec un nouvel ULID stable pour celui de droite. La sélection permet aussi de
+avec un nouvel ULID stable pour celui de droite. Lorsque **Sélection liée** est
+active, la même coupe est appliquée atomiquement au clip audio séparé et les
+deux côtés deviennent deux nouvelles paires A/V indépendantes. La sélection permet aussi de
 scrubber en continu dans les trous et la règle. `Espace` lance ou arrête la lecture ;
 maintenu pendant un drag, il devient temporairement l'outil Main. `J`, `K` et
 `L` contrôlent la lecture arrière, l'arrêt et la lecture avant. `F` cadre toute
@@ -111,33 +125,59 @@ piste vidéo, vert pour ajouter une piste audio. `Cmd+Shift+T` ajoute une piste
 vidéo et `Cmd+Option+Shift+T` une piste audio. La création est atomique et
 annulable ; un clip peut ensuite être glissé vers une piste compatible avec
 l'outil Sélection. Le player résout et compose toutes les pistes vidéo du
-document, sans limite fonctionnelle fixée à deux couches.
+document, sans limite fonctionnelle fixée à deux couches. `Cmd+T` ajoute un
+fondu enchaîné centré sur le cut vidéo au playhead (ou sur un raccord voisin
+du clip sélectionné). La transition est un objet de séquence distinct des
+clips : elle référence les deux clips, valide les poignées média exactes, se
+journalise via `Add/Update/RemoveTransition` et se rend de façon identique
+dans Metal et dans l’export FFmpeg. Elle ne crée ni ne modifie aucun clip
+audio.
 Un clic droit sur une piste propose **Supprimer la piste** et **Supprimer les
 pistes vides**. Une piste occupée demande confirmation ; ses clips sont inclus
 dans l'inverse de `RemoveTrackOperation`, afin que `Cmd+Z` restaure la piste et
 son contenu exacts.
 
+Le menu **CUTMACHINE > Raccourcis clavier…** (`Cmd+,`) permet de réassigner les
+outils, la lecture J/K/L, les points In/Out, delete/ripple delete, le fondu
+enchaîné, le magnétisme, la sélection liée, le cadrage et les commandes Source
+vers Record.
+Les combinaisons s'écrivent sous une forme comme `V`, `Space`, `Alt+X` ou
+`Cmd+Shift+L`. Une valeur vide désactive la commande. Les doublons et les
+conflits avec les raccourcis système fixes sont refusés ; un bouton restaure
+les valeurs par défaut. La configuration est globale à l'application,
+persistée dans les préférences macOS, et les menus sont actualisés
+immédiatement.
+
+Le cadenas dans chaque en-tête verrouille la piste via une opération persistée
+et annulable. Une piste verrouillée reste rendue et lisible, mais toute mutation
+qui la cible est refusée atomiquement. Le séparateur vertical du chutier ajuste
+sa largeur ; la frontière entre moniteur et timeline se glisse verticalement
+pour adapter l’espace de montage.
+
 ## Audio
 
-Les pistes audio embarquées dans les sources sont décodées par FFmpeg, puis
-converties en PCM float stéréo 48 kHz par `libswresample`. Un `AVAudioSourceNode`
-mixte en temps réel tous les clips actifs, qu'ils soient placés sur une piste
-vidéo ou audio. Le callback audio lit un plan immuable construit depuis la
+Les flux audio des sources sont décodés par FFmpeg, puis
+convertis en PCM float stéréo 48 kHz par `libswresample`. Un `AVAudioSourceNode`
+mixte en temps réel uniquement les clips placés sur des pistes audio. Un clip
+vidéo est toujours muet : aucun fallback de lecture ou d'export ne récupère
+son audio. Le callback audio lit un plan immuable construit depuis la
 timeline et ne touche jamais directement au document éditable. `Espace` et
 `J/K/L` pilotent simultanément image et son ; un seek, un trim, un move, une
 fermeture de trou ou un undo reconstruit le plan de mixage au raccord exact.
 Les échantillons additionnés sont limités dans `[-1, 1]` pour éviter un
 dépassement numérique lors du mixage multipiste.
 
-À l'ouverture d'un projet, tout clip vidéo dont la source contient du son est
-séparé par défaut. L'application crée au besoin des pistes audio et émet une
+À l'ouverture d'un ancien projet, tout clip vidéo dont le drapeau de migration
+indique encore du son embarqué est séparé. L'application crée au besoin des
+pistes audio et émet une
 `DetachAudioOperation` par clip dans l'event log : le rectangle audio reçoit
 son propre ULID mais conserve exactement les mêmes `source_in`, durée et
-`timeline_in`. Le clip vidéo passe à `include_audio:false`, donc le son n'est
-jamais joué deux fois. Audio et image peuvent ensuite être déplacés, trimés,
+`timeline_in`. Tous les nouveaux montages créent directement cette paire avec
+`include_audio:false` sur la vidéo ; le son n'est donc jamais embarqué ni joué
+deux fois. Audio et image peuvent ensuite être déplacés, trimés,
 coupés ou supprimés indépendamment. Cette normalisation est persistée et reste
 annulable avec `Cmd+Z`. Le bouton **Séparer audio** (`U`) reste disponible pour
-un éventuel clip lié ajouté ultérieurement.
+migrer manuellement un ancien clip.
 
 Les rectangles vidéo utilisent une palette bleue, tandis que les rectangles
 audio utilisent une palette verte, même lorsqu'ils proviennent du même média.
@@ -194,8 +234,59 @@ sélectionné. Des fichiers du Finder et des rushes déjà présents peuvent aus
 être déposés sur un chutier. Le menu contextuel **Déplacer…** propose la même
 organisation sans drag-and-drop via `SetMediaBinOperation`.
 
+L’analyse FFmpeg des imports passe par un `MediaTaskManager` à concurrence
+bornée. Chaque tâche possède un ULID, un type, un état, une progression, un
+détail et une erreur éventuelle. Le panneau Média montre la tâche active et
+permet son annulation coopérative. Les workers ne mutent jamais le projet : un
+batch terminé est validé, appliqué et sauvegardé sur le thread principal.
+
+Les proxies utilisent ce même ordonnanceur. Les rushes supérieurs à 1920 px,
+HEVC/H.265 ou AV1 déclenchent automatiquement un transcodage ProRes Proxy
+silencieux, limité à 1280 px de large, dans `.cutmachine/proxies/`. Le chemin
+du proxy est persisté dans le projet sans remplacer celui de l'original. Le
+menu contextuel d'un rush permet de le générer, le recréer ou le supprimer ;
+**Timeline → Utiliser les proxies** bascule immédiatement entre proxy et
+original. Un proxy absent, illisible ou incompatible retombe sur l'original.
+L'audio et l'export final utilisent toujours les médias originaux : aucun son
+n'est embarqué dans le clip vidéo ni dans son proxy.
+
+Les médias contenant de l'audio déclenchent aussi une analyse waveform en
+arrière-plan. Le cache binaire, régénérable, vit dans
+`.cutmachine/waveforms/` et n'alourdit pas le JSON du projet. Les clips des
+pistes audio affichent la portion exacte correspondant à leur `source_in` ;
+les pics sont agrégés selon le zoom afin de conserver les transitoires. Les
+clips vidéo restent silencieux et n'affichent jamais de waveform.
+
+La vue grille des chutiers utilise des thumbnails vidéo 320×180 générées par
+le même scheduler et stockées dans `.cutmachine/thumbnails/`. L'image est
+extraite à 10 % du rush (au plus à 10 secondes), respecte l'orientation puis
+est letterboxée sans déformation. Une vignette absente ou corrompue est
+recréée automatiquement ; **Régénérer la vignette** force son remplacement.
+Les médias offline conservent leur avertissement visuel.
+
+Le menu contextuel **Reconnecter le média…** remplace le fichier d'un rush
+sans changer son ULID, ses clips, ses liens A/V ni son chutier. Le nouveau
+fichier est probé par une tâche `Relink` avant toute mutation. Une cadence
+différente, une durée inférieure à l'original ou l'absence d'une piste audio
+déjà utilisée est refusée. Après sauvegarde transactionnelle, les workers
+vidéo et audio sont reconstruits et les proxy, waveform et thumbnail obsolètes
+sont invalidés puis régénérés depuis le remplacement.
+
+**Fichier → Reconnecter les médias offline…** effectue la même opération en
+lot depuis un dossier parcouru récursivement. La correspondance utilise le nom
+de fichier sans tenir compte de la casse. Un nom absent reste offline ; un nom
+présent plusieurs fois est signalé comme ambigu et n'est jamais choisi au
+hasard. Tous les remplacements compatibles trouvés sont sauvegardés dans une
+seule transaction, puis les workers et caches ne sont reconstruits qu'une
+fois pour le lot entier.
+
 Un double-clic sur un média, ou le bouton **Source**, l'ouvre dans le moniteur
-Metal. Un drag depuis la liste ou la grille vers une piste vidéo crée une
+Metal. Source et Record possèdent leurs propres points In/Out : `I`, `O` et
+`Alt+X` agissent sur le moniteur actif. `,` insère la zone Source sur la piste
+vidéo ciblée en ouvrant les pistes en sync lock ; `.` écrase la même durée sans
+décaler l'aval. Ces montages sont une seule opération exacte, annulable, même
+lorsqu'un clip au point de montage doit être scindé. Un drag depuis la liste
+ou la grille vers une piste vidéo crée une
 `InsertClipOperation` journalisée avec l'ULID de la source, son `source_in`
 zéro et sa durée rationnelle complète. Cliquer ensuite dans la timeline rend
 le moniteur au programme. `--ingest` crée désormais le `DocumentSource`
@@ -213,8 +304,10 @@ Media Pool` des NLE classiques.
 
 `Operations.h` expose `InsertClipOperation`, `RemoveClipOperation`,
 `TrimClipOperation`, `MoveClipOperation`, `DeleteGapOperation` et
-`SplitClipOperation`, ainsi que les variantes liées de move, trim et remove et
-`AddTrackOperation` pour le multipiste. Les marqueurs de projet sont des objets
+`SplitClipOperation`, ainsi que `RippleTrimOperation`, `RollEditOperation`,
+`SlipEditOperation`, les variantes liées de move, trim et remove et
+`AddTrackOperation` pour le
+multipiste. Les marqueurs de projet sont des objets
 adressables persistants ; `AddMarkerOperation`, `RemoveMarkerOperation` et
 `UpdateMarkerOperation` passent par le même journal et apparaissent dans
 `--describe` sous les aliases `K1`, `K2`, etc. Les réglages de la séquence
@@ -247,6 +340,10 @@ décodage média :
 ./build/cutmachine --describe ./example-timeline.json
 ./build/cutmachine --apply-op ./example-timeline.json \
   '{"type":"TrimClip","clip_id":"01K00000000000000000000003","edge":"Tail","delta":{"value":-1,"rate":25},"exact_clip":null}'
+./build/cutmachine --apply-project-op ./example-timeline.json \
+  '{"type":"AddProjectTimeline","name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1},"timeline_id":"","video_track_id":"","audio_track_id":"","exact_project_hex":null}'
+./build/cutmachine --undo-project-op ./example-timeline.json
+./build/cutmachine --redo-project-op ./example-timeline.json
 ./build/cutmachine --ingest ./example-timeline.json ./rushes --recursive
 ./build/cutmachine --export ./example-timeline.json ./film.mp4
 ```
@@ -294,6 +391,13 @@ HD, UHD, vertical et carré ainsi que les cadences usuelles. Les documents plus
 anciens sans bloc `sequence` sont migrés en mémoire à partir de la première
 source, avec un repli 1920×1080.
 
+L’application charge désormais un `Project` complet autour de ce document
+actif. Toutes ses timelines apparaissent dans le chutier ; un double-clic en
+active une et `Cmd+Option+N` en crée une nouvelle. Les anciens JSON
+mono-séquence restent lisibles et sont promus automatiquement lors de leur
+première sauvegarde. Une autosave du projet complet protège chaque commit
+atomique et peut être récupérée au lancement.
+
 `--describe` écrit uniquement la vue JSON condensée sur stdout, avec les blocs
 distincts `timeline` et `library`. Les médias de bibliothèque ont des alias
 `M1`, `M2`, etc. et restent disponibles lorsqu'ils sont montés (`in_use:true`).
@@ -337,6 +441,11 @@ réutilise le format canonique de `SerializeOperation`, remplace le document de
 façon transactionnelle et conserve le journal dans le fichier compagnon
 `<document>.editlog.json`. En cas de refus, ni le document ni ce journal ne sont
 modifiés.
+
+`--apply-project-op` applique de la même façon les opérations multi-timeline,
+de métadonnées de chutier et de relink. Son historique distinct est conservé
+dans `<document>.project-editlog.json` et les commandes `--undo-project-op` et
+`--redo-project-op` le parcourent sans initialiser l’interface graphique.
 
 ## Sidecar conversationnel
 

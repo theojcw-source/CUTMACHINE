@@ -4,6 +4,8 @@
 
 #include <string>
 
+class Project;
+
 // Autosaves are deliberately derived state. The project JSON remains the
 // authority until a caller explicitly saves a recovered Document to it.
 enum class ProjectRecoveryState {
@@ -30,6 +32,8 @@ public:
     // atomically replaces the autosave. Never writes the project itself.
     static bool WriteAutosave(const std::string& projectPath,
                               const Document& document, std::string& error);
+    static bool WriteAutosave(const std::string& projectPath,
+                              const Project& project, std::string& error);
 
     // Validates the autosave before reporting it as recoverable. An autosave
     // is Available only when it is newer than the project, or the project does
@@ -38,6 +42,8 @@ public:
 
     // Loads only the derived autosave. Output is unchanged on failure.
     static bool LoadAutosave(const std::string& projectPath, Document& output,
+                             std::string& error);
+    static bool LoadAutosave(const std::string& projectPath, Project& output,
                              std::string& error);
 
     // Removes only the deterministic autosave sidecar. Missing files are a

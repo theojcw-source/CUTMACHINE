@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Document.h"
+#include "Project.h"
 
 #include <optional>
 #include <string>
@@ -16,6 +17,7 @@ enum class EditError {
     UnknownSource,
     UnknownBin,
     UnknownMarker,
+    UnknownTransition,
     UnknownSequence,
     UnknownMedia,
     InvalidDuration,
@@ -25,6 +27,7 @@ enum class EditError {
     DuplicateId,
     ArithmeticError,
     InvalidOperation,
+    LockedTrack,
     ValidationFailed,
     EmptyUndo,
     EmptyRedo,
@@ -75,6 +78,29 @@ struct ExactTrackState {
     std::vector<DocumentClip> clips;
 };
 
+struct PastedClip {
+    // IDs from the copied selection are used only to rebuild links between the
+    // new clips. clip_id and link_group_id are generated on first apply.
+    Ulid copied_clip_id;
+    Ulid track_id;
+    Ulid source_id;
+    RationalTime source_in;
+    RationalTime duration;
+    RationalTime timeline_in;
+    Ulid clip_id;
+    Ulid copied_link_group_id;
+    Ulid link_group_id;
+    Ulid copied_sync_anchor_clip_id;
+    Ulid sync_anchor_clip_id;
+    RationalTime sync_reference_delta{0, 1};
+};
+
+struct PasteClipsOperation {
+    std::vector<PastedClip> clips;
+    std::vector<ExactTrackState> exact_track_result;
+    bool overwrite = false;
+};
+
 struct ClearClipOperation {
     Ulid clip_id;
     std::vector<ExactTrackState> exact_track_result;
@@ -117,6 +143,34 @@ struct TrimLinkedClipsOperation {
     std::vector<ExactTrackState> exact_track_result;
 };
 
+struct RippleTrimOperation {
+    Ulid clip_id;
+    TrimEdge edge = TrimEdge::Tail;
+    RationalTime delta;
+    std::vector<Ulid> linked_clip_ids;
+    std::vector<Ulid> sync_track_ids;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
+struct RollEditPair {
+    Ulid left_clip_id;
+    Ulid right_clip_id;
+};
+
+struct RollEditOperation {
+    std::vector<RollEditPair> pairs;
+    RationalTime delta;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
+// Slides source material underneath fixed timeline rectangles. Linked A/V
+// members remain separate clips and receive the same exact source delta.
+struct SlipEditOperation {
+    std::vector<Ulid> clip_ids;
+    RationalTime delta;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 struct RemoveLinkedClipsOperation {
     Ulid link_group_id;
     std::vector<Ulid> clip_ids;
@@ -152,6 +206,8 @@ struct AddTrackOperation {
     int32_t index = -1;
     // Populated by the inverse of RemoveTrack so undo restores its contents.
     std::vector<DocumentClip> clips;
+    bool locked = false;
+    bool sync_lock = true;
 };
 
 struct UpdateSequenceOperation {
@@ -164,6 +220,16 @@ struct UpdateSequenceOperation {
 
 struct RemoveTrackOperation {
     Ulid track_id;
+};
+
+struct SetTrackLockOperation {
+    Ulid track_id;
+    bool locked = false;
+};
+
+struct SetTrackSyncLockOperation {
+    Ulid track_id;
+    bool sync_lock = true;
 };
 
 struct AddBinOperation {
@@ -215,6 +281,23 @@ struct UpdateMarkerOperation {
     std::string category;
 };
 
+struct AddTransitionOperation {
+    DocumentTransition transition;
+    // -1 appends; inverse operations retain the exact sequence position.
+    int64_t insertion_index = -1;
+};
+
+struct RemoveTransitionOperation {
+    Ulid transition_id;
+};
+
+struct UpdateTransitionOperation {
+    Ulid transition_id;
+    std::string type = "cross_dissolve";
+    RationalTime duration;
+    TransitionAlignment alignment = TransitionAlignment::Center;
+};
+
 struct SetClipLinkOperation {
     Ulid first_clip_id;
     Ulid second_clip_id;
@@ -258,26 +341,82 @@ struct JoinClipOperation {
     ExactClipTimes joined_times;
 };
 
-using Operation =
-    std::variant<InsertClipOperation, RemoveClipOperation, ClearClipOperation,
-                 TrimClipOperation,
-                 MoveClipOperation, DeleteGapOperation, DetachAudioOperation,
-                 MoveLinkedClipsOperation, TrimLinkedClipsOperation,
-                 RemoveLinkedClipsOperation, ClearLinkedClipsOperation,
-                 AddTrackOperation,
-                 RemoveTrackOperation, UpdateSequenceOperation,
-                 SplitClipOperation, SplitLinkedClipsOperation,
-                 JoinClipOperation,
-                 AddBinOperation, RemoveBinOperation, RenameBinOperation,
-                 MoveBinOperation, SetMediaBinOperation, AddMarkerOperation,
-                 RemoveMarkerOperation, UpdateMarkerOperation,
-                 SetClipLinkOperation>;
+using Operation = std::variant<
+    InsertClipOperation, RemoveClipOperation, ClearClipOperation,
+    PasteClipsOperation, TrimClipOperation, MoveClipOperation,
+    DeleteGapOperation, DetachAudioOperation, MoveLinkedClipsOperation,
+    TrimLinkedClipsOperation, RippleTrimOperation, RollEditOperation,
+    SlipEditOperation, RemoveLinkedClipsOperation, ClearLinkedClipsOperation,
+    AddTrackOperation, RemoveTrackOperation, SetTrackLockOperation,
+    SetTrackSyncLockOperation, UpdateSequenceOperation, SplitClipOperation,
+    SplitLinkedClipsOperation, JoinClipOperation, AddBinOperation,
+    RemoveBinOperation, RenameBinOperation, MoveBinOperation,
+    SetMediaBinOperation, AddMarkerOperation, RemoveMarkerOperation,
+    UpdateMarkerOperation, AddTransitionOperation, RemoveTransitionOperation,
+    UpdateTransitionOperation, SetClipLinkOperation>;
+
+struct ExactProjectState {
+    std::string canonical_json;
+};
+
+struct AddProjectTimelineOperation {
+    std::string name = "New Timeline";
+    int32_t width = 1920;
+    int32_t height = 1080;
+    MediaRate frame_rate{25, 1};
+    Ulid timeline_id;
+    Ulid video_track_id;
+    Ulid audio_track_id;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
+struct RemoveProjectTimelineOperation {
+    Ulid timeline_id;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
+struct SetProjectBinMetadataOperation {
+    Ulid item_id;
+    ProjectBinMetadata metadata;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
+struct SetProjectTimelineBinOperation {
+    Ulid timeline_id;
+    Ulid bin_id;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
+struct ProjectRelinkItem {
+    Ulid media_id;
+    LibraryMedia replacement;
+    std::string stored_path;
+};
+
+struct RelinkProjectMediaOperation {
+    std::vector<ProjectRelinkItem> replacements;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
+using ProjectOperation =
+    std::variant<AddProjectTimelineOperation, RemoveProjectTimelineOperation,
+                 SetProjectBinMetadataOperation, SetProjectTimelineBinOperation,
+                 RelinkProjectMediaOperation>;
 
 // On success, operation is enriched with generated IDs and exact redo state.
 // Both document and operation remain unchanged on failure.
 bool ApplyOperation(Document& document, Operation& operation,
                     Operation& inverse, EditError& error, std::string& message);
 
+bool ApplyProjectOperation(Project& project, ProjectOperation& operation,
+                           ProjectOperation& inverse, EditError& error,
+                           std::string& message);
+
 std::string SerializeOperation(const Operation& operation);
 bool DeserializeOperation(const std::string& json, Operation& operation,
                           EditError& error, std::string& message);
+
+std::string SerializeProjectOperation(const ProjectOperation& operation);
+bool DeserializeProjectOperation(const std::string& json,
+                                 ProjectOperation& operation, EditError& error,
+                                 std::string& message);

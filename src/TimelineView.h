@@ -24,7 +24,7 @@ struct TimelineViewport {
     std::vector<double> TickXs(double width) const;
 };
 
-constexpr double kTimelineRulerHeight = 24.0;
+constexpr double kTimelineRulerHeight = 28.0;
 constexpr double kTimelineEdgeHitWidth = 6.0;
 constexpr double kTimelineSnapDistance = 8.0;
 
@@ -36,6 +36,7 @@ RationalTime QuantizePlayheadPosition(RationalTime position,
                                       int32_t sampleRate = 48000);
 
 enum class TimelineHitEdge { None, Head, Tail };
+enum class TimelineTrimMode { Normal, Ripple, Roll, Slip };
 
 struct TimelineHit {
     Ulid clip_id;
@@ -79,6 +80,13 @@ std::vector<Ulid> LassoHitTestTimeline(const Document& document,
                                        double endX, double endY, double width);
 std::vector<Ulid> ExpandLinkedClipSelection(const Document& document,
                                             const std::vector<Ulid>& clipIds);
+
+// Builds the canonical blade operation. With linked selection enabled, every
+// member of the same A/V group containing the cut is split atomically.
+Operation TimelineCutOperationForClip(const Document& document,
+                                      const DocumentClip& clip,
+                                      const RationalTime& position,
+                                      bool linkedSelection);
 
 struct TimelineTrimPreview {
     Ulid clip_id;
@@ -125,6 +133,8 @@ public:
     bool SnappingEnabled() const;
     const std::optional<RationalTime>& SnapGuideTime() const;
     void SetLinkedSelectionEnabled(bool enabled);
+    void SetTrimMode(TimelineTrimMode mode);
+    TimelineTrimMode TrimMode() const;
     std::optional<Operation> PendingOperation() const;
 
 private:
@@ -144,12 +154,14 @@ private:
     std::optional<RationalTime> requested_playhead_;
     std::optional<TimelineTrimPreview> preview_;
     std::optional<TimelineMovePreview> move_preview_;
+    std::optional<Operation> trim_operation_;
     std::optional<TimelineHit> drag_hit_;
     std::optional<RationalTime> drag_start_time_;
     int32_t drag_rate_ = 1;
     double drag_x_ = 0.0;
     bool snapping_enabled_ = true;
     bool linked_selection_enabled_ = true;
+    TimelineTrimMode trim_mode_ = TimelineTrimMode::Normal;
     std::optional<RationalTime> snap_guide_time_;
 };
 
@@ -158,3 +170,27 @@ std::vector<TimelineClipRect> VisibleTimelineClips(
     const std::vector<Ulid>& selectedClipIds,
     const std::optional<TimelineTrimPreview>& preview,
     const std::optional<TimelineMovePreview>& movePreview = std::nullopt);
+
+// Builds one exact, undoable edit over every unlocked track. Clear preserves
+// the range as a gap; ripple closes it. Clips crossing a boundary are split
+// while retaining exact source time.
+std::optional<DeleteGapOperation> TimelineRangeDeleteOperation(
+    const Document& document, const RationalTime& rangeIn,
+    const RationalTime& rangeOut, bool ripple);
+
+// Targeted tracks are edited directly. During ripple edits, other unlocked
+// tracks participate only when their sync lock is enabled. An empty target
+// list intentionally means that no track is edited.
+std::optional<DeleteGapOperation> TimelineRangeDeleteOperation(
+    const Document& document, const RationalTime& rangeIn,
+    const RationalTime& rangeOut, bool ripple,
+    const std::vector<Ulid>& targetedTrackIds);
+
+// Builds one atomic source-to-record edit. Insert opens time on the target and
+// every unlocked sync-locked follower; overwrite replaces only the target
+// interval. The returned exact-track operation is deterministic and undoable.
+std::optional<DeleteGapOperation> TimelineSourceEditOperation(
+    const Document& document, const Ulid& sourceId,
+    const RationalTime& sourceIn, const RationalTime& sourceOut,
+    const RationalTime& timelineIn, const Ulid& targetTrackId, bool insert,
+    const std::vector<Ulid>& audioTargetTrackIds = {});

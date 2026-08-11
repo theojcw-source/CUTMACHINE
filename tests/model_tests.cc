@@ -1,10 +1,10 @@
-#include "Document.h"
 #include "ColorManagement.h"
+#include "Document.h"
 #include "Timeline.h"
 #include "Ulid.h"
 
-#include <cstdio>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -120,8 +120,7 @@ int main() {
              "neutral S-Log3 90% white maps to HLG reference white");
         Near(hlg.red, hlg.green, 2e-5,
              "neutral conversion remains neutral in Rec.2020");
-        Near(hlg.green, hlg.blue, 2e-5,
-             "neutral conversion has no blue cast");
+        Near(hlg.green, hlg.blue, 2e-5, "neutral conversion has no blue cast");
         const YuvCodeParameters full = BuildYuvCodeParameters(10, true);
         const YuvCodeParameters legal = BuildYuvCodeParameters(10, false);
         Near(full.y_offset, 0.0, 1e-7, "full range starts at code zero");
@@ -210,8 +209,7 @@ int main() {
         std::string error;
         Check(Document::LoadFromString(json, document, error),
               "version 2 sequence migration must load: " + error);
-        Check(document.version == 3 &&
-                  document.sequence.markers.size() == 1 &&
+        Check(document.version == 3 && document.sequence.markers.size() == 1 &&
                   document.sequence.markers[0].name == "Cut",
               "root timeline objects move into the sequence");
         const std::string canonical = document.SaveToString();
@@ -240,17 +238,24 @@ int main() {
                   loaded.sequence.frame_rate.den == 1001,
               "sequence identity, dimensions and rational cadence round-trip");
         loaded.sequence.width = 0;
-        Check(!loaded.Validate(error) && error.find("sequence") != std::string::npos,
+        Check(!loaded.Validate(error) &&
+                  error.find("sequence") != std::string::npos,
               "invalid sequence dimensions are rejected");
     });
 
     Test("marker model persists exact time and validates identity", [] {
         Document document = ValidDocument();
         document.sequence.markers = {
-            {"01K83000000000000000000001", "Act 1", {1001, 24000},
-             "#ffcc00", "chapter"},
-            {"01K83000000000000000000002", "Needs sound", {73, 25},
-             "violet", "todo"},
+            {"01K83000000000000000000001",
+             "Act 1",
+             {1001, 24000},
+             "#ffcc00",
+             "chapter"},
+            {"01K83000000000000000000002",
+             "Needs sound",
+             {73, 25},
+             "violet",
+             "todo"},
         };
         std::string error;
         Document loaded;
@@ -266,11 +271,13 @@ int main() {
               "marker lookup retains exact rational time");
 
         loaded.sequence.markers[0].id = loaded.sequence.tracks[0].id;
-        Check(!loaded.Validate(error) && error.find("duplicate ID") != std::string::npos,
+        Check(!loaded.Validate(error) &&
+                  error.find("duplicate ID") != std::string::npos,
               "marker IDs participate in global identity validation");
         loaded = document;
         loaded.sequence.markers[0].category.clear();
-        Check(!loaded.Validate(error) && error.find("marker") != std::string::npos,
+        Check(!loaded.Validate(error) &&
+                  error.find("marker") != std::string::npos,
               "empty marker categories are rejected");
     });
 
@@ -285,7 +292,8 @@ int main() {
         document.color_management.output_gamut = "rec2020";
         document.color_management.output_transfer = "hlg";
         std::string error;
-        Check(document.Validate(error), "Sony/HLG pipeline must validate: " + error);
+        Check(document.Validate(error),
+              "Sony/HLG pipeline must validate: " + error);
         Document loaded;
         Check(Document::LoadFromString(document.SaveToString(), loaded, error),
               "Sony/HLG pipeline must load: " + error);
@@ -340,6 +348,55 @@ int main() {
             "Resolve must return one populated-or-hole result per track");
     });
 
+    Test(
+        "cross dissolve persists, validates handles and resolves two layers",
+        [] {
+            Document document = ValidDocument();
+            document.sequence.transitions = {{
+                "01K00000000000000000000008",
+                document.sequence.tracks[0].id,
+                document.sequence.tracks[0].clips[0].id,
+                document.sequence.tracks[0].clips[1].id,
+                "cross_dissolve",
+                {2, 25},
+                TransitionAlignment::Center,
+            }};
+            std::string error;
+            Check(document.Validate(error),
+                  "transition fixture validates: " + error);
+            Document loaded;
+            const std::string json = document.SaveToString();
+            Check(Document::LoadFromString(json, loaded, error) &&
+                      loaded.SaveToString() == json &&
+                      loaded.FindTransition("01K00000000000000000000008"),
+                  "transition JSON round-trips canonically");
+
+            Timeline timeline(document);
+            const Ulid track = document.sequence.tracks[0].id;
+            const auto beforeCut = timeline.ResolveTrackLayers(track, {1, 25});
+            Check(beforeCut.size() == 2 &&
+                      beforeCut[0].frame.source_frame == 101 &&
+                      beforeCut[1].frame.source_frame == 9 &&
+                      beforeCut[1].opacity == 0.0f,
+                  "transition begins with outgoing image and incoming head "
+                  "handle");
+            const auto atCut = timeline.ResolveTrackLayers(track, {2, 25});
+            Check(atCut.size() == 2 && atCut[0].frame.source_frame == 102 &&
+                      atCut[1].frame.source_frame == 10 &&
+                      std::abs(atCut[1].opacity - 0.5f) < 0.0001f,
+                  "cut center resolves both source handles at 50 percent");
+            const auto after = timeline.ResolveTrackLayers(track, {3, 25});
+            Check(
+                after.size() == 1 && after[0].frame.source_frame == 11,
+                "transition end is half-open and returns to normal resolution");
+
+            document.sequence.tracks[0].clips[1].source_in = {0, 25};
+            Check(!document.Validate(error) &&
+                      error.find("media handles") != std::string::npos,
+                  "a centered dissolve without an incoming head handle is "
+                  "rejected");
+        });
+
     Test("mixed-rate cut resolution at the common timebase", [] {
         Document document;
         document.sources = {
@@ -373,13 +430,13 @@ int main() {
         Check(timeline.Duration().rate == 30000,
               "timeline timebase must be the exact LCM 30000");
 
-        const auto before =
-            timeline.ResolveTrack(document.sequence.tracks[0].id, {29999, 30000});
+        const auto before = timeline.ResolveTrack(
+            document.sequence.tracks[0].id, {29999, 30000});
         Check(before && before->source_id == document.sources[0].id &&
                   before->source_frame == 24,
               "tick before cut must remain on the last 25 fps frame");
-        const auto atCut =
-            timeline.ResolveTrack(document.sequence.tracks[0].id, {30000, 30000});
+        const auto atCut = timeline.ResolveTrack(document.sequence.tracks[0].id,
+                                                 {30000, 30000});
         Check(atCut && atCut->source_id == document.sources[1].id &&
                   atCut->source_frame == 100,
               "cut tick must resolve to the first 30000/1001 clip frame");
@@ -393,7 +450,8 @@ int main() {
         }
         {
             Document value = ValidDocument();
-            value.sequence.tracks[0].clips[0].source_id = "01K00000000000000000000009";
+            value.sequence.tracks[0].clips[0].source_id =
+                "01K00000000000000000000009";
             ExpectInvalid(value, "unknown source_id", "unknown source_id");
         }
         {
@@ -403,7 +461,8 @@ int main() {
         }
         {
             Document value = ValidDocument();
-            std::swap(value.sequence.tracks[0].clips[0], value.sequence.tracks[0].clips[1]);
+            std::swap(value.sequence.tracks[0].clips[0],
+                      value.sequence.tracks[0].clips[1]);
             ExpectInvalid(value, "not sorted", "unsorted clips");
         }
         {
@@ -432,6 +491,46 @@ int main() {
             value.sequence.tracks[0].clips[0].timeline_in.rate = 0;
             ExpectInvalid(value, "time rate", "zero RationalTime rate");
         }
+    });
+
+    Test("track lock state persists", [] {
+        Document document = ValidDocument();
+        document.sequence.tracks[0].locked = true;
+        document.sequence.tracks[0].sync_lock = false;
+        Document loaded;
+        std::string error;
+        Check(Document::LoadFromString(document.SaveToString(), loaded, error),
+              "locked document loads: " + error);
+        Check(loaded.sequence.tracks[0].locked,
+              "locked state survives canonical JSON");
+        Check(!loaded.sequence.tracks[0].sync_lock,
+              "sync lock state survives canonical JSON");
+    });
+
+    Test("derived proxy path persists without replacing the original", [] {
+        Document document = ValidDocument();
+        LibraryMedia media;
+        media.id = document.sources[0].id;
+        media.path = document.sources[0].path;
+        media.filename = "A.MP4";
+        media.codec = "h264";
+        media.width = 3840;
+        media.height = 2160;
+        media.rate = document.sources[0].rate;
+        media.duration = document.sources[0].duration;
+        media.orientation = "landscape";
+        document.library.push_back(std::move(media));
+        const std::string original = document.library[0].path;
+        document.library[0].proxy_path =
+            ".cutmachine/proxies/01K00000000000000000000001.mov";
+        Document loaded;
+        std::string error;
+        Check(Document::LoadFromString(document.SaveToString(), loaded, error),
+              "document with proxy loads: " + error);
+        Check(
+            loaded.library[0].path == original &&
+                loaded.library[0].proxy_path == document.library[0].proxy_path,
+            "proxy remains derived metadata beside the original path");
     });
 
     if (failures != 0) {

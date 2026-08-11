@@ -311,7 +311,7 @@ void AudioPlayback::RebuildTimeline(const Document& document) {
     auto plan = std::make_shared<MixPlan>();
     for (const DocumentTrack& track : document.sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
-            if (track.kind == "video" && !clip.include_audio) continue;
+            if (track.kind != "audio") continue;
             const auto source = impl_->sources.find(clip.source_id);
             if (source == impl_->sources.end()) continue;
             MixClip mixed;

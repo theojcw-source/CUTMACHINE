@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <set>
 #include <stdexcept>
 
 namespace {
@@ -58,6 +60,26 @@ RationalTime MaxTime(const RationalTime& left, const RationalTime& right) {
 
 RationalTime MinTime(const RationalTime& left, const RationalTime& right) {
     return left > right ? right : left;
+}
+
+std::vector<const DocumentTrack*> TracksOfKindInEditOrder(
+    const Document& document, const std::string& kind) {
+    std::vector<const DocumentTrack*> result;
+    for (const DocumentTrack& track : document.sequence.tracks)
+        if (track.kind == kind) result.push_back(&track);
+    std::stable_sort(result.begin(), result.end(),
+                     [](const DocumentTrack* left, const DocumentTrack* right) {
+                         return left->index < right->index;
+                     });
+    return result;
+}
+
+std::optional<int64_t> TrackOrdinal(const Document& document,
+                                    const DocumentTrack& track) {
+    const auto tracks = TracksOfKindInEditOrder(document, track.kind);
+    const auto found = std::find(tracks.begin(), tracks.end(), &track);
+    if (found == tracks.end()) return std::nullopt;
+    return static_cast<int64_t>(std::distance(tracks.begin(), found));
 }
 
 }  // namespace
@@ -177,10 +199,15 @@ std::vector<const DocumentTrack*> TimelineTracksInDisplayOrder(
     const Document& document) {
     std::vector<const DocumentTrack*> tracks;
     tracks.reserve(document.sequence.tracks.size());
-    for (const DocumentTrack& track : document.sequence.tracks) tracks.push_back(&track);
+    for (const DocumentTrack& track : document.sequence.tracks)
+        tracks.push_back(&track);
     std::stable_sort(tracks.begin(), tracks.end(),
                      [](const DocumentTrack* a, const DocumentTrack* b) {
-                         return a->index < b->index;
+                         if (a->kind != b->kind) return a->kind == "video";
+                         // Like Resolve: the highest video layer is displayed
+                         // at the top, while audio counts downward from A1.
+                         return a->kind == "video" ? a->index > b->index
+                                                   : a->index < b->index;
                      });
     return tracks;
 }
@@ -293,6 +320,30 @@ std::vector<Ulid> ExpandLinkedClipSelection(const Document& document,
     return result;
 }
 
+Operation TimelineCutOperationForClip(const Document& document,
+                                      const DocumentClip& clip,
+                                      const RationalTime& position,
+                                      bool linkedSelection) {
+    if (linkedSelection && !clip.link_group_id.empty()) {
+        std::vector<Ulid> members =
+            ExpandLinkedClipSelection(document, {clip.id});
+        members.erase(
+            std::remove_if(
+                members.begin(), members.end(),
+                [&](const Ulid& id) {
+                    const DocumentClip* member = document.FindClip(id);
+                    return !member || position <= member->timeline_in ||
+                           position >=
+                               member->timeline_in.add(member->duration);
+                }),
+            members.end());
+        if (members.size() > 1)
+            return SplitLinkedClipsOperation{
+                clip.link_group_id, members, position, {}, {}, {}, {}};
+    }
+    return SplitClipOperation{clip.id, position, {}};
+}
+
 std::optional<RationalTime> ClipSyncDrift(const Document& document,
                                           const Ulid& clipId) {
     const DocumentClip* clip = document.FindClip(clipId);
@@ -318,11 +369,12 @@ void TimelineInteraction::PointerDown(double x, double y, double width,
                                       int32_t timeRate) {
     requested_playhead_.reset();
     preview_.reset();
+    trim_operation_.reset();
     move_preview_.reset();
     snap_guide_time_.reset();
     drag_hit_.reset();
     drag_start_time_.reset();
-    const auto hit = HitTestTimeline(document_, viewport_, x, y, width);
+    auto hit = HitTestTimeline(document_, viewport_, x, y, width);
     if (!hit) {
         selected_gap_ =
             HitTestTimelineGap(document_, viewport_, x, y, width, timeRate);
@@ -333,12 +385,15 @@ void TimelineInteraction::PointerDown(double x, double y, double width,
         selected_clip_ids_.clear();
         return;
     }
+    if (trim_mode_ == TimelineTrimMode::Slip) hit->edge = TimelineHitEdge::None;
     selected_gap_.reset();
     selected_clip_id_ = hit->clip_id;
     selected_clip_ids_ = {hit->clip_id};
     if (linked_selection_enabled_)
         selected_clip_ids_ =
             ExpandLinkedClipSelection(document_, selected_clip_ids_);
+    const DocumentTrack* selectedTrack = document_.FindTrack(hit->track_id);
+    if (selectedTrack && selectedTrack->locked) return;
     const DocumentClip* clip = document_.FindClip(hit->clip_id);
     drag_rate_ = clip ? clip->duration.rate : timeRate;
     drag_x_ = x;
@@ -363,6 +418,59 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
     drag_x_ = x;
     snap_guide_time_.reset();
     if (drag_hit_->edge == TimelineHitEdge::None) {
+        if (trim_mode_ == TimelineTrimMode::Slip) {
+            std::vector<Ulid> clipIds{clip->id};
+            if (linked_selection_enabled_ && !clip->link_group_id.empty()) {
+                for (const Ulid& id : selected_clip_ids_) {
+                    const DocumentClip* member = document_.FindClip(id);
+                    if (id != clip->id && member &&
+                        member->link_group_id == clip->link_group_id)
+                        clipIds.push_back(id);
+                }
+            }
+            RationalTime constrained = delta;
+            for (const Ulid& id : clipIds) {
+                const DocumentClip* member = document_.FindClip(id);
+                const DocumentSource* source =
+                    member ? document_.FindSource(member->source_id) : nullptr;
+                if (!member || !source) continue;
+                const RationalTime minimum =
+                    RationalTime{0, member->source_in.rate}.sub(
+                        member->source_in);
+                const RationalTime maximum = source->duration.sub(
+                    member->source_in.add(member->duration));
+                if (constrained < minimum) constrained = minimum;
+                if (constrained > maximum) constrained = maximum;
+            }
+            TimelineTrimPreview preview;
+            preview.clip_id = clip->id;
+            preview.link_group_id =
+                clipIds.size() > 1 ? clip->link_group_id : Ulid{};
+            Document candidate = document_;
+            Operation operation = SlipEditOperation{clipIds, constrained, {}};
+            Operation inverse = RemoveClipOperation{};
+            EditError error = EditError::None;
+            std::string message;
+            preview.valid =
+                ApplyOperation(candidate, operation, inverse, error, message);
+            for (const Ulid& id : clipIds) {
+                const DocumentClip* changed = candidate.FindClip(id);
+                if (!changed) continue;
+                const ExactClipTimes times{changed->source_in,
+                                           changed->duration,
+                                           changed->timeline_in};
+                if (id == clip->id) preview.times = times;
+                preview.linked_times.push_back({id, times});
+            }
+            if (preview.valid && constrained.value != 0)
+                trim_operation_ =
+                    SlipEditOperation{std::move(clipIds), constrained, {}};
+            else
+                trim_operation_.reset();
+            preview_ = std::move(preview);
+            move_preview_.reset();
+            return;
+        }
         TimelineMovePreview preview;
         preview.clip_id = clip->id;
         preview.timeline_in = clip->timeline_in.add(delta);
@@ -415,6 +523,20 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
                 if (linked) {
                     const RationalTime groupDelta =
                         anchorTimeline.sub(clip->timeline_in);
+                    const DocumentTrack* anchorTrack =
+                        document_.FindTrackForClip(clip->id);
+                    const DocumentTrack* anchorTarget =
+                        document_.FindTrack(preview.target_track_id);
+                    std::optional<int64_t> trackOffset;
+                    if (anchorTrack && anchorTarget &&
+                        anchorTrack->kind == anchorTarget->kind) {
+                        const auto sourceOrdinal =
+                            TrackOrdinal(document_, *anchorTrack);
+                        const auto targetOrdinal =
+                            TrackOrdinal(document_, *anchorTarget);
+                        if (sourceOrdinal && targetOrdinal)
+                            trackOffset = *targetOrdinal - *sourceOrdinal;
+                    }
                     for (const Ulid& id : selected_clip_ids_) {
                         const DocumentClip* member = document_.FindClip(id);
                         const DocumentTrack* memberTrack =
@@ -422,10 +544,32 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
                         if (!member || !memberTrack ||
                             member->link_group_id != clip->link_group_id)
                             continue;
+                        Ulid destinationTrack;
+                        if (trackOffset) {
+                            const auto memberOrdinal =
+                                TrackOrdinal(document_, *memberTrack);
+                            const auto compatibleTracks =
+                                TracksOfKindInEditOrder(document_,
+                                                        memberTrack->kind);
+                            if (memberOrdinal) {
+                                const int64_t destinationOrdinal =
+                                    *memberOrdinal + *trackOffset;
+                                if (destinationOrdinal >= 0 &&
+                                    static_cast<size_t>(destinationOrdinal) <
+                                        compatibleTracks.size())
+                                    destinationTrack =
+                                        compatibleTracks
+                                            [static_cast<size_t>(
+                                                 destinationOrdinal)]
+                                                ->id;
+                            }
+                        }
+                        // An empty destination deliberately makes the atomic
+                        // candidate invalid when one linked kind has no
+                        // corresponding Vn/An track. Never leave the partner
+                        // silently behind on its original track.
                         preview.linked_moves.push_back(
-                            {id,
-                             id == clip->id ? preview.target_track_id
-                                            : memberTrack->id,
+                            {id, destinationTrack,
                              member->timeline_in.add(groupDelta)});
                     }
                     if (preview.linked_moves.size() > 1) {
@@ -474,7 +618,8 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
         snappedBoundary = FindSnapTime(candidateBoundary, *track, clip->id);
         if (snappedBoundary) delta = snappedBoundary->sub(originalBoundary);
     }
-    delta = ConstrainTrimDelta(*clip, edge, delta);
+    if (trim_mode_ == TimelineTrimMode::Normal)
+        delta = ConstrainTrimDelta(*clip, edge, delta);
     candidateBoundary = originalBoundary.add(delta);
     if (snappedBoundary && candidateBoundary == *snappedBoundary)
         snap_guide_time_ = snappedBoundary;
@@ -485,7 +630,65 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
         Document candidate = document_;
         Operation operation =
             TrimClipOperation{clip->id, edge, delta, std::nullopt};
-        if (linked_selection_enabled_ && !clip->link_group_id.empty()) {
+        if (trim_mode_ == TimelineTrimMode::Ripple) {
+            std::vector<Ulid> linkedIds;
+            if (linked_selection_enabled_ && !clip->link_group_id.empty()) {
+                for (const Ulid& id : selected_clip_ids_)
+                    if (id != clip->id) linkedIds.push_back(id);
+            }
+            std::vector<Ulid> syncTracks;
+            for (const DocumentTrack& candidateTrack :
+                 document_.sequence.tracks)
+                if (candidateTrack.sync_lock)
+                    syncTracks.push_back(candidateTrack.id);
+            operation = RippleTrimOperation{clip->id,
+                                            edge,
+                                            delta,
+                                            std::move(linkedIds),
+                                            std::move(syncTracks),
+                                            {}};
+        } else if (trim_mode_ == TimelineTrimMode::Roll) {
+            const RationalTime cut = originalBoundary;
+            const DocumentClip* left = nullptr;
+            const DocumentClip* right = nullptr;
+            if (track) {
+                for (const DocumentClip& candidateClip : track->clips) {
+                    if (candidateClip.timeline_in.add(candidateClip.duration) ==
+                        cut)
+                        left = &candidateClip;
+                    if (candidateClip.timeline_in == cut)
+                        right = &candidateClip;
+                }
+            }
+            std::vector<RollEditPair> pairs;
+            if (left && right && left->id != right->id) {
+                pairs.push_back({left->id, right->id});
+                if (linked_selection_enabled_ && !left->link_group_id.empty() &&
+                    !right->link_group_id.empty()) {
+                    for (const DocumentTrack& candidateTrack :
+                         document_.sequence.tracks) {
+                        if (track && candidateTrack.id == track->id) continue;
+                        const DocumentClip* linkedLeft = nullptr;
+                        const DocumentClip* linkedRight = nullptr;
+                        for (const DocumentClip& candidateClip :
+                             candidateTrack.clips) {
+                            if (candidateClip.link_group_id ==
+                                    left->link_group_id &&
+                                candidateClip.timeline_in.add(
+                                    candidateClip.duration) == cut)
+                                linkedLeft = &candidateClip;
+                            if (candidateClip.link_group_id ==
+                                    right->link_group_id &&
+                                candidateClip.timeline_in == cut)
+                                linkedRight = &candidateClip;
+                        }
+                        if (linkedLeft && linkedRight)
+                            pairs.push_back({linkedLeft->id, linkedRight->id});
+                    }
+                }
+            }
+            operation = RollEditOperation{std::move(pairs), delta, {}};
+        } else if (linked_selection_enabled_ && !clip->link_group_id.empty()) {
             std::vector<LinkedClipTrim> trims;
             for (const Ulid& id : selected_clip_ids_) {
                 const DocumentClip* member = document_.FindClip(id);
@@ -498,13 +701,47 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
                     clip->link_group_id, std::move(trims), {}};
             }
         }
+        const Operation pendingOperation = operation;
         Operation inverse = RemoveClipOperation{};
         EditError error = EditError::None;
         std::string message;
         preview.valid =
             ApplyOperation(candidate, operation, inverse, error, message);
+        if (preview.valid) {
+            const DocumentClip* changed = candidate.FindClip(clip->id);
+            if (changed)
+                preview.times = {changed->source_in, changed->duration,
+                                 changed->timeline_in};
+            for (const DocumentTrack& candidateTrack :
+                 candidate.sequence.tracks) {
+                for (const DocumentClip& changedClip : candidateTrack.clips) {
+                    if (changedClip.id == clip->id) continue;
+                    const DocumentClip* original =
+                        document_.FindClip(changedClip.id);
+                    if (original &&
+                        (original->source_in != changedClip.source_in ||
+                         original->duration != changedClip.duration ||
+                         original->timeline_in != changedClip.timeline_in))
+                        preview.linked_times.push_back(
+                            {changedClip.id,
+                             {changedClip.source_in, changedClip.duration,
+                              changedClip.timeline_in}});
+                }
+            }
+            if (delta.value != 0)
+                trim_operation_ = pendingOperation;
+            else
+                trim_operation_.reset();
+        } else {
+            trim_operation_.reset();
+        }
         if (!preview.link_group_id.empty()) {
             for (const Ulid& id : selected_clip_ids_) {
+                if (std::any_of(
+                        preview.linked_times.begin(),
+                        preview.linked_times.end(),
+                        [&](const auto& linked) { return linked.first == id; }))
+                    continue;
                 const DocumentClip* member = preview.valid
                                                  ? candidate.FindClip(id)
                                                  : document_.FindClip(id);
@@ -520,6 +757,7 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
     } catch (const std::exception&) {
         preview.times = {clip->source_in, clip->duration, clip->timeline_in};
         preview.valid = false;
+        trim_operation_.reset();
     }
     preview_ = preview;
     move_preview_.reset();
@@ -602,6 +840,7 @@ std::optional<RationalTime> TimelineInteraction::FindSnapTime(
 
 std::optional<Operation> TimelineInteraction::PendingOperation() const {
     if (!drag_hit_ || !drag_start_time_) return std::nullopt;
+    if (trim_operation_) return trim_operation_;
     if (drag_hit_->edge == TimelineHitEdge::None) {
         if (!move_preview_ || move_preview_->target_track_id.empty())
             return std::nullopt;
@@ -659,6 +898,7 @@ bool TimelineInteraction::PointerUp(EditError& error, std::string& message) {
     drag_hit_.reset();
     drag_start_time_.reset();
     preview_.reset();
+    trim_operation_.reset();
     move_preview_.reset();
     snap_guide_time_.reset();
     return applied;
@@ -668,6 +908,7 @@ void TimelineInteraction::CancelDrag() {
     drag_hit_.reset();
     drag_start_time_.reset();
     preview_.reset();
+    trim_operation_.reset();
     move_preview_.reset();
     snap_guide_time_.reset();
 }
@@ -746,6 +987,12 @@ void TimelineInteraction::SetLinkedSelectionEnabled(bool enabled) {
     linked_selection_enabled_ = enabled;
 }
 
+void TimelineInteraction::SetTrimMode(TimelineTrimMode mode) {
+    trim_mode_ = mode;
+}
+
+TimelineTrimMode TimelineInteraction::TrimMode() const { return trim_mode_; }
+
 std::vector<TimelineClipRect> VisibleTimelineClips(
     const Document& document, const TimelineViewport& viewport, double width,
     const std::vector<Ulid>& selectedClipIds,
@@ -819,9 +1066,9 @@ std::vector<TimelineClipRect> VisibleTimelineClips(
                 clip.source_id,
                 left,
                 kTimelineRulerHeight +
-                    displayTrackIndex * viewport.track_height + 3.0,
+                    displayTrackIndex * viewport.track_height + 1.5,
                 right - left,
-                viewport.track_height - 6.0,
+                viewport.track_height - 3.0,
                 std::find(selectedClipIds.begin(), selectedClipIds.end(),
                           clip.id) != selectedClipIds.end(),
                 isPreview,
@@ -847,4 +1094,218 @@ std::vector<TimelineClipRect> VisibleTimelineClips(
     for (TimelineClipRect& rect : movingRects)
         result.push_back(std::move(rect));
     return result;
+}
+
+std::optional<DeleteGapOperation> TimelineRangeDeleteOperation(
+    const Document& document, const RationalTime& rangeIn,
+    const RationalTime& rangeOut, bool ripple) {
+    std::vector<Ulid> allTracks;
+    allTracks.reserve(document.sequence.tracks.size());
+    for (const DocumentTrack& track : document.sequence.tracks)
+        allTracks.push_back(track.id);
+    return TimelineRangeDeleteOperation(document, rangeIn, rangeOut, ripple,
+                                        allTracks);
+}
+
+std::optional<DeleteGapOperation> TimelineRangeDeleteOperation(
+    const Document& document, const RationalTime& rangeIn,
+    const RationalTime& rangeOut, bool ripple,
+    const std::vector<Ulid>& targetedTrackIds) {
+    if (rangeOut <= rangeIn) return std::nullopt;
+    const std::set<Ulid> targeted(targetedTrackIds.begin(),
+                                  targetedTrackIds.end());
+    const bool hasEditableTarget = std::any_of(
+        document.sequence.tracks.begin(), document.sequence.tracks.end(),
+        [&](const DocumentTrack& track) {
+            return !track.locked && targeted.count(track.id) != 0;
+        });
+    if (!hasEditableTarget) return std::nullopt;
+    const RationalTime rangeDuration = rangeOut.sub(rangeIn);
+    std::map<Ulid, Ulid> leftGroups;
+    std::map<Ulid, Ulid> rightGroups;
+    const auto sideGroup = [](std::map<Ulid, Ulid>& groups,
+                              const Ulid& original) -> Ulid {
+        if (original.empty()) return {};
+        auto [item, inserted] = groups.emplace(original, Ulid{});
+        if (inserted) item->second = GenerateUlid();
+        return item->second;
+    };
+    std::vector<ExactTrackState> results;
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        const bool directlyTargeted = targeted.count(track.id) != 0;
+        if (track.locked || (!directlyTargeted && !(ripple && track.sync_lock)))
+            continue;
+        std::vector<DocumentClip> clips;
+        bool changed = false;
+        for (const DocumentClip& original : track.clips) {
+            const RationalTime clipStart = original.timeline_in;
+            const RationalTime clipEnd = clipStart.add(original.duration);
+            if (clipEnd <= rangeIn) {
+                clips.push_back(original);
+                continue;
+            }
+            if (clipStart >= rangeOut) {
+                DocumentClip shifted = original;
+                if (ripple) {
+                    shifted.timeline_in = clipStart.sub(rangeDuration);
+                    changed = true;
+                }
+                clips.push_back(std::move(shifted));
+                continue;
+            }
+            changed = true;
+            const bool hasLeft = clipStart < rangeIn;
+            const bool hasRight = clipEnd > rangeOut;
+            if (hasLeft) {
+                DocumentClip left = original;
+                left.duration = rangeIn.sub(clipStart);
+                if (hasRight)
+                    left.link_group_id =
+                        sideGroup(leftGroups, original.link_group_id);
+                clips.push_back(std::move(left));
+            }
+            if (hasRight) {
+                DocumentClip right = original;
+                if (hasLeft) right.id = GenerateUlid();
+                right.source_in =
+                    original.source_in.add(rangeOut.sub(clipStart));
+                right.duration = clipEnd.sub(rangeOut);
+                right.timeline_in = ripple ? rangeIn : rangeOut;
+                if (hasLeft)
+                    right.link_group_id =
+                        sideGroup(rightGroups, original.link_group_id);
+                clips.push_back(std::move(right));
+            }
+        }
+        if (!changed) continue;
+        std::sort(clips.begin(), clips.end(),
+                  [](const DocumentClip& a, const DocumentClip& b) {
+                      return a.timeline_in < b.timeline_in;
+                  });
+        results.push_back({track.id, std::move(clips)});
+    }
+    if (results.empty()) return std::nullopt;
+    DeleteGapOperation operation{
+        results.front().track_id, rangeIn, rangeDuration, results, {}};
+    for (size_t index = 1; index < results.size(); ++index)
+        operation.linked_track_ids.push_back(results[index].track_id);
+    return operation;
+}
+
+std::optional<DeleteGapOperation> TimelineSourceEditOperation(
+    const Document& document, const Ulid& sourceId,
+    const RationalTime& sourceIn, const RationalTime& sourceOut,
+    const RationalTime& timelineIn, const Ulid& targetTrackId, bool insert,
+    const std::vector<Ulid>& audioTargetTrackIds) {
+    const DocumentSource* source = document.FindSource(sourceId);
+    const DocumentTrack* target = document.FindTrack(targetTrackId);
+    if (!source || !target || target->locked || target->kind != "video" ||
+        timelineIn.rate <= 0 || timelineIn.value < 0 || sourceIn.rate <= 0 ||
+        sourceOut <= sourceIn || sourceIn.value < 0 ||
+        sourceOut > source->duration)
+        return std::nullopt;
+    const std::set<Ulid> audioTargets(audioTargetTrackIds.begin(),
+                                      audioTargetTrackIds.end());
+    if (audioTargets.size() != audioTargetTrackIds.size() ||
+        std::any_of(
+            audioTargets.begin(), audioTargets.end(), [&](const Ulid& id) {
+                const DocumentTrack* track = document.FindTrack(id);
+                return !track || track->locked || track->kind != "audio";
+            }))
+        return std::nullopt;
+    const RationalTime duration = sourceOut.sub(sourceIn);
+    const RationalTime timelineOut = timelineIn.add(duration);
+    const Ulid videoClipId = GenerateUlid();
+    const Ulid linkGroupId = audioTargets.empty() ? Ulid{} : GenerateUlid();
+    std::vector<ExactTrackState> results;
+
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        const bool isTarget = track.id == targetTrackId;
+        const bool isAudioTarget = audioTargets.count(track.id) != 0;
+        const bool directlyTargeted = isTarget || isAudioTarget;
+        if (track.locked || (!directlyTargeted && !(insert && track.sync_lock)))
+            continue;
+        std::vector<DocumentClip> clips;
+        for (const DocumentClip& original : track.clips) {
+            const RationalTime start = original.timeline_in;
+            const RationalTime end = start.add(original.duration);
+            if (insert) {
+                if (end <= timelineIn) {
+                    clips.push_back(original);
+                } else if (start >= timelineIn) {
+                    DocumentClip shifted = original;
+                    shifted.timeline_in = start.add(duration);
+                    clips.push_back(std::move(shifted));
+                } else {
+                    DocumentClip left = original;
+                    left.duration = timelineIn.sub(start);
+                    clips.push_back(std::move(left));
+                    DocumentClip right = original;
+                    right.id = GenerateUlid();
+                    right.source_in =
+                        original.source_in.add(timelineIn.sub(start));
+                    right.duration = end.sub(timelineIn);
+                    right.timeline_in = timelineIn.add(duration);
+                    right.link_group_id.clear();
+                    right.sync_anchor_clip_id.clear();
+                    right.sync_reference_delta = {0, 1};
+                    clips.push_back(std::move(right));
+                }
+                continue;
+            }
+
+            if (end <= timelineIn || start >= timelineOut) {
+                clips.push_back(original);
+                continue;
+            }
+            if (start < timelineIn) {
+                DocumentClip left = original;
+                left.duration = timelineIn.sub(start);
+                clips.push_back(std::move(left));
+            }
+            if (end > timelineOut) {
+                DocumentClip right = original;
+                if (start < timelineIn) right.id = GenerateUlid();
+                right.source_in =
+                    original.source_in.add(timelineOut.sub(start));
+                right.duration = end.sub(timelineOut);
+                right.timeline_in = timelineOut;
+                if (start < timelineIn) {
+                    right.link_group_id.clear();
+                    right.sync_anchor_clip_id.clear();
+                    right.sync_reference_delta = {0, 1};
+                }
+                clips.push_back(std::move(right));
+            }
+        }
+        if (directlyTargeted) {
+            DocumentClip inserted{isTarget ? videoClipId : GenerateUlid(),
+                                  sourceId, sourceIn, duration, timelineIn};
+            if (isTarget) inserted.include_audio = false;
+            if (!audioTargets.empty()) {
+                inserted.link_group_id = linkGroupId;
+                inserted.sync_anchor_clip_id = videoClipId;
+                inserted.sync_reference_delta = {0, 1};
+            }
+            clips.push_back(std::move(inserted));
+        }
+        std::stable_sort(
+            clips.begin(), clips.end(),
+            [](const DocumentClip& left, const DocumentClip& right) {
+                return left.timeline_in < right.timeline_in;
+            });
+        results.push_back({track.id, std::move(clips)});
+    }
+    if (results.empty()) return std::nullopt;
+    const auto targetResult = std::find_if(
+        results.begin(), results.end(), [&](const ExactTrackState& state) {
+            return state.track_id == targetTrackId;
+        });
+    if (targetResult == results.end()) return std::nullopt;
+    DeleteGapOperation operation{
+        targetTrackId, timelineIn, duration, results, {}};
+    for (const ExactTrackState& state : results)
+        if (state.track_id != targetTrackId)
+            operation.linked_track_ids.push_back(state.track_id);
+    return operation;
 }

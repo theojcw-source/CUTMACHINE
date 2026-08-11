@@ -1,5 +1,6 @@
 #include "ProjectRecovery.h"
 
+#include "Project.h"
 #include "Ulid.h"
 
 #include <filesystem>
@@ -41,23 +42,44 @@ bool WriteFile(const fs::path& path, const std::string& contents,
                std::string& error) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) {
-        error = "unable to create recovery temporary file '" + path.string() +
-                "'";
+        error =
+            "unable to create recovery temporary file '" + path.string() + "'";
         return false;
     }
-    output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    output.write(contents.data(),
+                 static_cast<std::streamsize>(contents.size()));
     output.flush();
     if (!output) {
-        error = "unable to write recovery temporary file '" + path.string() +
-                "'";
+        error =
+            "unable to write recovery temporary file '" + path.string() + "'";
         return false;
     }
     output.close();
     if (!output) {
-        error = "unable to close recovery temporary file '" + path.string() +
-                "'";
+        error =
+            "unable to close recovery temporary file '" + path.string() + "'";
         return false;
     }
+    return true;
+}
+
+bool WriteCanonicalAutosave(const std::string& projectPath,
+                            const std::string& contents, std::string& error) {
+    if (!CheckProjectPath(projectPath, error)) return false;
+    const fs::path autosave(ProjectRecovery::AutosavePath(projectPath));
+    const fs::path temporaryPath =
+        fs::path(autosave.string() + "." + GenerateUlid() + ".tmp");
+    TemporaryFile temporary(temporaryPath);
+    if (!WriteFile(temporary.path(), contents, error)) return false;
+    std::error_code renameError;
+    fs::rename(temporary.path(), autosave, renameError);
+    if (renameError) {
+        error = "unable to atomically replace autosave '" + autosave.string() +
+                "': " + renameError.message();
+        return false;
+    }
+    temporary.Commit();
+    error.clear();
     return true;
 }
 
@@ -77,28 +99,21 @@ bool ProjectRecovery::WriteAutosave(const std::string& projectPath,
         return false;
     }
 
-    const fs::path autosave(AutosavePath(projectPath));
-    const fs::path temporaryPath =
-        fs::path(autosave.string() + "." + GenerateUlid() + ".tmp");
-    TemporaryFile temporary(temporaryPath);
-    if (!WriteFile(temporary.path(), document.SaveToString(), error)) {
-        return false;
-    }
-
-    std::error_code renameError;
-    fs::rename(temporary.path(), autosave, renameError);
-    if (renameError) {
-        error = "unable to atomically replace autosave '" + autosave.string() +
-                "': " + renameError.message();
-        return false;
-    }
-    temporary.Commit();
-    error.clear();
-    return true;
+    return WriteCanonicalAutosave(projectPath, document.SaveToString(), error);
 }
 
-ProjectRecoveryInfo ProjectRecovery::Inspect(
-    const std::string& projectPath) {
+bool ProjectRecovery::WriteAutosave(const std::string& projectPath,
+                                    const Project& project,
+                                    std::string& error) {
+    if (!CheckProjectPath(projectPath, error)) return false;
+    if (!project.Validate(error)) {
+        error = "cannot autosave invalid project: " + error;
+        return false;
+    }
+    return WriteCanonicalAutosave(projectPath, project.SaveToString(), error);
+}
+
+ProjectRecoveryInfo ProjectRecovery::Inspect(const std::string& projectPath) {
     ProjectRecoveryInfo info;
     info.project_path = projectPath;
     info.autosave_path = AutosavePath(projectPath);
@@ -123,16 +138,16 @@ ProjectRecoveryInfo ProjectRecovery::Inspect(
     }
     if (!fs::is_regular_file(autosaveStatus)) {
         info.state = ProjectRecoveryState::Invalid;
-        info.error = "autosave is not a regular file: '" +
-                     info.autosave_path + "'";
+        info.error =
+            "autosave is not a regular file: '" + info.autosave_path + "'";
         return info;
     }
 
     Document recovered;
     if (!Document::Load(info.autosave_path, recovered, info.error)) {
         info.state = ProjectRecoveryState::Invalid;
-        info.error = "invalid autosave '" + info.autosave_path + "': " +
-                     info.error;
+        info.error =
+            "invalid autosave '" + info.autosave_path + "': " + info.error;
         return info;
     }
 
@@ -140,8 +155,8 @@ ProjectRecoveryInfo ProjectRecovery::Inspect(
     const fs::file_status projectStatus = fs::status(projectPath, statusError);
     if (statusError != std::errc::no_such_file_or_directory && statusError) {
         info.state = ProjectRecoveryState::Invalid;
-        info.error = "unable to inspect project '" + projectPath + "': " +
-                     statusError.message();
+        info.error = "unable to inspect project '" + projectPath +
+                     "': " + statusError.message();
         return info;
     }
     if (statusError == std::errc::no_such_file_or_directory ||
@@ -192,6 +207,19 @@ bool ProjectRecovery::LoadAutosave(const std::string& projectPath,
     return true;
 }
 
+bool ProjectRecovery::LoadAutosave(const std::string& projectPath,
+                                   Project& output, std::string& error) {
+    if (!CheckProjectPath(projectPath, error)) return false;
+    Project recovered;
+    if (!Project::Load(AutosavePath(projectPath), recovered, error)) {
+        error = "unable to load project autosave: " + error;
+        return false;
+    }
+    output = std::move(recovered);
+    error.clear();
+    return true;
+}
+
 bool ProjectRecovery::DiscardAutosave(const std::string& projectPath,
                                       std::string& error) {
     if (!CheckProjectPath(projectPath, error)) return false;
@@ -209,8 +237,8 @@ bool ProjectRecovery::DiscardAutosave(const std::string& projectPath,
         return true;
     }
     if (fs::is_directory(status)) {
-        error = "refusing to discard autosave directory '" +
-                autosave.string() + "'";
+        error = "refusing to discard autosave directory '" + autosave.string() +
+                "'";
         return false;
     }
     std::error_code removeError;

@@ -1,13 +1,17 @@
 #include "Export.h"
 
-#include "Ingest.h"
 #include "ColorManagement.h"
+#include "Ingest.h"
 #include "Timeline.h"
 #include "Ulid.h"
 
+#include <poll.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <algorithm>
-#include <chrono>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstring>
@@ -17,12 +21,8 @@
 #include <limits>
 #include <locale>
 #include <map>
-#include <poll.h>
-#include <spawn.h>
 #include <sstream>
 #include <string_view>
-#include <sys/wait.h>
-#include <unistd.h>
 
 extern char** environ;
 
@@ -40,13 +40,12 @@ std::string Decimal(const RationalTime& time) {
 }
 
 std::string FilterSeconds(const RationalTime& time) {
-    return "(" + std::to_string(time.value) + "/" +
-           std::to_string(time.rate) + ")";
+    return "(" + std::to_string(time.value) + "/" + std::to_string(time.rate) +
+           ")";
 }
 
 int64_t CeilFrames(const RationalTime& duration, MediaRate rate) {
-    const __int128 numerator =
-        static_cast<__int128>(duration.value) * rate.num;
+    const __int128 numerator = static_cast<__int128>(duration.value) * rate.num;
     const __int128 denominator =
         static_cast<__int128>(duration.rate) * rate.den;
     const __int128 frames = (numerator + denominator - 1) / denominator;
@@ -56,8 +55,7 @@ int64_t CeilFrames(const RationalTime& duration, MediaRate rate) {
 }
 
 std::filesystem::path ResolveMediaPath(
-    const std::filesystem::path& baseDirectory,
-    const DocumentSource& source) {
+    const std::filesystem::path& baseDirectory, const DocumentSource& source) {
     std::filesystem::path path(source.path);
     if (path.is_relative()) path = baseDirectory / path;
     return std::filesystem::absolute(path).lexically_normal();
@@ -84,10 +82,9 @@ std::string BuildColorLut(const ColorManagementSettings& settings) {
         for (int green = 0; green < kSize; ++green) {
             for (int red = 0; red < kSize; ++red) {
                 const RgbColor transformed = TransformColorForOutput(
-                    settings,
-                    {static_cast<double>(red) / (kSize - 1),
-                     static_cast<double>(green) / (kSize - 1),
-                     static_cast<double>(blue) / (kSize - 1)});
+                    settings, {static_cast<double>(red) / (kSize - 1),
+                               static_cast<double>(green) / (kSize - 1),
+                               static_cast<double>(blue) / (kSize - 1)});
                 output << transformed.red << ' ' << transformed.green << ' '
                        << transformed.blue << '\n';
             }
@@ -122,10 +119,10 @@ bool ParseProgressLine(std::string_view line, ExportProgress& progress) {
         // Progress is advisory. A malformed line must not fail the render.
     }
     if (progress.total_frames > 0) {
-        progress.fraction = std::clamp(
-            static_cast<double>(progress.rendered_frames) /
-                progress.total_frames,
-            0.0, 1.0);
+        progress.fraction =
+            std::clamp(static_cast<double>(progress.rendered_frames) /
+                           progress.total_frames,
+                       0.0, 1.0);
     }
     return key == "progress";
 }
@@ -147,10 +144,10 @@ const std::vector<ExportPresetDescriptor>& Exporter::Presets() {
 }
 
 ExportSettings Exporter::SettingsForPreset(ExportPresetId preset,
-                                            const std::string& outputPath,
-                                            int32_t sourceWidth,
-                                            int32_t sourceHeight,
-                                            MediaRate sourceRate) {
+                                           const std::string& outputPath,
+                                           int32_t sourceWidth,
+                                           int32_t sourceHeight,
+                                           MediaRate sourceRate) {
     ExportSettings settings;
     settings.output_path = outputPath;
     settings.width = sourceWidth > 0 ? sourceWidth : 1920;
@@ -269,7 +266,8 @@ bool Exporter::BuildPlan(const Document& document,
     const std::filesystem::path baseDirectory =
         std::filesystem::absolute(documentPath).parent_path();
     for (const DocumentSource& source : document.sources) {
-        const std::filesystem::path path = ResolveMediaPath(baseDirectory, source);
+        const std::filesystem::path path =
+            ResolveMediaPath(baseDirectory, source);
         if (!std::filesystem::is_regular_file(path, filesystemError) ||
             filesystemError) {
             error = "source media is missing: " + path.string();
@@ -303,15 +301,19 @@ bool Exporter::BuildPlan(const Document& document,
         const DocumentTrack* track = nullptr;
         const DocumentClip* clip = nullptr;
         const DocumentSource* source = nullptr;
+        RationalTime source_in;
+        RationalTime duration;
+        RationalTime timeline_in;
+        std::optional<RationalTime> fade_in;
         int input_index = -1;
         bool video = false;
         bool audio = false;
     };
     std::vector<const DocumentTrack*> tracks;
-    for (const DocumentTrack& track : document.sequence.tracks) tracks.push_back(&track);
+    for (const DocumentTrack& track : document.sequence.tracks)
+        tracks.push_back(&track);
     std::stable_sort(tracks.begin(), tracks.end(),
-                     [](const DocumentTrack* left,
-                        const DocumentTrack* right) {
+                     [](const DocumentTrack* left, const DocumentTrack* right) {
                          return left->index < right->index;
                      });
 
@@ -325,24 +327,64 @@ bool Exporter::BuildPlan(const Document& document,
             }
             const bool video = track->kind == "video";
             const bool audio =
-                sourceHasAudio[clip.source_id] &&
-                (track->kind == "audio" || clip.include_audio);
+                sourceHasAudio[clip.source_id] && track->kind == "audio";
             if (!video && !audio) continue;
-            inputs.push_back(
-                {track, &clip, source, static_cast<int>(inputs.size()), video,
-                 audio});
+            InputClip input;
+            input.track = track;
+            input.clip = &clip;
+            input.source = source;
+            input.source_in = clip.source_in;
+            input.duration = clip.duration;
+            input.timeline_in = clip.timeline_in;
+            input.input_index = static_cast<int>(inputs.size());
+            input.video = video;
+            input.audio = audio;
+            if (video) {
+                for (const DocumentTransition& transition :
+                     document.sequence.transitions) {
+                    if (transition.track_id != track->id) continue;
+                    const int64_t frames = transition.duration.to_frames(
+                        document.sequence.frame_rate.num,
+                        document.sequence.frame_rate.den);
+                    int64_t preFrames = 0;
+                    int64_t postFrames = 0;
+                    if (transition.alignment == TransitionAlignment::Center) {
+                        preFrames = frames / 2;
+                        postFrames = frames - preFrames;
+                    } else if (transition.alignment ==
+                               TransitionAlignment::StartAtCut) {
+                        postFrames = frames;
+                    } else {
+                        preFrames = frames;
+                    }
+                    const RationalTime pre{
+                        preFrames * document.sequence.frame_rate.den,
+                        document.sequence.frame_rate.num};
+                    const RationalTime post{
+                        postFrames * document.sequence.frame_rate.den,
+                        document.sequence.frame_rate.num};
+                    if (transition.right_clip_id == clip.id) {
+                        input.source_in = input.source_in.sub(pre);
+                        input.timeline_in = input.timeline_in.sub(pre);
+                        input.duration = input.duration.add(pre);
+                        input.fade_in = transition.duration;
+                    }
+                    if (transition.left_clip_id == clip.id)
+                        input.duration = input.duration.add(post);
+                }
+            }
+            inputs.push_back(std::move(input));
         }
     }
 
     std::vector<std::string> arguments = {
-        "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1",
-        "-nostats",
+        "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
     };
     for (const InputClip& input : inputs) {
         arguments.push_back("-ss");
-        arguments.push_back(Decimal(input.clip->source_in));
+        arguments.push_back(Decimal(input.source_in));
         arguments.push_back("-t");
-        arguments.push_back(Decimal(input.clip->duration));
+        arguments.push_back(Decimal(input.duration));
         arguments.push_back("-i");
         arguments.push_back(
             ResolveMediaPath(baseDirectory, *input.source).string());
@@ -359,13 +401,17 @@ bool Exporter::BuildPlan(const Document& document,
     size_t videoOrdinal = 0;
     for (const InputClip& input : inputs) {
         if (!input.video) continue;
-        const std::string position = FilterSeconds(input.clip->timeline_in);
-        const std::string clipDuration = FilterSeconds(input.clip->duration);
+        const std::string position = FilterSeconds(input.timeline_in);
+        const std::string clipDuration = FilterSeconds(input.duration);
         graph << '[' << input.input_index << ":v:0]fps=" << rate
               << ",scale=" << settings.width << ':' << settings.height
               << ":force_original_aspect_ratio=decrease:flags=lanczos"
-              << ",setsar=1,setpts=PTS-STARTPTS+" << position
-              << "/TB[v" << videoOrdinal << "];"
+              << ",setsar=1";
+        if (input.fade_in)
+            graph << ",format=yuva444p10le,fade=t=in:st=0:d="
+                  << FilterSeconds(*input.fade_in) << ":alpha=1";
+        graph << ",setpts=PTS-STARTPTS+" << position << "/TB[v" << videoOrdinal
+              << "];"
               << "[base" << videoOrdinal << "][v" << videoOrdinal
               << "]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=pass:repeatlast=0:"
                  "shortest=0:enable=between(t\\,"
@@ -375,17 +421,16 @@ bool Exporter::BuildPlan(const Document& document,
     }
     graph << "[base" << videoOrdinal << ']';
     if (document.color_management.enabled) {
-        output.temporary_lut_path =
-            (std::filesystem::temp_directory_path() /
-             ("cutmachine-" + GenerateUlid() + ".cube"))
-                .string();
+        output.temporary_lut_path = (std::filesystem::temp_directory_path() /
+                                     ("cutmachine-" + GenerateUlid() + ".cube"))
+                                        .string();
         output.color_lut = BuildColorLut(document.color_management);
         graph << "scale=";
         bool hasInputOption = false;
         if (document.color_management.input_range != "auto") {
             graph << "in_range="
                   << (document.color_management.input_range == "full" ? "full"
-                                                                       : "tv");
+                                                                      : "tv");
             hasInputOption = true;
         }
         if (document.color_management.input_ycbcr_matrix != "auto") {
@@ -401,9 +446,8 @@ bool Exporter::BuildPlan(const Document& document,
         graph << "out_range=full,format=gbrp16le,lut3d=file='"
               << output.temporary_lut_path
               << "':interp=tetrahedral,scale=out_range=tv:out_color_matrix="
-              << (document.color_management.output_gamut == "rec2020"
-                      ? "bt2020"
-                      : "bt709")
+              << (document.color_management.output_gamut == "rec2020" ? "bt2020"
+                                                                      : "bt709")
               << ',';
     }
     graph << "format=" << (settings.main10 ? "yuv420p10le" : "yuv420p")
@@ -428,15 +472,16 @@ bool Exporter::BuildPlan(const Document& document,
     for (const InputClip& input : inputs) {
         if (!input.audio) continue;
         const __int128 sampleNumerator =
-            static_cast<__int128>(input.clip->timeline_in.value) *
+            static_cast<__int128>(input.timeline_in.value) *
             settings.audio_sample_rate;
-        const __int128 sampleDenominator = input.clip->timeline_in.rate;
+        const __int128 sampleDenominator = input.timeline_in.rate;
         const int64_t delaySamples = static_cast<int64_t>(
             (sampleNumerator + sampleDenominator / 2) / sampleDenominator);
-        graph << '[' << input.input_index << ":a:0]atrim=duration="
-              << Decimal(input.clip->duration)
+        graph << '[' << input.input_index
+              << ":a:0]atrim=duration=" << Decimal(input.duration)
               << ",asetpts=PTS-STARTPTS,aresample="
-              << settings.audio_sample_rate << ",aformat=sample_fmts=fltp:"
+              << settings.audio_sample_rate
+              << ",aformat=sample_fmts=fltp:"
                  "channel_layouts=stereo,adelay="
               << delaySamples << "S:all=1[a" << audioOrdinal << "];";
         ++audioOrdinal;
@@ -453,41 +498,50 @@ bool Exporter::BuildPlan(const Document& document,
               << "duration=" << Decimal(duration) << "[audio]";
     }
 
-    arguments.insert(arguments.end(), {"-filter_complex", graph.str(),
-                                       "-map", "[video]", "-map", "[audio]"});
+    arguments.insert(arguments.end(), {"-filter_complex", graph.str(), "-map",
+                                       "[video]", "-map", "[audio]"});
     if (settings.encoder == ExportEncoder::HevcVideoToolbox) {
-        arguments.insert(arguments.end(),
-                         {"-c:v", "hevc_videotoolbox", "-profile:v",
-                          settings.main10 ? "main10" : "main", "-b:v",
-                          std::to_string(settings.video_bitrate), "-allow_sw",
-                          "1"});
+        arguments.insert(
+            arguments.end(),
+            {"-c:v", "hevc_videotoolbox", "-profile:v",
+             settings.main10 ? "main10" : "main", "-b:v",
+             std::to_string(settings.video_bitrate), "-allow_sw", "1"});
     } else {
-        arguments.insert(arguments.end(),
-                         {"-c:v", "libx265", "-profile:v",
-                          settings.main10 ? "main10" : "main", "-preset",
-                          "medium", "-crf", "18"});
+        arguments.insert(arguments.end(), {"-c:v", "libx265", "-profile:v",
+                                           settings.main10 ? "main10" : "main",
+                                           "-preset", "medium", "-crf", "18"});
     }
-    arguments.insert(arguments.end(),
-                     {"-pix_fmt", settings.main10 ? "yuv420p10le" : "yuv420p",
-                      "-tag:v", "hvc1", "-color_primaries",
-                      document.color_management.enabled &&
-                              document.color_management.output_gamut == "rec2020"
-                          ? "bt2020"
-                          : "bt709",
-                      "-color_trc",
-                      document.color_management.enabled &&
-                              document.color_management.output_transfer == "hlg"
-                          ? "arib-std-b67"
-                          : "bt709",
-                      "-colorspace",
-                      document.color_management.enabled &&
-                              document.color_management.output_gamut == "rec2020"
-                          ? "bt2020nc"
-                          : "bt709",
-                      "-color_range", "tv", "-c:a", "aac", "-b:a",
-                      std::to_string(settings.audio_bitrate), "-ar",
-                      std::to_string(settings.audio_sample_rate), "-movflags",
-                      "+faststart"});
+    arguments.insert(
+        arguments.end(),
+        {"-pix_fmt",
+         settings.main10 ? "yuv420p10le" : "yuv420p",
+         "-tag:v",
+         "hvc1",
+         "-color_primaries",
+         document.color_management.enabled &&
+                 document.color_management.output_gamut == "rec2020"
+             ? "bt2020"
+             : "bt709",
+         "-color_trc",
+         document.color_management.enabled &&
+                 document.color_management.output_transfer == "hlg"
+             ? "arib-std-b67"
+             : "bt709",
+         "-colorspace",
+         document.color_management.enabled &&
+                 document.color_management.output_gamut == "rec2020"
+             ? "bt2020nc"
+             : "bt709",
+         "-color_range",
+         "tv",
+         "-c:a",
+         "aac",
+         "-b:a",
+         std::to_string(settings.audio_bitrate),
+         "-ar",
+         std::to_string(settings.audio_sample_rate),
+         "-movflags",
+         "+faststart"});
 
     output.settings = settings;
     output.settings.output_path = destination.string();
@@ -556,8 +610,9 @@ bool Exporter::Run(const ExportPlan& plan,
     posix_spawn_file_actions_addclose(&actions, progressPipe[1]);
     posix_spawn_file_actions_addclose(&actions, errorPipe[1]);
     pid_t process = 0;
-    const int spawnResult = posix_spawnp(
-        &process, storage.front().c_str(), &actions, nullptr, argv.data(), environ);
+    const int spawnResult =
+        posix_spawnp(&process, storage.front().c_str(), &actions, nullptr,
+                     argv.data(), environ);
     posix_spawn_file_actions_destroy(&actions);
     close(progressPipe[1]);
     close(errorPipe[1]);

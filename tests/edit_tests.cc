@@ -103,6 +103,69 @@ void ExpectRejected(Document document, Operation operation, EditError expected,
 }  // namespace
 
 int main() {
+    Test("transition operations are exact, serializable and undoable", [] {
+        Document document = EditDocument();
+        document.sequence.tracks[0].clips[1].timeline_in = {10, 25};
+        DocumentTransition transition{
+            "01K20000000000000000000030",
+            document.sequence.tracks[0].id,
+            document.sequence.tracks[0].clips[0].id,
+            document.sequence.tracks[0].clips[1].id,
+            "cross_dissolve",
+            {4, 25},
+            TransitionAlignment::Center,
+        };
+        const std::string before = document.SaveToString();
+        EditLog log;
+        Check(Apply(log, document, AddTransitionOperation{transition},
+                    "add transition"),
+              "transition add applies");
+        Check(document.FindTransition(transition.id) != nullptr,
+              "added transition is addressable");
+        const std::string added = document.SaveToString();
+        const std::string addJson =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(addJson, parsed, error, message) &&
+                  std::holds_alternative<AddTransitionOperation>(parsed) &&
+                  SerializeOperation(parsed) == addJson,
+              "AddTransition JSON round-trips exactly");
+
+        Check(Apply(log, document,
+                    UpdateTransitionOperation{transition.id,
+                                              "cross_dissolve",
+                                              {2, 25},
+                                              TransitionAlignment::EndAtCut},
+                    "update transition"),
+              "transition update applies");
+        Check(document.FindTransition(transition.id)->duration ==
+                      RationalTime{2, 25} &&
+                  document.FindTransition(transition.id)->alignment ==
+                      TransitionAlignment::EndAtCut,
+              "transition update changes only transition state");
+        Check(Apply(log, document, RemoveTransitionOperation{transition.id},
+                    "remove transition"),
+              "transition remove applies");
+        Check(!document.FindTransition(transition.id),
+              "transition remove leaves both clips intact");
+        Check(log.Undo(document, error, message) &&
+                  document.FindTransition(transition.id),
+              "remove undo restores transition");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == added,
+              "update undo restores exact added state");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "add undo restores byte-identical document");
+
+        document.sequence.tracks[0].locked = true;
+        ExpectRejected(document, AddTransitionOperation{transition},
+                       EditError::LockedTrack,
+                       "transition cannot be added to a locked track");
+    });
+
     Test("insert/remove ripple positions", [] {
         Document document = EditDocument();
         EditLog log;
@@ -116,9 +179,12 @@ int main() {
         Check(Apply(log, document, insert, "insert"), "insert applies");
         const auto& stored =
             std::get<InsertClipOperation>(log.AppliedEntries().back().op);
-        Check(document.sequence.tracks[0].clips.size() == 4, "insert adds one clip");
+        Check(document.sequence.tracks[0].clips.size() == 4,
+              "insert adds one clip");
         Check(document.FindClip(stored.clip_id) != nullptr,
               "inserted clip is addressed by generated ULID");
+        Check(!document.FindClip(stored.clip_id)->include_audio,
+              "new video inserts never embed source audio");
         Check(document.FindClip("01K20000000000000000000005")->timeline_in ==
                   RationalTime{25, 25},
               "second original clip ripples right by insertion duration");
@@ -151,9 +217,9 @@ int main() {
         Check(Apply(log, document, ClearClipOperation{clearedId, {}}, "clear"),
               "clear applies");
         Check(!document.FindClip(clearedId), "clear removes the selected clip");
-        Check(document.FindClip(followingId)->timeline_in ==
-                  RationalTime{40, 25},
-              "clear leaves the following clip in place and creates a gap");
+        Check(
+            document.FindClip(followingId)->timeline_in == RationalTime{40, 25},
+            "clear leaves the following clip in place and creates a gap");
         const std::string cleared = document.SaveToString();
         const std::string json =
             SerializeOperation(log.AppliedEntries().back().op);
@@ -177,6 +243,140 @@ int main() {
         Check(rippleDocument.FindClip(followingId)->timeline_in ==
                   RationalTime{30, 25},
               "ripple delete closes the removed clip interval");
+    });
+
+    Test("paste duplicates linked clips as one exact operation", [] {
+        Document document = EditDocument();
+        DocumentClip& video = document.sequence.tracks[0].clips[0];
+        video.include_audio = false;
+        video.link_group_id = "01K20000000000000000000020";
+        video.sync_anchor_clip_id = video.id;
+        video.sync_reference_delta = {0, 1};
+        const DocumentClip copiedVideo = video;
+        const Ulid videoTrackId = document.sequence.tracks[0].id;
+        DocumentTrack audio;
+        audio.id = "01K20000000000000000000021";
+        audio.kind = "audio";
+        audio.index = 1;
+        DocumentClip audioClip{"01K20000000000000000000022", video.source_id,
+                               video.source_in, video.duration,
+                               video.timeline_in};
+        audioClip.include_audio = false;
+        audioClip.link_group_id = video.link_group_id;
+        audioClip.sync_anchor_clip_id = video.id;
+        audioClip.sync_reference_delta = {0, 1};
+        audio.clips.push_back(audioClip);
+        document.sequence.tracks.push_back(audio);
+        const std::string before = document.SaveToString();
+
+        PasteClipsOperation paste{{
+            {copiedVideo.id,
+             videoTrackId,
+             copiedVideo.source_id,
+             copiedVideo.source_in,
+             copiedVideo.duration,
+             {60, 25},
+             {},
+             copiedVideo.link_group_id,
+             {},
+             copiedVideo.sync_anchor_clip_id,
+             {},
+             copiedVideo.sync_reference_delta},
+            {audioClip.id,
+             audio.id,
+             audioClip.source_id,
+             audioClip.source_in,
+             audioClip.duration,
+             {60, 25},
+             {},
+             audioClip.link_group_id,
+             {},
+             audioClip.sync_anchor_clip_id,
+             {},
+             audioClip.sync_reference_delta},
+        }};
+        EditLog log;
+        Check(Apply(log, document, paste, "paste linked clips"),
+              "paste applies");
+        const auto& stored =
+            std::get<PasteClipsOperation>(log.AppliedEntries().back().op);
+        Check(stored.clips.size() == 2 && !stored.clips[0].clip_id.empty() &&
+                  !stored.clips[1].clip_id.empty() &&
+                  stored.clips[0].link_group_id ==
+                      stored.clips[1].link_group_id &&
+                  stored.clips[0].link_group_id != copiedVideo.link_group_id,
+              "paste generates stable clip IDs and a fresh link group");
+        const DocumentClip* pastedVideo =
+            document.FindClip(stored.clips[0].clip_id);
+        const DocumentClip* pastedAudio =
+            document.FindClip(stored.clips[1].clip_id);
+        Check(pastedVideo && pastedAudio && !pastedVideo->include_audio &&
+                  !pastedAudio->include_audio &&
+                  pastedVideo->sync_anchor_clip_id == pastedVideo->id &&
+                  pastedAudio->sync_anchor_clip_id == pastedVideo->id,
+              "pasted A/V remains separate and linked to the new video clip");
+        const std::string after = document.SaveToString();
+        const std::string serialized =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(serialized, parsed, error, message) &&
+                  SerializeOperation(parsed) == serialized,
+              "PasteClips JSON round-trips exactly");
+        std::string legacyPaste = serialized;
+        const std::string appendedField = ",\"overwrite\":false";
+        const size_t appendedAt = legacyPaste.rfind(appendedField);
+        Check(appendedAt != std::string::npos,
+              "canonical paste contains its overwrite field");
+        if (appendedAt != std::string::npos)
+            legacyPaste.erase(appendedAt, appendedField.size());
+        Operation parsedLegacy = RemoveClipOperation{};
+        Check(DeserializeOperation(legacyPaste, parsedLegacy, error, message) &&
+                  std::holds_alternative<PasteClipsOperation>(parsedLegacy) &&
+                  !std::get<PasteClipsOperation>(parsedLegacy).overwrite,
+              "legacy PasteClips logs without overwrite remain readable");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "paste undo restores byte-identical document JSON");
+        Check(log.Redo(document, error, message) &&
+                  document.SaveToString() == after,
+              "paste redo retains generated clip and link IDs");
+
+        PasteClipsOperation overlap = paste;
+        overlap.exact_track_result.clear();
+        for (PastedClip& item : overlap.clips) {
+            item.timeline_in = {0, 25};
+            item.clip_id.clear();
+            item.link_group_id.clear();
+            item.sync_anchor_clip_id.clear();
+        }
+        ExpectRejected(document, overlap, EditError::Overlap,
+                       "paste cannot overwrite existing clips");
+
+        PasteClipsOperation overwrite = paste;
+        overwrite.overwrite = true;
+        for (PastedClip& item : overwrite.clips) item.timeline_in = {5, 25};
+        const std::string beforeOverwrite = document.SaveToString();
+        EditLog overwriteLog;
+        Check(Apply(overwriteLog, document, overwrite, "overwrite paste"),
+              "overwrite paste applies at the playhead");
+        Check(document.sequence.tracks[0].clips.front().duration ==
+                      RationalTime{5, 25} &&
+                  document.sequence.tracks[1].clips.front().duration ==
+                      RationalTime{5, 25},
+              "overwrite paste trims covered clips on video and audio tracks");
+        EditError overwriteError = EditError::None;
+        std::string overwriteMessage;
+        Check(overwriteLog.Undo(document, overwriteError, overwriteMessage) &&
+                  document.SaveToString() == beforeOverwrite,
+              "overwrite paste undo restores every covered track exactly");
+
+        PasteClipsOperation locked = paste;
+        for (PastedClip& item : locked.clips) item.timeline_in = {80, 25};
+        document.sequence.tracks[1].locked = true;
+        ExpectRejected(document, locked, EditError::LockedTrack,
+                       "paste cannot modify a locked destination track");
     });
 
     Test("mixed-rate ripple undo restores exact representation", [] {
@@ -232,16 +432,18 @@ int main() {
     Test("head and tail trim stay local", [] {
         {
             Document isolated = EditDocument();
-            isolated.sequence.tracks[0].clips.erase(isolated.sequence.tracks[0].clips.begin() + 1,
-                                           isolated.sequence.tracks[0].clips.end());
+            isolated.sequence.tracks[0].clips.erase(
+                isolated.sequence.tracks[0].clips.begin() + 1,
+                isolated.sequence.tracks[0].clips.end());
             EditLog log;
-            Check(Apply(log, isolated,
-                        TrimClipOperation{isolated.sequence.tracks[0].clips[0].id,
-                                          TrimEdge::Head,
-                                          {2, 25},
-                                          std::nullopt},
-                        "isolated head trim"),
-                  "isolated head trim applies");
+            Check(
+                Apply(log, isolated,
+                      TrimClipOperation{isolated.sequence.tracks[0].clips[0].id,
+                                        TrimEdge::Head,
+                                        {2, 25},
+                                        std::nullopt},
+                      "isolated head trim"),
+                "isolated head trim applies");
             const DocumentClip& clip = isolated.sequence.tracks[0].clips[0];
             Check(clip.source_in == RationalTime{102, 25} &&
                       clip.duration == RationalTime{8, 25} &&
@@ -253,7 +455,8 @@ int main() {
                             clip.id, TrimEdge::Tail, {-2, 25}, std::nullopt},
                         "isolated tail trim"),
                   "isolated tail trim applies");
-            Check(isolated.sequence.tracks[0].clips[0].duration == RationalTime{6, 25},
+            Check(isolated.sequence.tracks[0].clips[0].duration ==
+                      RationalTime{6, 25},
                   "tail trim changes duration");
         }
         {
@@ -269,8 +472,10 @@ int main() {
                             middle, TrimEdge::Head, {2, 25}, std::nullopt},
                         "framed head trim"),
                   "framed head trim applies");
-            Check(framed.sequence.tracks[0].clips[0].timeline_in == beforePrevious &&
-                      framed.sequence.tracks[0].clips[2].timeline_in == beforeNext,
+            Check(framed.sequence.tracks[0].clips[0].timeline_in ==
+                          beforePrevious &&
+                      framed.sequence.tracks[0].clips[2].timeline_in ==
+                          beforeNext,
                   "head trim does not move surrounding clips");
             Check(Apply(log, framed,
                         TrimClipOperation{
@@ -345,23 +550,24 @@ int main() {
         sourceBound.sequence.tracks[0].clips[0].timeline_in = {200, 25};
         sourceBound.sequence.tracks[0].clips[1].timeline_in = {220, 25};
         sourceBound.sequence.tracks[0].clips[2].timeline_in = {240, 25};
-        ExpectRejected(sourceBound,
-                       TrimClipOperation{sourceBound.sequence.tracks[0].clips[0].id,
-                                         TrimEdge::Head,
-                                         {-101, 25},
-                                         std::nullopt},
-                       EditError::SourceOutOfBounds,
-                       "head trim before source start");
+        ExpectRejected(
+            sourceBound,
+            TrimClipOperation{sourceBound.sequence.tracks[0].clips[0].id,
+                              TrimEdge::Head,
+                              {-101, 25},
+                              std::nullopt},
+            EditError::SourceOutOfBounds, "head trim before source start");
 
         Document tailOverlap = base;
         tailOverlap.sequence.tracks[0].clips[1].timeline_in = {11, 25};
         tailOverlap.sequence.tracks[0].clips[2].timeline_in = {40, 25};
-        ExpectRejected(tailOverlap,
-                       TrimClipOperation{tailOverlap.sequence.tracks[0].clips[0].id,
-                                         TrimEdge::Tail,
-                                         {2, 25},
-                                         std::nullopt},
-                       EditError::Overlap, "tail trim overlap");
+        ExpectRejected(
+            tailOverlap,
+            TrimClipOperation{tailOverlap.sequence.tracks[0].clips[0].id,
+                              TrimEdge::Tail,
+                              {2, 25},
+                              std::nullopt},
+            EditError::Overlap, "tail trim overlap");
     });
 
     Test("operation and edit-log serialization round trips", [] {
@@ -429,11 +635,12 @@ int main() {
         EditError error = EditError::None;
         std::string message;
 
-        Check(Apply(log, document,
-                    UpdateSequenceOperation{sequenceId, "Vertical master",
-                                            1080, 1920, {24000, 1001}},
-                    "update sequence"),
-              "sequence update succeeds");
+        Check(
+            Apply(log, document,
+                  UpdateSequenceOperation{
+                      sequenceId, "Vertical master", 1080, 1920, {24000, 1001}},
+                  "update sequence"),
+            "sequence update succeeds");
         Check(document.sequence.id == sequenceId &&
                   document.sequence.name == "Vertical master" &&
                   document.sequence.width == 1080 &&
@@ -460,8 +667,8 @@ int main() {
 
         ExpectRejected(
             document,
-            UpdateSequenceOperation{"01K83000000000000000000009", "Other",
-                                    1920, 1080, {25, 1}},
+            UpdateSequenceOperation{
+                "01K83000000000000000000009", "Other", 1920, 1080, {25, 1}},
             EditError::UnknownSequence, "unknown sequence");
         ExpectRejected(
             document,
@@ -631,87 +838,89 @@ int main() {
         Check(!cyclic.Validate(message), "bin hierarchy cycles are rejected");
     });
 
-    Test("markers are addressable, serializable and byte-exactly reversible", [] {
-        Document document = EditDocument();
-        const Ulid first = "01K82000000000000000000001";
-        const Ulid second = "01K82000000000000000000002";
-        document.sequence.markers = {
-            {first, "Opening", {0, 25}, "#e84a5f", "chapter"},
-            {second, "Interview", {125, 25}, "blue", "comment"},
-        };
-        std::string validation;
-        Check(document.Validate(validation),
-              "marker fixture validates: " + validation);
-        const std::string original = document.SaveToString();
-        EditLog log;
-        EditError error = EditError::None;
-        std::string message;
+    Test(
+        "markers are addressable, serializable and byte-exactly reversible",
+        [] {
+            Document document = EditDocument();
+            const Ulid first = "01K82000000000000000000001";
+            const Ulid second = "01K82000000000000000000002";
+            document.sequence.markers = {
+                {first, "Opening", {0, 25}, "#e84a5f", "chapter"},
+                {second, "Interview", {125, 25}, "blue", "comment"},
+            };
+            std::string validation;
+            Check(document.Validate(validation),
+                  "marker fixture validates: " + validation);
+            const std::string original = document.SaveToString();
+            EditLog log;
+            EditError error = EditError::None;
+            std::string message;
 
-        AddMarkerOperation add{{{}, "B-roll", {30000, 1001}, "#33aa77",
-                                "select"},
-                               -1};
-        Check(Apply(log, document, add, "add marker"),
-              "marker addition succeeds");
-        const auto& storedAdd =
-            std::get<AddMarkerOperation>(log.AppliedEntries().back().op);
-        Check(IsValidUlid(storedAdd.marker.id) &&
-                  document.FindMarker(storedAdd.marker.id),
-              "AddMarker receives and retains a stable ULID");
-        Check(storedAdd.insertion_index == 2,
-              "AddMarker records its exact canonical position");
-        const std::string added = document.SaveToString();
-        const std::string addJson = SerializeOperation(storedAdd);
-        Operation parsed = RemoveClipOperation{};
-        Check(DeserializeOperation(addJson, parsed, error, message) &&
-                  SerializeOperation(parsed) == addJson,
-              "AddMarker JSON round-trips canonically");
-        Check(log.Undo(document, error, message) &&
-                  document.SaveToString() == original,
-              "AddMarker undo restores original bytes");
-        Check(log.Redo(document, error, message) &&
-                  document.SaveToString() == added,
-              "AddMarker redo restores marker ID and bytes");
-        Check(log.Undo(document, error, message) &&
-                  document.SaveToString() == original,
-              "second AddMarker undo is byte-exact");
+            AddMarkerOperation add{
+                {{}, "B-roll", {30000, 1001}, "#33aa77", "select"}, -1};
+            Check(Apply(log, document, add, "add marker"),
+                  "marker addition succeeds");
+            const auto& storedAdd =
+                std::get<AddMarkerOperation>(log.AppliedEntries().back().op);
+            Check(IsValidUlid(storedAdd.marker.id) &&
+                      document.FindMarker(storedAdd.marker.id),
+                  "AddMarker receives and retains a stable ULID");
+            Check(storedAdd.insertion_index == 2,
+                  "AddMarker records its exact canonical position");
+            const std::string added = document.SaveToString();
+            const std::string addJson = SerializeOperation(storedAdd);
+            Operation parsed = RemoveClipOperation{};
+            Check(DeserializeOperation(addJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == addJson,
+                  "AddMarker JSON round-trips canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "AddMarker undo restores original bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == added,
+                  "AddMarker redo restores marker ID and bytes");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "second AddMarker undo is byte-exact");
 
-        UpdateMarkerOperation update{second, "Interview hero", {1001, 24000},
-                                     "amber", "approved"};
-        Check(Apply(log, document, update, "update marker"),
-              "marker update succeeds");
-        const std::string updateJson =
-            SerializeOperation(log.AppliedEntries().back().op);
-        Check(DeserializeOperation(updateJson, parsed, error, message) &&
-                  SerializeOperation(parsed) == updateJson,
-              "UpdateMarker JSON round-trips canonically");
-        Check(document.FindMarker(second)->time == RationalTime{1001, 24000},
-              "UpdateMarker preserves its exact rational time");
-        Check(log.Undo(document, error, message) &&
-                  document.SaveToString() == original,
-              "UpdateMarker inverse restores every field and original bytes");
+            UpdateMarkerOperation update{
+                second, "Interview hero", {1001, 24000}, "amber", "approved"};
+            Check(Apply(log, document, update, "update marker"),
+                  "marker update succeeds");
+            const std::string updateJson =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Check(DeserializeOperation(updateJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == updateJson,
+                  "UpdateMarker JSON round-trips canonically");
+            Check(
+                document.FindMarker(second)->time == RationalTime{1001, 24000},
+                "UpdateMarker preserves its exact rational time");
+            Check(
+                log.Undo(document, error, message) &&
+                    document.SaveToString() == original,
+                "UpdateMarker inverse restores every field and original bytes");
 
-        Check(Apply(log, document, RemoveMarkerOperation{first},
-                    "remove marker"),
-              "marker removal succeeds");
-        const std::string removeJson =
-            SerializeOperation(log.AppliedEntries().back().op);
-        Check(DeserializeOperation(removeJson, parsed, error, message) &&
-                  SerializeOperation(parsed) == removeJson,
-              "RemoveMarker JSON round-trips canonically");
-        Check(log.Undo(document, error, message) &&
-                  document.SaveToString() == original &&
-                  document.sequence.markers.front().id == first,
-              "RemoveMarker undo restores the original position and bytes");
+            Check(Apply(log, document, RemoveMarkerOperation{first},
+                        "remove marker"),
+                  "marker removal succeeds");
+            const std::string removeJson =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Check(DeserializeOperation(removeJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == removeJson,
+                  "RemoveMarker JSON round-trips canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original &&
+                      document.sequence.markers.front().id == first,
+                  "RemoveMarker undo restores the original position and bytes");
 
-        ExpectRejected(
-            document,
-            UpdateMarkerOperation{second, "Invalid", {-1, 25}, "blue",
-                                  "comment"},
-            EditError::ValidationFailed, "negative marker time");
-        ExpectRejected(document,
-                       RemoveMarkerOperation{"01K82000000000000000000009"},
-                       EditError::UnknownMarker, "unknown marker");
-    });
+            ExpectRejected(document,
+                           UpdateMarkerOperation{
+                               second, "Invalid", {-1, 25}, "blue", "comment"},
+                           EditError::ValidationFailed, "negative marker time");
+            ExpectRejected(document,
+                           RemoveMarkerOperation{"01K82000000000000000000009"},
+                           EditError::UnknownMarker, "unknown marker");
+        });
 
     Test("empty undo/redo and redo clearing", [] {
         Document document = EditDocument();
@@ -751,8 +960,9 @@ int main() {
         Document document = EditDocument();
         // Keep one base clip so eight end insertions form a simple, valid
         // chain.
-        document.sequence.tracks[0].clips.erase(document.sequence.tracks[0].clips.begin() + 1,
-                                       document.sequence.tracks[0].clips.end());
+        document.sequence.tracks[0].clips.erase(
+            document.sequence.tracks[0].clips.begin() + 1,
+            document.sequence.tracks[0].clips.end());
         std::string validation;
         Check(document.Validate(validation),
               "hash fixture validates: " + validation);
@@ -852,6 +1062,169 @@ int main() {
         std::cout << "HASH original=" << originalHash
                   << " edited=" << editedHash << " undo1=" << firstUndoHash
                   << " undo2=" << secondUndoHash << '\n';
+    });
+
+    Test("track locking is undoable and blocks edits", [] {
+        Document document = EditDocument();
+        EditLog log;
+        const Ulid trackId = document.sequence.tracks[0].id;
+        const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+        Check(Apply(log, document, SetTrackLockOperation{trackId, true},
+                    "lock track"),
+              "track lock applies");
+        Check(document.sequence.tracks[0].locked, "track is marked locked");
+        ExpectRejected(
+            document,
+            TrimClipOperation{clipId, TrimEdge::Tail, {-1, 25}, std::nullopt},
+            EditError::LockedTrack, "trim on locked track");
+        const std::string serialized =
+            SerializeOperation(SetTrackLockOperation{trackId, true});
+        Operation parsed = RemoveTrackOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(serialized, parsed, error, message) &&
+                  SerializeOperation(parsed) == serialized,
+              "SetTrackLock JSON round-trips");
+        Check(log.Undo(document, error, message), "track unlock undo");
+        Check(!document.sequence.tracks[0].locked,
+              "undo restores the unlocked state");
+    });
+
+    Test("sync locking is independent, undoable, and serializable", [] {
+        Document document = EditDocument();
+        EditLog log;
+        const Ulid trackId = document.sequence.tracks[0].id;
+        Check(document.sequence.tracks[0].sync_lock,
+              "new and migrated tracks start sync locked");
+        Check(Apply(log, document, SetTrackSyncLockOperation{trackId, false},
+                    "disable sync lock"),
+              "sync lock operation applies");
+        Check(!document.sequence.tracks[0].sync_lock &&
+                  !document.sequence.tracks[0].locked,
+              "sync lock does not change hard lock");
+        const std::string serialized =
+            SerializeOperation(SetTrackSyncLockOperation{trackId, false});
+        Operation parsed = RemoveTrackOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(serialized, parsed, error, message) &&
+                  SerializeOperation(parsed) == serialized,
+              "SetTrackSyncLock JSON round-trips");
+        Check(log.Undo(document, error, message) &&
+                  document.sequence.tracks[0].sync_lock,
+              "undo restores sync lock");
+    });
+
+    Test("ripple trim shifts downstream and sync-locked tracks atomically", [] {
+        Document document = EditDocument();
+        DocumentTrack audio;
+        audio.id = "01K20000000000000000000020";
+        audio.kind = "audio";
+        audio.index = 1;
+        audio.clips.push_back({"01K20000000000000000000021",
+                               document.sources[0].id,
+                               {400, 25},
+                               {5, 25},
+                               {20, 25},
+                               false});
+        document.sequence.tracks.push_back(audio);
+        const std::string before = document.SaveToString();
+        EditLog log;
+        RippleTrimOperation ripple{document.sequence.tracks[0].clips[0].id,
+                                   TrimEdge::Tail,
+                                   {5, 25},
+                                   {},
+                                   {audio.id},
+                                   {}};
+        Check(Apply(log, document, ripple, "ripple tail trim"),
+              "ripple trim applies");
+        Check(document.sequence.tracks[0].clips[0].duration ==
+                      RationalTime{15, 25} &&
+                  document.sequence.tracks[0].clips[1].timeline_in ==
+                      RationalTime{25, 25} &&
+                  document.sequence.tracks[1].clips[0].timeline_in ==
+                      RationalTime{25, 25},
+              "ripple extends the edge and shifts every affected downstream "
+              "clip");
+        const std::string serialized =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveTrackOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(serialized, parsed, error, message) &&
+                  SerializeOperation(parsed) == serialized,
+              "RippleTrim JSON round-trips exactly");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "one undo restores every ripple-trimmed track");
+
+        document.sequence.tracks[1].locked = true;
+        ExpectRejected(document, ripple, EditError::LockedTrack,
+                       "ripple cannot shift a locked sync track");
+    });
+
+    Test("roll edit moves one contiguous cut without changing total duration",
+         [] {
+             Document document = EditDocument();
+             document.sequence.tracks[0].clips[1].timeline_in = {10, 25};
+             document.sequence.tracks[0].clips[2].timeline_in = {30, 25};
+             const std::string before = document.SaveToString();
+             const RationalTime durationBefore = Timeline(document).Duration();
+             EditLog log;
+             RollEditOperation roll{{{document.sequence.tracks[0].clips[0].id,
+                                      document.sequence.tracks[0].clips[1].id}},
+                                    {2, 25},
+                                    {}};
+             Check(Apply(log, document, roll, "roll edit"),
+                   "roll edit applies");
+             const DocumentClip& left = document.sequence.tracks[0].clips[0];
+             const DocumentClip& right = document.sequence.tracks[0].clips[1];
+             Check(left.duration == RationalTime{12, 25} &&
+                       right.timeline_in == RationalTime{12, 25} &&
+                       right.source_in == RationalTime{202, 25} &&
+                       right.duration == RationalTime{8, 25} &&
+                       Timeline(document).Duration() == durationBefore,
+                   "roll preserves the program duration and clip contiguity");
+             const std::string serialized =
+                 SerializeOperation(log.AppliedEntries().back().op);
+             Operation parsed = RemoveTrackOperation{};
+             EditError error = EditError::None;
+             std::string message;
+             Check(DeserializeOperation(serialized, parsed, error, message) &&
+                       SerializeOperation(parsed) == serialized,
+                   "RollEdit JSON round-trips exactly");
+             Check(log.Undo(document, error, message) &&
+                       document.SaveToString() == before,
+                   "one undo restores both sides of the roll edit");
+         });
+
+    Test("slip edit changes only the source window and is reversible", [] {
+        Document document = EditDocument();
+        const std::string before = document.SaveToString();
+        const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+        EditLog log;
+        SlipEditOperation slip{{clipId}, {5, 25}, {}};
+        Check(Apply(log, document, slip, "slip edit"), "slip edit applies");
+        const DocumentClip& clip = document.sequence.tracks[0].clips[0];
+        Check(clip.source_in == RationalTime{105, 25} &&
+                  clip.duration == RationalTime{10, 25} &&
+                  clip.timeline_in == RationalTime{0, 25},
+              "slip advances source without moving or resizing the clip");
+        const std::string serialized =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveTrackOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(serialized, parsed, error, message) &&
+                  SerializeOperation(parsed) == serialized,
+              "SlipEdit JSON round-trips exactly");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "slip undo restores the document byte-exactly");
+
+        document.sequence.tracks[0].locked = true;
+        ExpectRejected(document, slip, EditError::LockedTrack,
+                       "slip rejects a locked track");
     });
 
     if (failures) {

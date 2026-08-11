@@ -73,6 +73,208 @@ uint64_t Hash(const std::string& bytes) {
 }  // namespace
 
 int main() {
+    Test("In/Out clear splits boundaries and leaves a gap", [] {
+        Document document = Fixture();
+        const std::string original = document.SaveToString();
+        auto operation = TimelineRangeDeleteOperation(
+            document, RationalTime{15, 10}, RationalTime{25, 10}, false);
+        Check(operation.has_value(), "clear range produces one exact edit");
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(operation &&
+                  log.Apply(document, Operation{*operation}, error, message),
+              "clear range applies: " + message);
+        const auto& clips = document.sequence.tracks[0].clips;
+        Check(clips.size() == 3 &&
+                  clips[0].timeline_in == RationalTime{10, 10} &&
+                  clips[0].duration == RationalTime{5, 10} &&
+                  clips[1].timeline_in == RationalTime{25, 10} &&
+                  clips[1].source_in == RationalTime{25, 10} &&
+                  clips[1].duration == RationalTime{5, 10} &&
+                  clips[2].timeline_in == RationalTime{40, 10},
+              "clear retains exact left/right survivors around the gap");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == original,
+              "clear range undoes byte-exactly");
+    });
+
+    Test("In/Out ripple delete closes the range on unlocked tracks", [] {
+        Document document = Fixture();
+        DocumentTrack locked = document.sequence.tracks[0];
+        locked.id = "01KT0000000000000000000008";
+        locked.index = 1;
+        locked.locked = true;
+        for (DocumentClip& clip : locked.clips) clip.id = GenerateUlid();
+        document.sequence.tracks.push_back(locked);
+        auto operation = TimelineRangeDeleteOperation(
+            document, RationalTime{15, 10}, RationalTime{25, 10}, true);
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(operation &&
+                  log.Apply(document, Operation{*operation}, error, message),
+              "ripple range applies: " + message);
+        const auto& clips = document.sequence.tracks[0].clips;
+        Check(clips.size() == 3 &&
+                  clips[0].timeline_in == RationalTime{10, 10} &&
+                  clips[0].duration == RationalTime{5, 10} &&
+                  clips[1].timeline_in == RationalTime{15, 10} &&
+                  clips[1].duration == RationalTime{5, 10} &&
+                  clips[2].timeline_in == RationalTime{30, 10},
+              "ripple removes ten ticks and closes both boundaries");
+        Check(document.sequence.tracks[1].clips[0].timeline_in ==
+                      RationalTime{10, 10} &&
+                  document.sequence.tracks[1].clips[0].duration ==
+                      RationalTime{20, 10} &&
+                  document.sequence.tracks[1].clips[1].timeline_in ==
+                      RationalTime{40, 10},
+              "locked track remains byte-for-byte timed as before");
+    });
+
+    Test("range edits obey targeting and independent sync lock", [] {
+        Document document = Fixture();
+        DocumentTrack follower = document.sequence.tracks[0];
+        follower.id = "01KT0000000000000000000008";
+        follower.kind = "audio";
+        follower.index = 1;
+        follower.sync_lock = false;
+        for (DocumentClip& clip : follower.clips) clip.id = GenerateUlid();
+        document.sequence.tracks.push_back(follower);
+        const Ulid target = document.sequence.tracks[0].id;
+
+        auto clear =
+            TimelineRangeDeleteOperation(document, RationalTime{15, 10},
+                                         RationalTime{25, 10}, false, {target});
+        Check(clear && clear->exact_track_result.size() == 1 &&
+                  clear->exact_track_result.front().track_id == target,
+              "clear edits only the explicitly targeted track");
+
+        auto unsyncedRipple =
+            TimelineRangeDeleteOperation(document, RationalTime{15, 10},
+                                         RationalTime{25, 10}, true, {target});
+        Check(unsyncedRipple && unsyncedRipple->exact_track_result.size() == 1,
+              "ripple leaves an untargeted sync-unlocked track untouched");
+
+        document.sequence.tracks[1].sync_lock = true;
+        auto syncedRipple =
+            TimelineRangeDeleteOperation(document, RationalTime{15, 10},
+                                         RationalTime{25, 10}, true, {target});
+        Check(syncedRipple && syncedRipple->exact_track_result.size() == 2,
+              "ripple carries an untargeted sync-locked track");
+        Check(!TimelineRangeDeleteOperation(document, RationalTime{15, 10},
+                                            RationalTime{25, 10}, true, {}),
+              "ripple without an editable target is a no-op");
+    });
+
+    Test("source insert opens sync-locked tracks atomically", [] {
+        Document document = Fixture();
+        DocumentTrack follower = document.sequence.tracks[0];
+        follower.id = "01KT0000000000000000000008";
+        follower.kind = "audio";
+        follower.index = 1;
+        for (DocumentClip& clip : follower.clips) clip.id = GenerateUlid();
+        document.sequence.tracks.push_back(follower);
+        const std::string original = document.SaveToString();
+        auto operation = TimelineSourceEditOperation(
+            document, document.sources[0].id, RationalTime{0, 10},
+            RationalTime{10, 10}, RationalTime{20, 10},
+            document.sequence.tracks[0].id, true);
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(operation && operation->exact_track_result.size() == 2 &&
+                  log.Apply(document, Operation{*operation}, error, message),
+              "source insert applies to target and sync follower: " + message);
+        const auto& target = document.sequence.tracks[0].clips;
+        Check(target.size() == 4 &&
+                  target[0].duration == RationalTime{10, 10} &&
+                  target[1].source_in == RationalTime{0, 10} &&
+                  target[1].timeline_in == RationalTime{20, 10} &&
+                  target[2].timeline_in == RationalTime{30, 10} &&
+                  target[3].timeline_in == RationalTime{50, 10},
+              "insert splits the edit-point clip and opens exact duration");
+        Check(document.sequence.tracks[1].clips.back().timeline_in ==
+                  RationalTime{50, 10},
+              "sync follower opens the same duration");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == original,
+              "source insert undoes byte-exactly");
+    });
+
+    Test("source overwrite replaces only the destination interval", [] {
+        Document document = Fixture();
+        auto operation = TimelineSourceEditOperation(
+            document, document.sources[0].id, RationalTime{0, 10},
+            RationalTime{10, 10}, RationalTime{20, 10},
+            document.sequence.tracks[0].id, false);
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(operation &&
+                  log.Apply(document, Operation{*operation}, error, message),
+              "source overwrite applies: " + message);
+        const auto& clips = document.sequence.tracks[0].clips;
+        Check(clips.size() == 3 && clips[0].duration == RationalTime{10, 10} &&
+                  clips[1].source_in == RationalTime{0, 10} &&
+                  clips[1].timeline_in == RationalTime{20, 10} &&
+                  clips[2].timeline_in == RationalTime{40, 10},
+              "overwrite preserves timeline duration and downstream clips");
+    });
+
+    Test("source edit patches linked audio to its explicit target", [] {
+        Document document = Fixture();
+        const Ulid audioTrackId = "01KT0000000000000000000008";
+        document.sequence.tracks.push_back(
+            {audioTrackId, "audio", 1, {}, false, false});
+        const std::string original = document.SaveToString();
+        auto operation = TimelineSourceEditOperation(
+            document, document.sources[0].id, RationalTime{0, 10},
+            RationalTime{10, 10}, RationalTime{20, 10},
+            document.sequence.tracks[0].id, false, {audioTrackId});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(operation && operation->exact_track_result.size() == 2 &&
+                  log.Apply(document, Operation{*operation}, error, message),
+              "video/audio source overwrite applies atomically: " + message);
+        const DocumentClip* video = nullptr;
+        for (const DocumentClip& clip : document.sequence.tracks[0].clips)
+            if (clip.timeline_in == RationalTime{20, 10}) video = &clip;
+        const auto& audio = document.sequence.tracks[1].clips;
+        Check(video && !video->include_audio && audio.size() == 1 &&
+                  !video->link_group_id.empty() &&
+                  audio[0].link_group_id == video->link_group_id &&
+                  video->sync_anchor_clip_id == video->id &&
+                  audio[0].sync_anchor_clip_id == video->id &&
+                  audio[0].source_in == video->source_in &&
+                  audio[0].duration == video->duration &&
+                  audio[0].timeline_in == video->timeline_in,
+              "patched audio is separate, sample-aligned, linked and synced");
+        Check(video &&
+                  ExpandLinkedClipSelection(document, {video->id}).size() == 2,
+              "linked selection expands across the patched pair");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == original,
+              "patched source edit undoes byte-exactly");
+    });
+
+    Test("display order follows professional video/audio stacking", [] {
+        Document document = Fixture();
+        document.sequence.tracks.push_back(
+            {"01KT0000000000000000000005", "video", 2, {}});
+        document.sequence.tracks.push_back(
+            {"01KT0000000000000000000006", "audio", 3, {}});
+        document.sequence.tracks.push_back(
+            {"01KT0000000000000000000007", "audio", 1, {}});
+        const auto tracks = TimelineTracksInDisplayOrder(document);
+        Check(tracks.size() == 4 && tracks[0]->kind == "video" &&
+                  tracks[0]->index == 2 && tracks[1]->kind == "video" &&
+                  tracks[1]->index == 0 && tracks[2]->kind == "audio" &&
+                  tracks[2]->index == 1 && tracks[3]->index == 3,
+              "higher video layers appear above V1 and audio starts at A1");
+    });
+
     Test("time and pixels invert at frame boundaries", [] {
         const struct Case {
             int32_t rate;
@@ -119,7 +321,8 @@ int main() {
         const double trackY = kTimelineRulerHeight + 20.0;
         const auto inside =
             HitTestTimeline(document, viewport, 200.0, trackY, 700.0);
-        Check(inside && inside->clip_id == document.sequence.tracks[0].clips[0].id &&
+        Check(inside &&
+                  inside->clip_id == document.sequence.tracks[0].clips[0].id &&
                   inside->edge == TimelineHitEdge::None,
               "clip body returns its ULID");
         Check(!HitTestTimeline(document, viewport, 375.0, trackY, 700.0),
@@ -227,19 +430,19 @@ int main() {
         EditError error = EditError::None;
         std::string message;
         const Ulid videoId = document.sequence.tracks[0].clips[1].id;
-        Operation detach = DetachAudioOperation{
-            videoId, document.sequence.tracks[1].id,
-            "01KT0000000000000000000006", {}};
+        Operation detach = DetachAudioOperation{videoId,
+                                                document.sequence.tracks[1].id,
+                                                "01KT0000000000000000000006",
+                                                {}};
         Check(log.Apply(document, std::move(detach), error, message),
               "linked gap fixture detaches the following audio");
         const Ulid audioId = document.sequence.tracks[1].clips.front().id;
         const std::string before = document.SaveToString();
-        Operation close = DeleteGapOperation{
-            document.sequence.tracks[0].id,
-            {30, 10},
-            {10, 10},
-            {},
-            {document.sequence.tracks[1].id}};
+        Operation close = DeleteGapOperation{document.sequence.tracks[0].id,
+                                             {30, 10},
+                                             {10, 10},
+                                             {},
+                                             {document.sequence.tracks[1].id}};
         Check(log.Apply(document, std::move(close), error, message),
               "linked gap deletion applies: " + message);
         Check(document.FindClip(videoId)->timeline_in == RationalTime{30, 10} &&
@@ -264,8 +467,8 @@ int main() {
         EditLog log;
         EditError error = EditError::None;
         std::string message;
-        Operation operation =
-            DeleteGapOperation{document.sequence.tracks[0].id, {20, 10}, {10, 10}, {}};
+        Operation operation = DeleteGapOperation{
+            document.sequence.tracks[0].id, {20, 10}, {10, 10}, {}};
         Check(!log.Apply(document, std::move(operation), error, message) &&
                   error == EditError::InvalidOperation,
               "range intersecting a clip is rejected");
@@ -311,8 +514,8 @@ int main() {
         EditError error = EditError::None;
         std::string message;
         const Ulid videoId = document.sequence.tracks[0].clips[0].id;
-        Operation detach =
-            DetachAudioOperation{videoId, document.sequence.tracks[1].id, "", {}};
+        Operation detach = DetachAudioOperation{
+            videoId, document.sequence.tracks[1].id, "", {}};
         Check(log.Apply(document, std::move(detach), error, message),
               "audio detach applies: " + message);
         Check(!document.sequence.tracks[0].clips[0].include_audio &&
@@ -320,14 +523,19 @@ int main() {
               "video contribution is muted and audio rectangle is created");
         const DocumentClip audio = document.sequence.tracks[1].clips[0];
         Check(IsValidUlid(audio.id) && audio.id != videoId &&
-                  audio.source_id == document.sequence.tracks[0].clips[0].source_id &&
-                  audio.source_in == document.sequence.tracks[0].clips[0].source_in &&
-                  audio.duration == document.sequence.tracks[0].clips[0].duration &&
-                  audio.timeline_in == document.sequence.tracks[0].clips[0].timeline_in,
+                  audio.source_id ==
+                      document.sequence.tracks[0].clips[0].source_id &&
+                  audio.source_in ==
+                      document.sequence.tracks[0].clips[0].source_in &&
+                  audio.duration ==
+                      document.sequence.tracks[0].clips[0].duration &&
+                  audio.timeline_in ==
+                      document.sequence.tracks[0].clips[0].timeline_in,
               "detached clip retains exact source and timeline timing");
-        Check(audio.link_group_id == audio.id &&
-                  document.sequence.tracks[0].clips[0].link_group_id == audio.id,
-              "detached image and audio share a stable link group");
+        Check(
+            audio.link_group_id == audio.id &&
+                document.sequence.tracks[0].clips[0].link_group_id == audio.id,
+            "detached image and audio share a stable link group");
         const std::vector<Ulid> linked =
             ExpandLinkedClipSelection(document, {videoId});
         Check(linked.size() == 2 && std::find(linked.begin(), linked.end(),
@@ -367,14 +575,15 @@ int main() {
         Check(log.Undo(document, error, message),
               "head trim sync test undo succeeds");
 
-        Operation move =
-            MoveClipOperation{audio.id, document.sequence.tracks[1].id, {50, 10}, {}};
+        Operation move = MoveClipOperation{
+            audio.id, document.sequence.tracks[1].id, {50, 10}, {}};
         Check(log.Apply(document, std::move(move), error, message),
               "detached audio moves independently: " + message);
-        Check(
-            document.sequence.tracks[1].clips[0].timeline_in == RationalTime{50, 10} &&
-                document.sequence.tracks[0].clips[0].timeline_in == RationalTime{10, 10},
-            "moving audio leaves video timing unchanged");
+        Check(document.sequence.tracks[1].clips[0].timeline_in ==
+                      RationalTime{50, 10} &&
+                  document.sequence.tracks[0].clips[0].timeline_in ==
+                      RationalTime{10, 10},
+              "moving audio leaves video timing unchanged");
         Check(log.Undo(document, error, message), "audio move undo succeeds");
         Check(log.Undo(document, error, message) &&
                   document.SaveToString() == initial,
@@ -407,8 +616,10 @@ int main() {
         EditError error = EditError::None;
         std::string message;
         const Ulid videoId = document.sequence.tracks[0].clips[0].id;
-        Operation detach = DetachAudioOperation{
-            videoId, document.sequence.tracks[1].id, "01KT0000000000000000000006", {}};
+        Operation detach = DetachAudioOperation{videoId,
+                                                document.sequence.tracks[1].id,
+                                                "01KT0000000000000000000006",
+                                                {}};
         Check(log.Apply(document, std::move(detach), error, message),
               "linked fixture detach applies: " + message);
         const Ulid audioId = document.sequence.tracks[1].clips[0].id;
@@ -445,6 +656,65 @@ int main() {
               "one undo restores the pre-move document byte-exactly");
     });
 
+    Test("linked cross-track move maps V1/A1 to V2/A2", [] {
+        Document document = Fixture();
+        document.sequence.tracks.push_back(
+            {"01KT0000000000000000000010", "video", 1, {}});
+        document.sequence.tracks.push_back(
+            {"01KT0000000000000000000011", "audio", 2, {}});
+        document.sequence.tracks.push_back(
+            {"01KT0000000000000000000012", "audio", 3, {}});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const Ulid videoId = document.sequence.tracks[0].clips[0].id;
+        Check(log.Apply(
+                  document,
+                  Operation{DetachAudioOperation{videoId,
+                                                 document.sequence.tracks[2].id,
+                                                 "01KT0000000000000000000013",
+                                                 {}}},
+                  error, message),
+              "four-track linked fixture detaches audio: " + message);
+        const Ulid audioId = document.sequence.tracks[2].clips[0].id;
+        const Ulid videoTwo = document.sequence.tracks[1].id;
+        const Ulid audioTwo = document.sequence.tracks[3].id;
+        TimelineViewport viewport = Viewport();
+        TimelineInteraction interaction(document, log, viewport);
+        // Display order is V2, V1, A1, A2.
+        const double videoOneY =
+            kTimelineRulerHeight + viewport.track_height + 20.0;
+        const double videoTwoY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(200.0, videoOneY, 700.0, 10);
+        interaction.PointerDrag(250.0, videoTwoY, 700.0);
+        const auto pending = interaction.PendingOperation();
+        Check(pending &&
+                  std::holds_alternative<MoveLinkedClipsOperation>(*pending),
+              "V1 to V2 emits one linked move");
+        if (pending) {
+            const auto& move = std::get<MoveLinkedClipsOperation>(*pending);
+            const auto video =
+                std::find_if(move.moves.begin(), move.moves.end(),
+                             [&](const LinkedClipMove& item) {
+                                 return item.clip_id == videoId;
+                             });
+            const auto audio =
+                std::find_if(move.moves.begin(), move.moves.end(),
+                             [&](const LinkedClipMove& item) {
+                                 return item.clip_id == audioId;
+                             });
+            Check(video != move.moves.end() && video->track_id == videoTwo &&
+                      audio != move.moves.end() && audio->track_id == audioTwo,
+                  "the same +1 ordinal maps video to V2 and audio to A2");
+        }
+        Check(interaction.PointerUp(error, message),
+              "paired V2/A2 move applies: " + message);
+        Check(document.FindTrackForClip(videoId)->id == videoTwo &&
+                  document.FindTrackForClip(audioId)->id == audioTwo &&
+                  ClipSyncDrift(document, audioId) == RationalTime{0, 1},
+              "linked clips land on V2/A2 without sync drift");
+    });
+
     Test("invalid linked move emits nothing and sync drift is exact", [] {
         Document document = Fixture();
         document.sequence.tracks.push_back(
@@ -453,13 +723,15 @@ int main() {
         EditError error = EditError::None;
         std::string message;
         const Ulid videoId = document.sequence.tracks[0].clips[0].id;
-        Operation detach = DetachAudioOperation{
-            videoId, document.sequence.tracks[1].id, "01KT0000000000000000000006", {}};
+        Operation detach = DetachAudioOperation{videoId,
+                                                document.sequence.tracks[1].id,
+                                                "01KT0000000000000000000006",
+                                                {}};
         Check(log.Apply(document, std::move(detach), error, message),
               "invalid fixture detach applies");
         const Ulid audioId = document.sequence.tracks[1].clips[0].id;
-        Operation offset =
-            MoveClipOperation{audioId, document.sequence.tracks[1].id, {0, 10}, {}};
+        Operation offset = MoveClipOperation{
+            audioId, document.sequence.tracks[1].id, {0, 10}, {}};
         Check(log.Apply(document, std::move(offset), error, message),
               "independent audio offset applies");
         Check(ClipSyncDrift(document, audioId) == RationalTime{-10, 10},
@@ -500,8 +772,10 @@ int main() {
         EditError error = EditError::None;
         std::string message;
         const Ulid videoId = document.sequence.tracks[0].clips[0].id;
-        Operation detach = DetachAudioOperation{
-            videoId, document.sequence.tracks[1].id, "01KT0000000000000000000006", {}};
+        Operation detach = DetachAudioOperation{videoId,
+                                                document.sequence.tracks[1].id,
+                                                "01KT0000000000000000000006",
+                                                {}};
         Check(log.Apply(document, std::move(detach), error, message),
               "linked trim fixture detaches audio");
         const Ulid audioId = document.sequence.tracks[1].clips[0].id;
@@ -544,10 +818,11 @@ int main() {
         EditLog log;
         EditError error = EditError::None;
         std::string message;
-        Operation detach = DetachAudioOperation{document.sequence.tracks[0].clips[0].id,
-                                                document.sequence.tracks[1].id,
-                                                "01KT0000000000000000000006",
-                                                {}};
+        Operation detach =
+            DetachAudioOperation{document.sequence.tracks[0].clips[0].id,
+                                 document.sequence.tracks[1].id,
+                                 "01KT0000000000000000000006",
+                                 {}};
         Check(log.Apply(document, std::move(detach), error, message),
               "invalid linked trim fixture detaches audio");
         document.sequence.tracks[1].clips[0].duration = {2, 10};
@@ -574,8 +849,10 @@ int main() {
         EditError error = EditError::None;
         std::string message;
         const Ulid videoId = document.sequence.tracks[0].clips[0].id;
-        Operation detach = DetachAudioOperation{
-            videoId, document.sequence.tracks[1].id, "01KT0000000000000000000006", {}};
+        Operation detach = DetachAudioOperation{videoId,
+                                                document.sequence.tracks[1].id,
+                                                "01KT0000000000000000000006",
+                                                {}};
         Check(log.Apply(document, std::move(detach), error, message),
               "linked delete fixture detaches audio");
         const Ulid audioId = document.sequence.tracks[1].clips[0].id;
@@ -595,8 +872,7 @@ int main() {
         Check(log.Undo(document, error, message) &&
                   document.SaveToString() == before,
               "linked delete undo restores exact document bytes");
-        const Ulid followingVideoId =
-            document.sequence.tracks[0].clips[1].id;
+        const Ulid followingVideoId = document.sequence.tracks[0].clips[1].id;
         const RationalTime followingPosition =
             document.sequence.tracks[0].clips[1].timeline_in;
         Operation clear =
@@ -652,10 +928,11 @@ int main() {
                  "drag creates a TrimClip operation");
              if (pending) {
                  const auto& trim = std::get<TrimClipOperation>(*pending);
-                 Check(trim.clip_id == document.sequence.tracks[0].clips[0].id &&
-                           trim.edge == TrimEdge::Tail &&
-                           trim.delta == RationalTime{-5, 10},
-                       "tail drag has the expected exact delta");
+                 Check(
+                     trim.clip_id == document.sequence.tracks[0].clips[0].id &&
+                         trim.edge == TrimEdge::Tail &&
+                         trim.delta == RationalTime{-5, 10},
+                     "tail drag has the expected exact delta");
              }
              EditError error = EditError::None;
              std::string message;
@@ -663,13 +940,135 @@ int main() {
                    "valid drag applies through the edit log: " + message);
              Check(log.AppliedCount() == 1,
                    "one mouse gesture emits exactly one operation");
-             Check(document.sequence.tracks[0].clips[0].duration == RationalTime{15, 10},
+             Check(document.sequence.tracks[0].clips[0].duration ==
+                       RationalTime{15, 10},
                    "document contains the trim result");
              Check(log.Undo(document, error, message),
                    "trim undo succeeds: " + message);
              Check(Hash(document.SaveToString()) == initialHash,
                    "undo restores the initial canonical document hash");
          });
+
+    Test("ripple trim gesture shifts downstream sync-locked clips", [] {
+        Document document = Fixture();
+        document.sequence.tracks.push_back({"01KT0000000000000000000005",
+                                            "audio",
+                                            1,
+                                            {{"01KT0000000000000000000006",
+                                              "01KT0000000000000000000001",
+                                              {40, 10},
+                                              {10, 10},
+                                              {40, 10}}}});
+        const std::string initial = document.SaveToString();
+        TimelineViewport viewport = Viewport();
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        interaction.SetTrimMode(TimelineTrimMode::Ripple);
+        const double videoY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(350.0, videoY, 700.0, 10);
+        interaction.PointerDrag(400.0, videoY, 700.0);
+        const auto pending = interaction.PendingOperation();
+        Check(interaction.TrimPreview() && interaction.TrimPreview()->valid &&
+                  interaction.TrimPreview()->linked_times.size() == 2,
+              "ripple preview includes primary and sync followers");
+        Check(pending && std::holds_alternative<RippleTrimOperation>(*pending),
+              "ripple gesture emits its dedicated atomic operation");
+        EditError error = EditError::None;
+        std::string message;
+        Check(interaction.PointerUp(error, message),
+              "ripple trim commits: " + message);
+        Check(document.sequence.tracks[0].clips[0].duration ==
+                      RationalTime{25, 10} &&
+                  document.sequence.tracks[0].clips[1].timeline_in ==
+                      RationalTime{45, 10} &&
+                  document.sequence.tracks[1].clips[0].timeline_in ==
+                      RationalTime{45, 10},
+              "ripple extends the edit and moves every sync follower exactly");
+        Check(log.AppliedCount() == 1 && log.Undo(document, error, message) &&
+                  document.SaveToString() == initial,
+              "one undo restores the ripple gesture byte-exactly");
+    });
+
+    Test("roll gesture moves one cut while preserving program duration", [] {
+        Document document = Fixture();
+        document.sequence.tracks[0].clips[1].timeline_in = {30, 10};
+        const std::string initial = document.SaveToString();
+        TimelineViewport viewport = Viewport();
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        interaction.SetTrimMode(TimelineTrimMode::Roll);
+        const double videoY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(350.0, videoY, 700.0, 10);
+        interaction.PointerDrag(400.0, videoY, 700.0);
+        const auto pending = interaction.PendingOperation();
+        Check(interaction.TrimPreview() && interaction.TrimPreview()->valid &&
+                  interaction.TrimPreview()->linked_times.size() == 1,
+              "roll preview updates both sides of the cut");
+        Check(pending && std::holds_alternative<RollEditOperation>(*pending),
+              "roll gesture emits its dedicated atomic operation");
+        EditError error = EditError::None;
+        std::string message;
+        Check(interaction.PointerUp(error, message),
+              "roll edit commits: " + message);
+        const auto& clips = document.sequence.tracks[0].clips;
+        Check(clips[0].duration == RationalTime{25, 10} &&
+                  clips[1].source_in == RationalTime{45, 10} &&
+                  clips[1].duration == RationalTime{5, 10} &&
+                  clips[1].timeline_in == RationalTime{35, 10} &&
+                  clips[1].timeline_in.add(clips[1].duration) ==
+                      RationalTime{40, 10},
+              "roll moves the cut without changing the sequence end");
+        Check(log.AppliedCount() == 1 && log.Undo(document, error, message) &&
+                  document.SaveToString() == initial,
+              "one undo restores the roll gesture byte-exactly");
+    });
+
+    Test("slip gesture keeps linked A/V rectangles fixed", [] {
+        Document document = Fixture();
+        document.sequence.tracks.push_back(
+            {"01KT0000000000000000000005", "audio", 1, {}});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const Ulid videoId = document.sequence.tracks[0].clips[0].id;
+        Check(log.Apply(document,
+                        DetachAudioOperation{videoId,
+                                             document.sequence.tracks[1].id,
+                                             "01KT0000000000000000000006",
+                                             {}},
+                        error, message),
+              "slip fixture detaches audio");
+        const Ulid audioId = document.sequence.tracks[1].clips[0].id;
+        const std::string before = document.SaveToString();
+        TimelineViewport viewport = Viewport();
+        TimelineInteraction interaction(document, log, viewport);
+        interaction.SetTrimMode(TimelineTrimMode::Slip);
+        const double videoY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(200.0, videoY, 700.0, 10);
+        interaction.PointerDrag(250.0, videoY, 700.0);
+        const auto pending = interaction.PendingOperation();
+        Check(interaction.TrimPreview() && interaction.TrimPreview()->valid &&
+                  interaction.TrimPreview()->linked_times.size() == 2,
+              "slip previews both separate linked rectangles");
+        Check(pending && std::holds_alternative<SlipEditOperation>(*pending),
+              "slip gesture emits one dedicated operation");
+        Check(interaction.PointerUp(error, message),
+              "linked slip commits: " + message);
+        Check(
+            document.FindClip(videoId)->source_in == RationalTime{15, 10} &&
+                document.FindClip(audioId)->source_in == RationalTime{15, 10} &&
+                document.FindClip(videoId)->timeline_in ==
+                    RationalTime{10, 10} &&
+                document.FindClip(audioId)->timeline_in ==
+                    RationalTime{10, 10} &&
+                document.FindClip(videoId)->duration == RationalTime{20, 10} &&
+                document.FindClip(audioId)->duration == RationalTime{20, 10} &&
+                ClipSyncDrift(document, audioId) == RationalTime{0, 1},
+            "slip changes only both source windows and preserves A/V sync");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "one undo restores the linked slip byte-exactly");
+    });
 
     Test("clip body drag moves atomically across tracks and undo restores hash",
          [] {
@@ -683,8 +1082,9 @@ int main() {
              const double firstTrackY = kTimelineRulerHeight + 20.0;
              const double secondTrackY =
                  kTimelineRulerHeight + viewport.track_height + 20.0;
-             interaction.PointerDown(200.0, firstTrackY, 700.0, 10);
-             interaction.PointerDrag(250.0, secondTrackY, 700.0);
+             // V2 is displayed above V1, matching professional NLE stacking.
+             interaction.PointerDown(200.0, secondTrackY, 700.0, 10);
+             interaction.PointerDrag(250.0, firstTrackY, 700.0);
              Check(
                  interaction.MovePreview() && interaction.MovePreview()->valid,
                  "cross-track move preview is valid");
@@ -735,12 +1135,12 @@ int main() {
         std::string message;
         Check(interaction.PointerUp(error, message) && log.AppliedCount() == 1,
               "overwrite emits one atomic move event");
-        Check(
-            document.sequence.tracks[0].clips.size() == 1 &&
-                document.sequence.tracks[0].clips[0].id ==
-                    "01KT0000000000000000000003" &&
-                document.sequence.tracks[0].clips[0].timeline_in == RationalTime{40, 10},
-            "fully covered destination clip is removed");
+        Check(document.sequence.tracks[0].clips.size() == 1 &&
+                  document.sequence.tracks[0].clips[0].id ==
+                      "01KT0000000000000000000003" &&
+                  document.sequence.tracks[0].clips[0].timeline_in ==
+                      RationalTime{40, 10},
+              "fully covered destination clip is removed");
         Check(log.Undo(document, error, message), "overwrite undo succeeds");
         Check(document.SaveToString() == initial,
               "overwrite undo restores document bytes");
@@ -749,13 +1149,13 @@ int main() {
     Test("overwrite through a longer clip preserves both survivors", [] {
         Document document = Fixture();
         document.sequence.tracks.push_back({"01KT0000000000000000000005",
-                                   "video",
-                                   1,
-                                   {{"01KT0000000000000000000006",
-                                     "01KT0000000000000000000001",
-                                     {40, 10},
-                                     {50, 10},
-                                     {30, 10}}}});
+                                            "video",
+                                            1,
+                                            {{"01KT0000000000000000000006",
+                                              "01KT0000000000000000000001",
+                                              {40, 10},
+                                              {50, 10},
+                                              {30, 10}}}});
         const std::string initial = document.SaveToString();
         TimelineViewport viewport = Viewport();
         EditLog log;
@@ -763,8 +1163,8 @@ int main() {
         const double firstTrackY = kTimelineRulerHeight + 20.0;
         const double secondTrackY =
             kTimelineRulerHeight + viewport.track_height + 20.0;
-        interaction.PointerDown(200.0, firstTrackY, 900.0, 10);
-        interaction.PointerDrag(600.0, secondTrackY, 900.0);
+        interaction.PointerDown(200.0, secondTrackY, 900.0, 10);
+        interaction.PointerDrag(600.0, firstTrackY, 900.0);
         EditError error = EditError::None;
         std::string message;
         Check(interaction.PointerUp(error, message),
@@ -800,10 +1200,11 @@ int main() {
         EditLog log;
         EditError error = EditError::None;
         std::string message;
-        Check(log.Apply(document,
-                        SplitClipOperation{
-                            document.sequence.tracks[0].clips[0].id, {20, 10}, {}},
-                        error, message),
+        Check(log.Apply(
+                  document,
+                  SplitClipOperation{
+                      document.sequence.tracks[0].clips[0].id, {20, 10}, {}},
+                  error, message),
               "split applies: " + message);
         const Ulid rightId =
             std::get<SplitClipOperation>(log.AppliedEntries().back().op)
@@ -841,22 +1242,22 @@ int main() {
         std::string message;
         const Ulid videoId = document.sequence.tracks[0].clips[0].id;
         Check(log.Apply(document,
-                        DetachAudioOperation{
-                            videoId, document.sequence.tracks[1].id,
-                            "01KT0000000000000000000006", {}},
+                        DetachAudioOperation{videoId,
+                                             document.sequence.tracks[1].id,
+                                             "01KT0000000000000000000006",
+                                             {}},
                         error, message),
               "linked cut fixture detaches audio: " + message);
         const Ulid audioId = document.sequence.tracks[1].clips[0].id;
-        const Ulid originalGroup = document.FindClip(videoId)->link_group_id;
         const std::string beforeCut = document.SaveToString();
-        Check(log.Apply(document,
-                        SplitLinkedClipsOperation{
-                            originalGroup, {videoId, audioId}, {20, 10},
-                            {}, {}, {}, {}},
-                        error, message),
+        Operation cut = TimelineCutOperationForClip(
+            document, *document.FindClip(videoId), {20, 10}, true);
+        Check(std::holds_alternative<SplitLinkedClipsOperation>(cut),
+              "linked selection builds one linked blade operation");
+        Check(log.Apply(document, std::move(cut), error, message),
               "linked cut applies atomically: " + message);
-        const auto& applied = std::get<SplitLinkedClipsOperation>(
-            log.AppliedEntries().back().op);
+        const auto& applied =
+            std::get<SplitLinkedClipsOperation>(log.AppliedEntries().back().op);
         Check(applied.right_clip_ids.size() == 2,
               "linked cut creates one stable right ID per A/V member");
         const Ulid rightVideoId = applied.right_clip_ids[0];
@@ -900,10 +1301,11 @@ int main() {
         EditLog log;
         EditError error = EditError::None;
         std::string message;
-        Check(!log.Apply(document,
-                         SplitClipOperation{
-                             document.sequence.tracks[0].clips[0].id, {10, 10}, {}},
-                         error, message) &&
+        Check(!log.Apply(
+                  document,
+                  SplitClipOperation{
+                      document.sequence.tracks[0].clips[0].id, {10, 10}, {}},
+                  error, message) &&
                   error == EditError::InvalidTimelineIn,
               "cut on head is rejected");
         Check(log.AppliedCount() == 0 && document.SaveToString() == initial,
@@ -928,7 +1330,8 @@ int main() {
         Check(interaction.PointerUp(error, message),
               "release applies the constrained trim");
         Check(log.AppliedCount() == 1 &&
-                  document.sequence.tracks[0].clips[0].duration == RationalTime{1, 10},
+                  document.sequence.tracks[0].clips[0].duration ==
+                      RationalTime{1, 10},
               "constrained trim emits one valid event");
         Check(log.Undo(document, error, message), "constrained trim undoes");
         Check(document.SaveToString() == initial,
@@ -954,13 +1357,15 @@ int main() {
         EditError error = EditError::None;
         std::string message;
         Check(interaction.PointerUp(error, message), "snapped trim applies");
-        Check(document.sequence.tracks[0].clips[0].duration == RationalTime{30, 10},
+        Check(document.sequence.tracks[0].clips[0].duration ==
+                  RationalTime{30, 10},
               "document receives the snapped duration");
     });
 
     Test("tail trim cannot pass the source media end", [] {
         Document document = Fixture();
-        document.sequence.tracks[0].clips.erase(document.sequence.tracks[0].clips.begin() + 1);
+        document.sequence.tracks[0].clips.erase(
+            document.sequence.tracks[0].clips.begin() + 1);
         TimelineViewport viewport = Viewport();
         EditLog log;
         TimelineInteraction interaction(document, log, viewport);

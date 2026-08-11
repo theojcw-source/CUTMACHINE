@@ -55,6 +55,9 @@ struct LibraryMedia {
     // Empty means the project root. Bins organize library media only and do
     // not change source or clip identity.
     Ulid bin_id;
+    // Derived video-only media used for interactive decoding. Export and
+    // audio always resolve the original path above.
+    std::string proxy_path;
 
     // Version-1 sources do not contain technical metadata. They are promoted
     // to the library on load without fabricating values; a later ingest of the
@@ -86,8 +89,8 @@ struct DocumentClip {
     RationalTime source_in;
     RationalTime duration;
     RationalTime timeline_in;
-    // Video clips contribute embedded audio until DetachAudio creates an
-    // independent audio-track clip and clears this flag.
+    // Deprecated migration flag. New video clips are always silent; audio is
+    // represented exclusively by clips on audio tracks.
     bool include_audio = true;
     // Clips produced by one A/V separation share this stable group. It is a
     // selection relationship only; their edit times remain independent.
@@ -98,11 +101,31 @@ struct DocumentClip {
     RationalTime sync_reference_delta{0, 1};
 };
 
+enum class TransitionAlignment { Center, StartAtCut, EndAtCut };
+
+// A transition belongs to the sequence, never to either clip. The referenced
+// clips keep their original, non-overlapping edit rectangles while the
+// transition reads the media handles around their shared cut.
+struct DocumentTransition {
+    Ulid id = GenerateUlid();
+    Ulid track_id;
+    Ulid left_clip_id;
+    Ulid right_clip_id;
+    std::string type = "cross_dissolve";
+    RationalTime duration;
+    TransitionAlignment alignment = TransitionAlignment::Center;
+};
+
 struct DocumentTrack {
     Ulid id = GenerateUlid();
     std::string kind;
     int32_t index = 0;
     std::vector<DocumentClip> clips;
+    // Locked tracks remain readable but reject edit operations.
+    bool locked = false;
+    // Ripple edits initiated on another track affect this track when enabled.
+    // This is independent from the hard edit lock above.
+    bool sync_lock = true;
 };
 
 // A sequence is the addressable owner of one timeline. Project media and bins
@@ -114,6 +137,7 @@ struct DocumentSequence {
     int32_t height = 1080;
     MediaRate frame_rate{25, 1};
     std::vector<DocumentMarker> markers;
+    std::vector<DocumentTransition> transitions;
     std::vector<DocumentTrack> tracks;
 };
 
@@ -142,6 +166,8 @@ public:
     DocumentBin* FindBin(const Ulid& id);
     const DocumentMarker* FindMarker(const Ulid& id) const;
     DocumentMarker* FindMarker(const Ulid& id);
+    const DocumentTransition* FindTransition(const Ulid& id) const;
+    DocumentTransition* FindTransition(const Ulid& id);
     const DocumentTrack* FindTrack(const Ulid& id) const;
     DocumentTrack* FindTrack(const Ulid& id);
     const DocumentClip* FindClip(const Ulid& id) const;
