@@ -1,7 +1,7 @@
 # Repo export for AI review
 
 - Root: `/Volumes/code/CUTMACHINE`
-- Generated: 2026-08-11 22:42 UTC
+- Generated: 2026-08-11 22:43 UTC
 - File list source: git ls-files (honours .gitignore)
 - Included: 91 files, ~1380 KB
 - Skipped: 12 files (see manifest at the end)

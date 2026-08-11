@@ -28,7 +28,8 @@ jobs:
             exit 0
           fi
           printf '%s\n' "${files[@]}"
-          clang-format-18 --dry-run --Werror -style=file "${files[@]}"
+          clang-format-18 -i -style=file "${files[@]}"
+          git diff --exit-code -- "${files[@]}"
 
   clang-tidy:
     runs-on: macos-14
