@@ -411,8 +411,7 @@ bool Exporter::BuildPlan(const Document& document,
             graph << ",format=yuva444p10le,fade=t=in:st=0:d="
                   << FilterSeconds(*input.fade_in) << ":alpha=1";
         graph << ",setpts=PTS-STARTPTS+" << position << "/TB[v" << videoOrdinal
-              << "];"
-              << "[base" << videoOrdinal << "][v" << videoOrdinal
+              << "];" << "[base" << videoOrdinal << "][v" << videoOrdinal
               << "]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=pass:repeatlast=0:"
                  "shortest=0:enable=between(t\\,"
               << position << "\\," << position << '+' << clipDuration

@@ -624,12 +624,10 @@ bool Project::Save(const std::string& path, std::string& error) const {
 std::string Project::SaveToString() const {
     std::ostringstream output;
     output << "{\n  \"project_format\":\"cutmachine-project\","
-           << "\n  \"project_version\":1,"
-           << "\n  \"id\":\"" << Escape(id) << "\","
-           << "\n  \"name\":\"" << Escape(name) << "\","
+           << "\n  \"project_version\":1," << "\n  \"id\":\"" << Escape(id)
+           << "\"," << "\n  \"name\":\"" << Escape(name) << "\","
            << "\n  \"active_timeline_id\":\"" << Escape(active_timeline_id)
-           << "\","
-           << "\n  \"timeline_documents\":[";
+           << "\"," << "\n  \"timeline_documents\":[";
     for (size_t index = 0; index < timelines.size(); ++index) {
         Document document;
         document.sequence = timelines[index];
@@ -1169,8 +1167,7 @@ std::string Document::SaveToString() const {
         output << "    ]}";
     }
     if (!sequence.tracks.empty()) output << '\n';
-    output << "  ]}"
-           << ",\n  \"color_management\":{\"enabled\":"
+    output << "  ]}" << ",\n  \"color_management\":{\"enabled\":"
            << (color_management.enabled ? "true" : "false")
            << ",\"input_gamut\":\"" << Escape(color_management.input_gamut)
            << "\",\"input_transfer\":\""

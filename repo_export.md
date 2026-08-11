@@ -1,7 +1,7 @@
 # Repo export for AI review
 
 - Root: `/Volumes/code/CUTMACHINE`
-- Generated: 2026-08-11 22:43 UTC
+- Generated: 2026-08-11 22:44 UTC
 - File list source: git ls-files (honours .gitignore)
 - Included: 91 files, ~1380 KB
 - Skipped: 12 files (see manifest at the end)
@@ -6887,12 +6887,10 @@ bool Project::Save(const std::string& path, std::string& error) const {
 std::string Project::SaveToString() const {
     std::ostringstream output;
     output << "{\n  \"project_format\":\"cutmachine-project\","
-           << "\n  \"project_version\":1,"
-           << "\n  \"id\":\"" << Escape(id) << "\","
-           << "\n  \"name\":\"" << Escape(name) << "\","
+           << "\n  \"project_version\":1," << "\n  \"id\":\"" << Escape(id)
+           << "\"," << "\n  \"name\":\"" << Escape(name) << "\","
            << "\n  \"active_timeline_id\":\"" << Escape(active_timeline_id)
-           << "\","
-           << "\n  \"timeline_documents\":[";
+           << "\"," << "\n  \"timeline_documents\":[";
     for (size_t index = 0; index < timelines.size(); ++index) {
         Document document;
         document.sequence = timelines[index];
@@ -7432,8 +7430,7 @@ std::string Document::SaveToString() const {
         output << "    ]}";
     }
     if (!sequence.tracks.empty()) output << '\n';
-    output << "  ]}"
-           << ",\n  \"color_management\":{\"enabled\":"
+    output << "  ]}" << ",\n  \"color_management\":{\"enabled\":"
            << (color_management.enabled ? "true" : "false")
            << ",\"input_gamut\":\"" << Escape(color_management.input_gamut)
            << "\",\"input_transfer\":\""
@@ -9036,8 +9033,7 @@ bool Exporter::BuildPlan(const Document& document,
             graph << ",format=yuva444p10le,fade=t=in:st=0:d="
                   << FilterSeconds(*input.fade_in) << ":alpha=1";
         graph << ",setpts=PTS-STARTPTS+" << position << "/TB[v" << videoOrdinal
-              << "];"
-              << "[base" << videoOrdinal << "][v" << videoOrdinal
+              << "];" << "[base" << videoOrdinal << "][v" << videoOrdinal
               << "]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=pass:repeatlast=0:"
                  "shortest=0:enable=between(t\\,"
               << position << "\\," << position << '+' << clipDuration
