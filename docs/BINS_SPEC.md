@@ -16,6 +16,10 @@ Media Pool de Resolve, adaptées au modèle journalisé de CUTMACHINE.
 - Un média sélectionné peut être déplacé dans le chutier courant. Le
   déplacement émet `SetMediaBinOperation` ; création et suppression utilisent
   `AddBinOperation` et `RemoveBinOperation`.
+- Les métadonnées d’affichage d’un rush ou d’une timeline émettent
+  `SetProjectBinMetadataOperation`. Le classement d’une timeline émet
+  `SetProjectTimelineBinOperation`. Ces mutations partagées passent par le
+  `ProjectEditLog`, sont sérialisables et s’annulent sans perte d’identité.
 - `Cmd+Z`/`Cmd+Shift+Z` annulent et rejouent toutes ces mutations.
 - Le clic droit sur un chutier permet de créer un enfant, le renommer ou le
   supprimer. `RenameBinOperation` rend le renommage sérialisable et annulable.
@@ -23,6 +27,8 @@ Media Pool de Resolve, adaptées au modèle journalisé de CUTMACHINE.
   le chutier sélectionné ou révéler son fichier dans le Finder.
 - Un double-clic, ou le bouton `Source`, charge le média dans le moniteur Metal
   sans déplacer le playhead de programme.
+- Un double-clic sur une timeline change seulement la sélection de session :
+  cette navigation ne modifie pas le projet et ne crée pas d’entrée d’undo.
 - Un drag depuis la liste ou la grille vers une piste vidéo émet une unique
   `InsertClipOperation` avec `source_in = 0` et la durée source exacte.
 

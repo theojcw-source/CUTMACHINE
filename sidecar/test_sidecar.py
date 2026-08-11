@@ -81,6 +81,20 @@ def trim_plan(
     }
 
 
+def add_marker_plan() -> dict[str, Any]:
+    return {
+        "operation": {
+            "type": "AddMarker",
+            "marker_id": "",
+            "marker_name": "Sélection interview",
+            "marker_time": {"value": 1001, "rate": 30000},
+            "marker_color": "#33AAFF",
+            "marker_category": "Montage",
+        },
+        "refusal": None,
+    }
+
+
 class PlannerProtocolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -99,6 +113,12 @@ class PlannerProtocolTests(unittest.TestCase):
         self.assertFalse(opener.body["stream"])
         self.assertEqual(opener.body["options"]["temperature"], 0)
         self.assertTrue(opener.request.full_url.endswith("/api/chat"))
+
+    def test_describe_exposes_sequence_format_to_the_planner(self) -> None:
+        sequence = self.timeline["sequence"]
+        self.assertGreater(sequence["width"], 0)
+        self.assertGreater(sequence["height"], 0)
+        self.assertRegex(sequence["frame_rate"], r"^\d+/\d+$")
 
     def test_shared_schema_uses_no_unsupported_composition_keywords(self) -> None:
         encoded = json.dumps(PLANNER_RESPONSE_SCHEMA)
@@ -195,6 +215,48 @@ class PlannerProtocolTests(unittest.TestCase):
                     operation["delta"],
                     {"value": expected_delta, "rate": 25},
                 )
+
+    def test_marker_plan_is_normalized_to_canonical_operation(self) -> None:
+        planner = OllamaPlanner(opener=RecordingOpener({
+            "message": {"content": json.dumps(add_marker_plan())},
+        }))
+        operation = planner.plan(
+            self.timeline, "Ajoute un marqueur pour la sélection interview"
+        ).operation
+        self.assertEqual(operation, {
+            "type": "AddMarker",
+            "marker": {
+                "id": "",
+                "name": "Sélection interview",
+                "time": {"value": 1001, "rate": 30000},
+                "color": "#33AAFF",
+                "category": "Montage",
+            },
+            "insertion_index": -1,
+        })
+
+    def test_marker_alias_overrides_a_model_guessed_id(self) -> None:
+        timeline = json.loads(json.dumps(self.timeline))
+        marker_id = "01K81111111111111111111111"
+        timeline["markers"] = [{
+            "alias": "K1", "id": marker_id, "name": "Choix",
+            "time": {"frames": 10, "seconds": 0.4},
+            "color": "#33AAFF", "category": "Montage",
+        }]
+        response = {
+            "operation": {
+                "type": "RemoveMarker",
+                "marker_id": "01K89999999999999999999999",
+            },
+            "refusal": None,
+        }
+        planner = OllamaPlanner(opener=RecordingOpener({
+            "message": {"content": json.dumps(response)},
+        }))
+        self.assertEqual(
+            planner.plan(timeline, "Supprime K1").operation,
+            {"type": "RemoveMarker", "marker_id": marker_id},
+        )
 
     def test_explicit_trim_language_controls_sign_timebase_and_type(self) -> None:
         response = trim_plan("Head", "Shorten", 99)
@@ -311,6 +373,43 @@ class BinaryIntegrationTests(unittest.TestCase):
         }
         result = self.binary.apply_operation(self.document, operation)
         self.assertTrue(result.ok, f"{result.error}: {result.detail}")
+
+    def test_markers_are_addressable_through_describe_and_apply_op(self) -> None:
+        add = self.binary.apply_operation(self.document, {
+            "type": "AddMarker",
+            "marker": {
+                "id": "",
+                "name": "Choix interview",
+                "time": {"value": 15, "rate": 25},
+                "color": "#33AAFF",
+                "category": "Montage",
+            },
+            "insertion_index": -1,
+        })
+        self.assertTrue(add.ok, f"{add.error}: {add.detail}")
+        timeline = self.binary.describe(self.document)
+        self.assertEqual(timeline["markers"][0]["alias"], "K1")
+        marker_id = timeline["markers"][0]["id"]
+
+        update = self.binary.apply_operation(self.document, {
+            "type": "UpdateMarker",
+            "marker_id": marker_id,
+            "name": "Choix final",
+            "time": {"value": 20, "rate": 25},
+            "color": "#FFAA33",
+            "category": "Validation",
+        })
+        self.assertTrue(update.ok, f"{update.error}: {update.detail}")
+        self.assertEqual(
+            self.binary.describe(self.document)["markers"][0]["name"],
+            "Choix final",
+        )
+
+        remove = self.binary.apply_operation(self.document, {
+            "type": "RemoveMarker", "marker_id": marker_id,
+        })
+        self.assertTrue(remove.ok, f"{remove.error}: {remove.detail}")
+        self.assertEqual(self.binary.describe(self.document)["markers"], [])
 
 
 class FakePlanner(Planner):

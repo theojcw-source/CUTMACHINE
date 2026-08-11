@@ -12,6 +12,7 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/log.h>
 #include <libavutil/mathematics.h>
+#include <libavutil/pixdesc.h>
 }
 
 #include <algorithm>
@@ -173,6 +174,18 @@ bool ProbeImpl(const std::filesystem::path& absolutePath, LibraryMedia& media,
     media.codec = avcodec_get_name(parameters->codec_id);
     media.width = parameters->width;
     media.height = parameters->height;
+    const char* pixelFormat =
+        av_get_pix_fmt_name(static_cast<AVPixelFormat>(parameters->format));
+    const char* colorRange = av_color_range_name(parameters->color_range);
+    const char* colorSpace = av_color_space_name(parameters->color_space);
+    const char* colorTransfer = av_color_transfer_name(parameters->color_trc);
+    const char* colorPrimaries =
+        av_color_primaries_name(parameters->color_primaries);
+    media.pixel_format = pixelFormat ? pixelFormat : "unknown";
+    media.color_range = colorRange ? colorRange : "unknown";
+    media.color_space = colorSpace ? colorSpace : "unknown";
+    media.color_transfer = colorTransfer ? colorTransfer : "unknown";
+    media.color_primaries = colorPrimaries ? colorPrimaries : "unknown";
     media.rate = {frameRate.num, frameRate.den};
     media.duration = {duration, frameRate.num};
     const double scale = std::max(displayedWidth, displayedHeight);

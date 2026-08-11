@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Document.h"
+
 #import <AppKit/AppKit.h>
 
 #include <cstdint>
@@ -20,7 +22,14 @@ struct MetalRect {
 
 struct TimelineRenderData {
     double video_height = 0.0;
+    // Zero fits the image to the viewer. Positive values are native-pixel
+    // magnifications: 1.0 = 100%, 2.0 = 200%.
+    double video_zoom = 0.0;
+    int32_t sequence_width = 1920;
+    int32_t sequence_height = 1080;
+    ColorManagementSettings color_management;
     std::vector<int32_t> video_rotation_degrees;
+    std::vector<float> video_opacities;
     std::vector<MetalRect> rectangles;
 };
 

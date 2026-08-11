@@ -8,7 +8,6 @@ extern "C" {
 }
 
 #include <algorithm>
-#include <cassert>
 #include <cstdio>
 
 namespace {
@@ -191,16 +190,18 @@ bool MediaSource::DecodeNextFrame(const AVFrame*& outFrame, int64_t& outPts) {
     while (true) {
         int result = avcodec_receive_frame(impl_->decoder, impl_->frame);
         if (result >= 0) {
-            if (impl_->frame->format != AV_PIX_FMT_YUV422P10LE) {
-                const char* actual = av_get_pix_fmt_name(
-                    static_cast<AVPixelFormat>(impl_->frame->format));
-                std::fprintf(
-                    stderr,
-                    "FATAL: expected yuv422p10le, decoder returned %s (%d)\n",
-                    actual ? actual : "unknown", impl_->frame->format);
-                assert(impl_->frame->format == AV_PIX_FMT_YUV422P10LE);
-                return false;
-            }
+            // Some containers signal colour only at stream level. Preserve it
+            // on every cached frame so the renderer never has to rediscover or
+            // guess metadata that FFmpeg already parsed.
+            const AVCodecParameters* parameters = impl_->stream->codecpar;
+            if (impl_->frame->color_range == AVCOL_RANGE_UNSPECIFIED)
+                impl_->frame->color_range = parameters->color_range;
+            if (impl_->frame->colorspace == AVCOL_SPC_UNSPECIFIED)
+                impl_->frame->colorspace = parameters->color_space;
+            if (impl_->frame->color_trc == AVCOL_TRC_UNSPECIFIED)
+                impl_->frame->color_trc = parameters->color_trc;
+            if (impl_->frame->color_primaries == AVCOL_PRI_UNSPECIFIED)
+                impl_->frame->color_primaries = parameters->color_primaries;
             outPts = impl_->frame->best_effort_timestamp;
             if (outPts == AV_NOPTS_VALUE) {
                 outPts = impl_->frame->pts;

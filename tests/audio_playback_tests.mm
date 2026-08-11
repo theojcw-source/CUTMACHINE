@@ -38,7 +38,7 @@ int main() {
     Document document;
     const Ulid sourceId = "01KA0000000000000000000001";
     document.sources = {{sourceId, "tone.mp4", {25, 1}, {25, 25}}};
-    document.tracks = {
+    document.sequence.tracks = {
         {"01KA0000000000000000000002",
          "video",
          0,
@@ -47,7 +47,7 @@ int main() {
            {0, 25},
            {25, 25},
            {0, 25},
-           false}}},
+           true}}},
         {"01KA0000000000000000000004",
          "audio",
          1,

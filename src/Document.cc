@@ -1,5 +1,6 @@
-#include "Document.h"
+#include "Project.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
@@ -7,6 +8,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -386,6 +388,23 @@ void WriteTime(std::ostringstream& output, const RationalTime& time) {
     output << "{\"value\":" << time.value << ",\"rate\":" << time.rate << "}";
 }
 
+Ulid MigratedSequenceId(const std::vector<DocumentSource>& sources) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (const DocumentSource& source : sources) {
+        for (const unsigned char byte : source.id) {
+            hash ^= byte;
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+    static constexpr char alphabet[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    std::string suffix(13, '0');
+    for (size_t index = suffix.size(); index-- > 0;) {
+        suffix[index] = alphabet[hash & 31U];
+        hash >>= 5;
+    }
+    return "0000000000000" + suffix;
+}
+
 bool RegisterId(const Ulid& id, const std::string& context, std::set<Ulid>& ids,
                 std::string& error) {
     if (!IsValidUlid(id)) {
@@ -399,7 +418,253 @@ bool RegisterId(const Ulid& id, const std::string& context, std::set<Ulid>& ids,
     return true;
 }
 
+Ulid MigratedProjectId(const Ulid& sequenceId) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (const unsigned char byte : sequenceId) {
+        hash ^= byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    static constexpr char alphabet[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    std::string suffix(13, '0');
+    for (size_t index = suffix.size(); index-- > 0;) {
+        suffix[index] = alphabet[hash & 31U];
+        hash >>= 5;
+    }
+    return "0000000000001" + suffix;
+}
+
 }  // namespace
+
+Project Project::FromDocument(Document document, std::string projectName) {
+    Project project(std::move(projectName));
+    project.id = MigratedProjectId(document.sequence.id);
+    project.settings.color_management = document.color_management;
+    project.rushes = std::move(document.library);
+    project.bins = std::move(document.bins);
+    project.sources = std::move(document.sources);
+    project.timelines = {std::move(document.sequence)};
+    project.active_timeline_id = project.timelines.front().id;
+    return project;
+}
+
+bool Project::Load(const std::string& path, Project& output,
+                   std::string& error) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        error = "unable to open project '" + path + "'";
+        return false;
+    }
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    if (!input.good() && !input.eof()) {
+        error = "unable to read project '" + path + "'";
+        return false;
+    }
+    return LoadFromString(contents.str(), output, error);
+}
+
+bool Project::LoadFromString(const std::string& json, Project& output,
+                             std::string& error) {
+    try {
+        const JsonValue root = JsonParser(json).Parse();
+        const JsonValue* format = Optional(root, "project_format",
+                                           JsonValue::Type::String, "project");
+        if (!format) {
+            Document legacy;
+            if (!Document::LoadFromString(json, legacy, error)) return false;
+            std::string projectName = legacy.sequence.name.empty()
+                                          ? "Untitled Project"
+                                          : legacy.sequence.name;
+            Project promoted = Project::FromDocument(std::move(legacy),
+                                                     std::move(projectName));
+            if (!promoted.Validate(error)) return false;
+            output = std::move(promoted);
+            error.clear();
+            return true;
+        }
+        if (format->string != "cutmachine-project")
+            throw std::runtime_error("unsupported project format '" +
+                                     format->string + "'");
+        if (Int32(root, "project_version", "project") != 1)
+            throw std::runtime_error("unsupported project version");
+
+        Project parsed(
+            Require(root, "name", JsonValue::Type::String, "project").string);
+        parsed.id =
+            Require(root, "id", JsonValue::Type::String, "project").string;
+        parsed.active_timeline_id = Require(root, "active_timeline_id",
+                                            JsonValue::Type::String, "project")
+                                        .string;
+        parsed.timelines.clear();
+
+        const JsonValue& documents = Require(root, "timeline_documents",
+                                             JsonValue::Type::Array, "project");
+        if (documents.array.empty())
+            throw std::runtime_error("project has no timeline documents");
+        std::optional<Document> shared;
+        for (size_t index = 0; index < documents.array.size(); ++index) {
+            const JsonValue& value = documents.array[index];
+            if (value.type != JsonValue::Type::String)
+                throw std::runtime_error("project.timeline_documents[" +
+                                         std::to_string(index) +
+                                         "] has the wrong JSON type");
+            Document document;
+            std::string documentError;
+            if (!Document::LoadFromString(value.string, document,
+                                          documentError))
+                throw std::runtime_error("invalid timeline document " +
+                                         std::to_string(index) + ": " +
+                                         documentError);
+            if (!shared) {
+                shared = document;
+                parsed.settings.color_management = document.color_management;
+                parsed.rushes = document.library;
+                parsed.bins = document.bins;
+                parsed.sources = document.sources;
+            } else {
+                Document candidate = document;
+                candidate.sequence = shared->sequence;
+                if (candidate.SaveToString() != shared->SaveToString())
+                    throw std::runtime_error(
+                        "timeline documents disagree on shared project data");
+            }
+            parsed.timelines.push_back(std::move(document.sequence));
+        }
+
+        parsed.bin_metadata.clear();
+        if (const JsonValue* metadata = Optional(
+                root, "bin_metadata", JsonValue::Type::Array, "project")) {
+            for (size_t index = 0; index < metadata->array.size(); ++index) {
+                const JsonValue& item = metadata->array[index];
+                const std::string context =
+                    "project.bin_metadata[" + std::to_string(index) + "]";
+                ProjectBinMetadata entry;
+                const Ulid itemId =
+                    Require(item, "item_id", JsonValue::Type::String, context)
+                        .string;
+                entry.description = Require(item, "description",
+                                            JsonValue::Type::String, context)
+                                        .string;
+                const int32_t rating = Int32(item, "rating", context);
+                if (rating < 0)
+                    throw std::runtime_error(context +
+                                             ".rating cannot be negative");
+                entry.rating = static_cast<uint32_t>(rating);
+                const int64_t order = Require(item, "insert_order",
+                                              JsonValue::Type::Number, context)
+                                          .number;
+                if (order < 0)
+                    throw std::runtime_error(
+                        context + ".insert_order cannot be negative");
+                entry.insert_order = static_cast<uint64_t>(order);
+                const JsonValue& tags =
+                    Require(item, "tags", JsonValue::Type::Array, context);
+                for (size_t tagIndex = 0; tagIndex < tags.array.size();
+                     ++tagIndex) {
+                    if (tags.array[tagIndex].type != JsonValue::Type::String)
+                        throw std::runtime_error(context + ".tags[" +
+                                                 std::to_string(tagIndex) +
+                                                 "] must be a string");
+                    entry.tags.push_back(tags.array[tagIndex].string);
+                }
+                if (!parsed.bin_metadata.emplace(itemId, std::move(entry))
+                         .second)
+                    throw std::runtime_error("duplicate bin metadata for '" +
+                                             itemId + "'");
+            }
+        }
+
+        parsed.timeline_bin_ids.clear();
+        if (const JsonValue* placements = Optional(
+                root, "timeline_bin_ids", JsonValue::Type::Array, "project")) {
+            for (size_t index = 0; index < placements->array.size(); ++index) {
+                const JsonValue& item = placements->array[index];
+                const std::string context =
+                    "project.timeline_bin_ids[" + std::to_string(index) + "]";
+                const Ulid timelineId =
+                    Require(item, "timeline_id", JsonValue::Type::String,
+                            context)
+                        .string;
+                const Ulid binId =
+                    Require(item, "bin_id", JsonValue::Type::String, context)
+                        .string;
+                if (!parsed.timeline_bin_ids.emplace(timelineId, binId).second)
+                    throw std::runtime_error(
+                        "duplicate timeline bin placement for '" + timelineId +
+                        "'");
+            }
+        }
+
+        if (!parsed.Validate(error)) return false;
+        output = std::move(parsed);
+        error.clear();
+        return true;
+    } catch (const std::exception& exception) {
+        error = exception.what();
+        return false;
+    }
+}
+
+bool Project::Save(const std::string& path, std::string& error) const {
+    if (!Validate(error)) return false;
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        error = "unable to create project '" + path + "'";
+        return false;
+    }
+    output << SaveToString();
+    if (!output) {
+        error = "unable to write project '" + path + "'";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+std::string Project::SaveToString() const {
+    std::ostringstream output;
+    output << "{\n  \"project_format\":\"cutmachine-project\","
+           << "\n  \"project_version\":1," << "\n  \"id\":\"" << Escape(id)
+           << "\"," << "\n  \"name\":\"" << Escape(name) << "\","
+           << "\n  \"active_timeline_id\":\"" << Escape(active_timeline_id)
+           << "\"," << "\n  \"timeline_documents\":[";
+    for (size_t index = 0; index < timelines.size(); ++index) {
+        Document document;
+        document.sequence = timelines[index];
+        document.color_management = settings.color_management;
+        document.library = rushes;
+        document.bins = bins;
+        document.sources = sources;
+        output << (index == 0 ? "\n" : ",\n") << "    \""
+               << Escape(document.SaveToString()) << "\"";
+    }
+    if (!timelines.empty()) output << '\n';
+    output << "  ],\n  \"bin_metadata\":[";
+    size_t metadataIndex = 0;
+    for (const auto& item : bin_metadata) {
+        output << (metadataIndex++ == 0 ? "\n" : ",\n") << "    {\"item_id\":\""
+               << Escape(item.first) << "\",\"description\":\""
+               << Escape(item.second.description)
+               << "\",\"rating\":" << item.second.rating << ",\"tags\":[";
+        for (size_t tagIndex = 0; tagIndex < item.second.tags.size();
+             ++tagIndex) {
+            if (tagIndex) output << ',';
+            output << "\"" << Escape(item.second.tags[tagIndex]) << "\"";
+        }
+        output << "],\"insert_order\":" << item.second.insert_order << '}';
+    }
+    if (!bin_metadata.empty()) output << '\n';
+    output << "  ],\n  \"timeline_bin_ids\":[";
+    size_t placementIndex = 0;
+    for (const auto& item : timeline_bin_ids) {
+        output << (placementIndex++ == 0 ? "\n" : ",\n")
+               << "    {\"timeline_id\":\"" << Escape(item.first)
+               << "\",\"bin_id\":\"" << Escape(item.second) << "\"}";
+    }
+    if (!timeline_bin_ids.empty()) output << '\n';
+    output << "  ]\n}\n";
+    return output.str();
+}
 
 bool Document::Load(const std::string& path, Document& output,
                     std::string& error) {
@@ -421,14 +686,85 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                               std::string& error) {
     try {
         const JsonValue root = JsonParser(json).Parse();
+        if (Optional(root, "project_format", JsonValue::Type::String,
+                     "document")) {
+            Project project;
+            if (!Project::LoadFromString(json, project, error)) return false;
+            output = project.MakeActiveDocument();
+            error.clear();
+            return true;
+        }
         Document parsed;
         parsed.version = Int32(root, "version", "document");
-        if (parsed.version != 1 && parsed.version != 2) {
+        if (parsed.version != 1 && parsed.version != 2 && parsed.version != 3) {
             throw std::runtime_error("unsupported document version " +
                                      std::to_string(parsed.version));
         }
 
-        if (parsed.version == 2) {
+        if (const JsonValue* color =
+                Optional(root, "color_management", JsonValue::Type::Object,
+                         "document")) {
+            const std::string context = "document.color_management";
+            parsed.color_management.enabled =
+                Require(*color, "enabled", JsonValue::Type::Boolean, context)
+                    .boolean;
+            parsed.color_management.input_gamut =
+                Require(*color, "input_gamut", JsonValue::Type::String, context)
+                    .string;
+            parsed.color_management.input_transfer =
+                Require(*color, "input_transfer", JsonValue::Type::String,
+                        context)
+                    .string;
+            parsed.color_management.input_ycbcr_matrix =
+                Require(*color, "input_ycbcr_matrix", JsonValue::Type::String,
+                        context)
+                    .string;
+            if (const JsonValue* range = Optional(
+                    *color, "input_range", JsonValue::Type::String, context))
+                parsed.color_management.input_range = range->string;
+            parsed.color_management.working_gamut =
+                Require(*color, "working_gamut", JsonValue::Type::String,
+                        context)
+                    .string;
+            parsed.color_management.output_gamut =
+                Require(*color, "output_gamut", JsonValue::Type::String,
+                        context)
+                    .string;
+            parsed.color_management.output_transfer =
+                Require(*color, "output_transfer", JsonValue::Type::String,
+                        context)
+                    .string;
+        }
+
+        const bool hasSequence =
+            Optional(root, "sequence", JsonValue::Type::Object, "document") !=
+            nullptr;
+        if (parsed.version == 3 && !hasSequence) {
+            throw std::runtime_error(
+                "version 3 document is missing its sequence object");
+        }
+        const JsonValue* sequenceValue = nullptr;
+        if (hasSequence) {
+            const JsonValue& sequence =
+                Require(root, "sequence", JsonValue::Type::Object, "document");
+            sequenceValue = &sequence;
+            const std::string context = "document.sequence";
+            parsed.sequence.id =
+                Require(sequence, "id", JsonValue::Type::String, context)
+                    .string;
+            parsed.sequence.name =
+                Require(sequence, "name", JsonValue::Type::String, context)
+                    .string;
+            parsed.sequence.width = Int32(sequence, "width", context);
+            parsed.sequence.height = Int32(sequence, "height", context);
+            const JsonValue& rate = Require(sequence, "frame_rate",
+                                            JsonValue::Type::Object, context);
+            parsed.sequence.frame_rate = {
+                Int32(rate, "num", context + ".frame_rate"),
+                Int32(rate, "den", context + ".frame_rate")};
+        }
+
+        if (parsed.version >= 2) {
             const JsonValue& library =
                 Require(root, "library", JsonValue::Type::Array, "document");
             for (size_t index = 0; index < library.array.size(); ++index) {
@@ -447,6 +783,9 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                 if (const JsonValue* bin = Optional(
                         item, "bin_id", JsonValue::Type::String, context))
                     media.bin_id = bin->string;
+                if (const JsonValue* proxy = Optional(
+                        item, "proxy_path", JsonValue::Type::String, context))
+                    media.proxy_path = proxy->string;
                 const JsonValue* codec =
                     Optional(item, "codec", JsonValue::Type::String, context);
                 if (!codec) {
@@ -455,6 +794,26 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     media.codec = codec->string;
                     media.width = Int32(item, "width", context);
                     media.height = Int32(item, "height", context);
+                    if (const JsonValue* value =
+                            Optional(item, "pixel_format",
+                                     JsonValue::Type::String, context))
+                        media.pixel_format = value->string;
+                    if (const JsonValue* value =
+                            Optional(item, "color_range",
+                                     JsonValue::Type::String, context))
+                        media.color_range = value->string;
+                    if (const JsonValue* value =
+                            Optional(item, "color_space",
+                                     JsonValue::Type::String, context))
+                        media.color_space = value->string;
+                    if (const JsonValue* value =
+                            Optional(item, "color_transfer",
+                                     JsonValue::Type::String, context))
+                        media.color_transfer = value->string;
+                    if (const JsonValue* value =
+                            Optional(item, "color_primaries",
+                                     JsonValue::Type::String, context))
+                        media.color_primaries = value->string;
                     if (Optional(item, "rotation_degrees",
                                  JsonValue::Type::Number, context))
                         media.rotation_degrees =
@@ -501,6 +860,84 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     parsed.bins.push_back(std::move(bin));
                 }
             }
+            const JsonValue& timelineOwner =
+                parsed.version == 3 ? *sequenceValue : root;
+            const std::string markerRoot =
+                parsed.version == 3 ? "document.sequence" : "document";
+            if (const JsonValue* markers =
+                    Optional(timelineOwner, "markers", JsonValue::Type::Array,
+                             markerRoot)) {
+                for (size_t index = 0; index < markers->array.size(); ++index) {
+                    const JsonValue& item = markers->array[index];
+                    const std::string context =
+                        markerRoot + ".markers[" + std::to_string(index) + "]";
+                    DocumentMarker marker;
+                    marker.id =
+                        Require(item, "id", JsonValue::Type::String, context)
+                            .string;
+                    marker.name =
+                        Require(item, "name", JsonValue::Type::String, context)
+                            .string;
+                    marker.time = ParseTime(
+                        Require(item, "time", JsonValue::Type::Object, context),
+                        context + ".time");
+                    marker.color =
+                        Require(item, "color", JsonValue::Type::String, context)
+                            .string;
+                    marker.category = Require(item, "category",
+                                              JsonValue::Type::String, context)
+                                          .string;
+                    parsed.sequence.markers.push_back(std::move(marker));
+                }
+            }
+            if (const JsonValue* transitions =
+                    Optional(timelineOwner, "transitions",
+                             JsonValue::Type::Array, markerRoot)) {
+                for (size_t index = 0; index < transitions->array.size();
+                     ++index) {
+                    const JsonValue& item = transitions->array[index];
+                    const std::string context = markerRoot + ".transitions[" +
+                                                std::to_string(index) + "]";
+                    DocumentTransition transition;
+                    transition.id =
+                        Require(item, "id", JsonValue::Type::String, context)
+                            .string;
+                    transition.track_id =
+                        Require(item, "track_id", JsonValue::Type::String,
+                                context)
+                            .string;
+                    transition.left_clip_id =
+                        Require(item, "left_clip_id", JsonValue::Type::String,
+                                context)
+                            .string;
+                    transition.right_clip_id =
+                        Require(item, "right_clip_id", JsonValue::Type::String,
+                                context)
+                            .string;
+                    transition.type =
+                        Require(item, "type", JsonValue::Type::String, context)
+                            .string;
+                    transition.duration =
+                        ParseTime(Require(item, "duration",
+                                          JsonValue::Type::Object, context),
+                                  context + ".duration");
+                    const std::string alignment =
+                        Require(item, "alignment", JsonValue::Type::String,
+                                context)
+                            .string;
+                    if (alignment == "center")
+                        transition.alignment = TransitionAlignment::Center;
+                    else if (alignment == "start_at_cut")
+                        transition.alignment = TransitionAlignment::StartAtCut;
+                    else if (alignment == "end_at_cut")
+                        transition.alignment = TransitionAlignment::EndAtCut;
+                    else
+                        throw std::runtime_error(context +
+                                                 " has invalid alignment");
+                    parsed.sequence.transitions.push_back(
+                        std::move(transition));
+                }
+            }
         }
 
         const JsonValue& sources =
@@ -525,7 +962,7 @@ bool Document::LoadFromString(const std::string& json, Document& output,
         }
 
         if (parsed.version == 1) {
-            parsed.version = 2;
+            parsed.version = 3;
             for (const DocumentSource& source : parsed.sources) {
                 LibraryMedia media;
                 media.id = source.id;
@@ -539,19 +976,44 @@ bool Document::LoadFromString(const std::string& json, Document& output,
             }
         }
 
-        const JsonValue& tracks =
-            Require(root, "tracks", JsonValue::Type::Array, "document");
+        if (!hasSequence) {
+            parsed.sequence.id = MigratedSequenceId(parsed.sources);
+            if (!parsed.sources.empty())
+                parsed.sequence.frame_rate = parsed.sources.front().rate;
+            if (!parsed.library.empty() &&
+                parsed.library.front().metadata_complete) {
+                const LibraryMedia& media = parsed.library.front();
+                parsed.sequence.width = media.width;
+                parsed.sequence.height = media.height;
+                if (std::abs(media.rotation_degrees) == 90)
+                    std::swap(parsed.sequence.width, parsed.sequence.height);
+            }
+        }
+
+        const JsonValue& timelineOwner =
+            parsed.version == 3 && sequenceValue ? *sequenceValue : root;
+        const std::string tracksRoot = parsed.version == 3 && sequenceValue
+                                           ? "document.sequence"
+                                           : "document";
+        const JsonValue& tracks = Require(timelineOwner, "tracks",
+                                          JsonValue::Type::Array, tracksRoot);
         for (size_t trackIndex = 0; trackIndex < tracks.array.size();
              ++trackIndex) {
             const JsonValue& item = tracks.array[trackIndex];
             const std::string context =
-                "tracks[" + std::to_string(trackIndex) + "]";
+                tracksRoot + ".tracks[" + std::to_string(trackIndex) + "]";
             DocumentTrack track;
             track.id =
                 Require(item, "id", JsonValue::Type::String, context).string;
             track.kind =
                 Require(item, "kind", JsonValue::Type::String, context).string;
             track.index = Int32(item, "index", context);
+            if (const JsonValue* locked =
+                    Optional(item, "locked", JsonValue::Type::Boolean, context))
+                track.locked = locked->boolean;
+            if (const JsonValue* syncLock = Optional(
+                    item, "sync_lock", JsonValue::Type::Boolean, context))
+                track.sync_lock = syncLock->boolean;
             const JsonValue& clips =
                 Require(item, "clips", JsonValue::Type::Array, context);
             for (size_t clipIndex = 0; clipIndex < clips.array.size();
@@ -597,9 +1059,10 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                 }
                 track.clips.push_back(std::move(clip));
             }
-            parsed.tracks.push_back(std::move(track));
+            parsed.sequence.tracks.push_back(std::move(track));
         }
 
+        parsed.version = 3;
         if (!parsed.Validate(error)) {
             return false;
         }
@@ -632,7 +1095,92 @@ bool Document::Save(const std::string& path, std::string& error) const {
 
 std::string Document::SaveToString() const {
     std::ostringstream output;
-    output << "{\n  \"version\": " << version << ",\n  \"library\": [";
+    output << "{\n  \"version\": " << version << ",\n  \"sequence\":{"
+           << "\"id\":\"" << Escape(sequence.id) << "\",\"name\":\""
+           << Escape(sequence.name) << "\",\"width\":" << sequence.width
+           << ",\"height\":" << sequence.height
+           << ",\"frame_rate\":{\"num\":" << sequence.frame_rate.num
+           << ",\"den\":" << sequence.frame_rate.den << "},\"markers\":[";
+    for (size_t index = 0; index < sequence.markers.size(); ++index) {
+        const DocumentMarker& marker = sequence.markers[index];
+        output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(marker.id) << "\",\"name\":\"" << Escape(marker.name)
+               << "\",\"time\":";
+        WriteTime(output, marker.time);
+        output << ",\"color\":\"" << Escape(marker.color)
+               << "\",\"category\":\"" << Escape(marker.category) << "\"}";
+    }
+    if (!sequence.markers.empty()) output << '\n';
+    output << "  ],\"transitions\":[";
+    for (size_t index = 0; index < sequence.transitions.size(); ++index) {
+        const DocumentTransition& transition = sequence.transitions[index];
+        const char* alignment =
+            transition.alignment == TransitionAlignment::Center ? "center"
+            : transition.alignment == TransitionAlignment::StartAtCut
+                ? "start_at_cut"
+                : "end_at_cut";
+        output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(transition.id) << "\",\"track_id\":\""
+               << Escape(transition.track_id) << "\",\"left_clip_id\":\""
+               << Escape(transition.left_clip_id) << "\",\"right_clip_id\":\""
+               << Escape(transition.right_clip_id) << "\",\"type\":\""
+               << Escape(transition.type) << "\",\"duration\":";
+        WriteTime(output, transition.duration);
+        output << ",\"alignment\":\"" << alignment << "\"}";
+    }
+    if (!sequence.transitions.empty()) output << '\n';
+    output << "  ],\"tracks\":[";
+    for (size_t trackIndex = 0; trackIndex < sequence.tracks.size();
+         ++trackIndex) {
+        const DocumentTrack& track = sequence.tracks[trackIndex];
+        output << (trackIndex == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(track.id) << "\",\"kind\":\"" << Escape(track.kind)
+               << "\",\"index\":" << track.index
+               << ",\"locked\":" << (track.locked ? "true" : "false")
+               << ",\"sync_lock\":" << (track.sync_lock ? "true" : "false")
+               << ",\"clips\":[";
+        for (size_t clipIndex = 0; clipIndex < track.clips.size();
+             ++clipIndex) {
+            const DocumentClip& clip = track.clips[clipIndex];
+            output << (clipIndex == 0 ? "\n" : ",\n") << "      {\"id\":\""
+                   << Escape(clip.id) << "\",\"source_id\":\""
+                   << Escape(clip.source_id) << "\",\"source_in\":";
+            WriteTime(output, clip.source_in);
+            output << ",\"duration\":";
+            WriteTime(output, clip.duration);
+            output << ",\"timeline_in\":";
+            WriteTime(output, clip.timeline_in);
+            output << ",\"include_audio\":"
+                   << (clip.include_audio ? "true" : "false");
+            if (!clip.link_group_id.empty())
+                output << ",\"link_group_id\":\"" << Escape(clip.link_group_id)
+                       << "\"";
+            if (!clip.sync_anchor_clip_id.empty()) {
+                output << ",\"sync_anchor_clip_id\":\""
+                       << Escape(clip.sync_anchor_clip_id)
+                       << "\",\"sync_reference_delta\":";
+                WriteTime(output, clip.sync_reference_delta);
+            }
+            output << "}";
+        }
+        if (!track.clips.empty()) output << '\n';
+        output << "    ]}";
+    }
+    if (!sequence.tracks.empty()) output << '\n';
+    output << "  ]}" << ",\n  \"color_management\":{\"enabled\":"
+           << (color_management.enabled ? "true" : "false")
+           << ",\"input_gamut\":\"" << Escape(color_management.input_gamut)
+           << "\",\"input_transfer\":\""
+           << Escape(color_management.input_transfer)
+           << "\",\"input_ycbcr_matrix\":\""
+           << Escape(color_management.input_ycbcr_matrix)
+           << "\",\"input_range\":\"" << Escape(color_management.input_range)
+           << "\",\"working_gamut\":\""
+           << Escape(color_management.working_gamut) << "\",\"output_gamut\":\""
+           << Escape(color_management.output_gamut)
+           << "\",\"output_transfer\":\""
+           << Escape(color_management.output_transfer)
+           << "\"},\n  \"library\": [";
     for (size_t index = 0; index < library.size(); ++index) {
         const LibraryMedia& media = library[index];
         output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
@@ -640,11 +1188,19 @@ std::string Document::SaveToString() const {
                << "\",\"filename\":\"" << Escape(media.filename) << "\"";
         if (!media.bin_id.empty())
             output << ",\"bin_id\":\"" << Escape(media.bin_id) << "\"";
+        if (!media.proxy_path.empty())
+            output << ",\"proxy_path\":\"" << Escape(media.proxy_path) << "\"";
         if (media.metadata_complete) {
             output << ",\"codec\":\"" << Escape(media.codec)
                    << "\",\"width\":" << media.width
                    << ",\"height\":" << media.height
-                   << ",\"rotation_degrees\":" << media.rotation_degrees;
+                   << ",\"rotation_degrees\":" << media.rotation_degrees
+                   << ",\"pixel_format\":\"" << Escape(media.pixel_format)
+                   << "\",\"color_range\":\"" << Escape(media.color_range)
+                   << "\",\"color_space\":\"" << Escape(media.color_space)
+                   << "\",\"color_transfer\":\"" << Escape(media.color_transfer)
+                   << "\",\"color_primaries\":\""
+                   << Escape(media.color_primaries) << "\"";
         }
         output << ",\"rate\":{\"num\":" << media.rate.num
                << ",\"den\":" << media.rate.den << "},\"duration\":";
@@ -683,51 +1239,51 @@ std::string Document::SaveToString() const {
         output << "}";
     }
     if (!sources.empty()) output << '\n';
-    output << "  ],\n  \"tracks\": [";
-    for (size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
-        const DocumentTrack& track = tracks[trackIndex];
-        output << (trackIndex == 0 ? "\n" : ",\n") << "    {\"id\":\""
-               << Escape(track.id) << "\",\"kind\":\"" << Escape(track.kind)
-               << "\",\"index\":" << track.index << ",\"clips\":[";
-        for (size_t clipIndex = 0; clipIndex < track.clips.size();
-             ++clipIndex) {
-            const DocumentClip& clip = track.clips[clipIndex];
-            output << (clipIndex == 0 ? "\n" : ",\n") << "      {\"id\":\""
-                   << Escape(clip.id) << "\",\"source_id\":\""
-                   << Escape(clip.source_id) << "\",\"source_in\":";
-            WriteTime(output, clip.source_in);
-            output << ",\"duration\":";
-            WriteTime(output, clip.duration);
-            output << ",\"timeline_in\":";
-            WriteTime(output, clip.timeline_in);
-            output << ",\"include_audio\":"
-                   << (clip.include_audio ? "true" : "false");
-            if (!clip.link_group_id.empty())
-                output << ",\"link_group_id\":\"" << Escape(clip.link_group_id)
-                       << "\"";
-            if (!clip.sync_anchor_clip_id.empty()) {
-                output << ",\"sync_anchor_clip_id\":\""
-                       << Escape(clip.sync_anchor_clip_id)
-                       << "\",\"sync_reference_delta\":";
-                WriteTime(output, clip.sync_reference_delta);
-            }
-            output << "}";
-        }
-        if (!track.clips.empty()) output << '\n';
-        output << "    ]}";
-    }
-    if (!tracks.empty()) output << '\n';
     output << "  ]\n}\n";
     return output.str();
 }
 
 bool Document::Validate(std::string& error) const {
-    if (version != 2) {
+    if (version != 3) {
         error = "unsupported document version " + std::to_string(version);
+        return false;
+    }
+    if (!IsValidUlid(sequence.id) || sequence.name.empty() ||
+        sequence.width <= 0 || sequence.height <= 0 || sequence.width > 16384 ||
+        sequence.height > 16384 || sequence.frame_rate.num <= 0 ||
+        sequence.frame_rate.den <= 0) {
+        error = "sequence has an invalid ID, name, dimensions or frame rate";
+        return false;
+    }
+
+    const auto oneOf = [](const std::string& value,
+                          std::initializer_list<const char*> allowed) {
+        return std::any_of(allowed.begin(), allowed.end(),
+                           [&](const char* item) { return value == item; });
+    };
+    if (!oneOf(color_management.input_gamut,
+               {"rec709", "sony_sgamut3_cine", "sony_sgamut3", "rec2020"}) ||
+        !oneOf(color_management.input_transfer,
+               {"rec709", "sony_slog3", "linear"}) ||
+        !oneOf(color_management.input_ycbcr_matrix,
+               {"auto", "bt709", "bt2020_ncl"}) ||
+        !oneOf(color_management.input_range, {"auto", "full", "limited"}) ||
+        !oneOf(color_management.working_gamut,
+               {"acescct", "rec2020", "rec709"}) ||
+        !oneOf(color_management.output_gamut, {"rec709", "rec2020"}) ||
+        !oneOf(color_management.output_transfer, {"rec709", "hlg"})) {
+        error =
+            "color_management contains an unsupported color space or transfer";
+        return false;
+    }
+    if (color_management.output_transfer == "hlg" &&
+        color_management.output_gamut != "rec2020") {
+        error = "HLG output requires the rec2020 output gamut";
         return false;
     }
 
     std::set<Ulid> ids;
+    if (!RegisterId(sequence.id, "sequence", ids, error)) return false;
     std::set<Ulid> binIds;
     for (size_t index = 0; index < bins.size(); ++index) {
         const DocumentBin& bin = bins[index];
@@ -756,6 +1312,27 @@ bool Document::Validate(std::string& error) const {
             }
             cursor = FindBin(cursor->parent_id);
             if (!cursor) break;
+        }
+    }
+    const auto validMarkerText = [](const std::string& value, size_t maximum) {
+        if (value.empty() || value.size() > maximum) return false;
+        return std::none_of(value.begin(), value.end(), [](unsigned char byte) {
+            return byte < 0x20 || byte == 0x7f;
+        });
+    };
+    for (size_t index = 0; index < sequence.markers.size(); ++index) {
+        const DocumentMarker& marker = sequence.markers[index];
+        const std::string context = "marker " + std::to_string(index);
+        if (!RegisterId(marker.id, context, ids, error)) return false;
+        if (!validMarkerText(marker.name, 4096) ||
+            !validMarkerText(marker.color, 64) ||
+            !validMarkerText(marker.category, 128)) {
+            error = context + " has an invalid name, color or category";
+            return false;
+        }
+        if (marker.time.rate <= 0 || marker.time.value < 0) {
+            error = context + " has an invalid time";
+            return false;
         }
     }
     std::set<Ulid> libraryIds;
@@ -839,8 +1416,9 @@ bool Document::Validate(std::string& error) const {
     }
 
     std::set<int32_t> trackIndices;
-    for (size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
-        const DocumentTrack& track = tracks[trackIndex];
+    for (size_t trackIndex = 0; trackIndex < sequence.tracks.size();
+         ++trackIndex) {
+        const DocumentTrack& track = sequence.tracks[trackIndex];
         const std::string trackContext = "track " + std::to_string(trackIndex);
         if (!RegisterId(track.id, trackContext, ids, error)) return false;
         if (!trackIndices.insert(track.index).second) {
@@ -930,6 +1508,79 @@ bool Document::Validate(std::string& error) const {
             previous = &clip;
         }
     }
+    for (size_t index = 0; index < sequence.transitions.size(); ++index) {
+        const DocumentTransition& transition = sequence.transitions[index];
+        const std::string context = "transition " + std::to_string(index);
+        if (!RegisterId(transition.id, context, ids, error)) return false;
+        const DocumentTrack* track = FindTrack(transition.track_id);
+        if (!track || track->kind != "video") {
+            error = context + " must reference a video track";
+            return false;
+        }
+        if (transition.type != "cross_dissolve" ||
+            transition.duration.rate <= 0 || transition.duration.value <= 0) {
+            error = context + " has an unsupported type or invalid duration";
+            return false;
+        }
+        size_t leftIndex = track->clips.size();
+        size_t rightIndex = track->clips.size();
+        for (size_t clipIndex = 0; clipIndex < track->clips.size();
+             ++clipIndex) {
+            if (track->clips[clipIndex].id == transition.left_clip_id)
+                leftIndex = clipIndex;
+            if (track->clips[clipIndex].id == transition.right_clip_id)
+                rightIndex = clipIndex;
+        }
+        if (leftIndex == track->clips.size() || rightIndex != leftIndex + 1) {
+            error = context + " must reference adjacent clips in edit order";
+            return false;
+        }
+        const DocumentClip& left = track->clips[leftIndex];
+        const DocumentClip& right = track->clips[rightIndex];
+        try {
+            const RationalTime cut = left.timeline_in.add(left.duration);
+            if (cut != right.timeline_in) {
+                error = context + " clips do not share a cut";
+                return false;
+            }
+            const int64_t frames = transition.duration.to_frames(
+                sequence.frame_rate.num, sequence.frame_rate.den);
+            const RationalTime exactDuration{
+                frames * static_cast<int64_t>(sequence.frame_rate.den),
+                sequence.frame_rate.num};
+            if (frames <= 0 || exactDuration != transition.duration) {
+                error =
+                    context + " duration must contain whole sequence frames";
+                return false;
+            }
+            int64_t preFrames = 0;
+            int64_t postFrames = 0;
+            if (transition.alignment == TransitionAlignment::Center) {
+                preFrames = frames / 2;
+                postFrames = frames - preFrames;
+            } else if (transition.alignment ==
+                       TransitionAlignment::StartAtCut) {
+                postFrames = frames;
+            } else {
+                preFrames = frames;
+            }
+            const RationalTime pre{preFrames * sequence.frame_rate.den,
+                                   sequence.frame_rate.num};
+            const RationalTime post{postFrames * sequence.frame_rate.den,
+                                    sequence.frame_rate.num};
+            const DocumentSource* leftSource = FindSource(left.source_id);
+            const RationalTime leftOut = left.source_in.add(left.duration);
+            if (leftOut.add(post) > leftSource->duration ||
+                right.source_in < pre) {
+                error = context + " exceeds available media handles";
+                return false;
+            }
+        } catch (const std::exception& exception) {
+            error = context + " has invalid rational time arithmetic: " +
+                    exception.what();
+            return false;
+        }
+    }
     error.clear();
     return true;
 }
@@ -976,22 +1627,50 @@ DocumentBin* Document::FindBin(const Ulid& id) {
     return nullptr;
 }
 
+const DocumentMarker* Document::FindMarker(const Ulid& id) const {
+    for (const DocumentMarker& marker : sequence.markers) {
+        if (marker.id == id) return &marker;
+    }
+    return nullptr;
+}
+
+DocumentMarker* Document::FindMarker(const Ulid& id) {
+    for (DocumentMarker& marker : sequence.markers) {
+        if (marker.id == id) return &marker;
+    }
+    return nullptr;
+}
+
+const DocumentTransition* Document::FindTransition(const Ulid& id) const {
+    for (const DocumentTransition& transition : sequence.transitions) {
+        if (transition.id == id) return &transition;
+    }
+    return nullptr;
+}
+
+DocumentTransition* Document::FindTransition(const Ulid& id) {
+    for (DocumentTransition& transition : sequence.transitions) {
+        if (transition.id == id) return &transition;
+    }
+    return nullptr;
+}
+
 const DocumentTrack* Document::FindTrack(const Ulid& id) const {
-    for (const DocumentTrack& track : tracks) {
+    for (const DocumentTrack& track : sequence.tracks) {
         if (track.id == id) return &track;
     }
     return nullptr;
 }
 
 DocumentTrack* Document::FindTrack(const Ulid& id) {
-    for (DocumentTrack& track : tracks) {
+    for (DocumentTrack& track : sequence.tracks) {
         if (track.id == id) return &track;
     }
     return nullptr;
 }
 
 const DocumentClip* Document::FindClip(const Ulid& id) const {
-    for (const DocumentTrack& track : tracks) {
+    for (const DocumentTrack& track : sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             if (clip.id == id) return &clip;
         }
@@ -1000,7 +1679,7 @@ const DocumentClip* Document::FindClip(const Ulid& id) const {
 }
 
 DocumentClip* Document::FindClip(const Ulid& id) {
-    for (DocumentTrack& track : tracks) {
+    for (DocumentTrack& track : sequence.tracks) {
         for (DocumentClip& clip : track.clips) {
             if (clip.id == id) return &clip;
         }
@@ -1009,7 +1688,7 @@ DocumentClip* Document::FindClip(const Ulid& id) {
 }
 
 const DocumentTrack* Document::FindTrackForClip(const Ulid& clipId) const {
-    for (const DocumentTrack& track : tracks) {
+    for (const DocumentTrack& track : sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             if (clip.id == clipId) return &track;
         }
@@ -1018,7 +1697,7 @@ const DocumentTrack* Document::FindTrackForClip(const Ulid& clipId) const {
 }
 
 DocumentTrack* Document::FindTrackForClip(const Ulid& clipId) {
-    for (DocumentTrack& track : tracks) {
+    for (DocumentTrack& track : sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             if (clip.id == clipId) return &track;
         }

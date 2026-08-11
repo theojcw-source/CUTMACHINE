@@ -36,6 +36,7 @@ public:
     bool TouchFrame(const SourceId& sourceId, int64_t frameIndex);
     void RegisterSource(const SourceId& sourceId);
     void UnregisterSource(const SourceId& sourceId);
+    void ClearSource(const SourceId& sourceId);
     PrefetchWindow WindowForSource(const SourceId& sourceId) const;
 
     size_t ByteBudget() const;

@@ -32,6 +32,7 @@ DartConfiguration.tcl
 
 # Runtime and tooling logs
 *.log
+.cutmachine/
 
 # Python tooling (harnesses, scripts)
 __pycache__/

@@ -33,7 +33,7 @@ Document Fixture() {
     document.sources = {
         {"01K30000000000000000000001", "folder/A.MP4", {25, 1}, {1000, 25}},
     };
-    document.tracks = {
+    document.sequence.tracks = {
         {"01K30000000000000000000002",
          "video",
          0,
@@ -47,6 +47,13 @@ Document Fixture() {
            {200, 25},
            {10, 25},
            {20, 25}}}},
+    };
+    document.sequence.markers = {
+        {"01K30000000000000000000005",
+         "Premier raccord",
+         {15, 25},
+         "#33AAFF",
+         "Montage"},
     };
     return document;
 }
@@ -77,6 +84,11 @@ int main() {
     Check(firstDescription.find("\"frames\":") != std::string::npos &&
               firstDescription.find("\"seconds\":") != std::string::npos,
           "describe emits frames and decimal seconds");
+    Check(firstDescription.find("\"markers\":[{\"alias\":\"K1\"") !=
+                  std::string::npos &&
+              firstDescription.find("\"name\":\"Premier raccord\"") !=
+                  std::string::npos,
+          "describe exposes stable marker IDs and aliases");
 
     const std::string before = Read(path);
     const Operation trim = TrimClipOperation{
@@ -130,6 +142,61 @@ int main() {
           "malformed operation returns ParseError");
     Check(Read(path) == afterBin,
           "malformed operation leaves document byte-identical");
+
+    const std::filesystem::path projectPath = directory / "project.json";
+    Project project = Project::FromDocument(Fixture(), "CLI project");
+    Check(project.Save(projectPath.string(), error),
+          "project fixture saves: " + error);
+    const std::string projectBefore = Read(projectPath);
+    const ProjectOperation addTimeline =
+        AddProjectTimelineOperation{"CLI vertical",
+                                    1080,
+                                    1920,
+                                    {25, 1},
+                                    "01K30000000000000000000010",
+                                    "01K30000000000000000000011",
+                                    "01K30000000000000000000012"};
+    Check(ApplyProjectOperationCommand(projectPath.string(),
+                                       SerializeProjectOperation(addTimeline),
+                                       result) == 0,
+          "valid apply-project-op succeeds: " + result);
+    Check(result.find("{\"ok\":true,\"project_hash\":\"") == 0,
+          "apply-project-op returns a project hash");
+    const std::string projectAfter = Read(projectPath);
+    Check(projectAfter != projectBefore,
+          "apply-project-op changes project bytes");
+
+    ProjectEditLog projectLog;
+    Check(
+        ProjectEditLog::Load(ProjectEditLogPathForProject(projectPath.string()),
+                             projectLog, editError, detail),
+        "project edit log loads: " + detail);
+    Check(projectLog.AppliedCount() == 1,
+          "apply-project-op increments the project log");
+    Check(UndoProjectOperationCommand(projectPath.string(), result) == 0,
+          "undo-project-op succeeds: " + result);
+    Check(Read(projectPath) == projectBefore,
+          "CLI project undo restores byte-identical JSON");
+    Check(RedoProjectOperationCommand(projectPath.string(), result) == 0,
+          "redo-project-op succeeds: " + result);
+    Check(Read(projectPath) == projectAfter,
+          "CLI project redo restores deterministic JSON");
+
+    const std::string projectLogBeforeRejection =
+        Read(ProjectEditLogPathForProject(projectPath.string()));
+    const ProjectOperation rejectedProject =
+        RemoveProjectTimelineOperation{"01K39999999999999999999999"};
+    Check(ApplyProjectOperationCommand(
+              projectPath.string(), SerializeProjectOperation(rejectedProject),
+              result) == 1,
+          "refused project operation returns status 1");
+    Check(result.find("\"error\":\"UnknownSequence\"") != std::string::npos,
+          "refused project operation returns its exact error");
+    Check(Read(projectPath) == projectAfter,
+          "refused project operation leaves project byte-identical");
+    Check(Read(ProjectEditLogPathForProject(projectPath.string())) ==
+              projectLogBeforeRejection,
+          "refused project operation leaves project log byte-identical");
 
     std::filesystem::remove_all(directory);
     if (failures != 0) {

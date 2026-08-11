@@ -12,6 +12,19 @@ struct MediaRate {
     int32_t den = 1;
 };
 
+// Project-wide display pipeline. Values are deliberately named (rather than
+// opaque numeric IDs) so project files remain readable and extensible.
+struct ColorManagementSettings {
+    bool enabled = false;
+    std::string input_gamut = "rec709";
+    std::string input_transfer = "rec709";
+    std::string input_ycbcr_matrix = "auto";
+    std::string input_range = "auto";
+    std::string working_gamut = "acescct";
+    std::string output_gamut = "rec709";
+    std::string output_transfer = "rec709";
+};
+
 struct DocumentSource {
     Ulid id = GenerateUlid();
     std::string path;
@@ -26,6 +39,11 @@ struct LibraryMedia {
     std::string codec;
     int32_t width = 0;
     int32_t height = 0;
+    std::string pixel_format;
+    std::string color_range;
+    std::string color_space;
+    std::string color_transfer;
+    std::string color_primaries;
     // Counterclockwise display rotation reported by FFmpeg's display matrix.
     int32_t rotation_degrees = 0;
     MediaRate rate;
@@ -37,6 +55,9 @@ struct LibraryMedia {
     // Empty means the project root. Bins organize library media only and do
     // not change source or clip identity.
     Ulid bin_id;
+    // Derived video-only media used for interactive decoding. Export and
+    // audio always resolve the original path above.
+    std::string proxy_path;
 
     // Version-1 sources do not contain technical metadata. They are promoted
     // to the library on load without fabricating values; a later ingest of the
@@ -51,14 +72,25 @@ struct DocumentBin {
     Ulid parent_id;
 };
 
+// A project marker is addressable independently from clips and tracks. Its
+// position remains exact in the document time domain; color and category stay
+// textual so project files remain readable and extensible.
+struct DocumentMarker {
+    Ulid id = GenerateUlid();
+    std::string name;
+    RationalTime time;
+    std::string color = "#f5c542";
+    std::string category = "note";
+};
+
 struct DocumentClip {
     Ulid id = GenerateUlid();
     Ulid source_id;
     RationalTime source_in;
     RationalTime duration;
     RationalTime timeline_in;
-    // Video clips contribute embedded audio until DetachAudio creates an
-    // independent audio-track clip and clears this flag.
+    // Deprecated migration flag. New video clips are always silent; audio is
+    // represented exclusively by clips on audio tracks.
     bool include_audio = true;
     // Clips produced by one A/V separation share this stable group. It is a
     // selection relationship only; their edit times remain independent.
@@ -69,20 +101,54 @@ struct DocumentClip {
     RationalTime sync_reference_delta{0, 1};
 };
 
+enum class TransitionAlignment { Center, StartAtCut, EndAtCut };
+
+// A transition belongs to the sequence, never to either clip. The referenced
+// clips keep their original, non-overlapping edit rectangles while the
+// transition reads the media handles around their shared cut.
+struct DocumentTransition {
+    Ulid id = GenerateUlid();
+    Ulid track_id;
+    Ulid left_clip_id;
+    Ulid right_clip_id;
+    std::string type = "cross_dissolve";
+    RationalTime duration;
+    TransitionAlignment alignment = TransitionAlignment::Center;
+};
+
 struct DocumentTrack {
     Ulid id = GenerateUlid();
     std::string kind;
     int32_t index = 0;
     std::vector<DocumentClip> clips;
+    // Locked tracks remain readable but reject edit operations.
+    bool locked = false;
+    // Ripple edits initiated on another track affect this track when enabled.
+    // This is independent from the hard edit lock above.
+    bool sync_lock = true;
+};
+
+// A sequence is the addressable owner of one timeline. Project media and bins
+// remain outside it; tracks and sequence markers cannot exist without it.
+struct DocumentSequence {
+    Ulid id = GenerateUlid();
+    std::string name = "Sequence 1";
+    int32_t width = 1920;
+    int32_t height = 1080;
+    MediaRate frame_rate{25, 1};
+    std::vector<DocumentMarker> markers;
+    std::vector<DocumentTransition> transitions;
+    std::vector<DocumentTrack> tracks;
 };
 
 class Document {
 public:
-    int32_t version = 2;
+    int32_t version = 3;
+    DocumentSequence sequence;
+    ColorManagementSettings color_management;
     std::vector<LibraryMedia> library;
     std::vector<DocumentBin> bins;
     std::vector<DocumentSource> sources;
-    std::vector<DocumentTrack> tracks;
 
     static bool Load(const std::string& path, Document& output,
                      std::string& error);
@@ -98,6 +164,10 @@ public:
     LibraryMedia* FindLibraryMedia(const Ulid& id);
     const DocumentBin* FindBin(const Ulid& id) const;
     DocumentBin* FindBin(const Ulid& id);
+    const DocumentMarker* FindMarker(const Ulid& id) const;
+    DocumentMarker* FindMarker(const Ulid& id);
+    const DocumentTransition* FindTransition(const Ulid& id) const;
+    DocumentTransition* FindTransition(const Ulid& id);
     const DocumentTrack* FindTrack(const Ulid& id) const;
     DocumentTrack* FindTrack(const Ulid& id);
     const DocumentClip* FindClip(const Ulid& id) const;

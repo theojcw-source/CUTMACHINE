@@ -154,6 +154,21 @@ void FrameCache::UnregisterSource(const SourceId& sourceId) {
     activeSources_.erase(sourceId);
 }
 
+void FrameCache::ClearSource(const SourceId& sourceId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto entry = entries_.begin(); entry != entries_.end();) {
+        if (entry->first.sourceId != sourceId) {
+            ++entry;
+            continue;
+        }
+        totalBytes_ -= entry->second.bytes;
+        lru_.erase(entry->second.lruPosition);
+        av_frame_free(&entry->second.frame);
+        entry = entries_.erase(entry);
+    }
+    sourceFrameBytes_.erase(sourceId);
+}
+
 FrameCache::PrefetchWindow FrameCache::WindowForSource(
     const SourceId& sourceId) const {
     std::lock_guard<std::mutex> lock(mutex_);
