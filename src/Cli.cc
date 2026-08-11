@@ -2,6 +2,7 @@
 
 #include "Document.h"
 #include "EditLog.h"
+#include "Export.h"
 #include "Operations.h"
 #include "Timeline.h"
 #include "Ulid.h"
@@ -206,8 +207,7 @@ std::string AliasPrefix(size_t ordinal) {
 }
 
 MediaRate PresentationRate(const Document& document) {
-    if (!document.sources.empty()) return document.sources.front().rate;
-    return {1, 1};
+    return document.sequence.frame_rate;
 }
 
 std::string Describe(const Document& document) {
@@ -216,7 +216,14 @@ std::string Describe(const Document& document) {
     const RationalTime duration = timeline.Duration();
     std::ostringstream output;
     output.imbue(std::locale::classic());
-    output << "{\"timeline\":{\"sources\":[";
+    output << "{\"sequence\":{\"id\":\""
+           << EscapeJson(document.sequence.id) << "\",\"name\":\""
+           << EscapeJson(document.sequence.name) << "\",\"width\":"
+           << document.sequence.width << ",\"height\":"
+           << document.sequence.height << ",\"frame_rate\":\""
+           << document.sequence.frame_rate.num << '/'
+           << document.sequence.frame_rate.den
+           << "\"},\"timeline\":{\"sources\":[";
     for (size_t index = 0; index < document.sources.size(); ++index) {
         if (index) output << ',';
         const DocumentSource& source = document.sources[index];
@@ -231,7 +238,7 @@ std::string Describe(const Document& document) {
     output << "],\"tracks\":[";
 
     std::vector<const DocumentTrack*> tracks;
-    for (const DocumentTrack& track : document.tracks) tracks.push_back(&track);
+    for (const DocumentTrack& track : document.sequence.tracks) tracks.push_back(&track);
     std::stable_sort(tracks.begin(), tracks.end(),
                      [](const DocumentTrack* left, const DocumentTrack* right) {
                          return left->index < right->index;
@@ -298,7 +305,7 @@ std::string Describe(const Document& document) {
     WriteTime(output, duration, timelineRate);
     output << "},\"library\":[";
     std::set<Ulid> usedMedia;
-    for (const DocumentTrack& track : document.tracks) {
+    for (const DocumentTrack& track : document.sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             usedMedia.insert(clip.source_id);
         }
@@ -314,7 +321,17 @@ std::string Describe(const Document& document) {
             output << ",\"codec\":\"" << EscapeJson(media.codec)
                    << "\",\"width\":" << media.width
                    << ",\"height\":" << media.height
-                   << ",\"rotation_degrees\":" << media.rotation_degrees;
+                   << ",\"rotation_degrees\":" << media.rotation_degrees
+                   << ",\"pixel_format\":\""
+                   << EscapeJson(media.pixel_format)
+                   << "\",\"color_range\":\""
+                   << EscapeJson(media.color_range)
+                   << "\",\"color_space\":\""
+                   << EscapeJson(media.color_space)
+                   << "\",\"color_transfer\":\""
+                   << EscapeJson(media.color_transfer)
+                   << "\",\"color_primaries\":\""
+                   << EscapeJson(media.color_primaries) << "\"";
         }
         output << ",\"rate\":{\"num\":" << media.rate.num
                << ",\"den\":" << media.rate.den
@@ -345,6 +362,18 @@ std::string Describe(const Document& document) {
                    << EscapeJson(document.bins[index].parent_id) << "\"";
         output << "}";
     }
+    output << "],\"markers\":[";
+    for (size_t index = 0; index < document.sequence.markers.size(); ++index) {
+        if (index) output << ',';
+        const DocumentMarker& marker = document.sequence.markers[index];
+        output << "{\"alias\":\"K" << (index + 1) << "\",\"id\":\""
+               << EscapeJson(marker.id) << "\",\"name\":\""
+               << EscapeJson(marker.name) << "\",\"time\":";
+        WriteTime(output, marker.time, timelineRate);
+        output << ",\"color\":\"" << EscapeJson(marker.color)
+               << "\",\"category\":\"" << EscapeJson(marker.category)
+               << "\"}";
+    }
     output << "]}\n";
     return output.str();
 }
@@ -371,6 +400,38 @@ bool CommitDocumentAndEditLog(const std::string& documentPath,
                               std::string& message) {
     return CommitPair(documentPath, document.SaveToString(), log.Serialize(),
                       message);
+}
+
+int ExportCommand(const std::string& documentPath,
+                  const ExportSettings& settings,
+                  const ExportProgressCallback& progress,
+                  const std::atomic_bool* cancel, std::string& output) {
+    Document document;
+    std::string error;
+    if (!Document::Load(documentPath, document, error)) {
+        output = "{\"ok\":false,\"error\":\"InvalidDocument\",\"detail\":\"" +
+                 EscapeJson(error) + "\"}\n";
+        return 1;
+    }
+    ExportPlan plan;
+    if (!Exporter::BuildPlan(document, documentPath, settings, plan, error)) {
+        output = "{\"ok\":false,\"error\":\"InvalidExport\",\"detail\":\"" +
+                 EscapeJson(error) + "\"}\n";
+        return 1;
+    }
+    if (!Exporter::Run(plan, progress, cancel, error)) {
+        output = "{\"ok\":false,\"error\":\"ExportFailed\",\"detail\":\"" +
+                 EscapeJson(error) + "\"}\n";
+        return 1;
+    }
+    output = "{\"ok\":true,\"codec\":\"hevc\",\"profile\":\"" +
+             std::string(settings.main10 ? "main10" : "main") +
+             "\",\"width\":" + std::to_string(settings.width) +
+             ",\"height\":" + std::to_string(settings.height) +
+             ",\"frames\":" + std::to_string(plan.total_frames) +
+             ",\"path\":\"" + EscapeJson(plan.settings.output_path) +
+             "\"}\n";
+    return 0;
 }
 
 int DescribeCommand(const std::string& documentPath, std::string& output) {

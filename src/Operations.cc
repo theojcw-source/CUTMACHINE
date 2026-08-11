@@ -216,6 +216,47 @@ bool ApplyRemove(Document& candidate, RemoveClipOperation& operation,
     return true;
 }
 
+bool ApplyClear(Document& candidate, ClearClipOperation& operation,
+                Operation& inverse, EditError& error, std::string& message) {
+    if (!operation.exact_track_result.empty()) {
+        if (operation.exact_track_result.size() != 1) {
+            Fail(EditError::InvalidOperation,
+                 "exact clear state must contain the clip track", error,
+                 message);
+            return false;
+        }
+        DocumentTrack* track =
+            candidate.FindTrack(operation.exact_track_result.front().track_id);
+        if (!track) {
+            Fail(EditError::UnknownTrack,
+                 "exact clear references an unknown track", error, message);
+            return false;
+        }
+        const ExactTrackState before{track->id, track->clips};
+        track->clips = operation.exact_track_result.front().clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = ClearClipOperation{operation.clip_id, {before}};
+        return true;
+    }
+    DocumentTrack* track = candidate.FindTrackForClip(operation.clip_id);
+    if (!track) {
+        Fail(EditError::UnknownClip,
+             "unknown clip_id '" + operation.clip_id + "'", error, message);
+        return false;
+    }
+    const ExactTrackState before{track->id, track->clips};
+    track->clips.erase(
+        std::remove_if(track->clips.begin(), track->clips.end(),
+                       [&](const DocumentClip& clip) {
+                           return clip.id == operation.clip_id;
+                       }),
+        track->clips.end());
+    if (!ValidateResult(candidate, error, message)) return false;
+    operation.exact_track_result = {{track->id, track->clips}};
+    inverse = ClearClipOperation{operation.clip_id, {before}};
+    return true;
+}
+
 bool Negate(const RationalTime& value, RationalTime& output) {
     if (value.value == std::numeric_limits<int64_t>::min()) return false;
     output = {-value.value, value.rate};
@@ -630,30 +671,126 @@ bool ApplyRemoveLinked(Document& candidate,
     return true;
 }
 
+bool ApplyClearLinked(Document& candidate,
+                      ClearLinkedClipsOperation& operation,
+                      Operation& inverse, EditError& error,
+                      std::string& message) {
+    const auto snapshots = [&](const std::vector<Ulid>& ids) {
+        std::vector<ExactTrackState> result;
+        for (const Ulid& id : ids) {
+            const DocumentTrack* track = candidate.FindTrackForClip(id);
+            if (!track || std::any_of(result.begin(), result.end(),
+                                      [&](const ExactTrackState& state) {
+                                          return state.track_id == track->id;
+                                      }))
+                continue;
+            result.push_back({track->id, track->clips});
+        }
+        return result;
+    };
+    if (!operation.exact_track_result.empty()) {
+        std::vector<ExactTrackState> before;
+        for (const ExactTrackState& state : operation.exact_track_result) {
+            DocumentTrack* track = candidate.FindTrack(state.track_id);
+            if (!track) {
+                Fail(EditError::UnknownTrack,
+                     "exact linked clear references an unknown track", error,
+                     message);
+                return false;
+            }
+            before.push_back({track->id, track->clips});
+        }
+        for (const ExactTrackState& state : operation.exact_track_result)
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = ClearLinkedClipsOperation{operation.link_group_id,
+                                            operation.clip_ids, before};
+        return true;
+    }
+    if (operation.link_group_id.empty() || operation.clip_ids.size() < 2) {
+        Fail(EditError::InvalidOperation,
+             "ClearLinkedClips requires at least two linked members", error,
+             message);
+        return false;
+    }
+    std::vector<Ulid> seen;
+    for (const Ulid& id : operation.clip_ids) {
+        const DocumentClip* clip = candidate.FindClip(id);
+        if (!clip || clip->link_group_id != operation.link_group_id ||
+            std::find(seen.begin(), seen.end(), id) != seen.end()) {
+            Fail(EditError::InvalidOperation,
+                 "linked clear members must be unique and share "
+                 "link_group_id",
+                 error, message);
+            return false;
+        }
+        seen.push_back(id);
+    }
+    const std::vector<ExactTrackState> before = snapshots(operation.clip_ids);
+    for (const Ulid& id : operation.clip_ids) {
+        DocumentTrack* track = candidate.FindTrackForClip(id);
+        track->clips.erase(
+            std::remove_if(track->clips.begin(), track->clips.end(),
+                           [&](const DocumentClip& clip) {
+                               return clip.id == id;
+                           }),
+            track->clips.end());
+    }
+    if (!ValidateResult(candidate, error, message)) return false;
+    operation.exact_track_result = before;
+    for (ExactTrackState& state : operation.exact_track_result)
+        state.clips = candidate.FindTrack(state.track_id)->clips;
+    inverse = ClearLinkedClipsOperation{operation.link_group_id,
+                                        operation.clip_ids, before};
+    return true;
+}
+
 bool ApplyDeleteGap(Document& candidate, DeleteGapOperation& operation,
                     Operation& inverse, EditError& error,
                     std::string& message) {
-    DocumentTrack* track = candidate.FindTrack(operation.track_id);
-    if (!track) {
-        Fail(EditError::UnknownTrack,
-             "unknown track_id '" + operation.track_id + "'", error, message);
-        return false;
-    }
-    const ExactTrackState before{track->id, track->clips};
-    if (!operation.exact_track_result.empty()) {
-        if (operation.exact_track_result.size() != 1 ||
-            operation.exact_track_result[0].track_id != track->id) {
+    std::vector<Ulid> trackIds{operation.track_id};
+    for (const Ulid& id : operation.linked_track_ids) {
+        if (id == operation.track_id ||
+            std::find(trackIds.begin(), trackIds.end(), id) != trackIds.end()) {
             Fail(EditError::InvalidOperation,
-                 "exact gap state must contain its destination track", error,
+                 "linked gap track_ids must be unique", error, message);
+            return false;
+        }
+        trackIds.push_back(id);
+    }
+    std::vector<ExactTrackState> before;
+    for (const Ulid& id : trackIds) {
+        DocumentTrack* track = candidate.FindTrack(id);
+        if (!track) {
+            Fail(EditError::UnknownTrack, "unknown track_id '" + id + "'",
+                 error, message);
+            return false;
+        }
+        before.push_back({track->id, track->clips});
+    }
+    if (!operation.exact_track_result.empty()) {
+        if (operation.exact_track_result.size() != trackIds.size()) {
+            Fail(EditError::InvalidOperation,
+                 "exact gap state must contain every destination track", error,
                  message);
             return false;
         }
-        track->clips = operation.exact_track_result[0].clips;
+        for (const ExactTrackState& state : operation.exact_track_result) {
+            if (std::find(trackIds.begin(), trackIds.end(), state.track_id) ==
+                trackIds.end()) {
+                Fail(EditError::InvalidOperation,
+                     "exact gap state contains an unexpected track", error,
+                     message);
+                return false;
+            }
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        }
         if (!ValidateResult(candidate, error, message)) return false;
         inverse = DeleteGapOperation{operation.track_id,
                                      operation.gap_start,
                                      operation.gap_duration,
-                                     {before}};
+                                     before,
+                                     operation.linked_track_ids};
         return true;
     }
     if (operation.gap_start.rate <= 0 || operation.gap_start.value < 0 ||
@@ -664,33 +801,41 @@ bool ApplyDeleteGap(Document& candidate, DeleteGapOperation& operation,
         return false;
     }
     const RationalTime gapEnd = operation.gap_start.add(operation.gap_duration);
-    bool hasFollowingClip = false;
-    for (const DocumentClip& clip : track->clips) {
-        const RationalTime clipEnd = clip.timeline_in.add(clip.duration);
-        if (clip.timeline_in < gapEnd && clipEnd > operation.gap_start) {
+    for (const Ulid& id : trackIds) {
+        DocumentTrack* track = candidate.FindTrack(id);
+        bool hasFollowingClip = false;
+        for (const DocumentClip& clip : track->clips) {
+            const RationalTime clipEnd = clip.timeline_in.add(clip.duration);
+            if (clip.timeline_in < gapEnd && clipEnd > operation.gap_start) {
+                Fail(EditError::InvalidOperation,
+                     "DeleteGap range contains clip_id '" + clip.id + "'",
+                     error, message);
+                return false;
+            }
+            if (clip.timeline_in >= gapEnd) hasFollowingClip = true;
+        }
+        if (!hasFollowingClip) {
             Fail(EditError::InvalidOperation,
-                 "DeleteGap range contains clip_id '" + clip.id + "'", error,
-                 message);
+                 "DeleteGap requires a following clip on every linked track",
+                 error, message);
             return false;
         }
-        if (clip.timeline_in >= gapEnd) hasFollowingClip = true;
-    }
-    if (!hasFollowingClip) {
-        Fail(EditError::InvalidOperation,
-             "DeleteGap requires a following clip to close the gap", error,
-             message);
-        return false;
-    }
-    for (DocumentClip& clip : track->clips) {
-        if (clip.timeline_in >= gapEnd)
-            clip.timeline_in = clip.timeline_in.sub(operation.gap_duration);
+        for (DocumentClip& clip : track->clips) {
+            if (clip.timeline_in >= gapEnd)
+                clip.timeline_in = clip.timeline_in.sub(operation.gap_duration);
+        }
     }
     if (!ValidateResult(candidate, error, message)) return false;
-    operation.exact_track_result = {{track->id, track->clips}};
+    operation.exact_track_result.clear();
+    for (const Ulid& id : trackIds) {
+        const DocumentTrack* track = candidate.FindTrack(id);
+        operation.exact_track_result.push_back({id, track->clips});
+    }
     inverse = DeleteGapOperation{operation.track_id,
                                  operation.gap_start,
                                  operation.gap_duration,
-                                 {before}};
+                                 before,
+                                 operation.linked_track_ids};
     return true;
 }
 
@@ -830,7 +975,7 @@ bool ApplyAddTrack(Document& candidate, AddTrackOperation& operation,
         return false;
     }
     if (operation.index < 0 ||
-        std::any_of(candidate.tracks.begin(), candidate.tracks.end(),
+        std::any_of(candidate.sequence.tracks.begin(), candidate.sequence.tracks.end(),
                     [&](const DocumentTrack& track) {
                         return track.index == operation.index;
                     })) {
@@ -838,8 +983,8 @@ bool ApplyAddTrack(Document& candidate, AddTrackOperation& operation,
              "track index must be non-negative and unique", error, message);
         return false;
     }
-    candidate.tracks.push_back(
-        {operation.track_id, operation.kind, operation.index, {}});
+    candidate.sequence.tracks.push_back(
+        {operation.track_id, operation.kind, operation.index, operation.clips});
     if (!ValidateResult(candidate, error, message)) return false;
     inverse = RemoveTrackOperation{operation.track_id};
     return true;
@@ -849,22 +994,38 @@ bool ApplyRemoveTrack(Document& candidate, RemoveTrackOperation& operation,
                       Operation& inverse, EditError& error,
                       std::string& message) {
     const auto found =
-        std::find_if(candidate.tracks.begin(), candidate.tracks.end(),
+        std::find_if(candidate.sequence.tracks.begin(), candidate.sequence.tracks.end(),
                      [&](const DocumentTrack& track) {
                          return track.id == operation.track_id;
                      });
-    if (found == candidate.tracks.end()) {
+    if (found == candidate.sequence.tracks.end()) {
         Fail(EditError::UnknownTrack,
              "unknown track_id '" + operation.track_id + "'", error, message);
         return false;
     }
-    if (!found->clips.empty()) {
-        Fail(EditError::InvalidOperation, "cannot remove a non-empty track",
-             error, message);
+    inverse =
+        AddTrackOperation{found->id, found->kind, found->index, found->clips};
+    candidate.sequence.tracks.erase(found);
+    return ValidateResult(candidate, error, message);
+}
+
+bool ApplyUpdateSequence(Document& candidate,
+                         UpdateSequenceOperation& operation,
+                         Operation& inverse, EditError& error,
+                         std::string& message) {
+    if (operation.sequence_id != candidate.sequence.id) {
+        Fail(EditError::UnknownSequence,
+             "unknown sequence_id '" + operation.sequence_id + "'", error,
+             message);
         return false;
     }
-    inverse = AddTrackOperation{found->id, found->kind, found->index};
-    candidate.tracks.erase(found);
+    const DocumentSequence& current = candidate.sequence;
+    inverse = UpdateSequenceOperation{current.id, current.name, current.width,
+                                      current.height, current.frame_rate};
+    candidate.sequence.name = operation.name;
+    candidate.sequence.width = operation.width;
+    candidate.sequence.height = operation.height;
+    candidate.sequence.frame_rate = operation.frame_rate;
     return ValidateResult(candidate, error, message);
 }
 
@@ -959,6 +1120,43 @@ bool ApplyRenameBin(Document& candidate, RenameBinOperation& operation,
     return ValidateResult(candidate, error, message);
 }
 
+bool ApplyMoveBin(Document& candidate, MoveBinOperation& operation,
+                  Operation& inverse, EditError& error,
+                  std::string& message) {
+    DocumentBin* bin = candidate.FindBin(operation.bin_id);
+    if (!bin) {
+        Fail(EditError::UnknownBin, "unknown bin_id '" + operation.bin_id +
+                                        "'",
+             error, message);
+        return false;
+    }
+    if (operation.parent_id == operation.bin_id) {
+        Fail(EditError::InvalidOperation, "a bin cannot contain itself", error,
+             message);
+        return false;
+    }
+    if (!operation.parent_id.empty() &&
+        !candidate.FindBin(operation.parent_id)) {
+        Fail(EditError::UnknownBin,
+             "unknown parent bin_id '" + operation.parent_id + "'", error,
+             message);
+        return false;
+    }
+    const DocumentBin* cursor = candidate.FindBin(operation.parent_id);
+    while (cursor) {
+        if (cursor->id == operation.bin_id) {
+            Fail(EditError::InvalidOperation,
+                 "a bin cannot be moved into one of its descendants", error,
+                 message);
+            return false;
+        }
+        cursor = candidate.FindBin(cursor->parent_id);
+    }
+    inverse = MoveBinOperation{bin->id, bin->parent_id};
+    bin->parent_id = operation.parent_id;
+    return ValidateResult(candidate, error, message);
+}
+
 bool ApplySetMediaBin(Document& candidate, SetMediaBinOperation& operation,
                       Operation& inverse, EditError& error,
                       std::string& message) {
@@ -976,6 +1174,84 @@ bool ApplySetMediaBin(Document& candidate, SetMediaBinOperation& operation,
     inverse = SetMediaBinOperation{operation.media_id, media->bin_id};
     media->bin_id = operation.bin_id;
     return ValidateResult(candidate, error, message);
+}
+
+bool ApplyAddMarker(Document& candidate, AddMarkerOperation& operation,
+                    Operation& inverse, EditError& error,
+                    std::string& message) {
+    if (operation.marker.id.empty()) operation.marker.id = GenerateUlid();
+    const Ulid& id = operation.marker.id;
+    const bool collision =
+        id == candidate.sequence.id || candidate.FindMarker(id) ||
+        candidate.FindBin(id) || candidate.FindLibraryMedia(id) ||
+        candidate.FindSource(id) || candidate.FindTrack(id) ||
+        candidate.FindClip(id);
+    if (!IsValidUlid(id) || collision) {
+        Fail(EditError::DuplicateId,
+             "marker_id is invalid or already exists: '" + id + "'", error,
+             message);
+        return false;
+    }
+    if (operation.insertion_index < -1 ||
+        (operation.insertion_index >= 0 &&
+         static_cast<uint64_t>(operation.insertion_index) >
+             candidate.sequence.markers.size())) {
+        Fail(EditError::InvalidOperation,
+             "marker insertion_index is outside the marker list", error,
+             message);
+        return false;
+    }
+    if (operation.insertion_index < 0)
+        operation.insertion_index =
+            static_cast<int64_t>(candidate.sequence.markers.size());
+    candidate.sequence.markers.insert(
+        candidate.sequence.markers.begin() + operation.insertion_index,
+        operation.marker);
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = RemoveMarkerOperation{id};
+    return true;
+}
+
+bool ApplyRemoveMarker(Document& candidate, RemoveMarkerOperation& operation,
+                       Operation& inverse, EditError& error,
+                       std::string& message) {
+    const auto found = std::find_if(
+        candidate.sequence.markers.begin(), candidate.sequence.markers.end(),
+        [&](const DocumentMarker& marker) { return marker.id == operation.marker_id; });
+    if (found == candidate.sequence.markers.end()) {
+        Fail(EditError::UnknownMarker,
+             "unknown marker_id '" + operation.marker_id + "'", error,
+             message);
+        return false;
+    }
+    const int64_t index = static_cast<int64_t>(
+        std::distance(candidate.sequence.markers.begin(), found));
+    const DocumentMarker removed = *found;
+    candidate.sequence.markers.erase(found);
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = AddMarkerOperation{removed, index};
+    return true;
+}
+
+bool ApplyUpdateMarker(Document& candidate, UpdateMarkerOperation& operation,
+                       Operation& inverse, EditError& error,
+                       std::string& message) {
+    DocumentMarker* marker = candidate.FindMarker(operation.marker_id);
+    if (!marker) {
+        Fail(EditError::UnknownMarker,
+             "unknown marker_id '" + operation.marker_id + "'", error,
+             message);
+        return false;
+    }
+    const DocumentMarker before = *marker;
+    marker->name = operation.name;
+    marker->time = operation.time;
+    marker->color = operation.color;
+    marker->category = operation.category;
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = UpdateMarkerOperation{before.id, before.name, before.time,
+                                    before.color, before.category};
+    return true;
 }
 
 bool ApplySetClipLink(Document& candidate, SetClipLinkOperation& operation,
@@ -1105,6 +1381,140 @@ bool ApplySplit(Document& candidate, SplitClipOperation& operation,
     if (!ValidateResult(candidate, error, message)) return false;
     inverse = JoinClipOperation{original.id, operation.right_clip_id,
                                 TimesOf(original)};
+    return true;
+}
+
+bool ApplySplitLinked(Document& candidate,
+                      SplitLinkedClipsOperation& operation,
+                      Operation& inverse, EditError& error,
+                      std::string& message) {
+    const auto snapshots = [&](const std::vector<Ulid>& ids) {
+        std::vector<ExactTrackState> result;
+        for (const Ulid& id : ids) {
+            const DocumentTrack* track = candidate.FindTrackForClip(id);
+            if (!track || std::any_of(result.begin(), result.end(),
+                                      [&](const ExactTrackState& state) {
+                                          return state.track_id == track->id;
+                                      }))
+                continue;
+            result.push_back({track->id, track->clips});
+        }
+        return result;
+    };
+    if (!operation.exact_track_result.empty()) {
+        std::vector<ExactTrackState> before;
+        for (const ExactTrackState& state : operation.exact_track_result) {
+            DocumentTrack* track = candidate.FindTrack(state.track_id);
+            if (!track) {
+                Fail(EditError::UnknownTrack,
+                     "exact linked split references an unknown track", error,
+                     message);
+                return false;
+            }
+            before.push_back({track->id, track->clips});
+        }
+        for (const ExactTrackState& state : operation.exact_track_result)
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = SplitLinkedClipsOperation{
+            operation.link_group_id, operation.clip_ids,
+            operation.timeline_position, operation.left_group_id,
+            operation.right_group_id, operation.right_clip_ids,
+            std::move(before)};
+        return true;
+    }
+    if (operation.link_group_id.empty() || operation.clip_ids.size() < 2) {
+        Fail(EditError::InvalidOperation,
+             "SplitLinkedClips requires at least two linked members", error,
+             message);
+        return false;
+    }
+    std::vector<Ulid> seen;
+    for (const Ulid& id : operation.clip_ids) {
+        const DocumentClip* clip = candidate.FindClip(id);
+        if (!clip || clip->link_group_id != operation.link_group_id ||
+            std::find(seen.begin(), seen.end(), id) != seen.end() ||
+            operation.timeline_position <= clip->timeline_in ||
+            operation.timeline_position >=
+                clip->timeline_in.add(clip->duration)) {
+            Fail(EditError::InvalidOperation,
+                 "linked split members must be unique, share link_group_id, "
+                 "and contain the cut position",
+                 error, message);
+            return false;
+        }
+        seen.push_back(id);
+    }
+    if (operation.left_group_id.empty()) operation.left_group_id = GenerateUlid();
+    if (operation.right_group_id.empty())
+        operation.right_group_id = GenerateUlid();
+    if (!IsValidUlid(operation.left_group_id) ||
+        !IsValidUlid(operation.right_group_id) ||
+        operation.left_group_id == operation.right_group_id) {
+        Fail(EditError::InvalidOperation,
+             "linked split requires two distinct valid group IDs", error,
+             message);
+        return false;
+    }
+    if (operation.right_clip_ids.empty()) {
+        for (size_t index = 0; index < operation.clip_ids.size(); ++index)
+            operation.right_clip_ids.push_back(GenerateUlid());
+    }
+    if (operation.right_clip_ids.size() != operation.clip_ids.size()) {
+        Fail(EditError::InvalidOperation,
+             "linked split requires one right clip ID per member", error,
+             message);
+        return false;
+    }
+    std::vector<Ulid> generated;
+    for (const Ulid& id : operation.right_clip_ids) {
+        if (!IsValidUlid(id) || candidate.FindClip(id) ||
+            candidate.FindTrack(id) || candidate.FindSource(id) ||
+            std::find(generated.begin(), generated.end(), id) !=
+                generated.end()) {
+            Fail(EditError::DuplicateId,
+                 "linked split right clip ID is invalid or already exists",
+                 error, message);
+            return false;
+        }
+        generated.push_back(id);
+    }
+
+    const std::vector<ExactTrackState> before = snapshots(operation.clip_ids);
+    Ulid leftAnchor = operation.clip_ids.front();
+    for (const Ulid& id : operation.clip_ids) {
+        const DocumentClip* clip = candidate.FindClip(id);
+        if (clip && clip->sync_anchor_clip_id == id) {
+            leftAnchor = id;
+            break;
+        }
+    }
+    const auto anchorPosition = std::find(operation.clip_ids.begin(),
+                                          operation.clip_ids.end(), leftAnchor);
+    const size_t anchorIndex = static_cast<size_t>(
+        std::distance(operation.clip_ids.begin(), anchorPosition));
+    const Ulid rightAnchor = operation.right_clip_ids[anchorIndex];
+    for (size_t index = 0; index < operation.clip_ids.size(); ++index) {
+        SplitClipOperation split{operation.clip_ids[index],
+                                 operation.timeline_position,
+                                 operation.right_clip_ids[index]};
+        Operation ignored = RemoveClipOperation{};
+        if (!ApplySplit(candidate, split, ignored, error, message)) return false;
+    }
+    for (size_t index = 0; index < operation.clip_ids.size(); ++index) {
+        DocumentClip* left = candidate.FindClip(operation.clip_ids[index]);
+        DocumentClip* right = candidate.FindClip(operation.right_clip_ids[index]);
+        left->link_group_id = operation.left_group_id;
+        left->sync_anchor_clip_id = leftAnchor;
+        right->link_group_id = operation.right_group_id;
+        right->sync_anchor_clip_id = rightAnchor;
+    }
+    if (!ValidateResult(candidate, error, message)) return false;
+    operation.exact_track_result = snapshots(operation.clip_ids);
+    inverse = SplitLinkedClipsOperation{
+        operation.link_group_id, operation.clip_ids, operation.timeline_position,
+        operation.left_group_id, operation.right_group_id,
+        operation.right_clip_ids, before};
     return true;
 }
 
@@ -1378,6 +1788,10 @@ const char* EditErrorName(EditError error) {
             return "UnknownSource";
         case EditError::UnknownBin:
             return "UnknownBin";
+        case EditError::UnknownMarker:
+            return "UnknownMarker";
+        case EditError::UnknownSequence:
+            return "UnknownSequence";
         case EditError::UnknownMedia:
             return "UnknownMedia";
         case EditError::InvalidDuration:
@@ -1423,6 +1837,10 @@ bool ApplyOperation(Document& document, Operation& operation,
                        std::get_if<RemoveClipOperation>(&normalized)) {
             applied = ApplyRemove(candidate, *remove, generatedInverse, error,
                                   message);
+        } else if (auto* clear =
+                       std::get_if<ClearClipOperation>(&normalized)) {
+            applied = ApplyClear(candidate, *clear, generatedInverse, error,
+                                 message);
         } else if (auto* trim = std::get_if<TrimClipOperation>(&normalized)) {
             applied =
                 ApplyTrim(candidate, *trim, generatedInverse, error, message);
@@ -1441,9 +1859,17 @@ bool ApplyOperation(Document& document, Operation& operation,
                        std::get_if<RemoveLinkedClipsOperation>(&normalized)) {
             applied = ApplyRemoveLinked(candidate, *linkedRemove,
                                         generatedInverse, error, message);
+        } else if (auto* linkedClear =
+                       std::get_if<ClearLinkedClipsOperation>(&normalized)) {
+            applied = ApplyClearLinked(candidate, *linkedClear,
+                                       generatedInverse, error, message);
         } else if (auto* split = std::get_if<SplitClipOperation>(&normalized)) {
             applied =
                 ApplySplit(candidate, *split, generatedInverse, error, message);
+        } else if (auto* linkedSplit =
+                       std::get_if<SplitLinkedClipsOperation>(&normalized)) {
+            applied = ApplySplitLinked(candidate, *linkedSplit,
+                                       generatedInverse, error, message);
         } else if (auto* gap = std::get_if<DeleteGapOperation>(&normalized)) {
             applied = ApplyDeleteGap(candidate, *gap, generatedInverse, error,
                                      message);
@@ -1459,6 +1885,10 @@ bool ApplyOperation(Document& document, Operation& operation,
                        std::get_if<RemoveTrackOperation>(&normalized)) {
             applied = ApplyRemoveTrack(candidate, *removeTrack,
                                        generatedInverse, error, message);
+        } else if (auto* updateSequence =
+                       std::get_if<UpdateSequenceOperation>(&normalized)) {
+            applied = ApplyUpdateSequence(candidate, *updateSequence,
+                                          generatedInverse, error, message);
         } else if (auto* addBin = std::get_if<AddBinOperation>(&normalized)) {
             applied = ApplyAddBin(candidate, *addBin, generatedInverse, error,
                                   message);
@@ -1470,10 +1900,26 @@ bool ApplyOperation(Document& document, Operation& operation,
                        std::get_if<RenameBinOperation>(&normalized)) {
             applied = ApplyRenameBin(candidate, *renameBin, generatedInverse,
                                      error, message);
+        } else if (auto* moveBin =
+                       std::get_if<MoveBinOperation>(&normalized)) {
+            applied = ApplyMoveBin(candidate, *moveBin, generatedInverse, error,
+                                   message);
         } else if (auto* setMediaBin =
                        std::get_if<SetMediaBinOperation>(&normalized)) {
             applied = ApplySetMediaBin(candidate, *setMediaBin,
                                        generatedInverse, error, message);
+        } else if (auto* addMarker =
+                       std::get_if<AddMarkerOperation>(&normalized)) {
+            applied = ApplyAddMarker(candidate, *addMarker, generatedInverse,
+                                     error, message);
+        } else if (auto* removeMarker =
+                       std::get_if<RemoveMarkerOperation>(&normalized)) {
+            applied = ApplyRemoveMarker(candidate, *removeMarker,
+                                        generatedInverse, error, message);
+        } else if (auto* updateMarker =
+                       std::get_if<UpdateMarkerOperation>(&normalized)) {
+            applied = ApplyUpdateMarker(candidate, *updateMarker,
+                                        generatedInverse, error, message);
         } else if (auto* setClipLink =
                        std::get_if<SetClipLinkOperation>(&normalized)) {
             applied = ApplySetClipLink(candidate, *setClipLink,
@@ -1515,6 +1961,13 @@ std::string SerializeOperation(const Operation& operation) {
         output << "{\"type\":\"RemoveClip\",\"clip_id\":\"" << remove->clip_id
                << "\",\"exact_timeline\":";
         WriteExactPositions(output, remove->exact_timeline_result);
+        output << '}';
+    } else if (const auto* clear =
+                   std::get_if<ClearClipOperation>(&operation)) {
+        output << "{\"type\":\"ClearClip\",\"clip_id\":";
+        WriteString(output, clear->clip_id);
+        output << ",\"exact_tracks\":";
+        WriteExactTracks(output, clear->exact_track_result);
         output << '}';
     } else if (const auto* trim = std::get_if<TrimClipOperation>(&operation)) {
         output << "{\"type\":\"TrimClip\",\"clip_id\":\"" << trim->clip_id
@@ -1585,18 +2038,61 @@ std::string SerializeOperation(const Operation& operation) {
         output << "],\"exact_tracks\":";
         WriteExactTracks(output, linkedRemove->exact_track_result);
         output << '}';
+    } else if (const auto* linkedClear =
+                   std::get_if<ClearLinkedClipsOperation>(&operation)) {
+        output << "{\"type\":\"ClearLinkedClips\",\"link_group_id\":";
+        WriteString(output, linkedClear->link_group_id);
+        output << ",\"clip_ids\":[";
+        for (size_t index = 0; index < linkedClear->clip_ids.size(); ++index) {
+            if (index) output << ',';
+            WriteString(output, linkedClear->clip_ids[index]);
+        }
+        output << "],\"exact_tracks\":";
+        WriteExactTracks(output, linkedClear->exact_track_result);
+        output << '}';
     } else if (const auto* split =
                    std::get_if<SplitClipOperation>(&operation)) {
         output << "{\"type\":\"SplitClip\",\"clip_id\":\"" << split->clip_id
                << "\",\"timeline_position\":";
         WriteTime(output, split->timeline_position);
         output << ",\"right_clip_id\":\"" << split->right_clip_id << "\"}";
+    } else if (const auto* split =
+                   std::get_if<SplitLinkedClipsOperation>(&operation)) {
+        output << "{\"type\":\"SplitLinkedClips\",\"link_group_id\":";
+        WriteString(output, split->link_group_id);
+        output << ",\"clip_ids\":[";
+        for (size_t index = 0; index < split->clip_ids.size(); ++index) {
+            if (index) output << ',';
+            WriteString(output, split->clip_ids[index]);
+        }
+        output << "],\"timeline_position\":";
+        WriteTime(output, split->timeline_position);
+        output << ",\"left_group_id\":";
+        WriteString(output, split->left_group_id);
+        output << ",\"right_group_id\":";
+        WriteString(output, split->right_group_id);
+        output << ",\"right_clip_ids\":[";
+        for (size_t index = 0; index < split->right_clip_ids.size(); ++index) {
+            if (index) output << ',';
+            WriteString(output, split->right_clip_ids[index]);
+        }
+        output << "],\"exact_tracks\":";
+        WriteExactTracks(output, split->exact_track_result);
+        output << '}';
     } else if (const auto* gap = std::get_if<DeleteGapOperation>(&operation)) {
         output << "{\"type\":\"DeleteGap\",\"track_id\":\"" << gap->track_id
                << "\",\"gap_start\":";
         WriteTime(output, gap->gap_start);
         output << ",\"gap_duration\":";
         WriteTime(output, gap->gap_duration);
+        if (!gap->linked_track_ids.empty()) {
+            output << ",\"linked_track_ids\":[";
+            for (size_t index = 0; index < gap->linked_track_ids.size(); ++index) {
+                if (index) output << ',';
+                WriteString(output, gap->linked_track_ids[index]);
+            }
+            output << ']';
+        }
         output << ",\"exact_tracks\":";
         WriteExactTracks(output, gap->exact_track_result);
         output << '}';
@@ -1612,11 +2108,27 @@ std::string SerializeOperation(const Operation& operation) {
                    std::get_if<AddTrackOperation>(&operation)) {
         output << "{\"type\":\"AddTrack\",\"track_id\":\"" << addTrack->track_id
                << "\",\"kind\":\"" << addTrack->kind
-               << "\",\"index\":" << addTrack->index << '}';
+               << "\",\"index\":" << addTrack->index;
+        if (!addTrack->clips.empty()) {
+            output << ",\"exact_tracks\":";
+            WriteExactTracks(output,
+                             {{addTrack->track_id, addTrack->clips}});
+        }
+        output << '}';
     } else if (const auto* removeTrack =
                    std::get_if<RemoveTrackOperation>(&operation)) {
         output << "{\"type\":\"RemoveTrack\",\"track_id\":\""
                << removeTrack->track_id << "\"}";
+    } else if (const auto* updateSequence =
+                   std::get_if<UpdateSequenceOperation>(&operation)) {
+        output << "{\"type\":\"UpdateSequence\",\"sequence_id\":\""
+               << updateSequence->sequence_id << "\",\"name\":";
+        WriteString(output, updateSequence->name);
+        output << ",\"width\":" << updateSequence->width
+               << ",\"height\":" << updateSequence->height
+               << ",\"frame_rate\":{\"num\":"
+               << updateSequence->frame_rate.num << ",\"den\":"
+               << updateSequence->frame_rate.den << "}}";
     } else if (const auto* addBin = std::get_if<AddBinOperation>(&operation)) {
         output << "{\"type\":\"AddBin\",\"bin_id\":\"" << addBin->bin_id
                << "\",\"name\":";
@@ -1636,11 +2148,44 @@ std::string SerializeOperation(const Operation& operation) {
                << "\",\"name\":";
         WriteString(output, renameBin->name);
         output << '}';
+    } else if (const auto* moveBin =
+                   std::get_if<MoveBinOperation>(&operation)) {
+        output << "{\"type\":\"MoveBin\",\"bin_id\":\"" << moveBin->bin_id
+               << "\",\"parent_id\":\"" << moveBin->parent_id << "\"}";
     } else if (const auto* setMediaBin =
                    std::get_if<SetMediaBinOperation>(&operation)) {
         output << "{\"type\":\"SetMediaBin\",\"media_id\":\""
                << setMediaBin->media_id << "\",\"bin_id\":\""
                << setMediaBin->bin_id << "\"}";
+    } else if (const auto* addMarker =
+                   std::get_if<AddMarkerOperation>(&operation)) {
+        output << "{\"type\":\"AddMarker\",\"marker\":{\"id\":\""
+               << addMarker->marker.id << "\",\"name\":";
+        WriteString(output, addMarker->marker.name);
+        output << ",\"time\":";
+        WriteTime(output, addMarker->marker.time);
+        output << ",\"color\":";
+        WriteString(output, addMarker->marker.color);
+        output << ",\"category\":";
+        WriteString(output, addMarker->marker.category);
+        output << "},\"insertion_index\":" << addMarker->insertion_index
+               << '}';
+    } else if (const auto* removeMarker =
+                   std::get_if<RemoveMarkerOperation>(&operation)) {
+        output << "{\"type\":\"RemoveMarker\",\"marker_id\":\""
+               << removeMarker->marker_id << "\"}";
+    } else if (const auto* updateMarker =
+                   std::get_if<UpdateMarkerOperation>(&operation)) {
+        output << "{\"type\":\"UpdateMarker\",\"marker_id\":\""
+               << updateMarker->marker_id << "\",\"name\":";
+        WriteString(output, updateMarker->name);
+        output << ",\"time\":";
+        WriteTime(output, updateMarker->time);
+        output << ",\"color\":";
+        WriteString(output, updateMarker->color);
+        output << ",\"category\":";
+        WriteString(output, updateMarker->category);
+        output << '}';
     } else if (const auto* setClipLink =
                    std::get_if<SetClipLinkOperation>(&operation)) {
         output << "{\"type\":\"SetClipLink\",\"first_clip_id\":\""
@@ -1708,6 +2253,14 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             value.clip_id = reader.String();
             reader.Expect(",\"exact_timeline\":");
             value.exact_timeline_result = ReadExactPositions(reader);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "ClearClip") {
+            ClearClipOperation value;
+            reader.Expect(",\"clip_id\":");
+            value.clip_id = reader.String();
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
             reader.Expect("}");
             operation = std::move(value);
         } else if (type == "TrimClip") {
@@ -1820,6 +2373,22 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             value.exact_track_result = ReadExactTracks(reader);
             reader.Expect("}");
             operation = std::move(value);
+        } else if (type == "ClearLinkedClips") {
+            ClearLinkedClipsOperation value;
+            reader.Expect(",\"link_group_id\":");
+            value.link_group_id = reader.String();
+            reader.Expect(",\"clip_ids\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    value.clip_ids.push_back(reader.String());
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
+            reader.Expect("}");
+            operation = std::move(value);
         } else if (type == "SplitClip") {
             reader.Expect(",\"clip_id\":");
             SplitClipOperation value;
@@ -1830,6 +2399,36 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             value.right_clip_id = reader.String();
             reader.Expect("}");
             operation = std::move(value);
+        } else if (type == "SplitLinkedClips") {
+            SplitLinkedClipsOperation value;
+            reader.Expect(",\"link_group_id\":");
+            value.link_group_id = reader.String();
+            reader.Expect(",\"clip_ids\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    value.clip_ids.push_back(reader.String());
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"timeline_position\":");
+            value.timeline_position = ReadTime(reader);
+            reader.Expect(",\"left_group_id\":");
+            value.left_group_id = reader.String();
+            reader.Expect(",\"right_group_id\":");
+            value.right_group_id = reader.String();
+            reader.Expect(",\"right_clip_ids\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    value.right_clip_ids.push_back(reader.String());
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
+            reader.Expect("}");
+            operation = std::move(value);
         } else if (type == "DeleteGap") {
             reader.Expect(",\"track_id\":");
             DeleteGapOperation value;
@@ -1838,6 +2437,15 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             value.gap_start = ReadTime(reader);
             reader.Expect(",\"gap_duration\":");
             value.gap_duration = ReadTime(reader);
+            if (reader.Consume(",\"linked_track_ids\":[")) {
+                if (!reader.Consume("]")) {
+                    while (true) {
+                        value.linked_track_ids.push_back(reader.String());
+                        if (reader.Consume("]")) break;
+                        reader.Expect(",");
+                    }
+                }
+            }
             reader.Expect(",\"exact_tracks\":");
             value.exact_track_result = ReadExactTracks(reader);
             reader.Expect("}");
@@ -1866,13 +2474,53 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
                 index > std::numeric_limits<int32_t>::max())
                 throw std::runtime_error("track index outside int32_t range");
             value.index = static_cast<int32_t>(index);
-            reader.Expect("}");
+            if (!reader.Consume("}")) {
+                reader.Expect(",\"exact_tracks\":");
+                const auto tracks = ReadExactTracks(reader);
+                if (tracks.size() != 1 || tracks.front().track_id != value.track_id)
+                    throw std::runtime_error(
+                        "AddTrack exact state must match track_id");
+                value.clips = tracks.front().clips;
+                reader.Expect("}");
+            }
             operation = std::move(value);
         } else if (type == "RemoveTrack") {
             reader.Expect(",\"track_id\":");
             RemoveTrackOperation value;
             value.track_id = reader.String();
             reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "UpdateSequence") {
+            UpdateSequenceOperation value;
+            reader.Expect(",\"sequence_id\":");
+            value.sequence_id = reader.String();
+            reader.Expect(",\"name\":");
+            value.name = reader.String();
+            reader.Expect(",\"width\":");
+            const int64_t width = reader.Integer();
+            reader.Expect(",\"height\":");
+            const int64_t height = reader.Integer();
+            if (width < std::numeric_limits<int32_t>::min() ||
+                width > std::numeric_limits<int32_t>::max() ||
+                height < std::numeric_limits<int32_t>::min() ||
+                height > std::numeric_limits<int32_t>::max())
+                throw std::runtime_error(
+                    "sequence dimensions outside int32_t range");
+            value.width = static_cast<int32_t>(width);
+            value.height = static_cast<int32_t>(height);
+            reader.Expect(",\"frame_rate\":{\"num\":");
+            const int64_t rateNum = reader.Integer();
+            reader.Expect(",\"den\":");
+            const int64_t rateDen = reader.Integer();
+            if (rateNum < std::numeric_limits<int32_t>::min() ||
+                rateNum > std::numeric_limits<int32_t>::max() ||
+                rateDen < std::numeric_limits<int32_t>::min() ||
+                rateDen > std::numeric_limits<int32_t>::max())
+                throw std::runtime_error(
+                    "sequence frame rate outside int32_t range");
+            value.frame_rate = {static_cast<int32_t>(rateNum),
+                                static_cast<int32_t>(rateDen)};
+            reader.Expect("}}");
             operation = std::move(value);
         } else if (type == "AddBin") {
             reader.Expect(",\"bin_id\":");
@@ -1906,12 +2554,56 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             value.name = reader.String();
             reader.Expect("}");
             operation = std::move(value);
+        } else if (type == "MoveBin") {
+            reader.Expect(",\"bin_id\":");
+            MoveBinOperation value;
+            value.bin_id = reader.String();
+            reader.Expect(",\"parent_id\":");
+            value.parent_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
         } else if (type == "SetMediaBin") {
             reader.Expect(",\"media_id\":");
             SetMediaBinOperation value;
             value.media_id = reader.String();
             reader.Expect(",\"bin_id\":");
             value.bin_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "AddMarker") {
+            AddMarkerOperation value;
+            reader.Expect(",\"marker\":{\"id\":");
+            value.marker.id = reader.String();
+            reader.Expect(",\"name\":");
+            value.marker.name = reader.String();
+            reader.Expect(",\"time\":");
+            value.marker.time = ReadTime(reader);
+            reader.Expect(",\"color\":");
+            value.marker.color = reader.String();
+            reader.Expect(",\"category\":");
+            value.marker.category = reader.String();
+            reader.Expect("},\"insertion_index\":");
+            value.insertion_index = reader.Integer();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "RemoveMarker") {
+            RemoveMarkerOperation value;
+            reader.Expect(",\"marker_id\":");
+            value.marker_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "UpdateMarker") {
+            UpdateMarkerOperation value;
+            reader.Expect(",\"marker_id\":");
+            value.marker_id = reader.String();
+            reader.Expect(",\"name\":");
+            value.name = reader.String();
+            reader.Expect(",\"time\":");
+            value.time = ReadTime(reader);
+            reader.Expect(",\"color\":");
+            value.color = reader.String();
+            reader.Expect(",\"category\":");
+            value.category = reader.String();
             reader.Expect("}");
             operation = std::move(value);
         } else if (type == "SetClipLink") {

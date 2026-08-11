@@ -101,7 +101,10 @@ OPERATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "type": {"enum": ["InsertClip", "RemoveClip", "TrimClip"]},
+        "type": {"enum": [
+            "InsertClip", "RemoveClip", "TrimClip",
+            "AddMarker", "RemoveMarker", "UpdateMarker",
+        ]},
         "track_id": {"type": "string"},
         "source_id": {"type": "string"},
         "source_in": NONNEGATIVE_TIME_SCHEMA,
@@ -113,6 +116,11 @@ OPERATION_SCHEMA: dict[str, Any] = {
         "trim_action": {"enum": ["Shorten", "Extend"]},
         "trim_amount": POSITIVE_QUANTITY_SCHEMA,
         "exact_clip": {"type": "null"},
+        "marker_id": {"type": "string"},
+        "marker_name": {"type": "string"},
+        "marker_time": NONNEGATIVE_TIME_SCHEMA,
+        "marker_color": {"type": "string"},
+        "marker_category": {"type": "string"},
     },
     # Requiring the union is deliberate: conditional `required` needs schema
     # composition, unsupported by Anthropic strict tools. The adapter discards
@@ -121,6 +129,8 @@ OPERATION_SCHEMA: dict[str, Any] = {
         "type", "track_id", "source_id", "source_in", "duration",
         "timeline_in", "clip_id", "exact_timeline", "edge", "trim_action",
         "trim_amount", "exact_clip",
+        "marker_id", "marker_name", "marker_time", "marker_color",
+        "marker_category",
     ],
 }
 

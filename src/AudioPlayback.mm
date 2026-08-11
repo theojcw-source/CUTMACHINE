@@ -309,7 +309,7 @@ bool AudioPlayback::Open(const Document& document,
 
 void AudioPlayback::RebuildTimeline(const Document& document) {
     auto plan = std::make_shared<MixPlan>();
-    for (const DocumentTrack& track : document.tracks) {
+    for (const DocumentTrack& track : document.sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             if (track.kind == "video" && !clip.include_audio) continue;
             const auto source = impl_->sources.find(clip.source_id);

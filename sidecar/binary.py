@@ -55,6 +55,40 @@ def _canonical_operation(operation: dict[str, Any]) -> dict[str, Any]:
                 "delta": _canonical_time(operation["delta"]),
                 "exact_clip": operation["exact_clip"],
             }
+        if operation_type == "AddMarker":
+            marker = operation["marker"]
+            return {
+                "type": operation_type,
+                "marker": {
+                    "id": marker["id"],
+                    "name": marker["name"],
+                    "time": _canonical_time(marker["time"]),
+                    "color": marker["color"],
+                    "category": marker["category"],
+                },
+                "insertion_index": operation["insertion_index"],
+            }
+        if operation_type == "RemoveMarker":
+            return {"type": operation_type, "marker_id": operation["marker_id"]}
+        if operation_type == "UpdateMarker":
+            return {
+                "type": operation_type,
+                "marker_id": operation["marker_id"],
+                "name": operation["name"],
+                "time": _canonical_time(operation["time"]),
+                "color": operation["color"],
+                "category": operation["category"],
+            }
+        if operation_type == "UpdateSequence":
+            rate = operation["frame_rate"]
+            return {
+                "type": operation_type,
+                "sequence_id": operation["sequence_id"],
+                "name": operation["name"],
+                "width": operation["width"],
+                "height": operation["height"],
+                "frame_rate": {"num": rate["num"], "den": rate["den"]},
+            }
     except KeyError as exc:
         raise BinaryError(f"operation is missing {exc.args[0]!r}") from exc
     raise BinaryError(f"unknown operation type {operation_type!r}")
@@ -102,7 +136,15 @@ class CutmachineBinary:
         # timeline. Editing planners deliberately keep receiving only the
         # timeline because this milestone does not add library edit operations.
         timeline = payload.get("timeline")
-        return timeline if isinstance(timeline, dict) else payload
+        if isinstance(timeline, dict):
+            sequence = payload.get("sequence")
+            if isinstance(sequence, dict):
+                timeline = {"sequence": sequence, **timeline}
+            markers = payload.get("markers")
+            if isinstance(markers, list):
+                timeline = {**timeline, "markers": markers}
+            return timeline
+        return payload
 
     def apply_operation(
         self, document: str | os.PathLike[str], operation: dict[str, Any]

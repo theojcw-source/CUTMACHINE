@@ -1,5 +1,6 @@
 #include "Document.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
@@ -386,6 +387,23 @@ void WriteTime(std::ostringstream& output, const RationalTime& time) {
     output << "{\"value\":" << time.value << ",\"rate\":" << time.rate << "}";
 }
 
+Ulid MigratedSequenceId(const std::vector<DocumentSource>& sources) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (const DocumentSource& source : sources) {
+        for (const unsigned char byte : source.id) {
+            hash ^= byte;
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+    static constexpr char alphabet[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    std::string suffix(13, '0');
+    for (size_t index = suffix.size(); index-- > 0;) {
+        suffix[index] = alphabet[hash & 31U];
+        hash >>= 5;
+    }
+    return "0000000000000" + suffix;
+}
+
 bool RegisterId(const Ulid& id, const std::string& context, std::set<Ulid>& ids,
                 std::string& error) {
     if (!IsValidUlid(id)) {
@@ -423,12 +441,76 @@ bool Document::LoadFromString(const std::string& json, Document& output,
         const JsonValue root = JsonParser(json).Parse();
         Document parsed;
         parsed.version = Int32(root, "version", "document");
-        if (parsed.version != 1 && parsed.version != 2) {
+        if (parsed.version != 1 && parsed.version != 2 &&
+            parsed.version != 3) {
             throw std::runtime_error("unsupported document version " +
                                      std::to_string(parsed.version));
         }
 
-        if (parsed.version == 2) {
+        if (const JsonValue* color = Optional(
+                root, "color_management", JsonValue::Type::Object,
+                "document")) {
+            const std::string context = "document.color_management";
+            parsed.color_management.enabled =
+                Require(*color, "enabled", JsonValue::Type::Boolean, context)
+                    .boolean;
+            parsed.color_management.input_gamut =
+                Require(*color, "input_gamut", JsonValue::Type::String,
+                        context)
+                    .string;
+            parsed.color_management.input_transfer =
+                Require(*color, "input_transfer", JsonValue::Type::String,
+                        context)
+                    .string;
+            parsed.color_management.input_ycbcr_matrix =
+                Require(*color, "input_ycbcr_matrix", JsonValue::Type::String,
+                        context)
+                    .string;
+            if (const JsonValue* range = Optional(
+                    *color, "input_range", JsonValue::Type::String, context))
+                parsed.color_management.input_range = range->string;
+            parsed.color_management.working_gamut =
+                Require(*color, "working_gamut", JsonValue::Type::String,
+                        context)
+                    .string;
+            parsed.color_management.output_gamut =
+                Require(*color, "output_gamut", JsonValue::Type::String,
+                        context)
+                    .string;
+            parsed.color_management.output_transfer =
+                Require(*color, "output_transfer", JsonValue::Type::String,
+                        context)
+                    .string;
+        }
+
+        const bool hasSequence = Optional(
+            root, "sequence", JsonValue::Type::Object, "document") != nullptr;
+        if (parsed.version == 3 && !hasSequence) {
+            throw std::runtime_error(
+                "version 3 document is missing its sequence object");
+        }
+        const JsonValue* sequenceValue = nullptr;
+        if (hasSequence) {
+            const JsonValue& sequence =
+                Require(root, "sequence", JsonValue::Type::Object, "document");
+            sequenceValue = &sequence;
+            const std::string context = "document.sequence";
+            parsed.sequence.id =
+                Require(sequence, "id", JsonValue::Type::String, context).string;
+            parsed.sequence.name =
+                Require(sequence, "name", JsonValue::Type::String, context)
+                    .string;
+            parsed.sequence.width = Int32(sequence, "width", context);
+            parsed.sequence.height = Int32(sequence, "height", context);
+            const JsonValue& rate =
+                Require(sequence, "frame_rate", JsonValue::Type::Object,
+                        context);
+            parsed.sequence.frame_rate = {
+                Int32(rate, "num", context + ".frame_rate"),
+                Int32(rate, "den", context + ".frame_rate")};
+        }
+
+        if (parsed.version >= 2) {
             const JsonValue& library =
                 Require(root, "library", JsonValue::Type::Array, "document");
             for (size_t index = 0; index < library.array.size(); ++index) {
@@ -455,6 +537,26 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     media.codec = codec->string;
                     media.width = Int32(item, "width", context);
                     media.height = Int32(item, "height", context);
+                    if (const JsonValue* value = Optional(
+                            item, "pixel_format", JsonValue::Type::String,
+                            context))
+                        media.pixel_format = value->string;
+                    if (const JsonValue* value = Optional(
+                            item, "color_range", JsonValue::Type::String,
+                            context))
+                        media.color_range = value->string;
+                    if (const JsonValue* value = Optional(
+                            item, "color_space", JsonValue::Type::String,
+                            context))
+                        media.color_space = value->string;
+                    if (const JsonValue* value = Optional(
+                            item, "color_transfer", JsonValue::Type::String,
+                            context))
+                        media.color_transfer = value->string;
+                    if (const JsonValue* value = Optional(
+                            item, "color_primaries", JsonValue::Type::String,
+                            context))
+                        media.color_primaries = value->string;
                     if (Optional(item, "rotation_degrees",
                                  JsonValue::Type::Number, context))
                         media.rotation_degrees =
@@ -501,6 +603,40 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     parsed.bins.push_back(std::move(bin));
                 }
             }
+            const JsonValue& timelineOwner =
+                parsed.version == 3 ? *sequenceValue : root;
+            const std::string markerRoot = parsed.version == 3
+                                               ? "document.sequence"
+                                               : "document";
+            if (const JsonValue* markers = Optional(
+                    timelineOwner, "markers", JsonValue::Type::Array,
+                    markerRoot)) {
+                for (size_t index = 0; index < markers->array.size(); ++index) {
+                    const JsonValue& item = markers->array[index];
+                    const std::string context = markerRoot + ".markers[" +
+                                                std::to_string(index) + "]";
+                    DocumentMarker marker;
+                    marker.id =
+                        Require(item, "id", JsonValue::Type::String, context)
+                            .string;
+                    marker.name =
+                        Require(item, "name", JsonValue::Type::String, context)
+                            .string;
+                    marker.time = ParseTime(
+                        Require(item, "time", JsonValue::Type::Object,
+                                context),
+                        context + ".time");
+                    marker.color =
+                        Require(item, "color", JsonValue::Type::String,
+                                context)
+                            .string;
+                    marker.category =
+                        Require(item, "category", JsonValue::Type::String,
+                                context)
+                            .string;
+                    parsed.sequence.markers.push_back(std::move(marker));
+                }
+            }
         }
 
         const JsonValue& sources =
@@ -525,7 +661,7 @@ bool Document::LoadFromString(const std::string& json, Document& output,
         }
 
         if (parsed.version == 1) {
-            parsed.version = 2;
+            parsed.version = 3;
             for (const DocumentSource& source : parsed.sources) {
                 LibraryMedia media;
                 media.id = source.id;
@@ -539,13 +675,32 @@ bool Document::LoadFromString(const std::string& json, Document& output,
             }
         }
 
-        const JsonValue& tracks =
-            Require(root, "tracks", JsonValue::Type::Array, "document");
+        if (!hasSequence) {
+            parsed.sequence.id = MigratedSequenceId(parsed.sources);
+            if (!parsed.sources.empty())
+                parsed.sequence.frame_rate = parsed.sources.front().rate;
+            if (!parsed.library.empty() &&
+                parsed.library.front().metadata_complete) {
+                const LibraryMedia& media = parsed.library.front();
+                parsed.sequence.width = media.width;
+                parsed.sequence.height = media.height;
+                if (std::abs(media.rotation_degrees) == 90)
+                    std::swap(parsed.sequence.width, parsed.sequence.height);
+            }
+        }
+
+        const JsonValue& timelineOwner =
+            parsed.version == 3 && sequenceValue ? *sequenceValue : root;
+        const std::string tracksRoot =
+            parsed.version == 3 && sequenceValue ? "document.sequence"
+                                                 : "document";
+        const JsonValue& tracks = Require(timelineOwner, "tracks",
+                                          JsonValue::Type::Array, tracksRoot);
         for (size_t trackIndex = 0; trackIndex < tracks.array.size();
              ++trackIndex) {
             const JsonValue& item = tracks.array[trackIndex];
-            const std::string context =
-                "tracks[" + std::to_string(trackIndex) + "]";
+            const std::string context = tracksRoot + ".tracks[" +
+                                        std::to_string(trackIndex) + "]";
             DocumentTrack track;
             track.id =
                 Require(item, "id", JsonValue::Type::String, context).string;
@@ -597,9 +752,10 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                 }
                 track.clips.push_back(std::move(clip));
             }
-            parsed.tracks.push_back(std::move(track));
+            parsed.sequence.tracks.push_back(std::move(track));
         }
 
+        parsed.version = 3;
         if (!parsed.Validate(error)) {
             return false;
         }
@@ -632,7 +788,75 @@ bool Document::Save(const std::string& path, std::string& error) const {
 
 std::string Document::SaveToString() const {
     std::ostringstream output;
-    output << "{\n  \"version\": " << version << ",\n  \"library\": [";
+    output << "{\n  \"version\": " << version
+           << ",\n  \"sequence\":{" << "\"id\":\""
+           << Escape(sequence.id) << "\",\"name\":\""
+           << Escape(sequence.name) << "\",\"width\":" << sequence.width
+           << ",\"height\":" << sequence.height
+           << ",\"frame_rate\":{\"num\":" << sequence.frame_rate.num
+           << ",\"den\":" << sequence.frame_rate.den << "},\"markers\":[";
+    for (size_t index = 0; index < sequence.markers.size(); ++index) {
+        const DocumentMarker& marker = sequence.markers[index];
+        output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(marker.id) << "\",\"name\":\""
+               << Escape(marker.name) << "\",\"time\":";
+        WriteTime(output, marker.time);
+        output << ",\"color\":\"" << Escape(marker.color)
+               << "\",\"category\":\"" << Escape(marker.category) << "\"}";
+    }
+    if (!sequence.markers.empty()) output << '\n';
+    output << "  ],\"tracks\":[";
+    for (size_t trackIndex = 0; trackIndex < sequence.tracks.size();
+         ++trackIndex) {
+        const DocumentTrack& track = sequence.tracks[trackIndex];
+        output << (trackIndex == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(track.id) << "\",\"kind\":\"" << Escape(track.kind)
+               << "\",\"index\":" << track.index << ",\"clips\":[";
+        for (size_t clipIndex = 0; clipIndex < track.clips.size();
+             ++clipIndex) {
+            const DocumentClip& clip = track.clips[clipIndex];
+            output << (clipIndex == 0 ? "\n" : ",\n") << "      {\"id\":\""
+                   << Escape(clip.id) << "\",\"source_id\":\""
+                   << Escape(clip.source_id) << "\",\"source_in\":";
+            WriteTime(output, clip.source_in);
+            output << ",\"duration\":";
+            WriteTime(output, clip.duration);
+            output << ",\"timeline_in\":";
+            WriteTime(output, clip.timeline_in);
+            output << ",\"include_audio\":"
+                   << (clip.include_audio ? "true" : "false");
+            if (!clip.link_group_id.empty())
+                output << ",\"link_group_id\":\"" << Escape(clip.link_group_id)
+                       << "\"";
+            if (!clip.sync_anchor_clip_id.empty()) {
+                output << ",\"sync_anchor_clip_id\":\""
+                       << Escape(clip.sync_anchor_clip_id)
+                       << "\",\"sync_reference_delta\":";
+                WriteTime(output, clip.sync_reference_delta);
+            }
+            output << "}";
+        }
+        if (!track.clips.empty()) output << '\n';
+        output << "    ]}";
+    }
+    if (!sequence.tracks.empty()) output << '\n';
+    output << "  ]}"
+           << ",\n  \"color_management\":{\"enabled\":"
+           << (color_management.enabled ? "true" : "false")
+           << ",\"input_gamut\":\"" << Escape(color_management.input_gamut)
+           << "\",\"input_transfer\":\""
+           << Escape(color_management.input_transfer)
+           << "\",\"input_ycbcr_matrix\":\""
+           << Escape(color_management.input_ycbcr_matrix)
+           << "\",\"input_range\":\""
+           << Escape(color_management.input_range)
+           << "\",\"working_gamut\":\""
+           << Escape(color_management.working_gamut)
+           << "\",\"output_gamut\":\""
+           << Escape(color_management.output_gamut)
+           << "\",\"output_transfer\":\""
+           << Escape(color_management.output_transfer)
+           << "\"},\n  \"library\": [";
     for (size_t index = 0; index < library.size(); ++index) {
         const LibraryMedia& media = library[index];
         output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
@@ -644,7 +868,14 @@ std::string Document::SaveToString() const {
             output << ",\"codec\":\"" << Escape(media.codec)
                    << "\",\"width\":" << media.width
                    << ",\"height\":" << media.height
-                   << ",\"rotation_degrees\":" << media.rotation_degrees;
+                   << ",\"rotation_degrees\":" << media.rotation_degrees
+                   << ",\"pixel_format\":\"" << Escape(media.pixel_format)
+                   << "\",\"color_range\":\"" << Escape(media.color_range)
+                   << "\",\"color_space\":\"" << Escape(media.color_space)
+                   << "\",\"color_transfer\":\""
+                   << Escape(media.color_transfer)
+                   << "\",\"color_primaries\":\""
+                   << Escape(media.color_primaries) << "\"";
         }
         output << ",\"rate\":{\"num\":" << media.rate.num
                << ",\"den\":" << media.rate.den << "},\"duration\":";
@@ -683,51 +914,51 @@ std::string Document::SaveToString() const {
         output << "}";
     }
     if (!sources.empty()) output << '\n';
-    output << "  ],\n  \"tracks\": [";
-    for (size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
-        const DocumentTrack& track = tracks[trackIndex];
-        output << (trackIndex == 0 ? "\n" : ",\n") << "    {\"id\":\""
-               << Escape(track.id) << "\",\"kind\":\"" << Escape(track.kind)
-               << "\",\"index\":" << track.index << ",\"clips\":[";
-        for (size_t clipIndex = 0; clipIndex < track.clips.size();
-             ++clipIndex) {
-            const DocumentClip& clip = track.clips[clipIndex];
-            output << (clipIndex == 0 ? "\n" : ",\n") << "      {\"id\":\""
-                   << Escape(clip.id) << "\",\"source_id\":\""
-                   << Escape(clip.source_id) << "\",\"source_in\":";
-            WriteTime(output, clip.source_in);
-            output << ",\"duration\":";
-            WriteTime(output, clip.duration);
-            output << ",\"timeline_in\":";
-            WriteTime(output, clip.timeline_in);
-            output << ",\"include_audio\":"
-                   << (clip.include_audio ? "true" : "false");
-            if (!clip.link_group_id.empty())
-                output << ",\"link_group_id\":\"" << Escape(clip.link_group_id)
-                       << "\"";
-            if (!clip.sync_anchor_clip_id.empty()) {
-                output << ",\"sync_anchor_clip_id\":\""
-                       << Escape(clip.sync_anchor_clip_id)
-                       << "\",\"sync_reference_delta\":";
-                WriteTime(output, clip.sync_reference_delta);
-            }
-            output << "}";
-        }
-        if (!track.clips.empty()) output << '\n';
-        output << "    ]}";
-    }
-    if (!tracks.empty()) output << '\n';
     output << "  ]\n}\n";
     return output.str();
 }
 
 bool Document::Validate(std::string& error) const {
-    if (version != 2) {
+    if (version != 3) {
         error = "unsupported document version " + std::to_string(version);
+        return false;
+    }
+    if (!IsValidUlid(sequence.id) || sequence.name.empty() ||
+        sequence.width <= 0 || sequence.height <= 0 || sequence.width > 16384 ||
+        sequence.height > 16384 || sequence.frame_rate.num <= 0 ||
+        sequence.frame_rate.den <= 0) {
+        error = "sequence has an invalid ID, name, dimensions or frame rate";
+        return false;
+    }
+
+    const auto oneOf = [](const std::string& value,
+                          std::initializer_list<const char*> allowed) {
+        return std::any_of(allowed.begin(), allowed.end(),
+                           [&](const char* item) { return value == item; });
+    };
+    if (!oneOf(color_management.input_gamut,
+               {"rec709", "sony_sgamut3_cine", "sony_sgamut3", "rec2020"}) ||
+        !oneOf(color_management.input_transfer,
+               {"rec709", "sony_slog3", "linear"}) ||
+        !oneOf(color_management.input_ycbcr_matrix,
+               {"auto", "bt709", "bt2020_ncl"}) ||
+        !oneOf(color_management.input_range,
+               {"auto", "full", "limited"}) ||
+        !oneOf(color_management.working_gamut,
+               {"acescct", "rec2020", "rec709"}) ||
+        !oneOf(color_management.output_gamut, {"rec709", "rec2020"}) ||
+        !oneOf(color_management.output_transfer, {"rec709", "hlg"})) {
+        error = "color_management contains an unsupported color space or transfer";
+        return false;
+    }
+    if (color_management.output_transfer == "hlg" &&
+        color_management.output_gamut != "rec2020") {
+        error = "HLG output requires the rec2020 output gamut";
         return false;
     }
 
     std::set<Ulid> ids;
+    if (!RegisterId(sequence.id, "sequence", ids, error)) return false;
     std::set<Ulid> binIds;
     for (size_t index = 0; index < bins.size(); ++index) {
         const DocumentBin& bin = bins[index];
@@ -756,6 +987,28 @@ bool Document::Validate(std::string& error) const {
             }
             cursor = FindBin(cursor->parent_id);
             if (!cursor) break;
+        }
+    }
+    const auto validMarkerText = [](const std::string& value,
+                                    size_t maximum) {
+        if (value.empty() || value.size() > maximum) return false;
+        return std::none_of(value.begin(), value.end(), [](unsigned char byte) {
+            return byte < 0x20 || byte == 0x7f;
+        });
+    };
+    for (size_t index = 0; index < sequence.markers.size(); ++index) {
+        const DocumentMarker& marker = sequence.markers[index];
+        const std::string context = "marker " + std::to_string(index);
+        if (!RegisterId(marker.id, context, ids, error)) return false;
+        if (!validMarkerText(marker.name, 4096) ||
+            !validMarkerText(marker.color, 64) ||
+            !validMarkerText(marker.category, 128)) {
+            error = context + " has an invalid name, color or category";
+            return false;
+        }
+        if (marker.time.rate <= 0 || marker.time.value < 0) {
+            error = context + " has an invalid time";
+            return false;
         }
     }
     std::set<Ulid> libraryIds;
@@ -839,8 +1092,9 @@ bool Document::Validate(std::string& error) const {
     }
 
     std::set<int32_t> trackIndices;
-    for (size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
-        const DocumentTrack& track = tracks[trackIndex];
+    for (size_t trackIndex = 0; trackIndex < sequence.tracks.size();
+         ++trackIndex) {
+        const DocumentTrack& track = sequence.tracks[trackIndex];
         const std::string trackContext = "track " + std::to_string(trackIndex);
         if (!RegisterId(track.id, trackContext, ids, error)) return false;
         if (!trackIndices.insert(track.index).second) {
@@ -976,22 +1230,36 @@ DocumentBin* Document::FindBin(const Ulid& id) {
     return nullptr;
 }
 
+const DocumentMarker* Document::FindMarker(const Ulid& id) const {
+    for (const DocumentMarker& marker : sequence.markers) {
+        if (marker.id == id) return &marker;
+    }
+    return nullptr;
+}
+
+DocumentMarker* Document::FindMarker(const Ulid& id) {
+    for (DocumentMarker& marker : sequence.markers) {
+        if (marker.id == id) return &marker;
+    }
+    return nullptr;
+}
+
 const DocumentTrack* Document::FindTrack(const Ulid& id) const {
-    for (const DocumentTrack& track : tracks) {
+    for (const DocumentTrack& track : sequence.tracks) {
         if (track.id == id) return &track;
     }
     return nullptr;
 }
 
 DocumentTrack* Document::FindTrack(const Ulid& id) {
-    for (DocumentTrack& track : tracks) {
+    for (DocumentTrack& track : sequence.tracks) {
         if (track.id == id) return &track;
     }
     return nullptr;
 }
 
 const DocumentClip* Document::FindClip(const Ulid& id) const {
-    for (const DocumentTrack& track : tracks) {
+    for (const DocumentTrack& track : sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             if (clip.id == id) return &clip;
         }
@@ -1000,7 +1268,7 @@ const DocumentClip* Document::FindClip(const Ulid& id) const {
 }
 
 DocumentClip* Document::FindClip(const Ulid& id) {
-    for (DocumentTrack& track : tracks) {
+    for (DocumentTrack& track : sequence.tracks) {
         for (DocumentClip& clip : track.clips) {
             if (clip.id == id) return &clip;
         }
@@ -1009,7 +1277,7 @@ DocumentClip* Document::FindClip(const Ulid& id) {
 }
 
 const DocumentTrack* Document::FindTrackForClip(const Ulid& clipId) const {
-    for (const DocumentTrack& track : tracks) {
+    for (const DocumentTrack& track : sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             if (clip.id == clipId) return &track;
         }
@@ -1018,7 +1286,7 @@ const DocumentTrack* Document::FindTrackForClip(const Ulid& clipId) const {
 }
 
 DocumentTrack* Document::FindTrackForClip(const Ulid& clipId) {
-    for (DocumentTrack& track : tracks) {
+    for (DocumentTrack& track : sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             if (clip.id == clipId) return &track;
         }

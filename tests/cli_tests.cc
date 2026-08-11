@@ -33,7 +33,7 @@ Document Fixture() {
     document.sources = {
         {"01K30000000000000000000001", "folder/A.MP4", {25, 1}, {1000, 25}},
     };
-    document.tracks = {
+    document.sequence.tracks = {
         {"01K30000000000000000000002",
          "video",
          0,
@@ -47,6 +47,10 @@ Document Fixture() {
            {200, 25},
            {10, 25},
            {20, 25}}}},
+    };
+    document.sequence.markers = {
+        {"01K30000000000000000000005", "Premier raccord", {15, 25},
+         "#33AAFF", "Montage"},
     };
     return document;
 }
@@ -77,6 +81,11 @@ int main() {
     Check(firstDescription.find("\"frames\":") != std::string::npos &&
               firstDescription.find("\"seconds\":") != std::string::npos,
           "describe emits frames and decimal seconds");
+    Check(firstDescription.find("\"markers\":[{\"alias\":\"K1\"") !=
+                  std::string::npos &&
+              firstDescription.find("\"name\":\"Premier raccord\"") !=
+                  std::string::npos,
+          "describe exposes stable marker IDs and aliases");
 
     const std::string before = Read(path);
     const Operation trim = TrimClipOperation{

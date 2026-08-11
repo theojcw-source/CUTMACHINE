@@ -17,17 +17,21 @@ from .schema import PLANNER_RESPONSE_SCHEMA
 
 SYSTEM_PROMPT = """Tu pilotes CUTMACHINE, un éditeur vidéo déterministe.
 Tu dois soumettre exactement une réponse structurée : une seule opération, ou un
-refus motivé si la demande est impossible avec InsertClip, RemoveClip et TrimClip.
+refus motivé si la demande est impossible avec InsertClip, RemoveClip,
+TrimClip, AddMarker, RemoveMarker et UpdateMarker.
 La réponse contient toujours les champs operation et refusal : celui qui n'est
 pas utilisé vaut null.
 Le schéma commun aux deux backends exige dans operation l'union des champs des
-trois variantes. Choisis d'abord type et renseigne correctement ses champs ; les
+six variantes. Choisis d'abord type et renseigne correctement ses champs ; les
 champs sans rapport avec ce type sont des placeholders et seront ignorés.
 
 Règles impératives :
-- Les aliases (A1, A2...) servent uniquement à comprendre la demande.
-- Dans l'opération, adresse toujours clips, pistes et sources par leur ULID complet.
-- N'invente jamais un ULID absent de la vue de timeline.
+- Les aliases (A1, A2... pour les clips, K1... pour les marqueurs) servent
+  uniquement à comprendre la demande.
+- Dans l'opération, adresse toujours clips, pistes, sources et marqueurs par
+  leur ULID complet.
+- N'invente jamais un ULID absent de la vue de timeline. AddMarker est la seule
+  exception : laisse marker_id vide, CUTMACHINE générera son ULID.
 - Produis une seule opération par tour, jamais une suite d'opérations.
 - N'approxime pas une demande qui exige une autre capacité : refuse-la.
 - Les pistes sont affichées par index à partir de zéro : « piste 1 » désigne
@@ -44,6 +48,8 @@ Règles impératives :
 - Pour InsertClip, laisse clip_id vide et exact_timeline vide.
 - Pour RemoveClip, laisse exact_timeline vide.
 - Pour TrimClip, laisse exact_clip à null.
+- Pour AddMarker, renseigne le nom, le temps, la couleur et la catégorie.
+- Pour UpdateMarker, renvoie l'état complet du marqueur après modification.
 """
 
 
@@ -196,7 +202,9 @@ def _validate_time(value: Any, field: str, *, positive: bool = False,
         raise PlannerError(f"{field}.value must be non-negative")
 
 
-def _known_ids(timeline: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
+def _known_ids(
+    timeline: dict[str, Any]
+) -> tuple[set[str], set[str], set[str], set[str]]:
     source_ids = {
         source["id"] for source in timeline.get("sources", [])
         if isinstance(source, dict) and isinstance(source.get("id"), str)
@@ -212,7 +220,11 @@ def _known_ids(timeline: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
             if (isinstance(item, dict) and item.get("type") == "clip" and
                     isinstance(item.get("id"), str)):
                 clip_ids.add(item["id"])
-    return source_ids, track_ids, clip_ids
+    marker_ids = {
+        marker["id"] for marker in timeline.get("markers", [])
+        if isinstance(marker, dict) and isinstance(marker.get("id"), str)
+    }
+    return source_ids, track_ids, clip_ids, marker_ids
 
 
 _ORDINALS = {
@@ -288,6 +300,9 @@ def _resolve_entities(
     ]
     if len(matching_sources) == 1:
         resolution["source_id"] = matching_sources[0]
+    marker_alias = _explicit_marker_alias(timeline, instruction)
+    if marker_alias:
+        resolution["marker_id"] = marker_alias
     return resolution
 
 
@@ -333,6 +348,12 @@ def _clip_rate(
 
 
 def _timeline_rate(timeline: dict[str, Any]) -> tuple[int, int] | None:
+    sequence = timeline.get("sequence")
+    if isinstance(sequence, dict):
+        match = re.fullmatch(
+            r"(\d+)/(\d+)", str(sequence.get("frame_rate", "")))
+        if match and int(match.group(1)) > 0 and int(match.group(2)) > 0:
+            return int(match.group(1)), int(match.group(2))
     for source in timeline.get("sources", []):
         if not isinstance(source, dict):
             continue
@@ -385,6 +406,19 @@ def _explicit_clip_alias(
     return None
 
 
+def _explicit_marker_alias(
+    timeline: dict[str, Any], instruction: str
+) -> str | None:
+    aliases = {
+        marker.get("alias", "").casefold(): marker.get("id")
+        for marker in timeline.get("markers", []) if isinstance(marker, dict)
+    }
+    for token in re.findall(r"\bk\d+\b", instruction.casefold()):
+        if token in aliases and isinstance(aliases[token], str):
+            return aliases[token]
+    return None
+
+
 def _trim_delta(
     amount: dict[str, Any], edge: str, action: str,
     timeline: dict[str, Any], clip_id: str,
@@ -409,7 +443,7 @@ def _trim_delta(
 def _normalize_operation(
     operation: dict[str, Any], timeline: dict[str, Any], instruction: str = ""
 ) -> dict[str, Any]:
-    source_ids, track_ids, clip_ids = _known_ids(timeline)
+    source_ids, track_ids, clip_ids, marker_ids = _known_ids(timeline)
     resolved = _resolve_entities(timeline, instruction)
     operation_type = operation.get("type")
     explicit_trim = _explicit_trim_intent(instruction)
@@ -484,6 +518,57 @@ def _normalize_operation(
             "delta": _trim_delta(
                 amount, edge, action, timeline, clip_id),
             "exact_clip": None,
+        }
+    elif operation_type == "AddMarker":
+        required = {"marker_name", "marker_time", "marker_color",
+                    "marker_category"}
+        if not required.issubset(operation):
+            raise PlannerError("AddMarker is missing required fields")
+        _validate_time(operation["marker_time"], "marker_time",
+                       nonnegative=True)
+        for field in ("marker_name", "marker_color", "marker_category"):
+            if (not isinstance(operation[field], str) or
+                    not operation[field].strip()):
+                raise PlannerError(f"{field} must be a non-empty string")
+        return {
+            "type": "AddMarker",
+            "marker": {
+                "id": "",
+                "name": operation["marker_name"].strip(),
+                "time": operation["marker_time"],
+                "color": operation["marker_color"].strip(),
+                "category": operation["marker_category"].strip(),
+            },
+            "insertion_index": -1,
+        }
+    elif operation_type == "RemoveMarker":
+        marker_id = resolved.get("marker_id", operation.get("marker_id"))
+        if marker_id not in marker_ids:
+            raise PlannerError(
+                "RemoveMarker references a marker ULID absent from the view")
+        return {"type": "RemoveMarker", "marker_id": marker_id}
+    elif operation_type == "UpdateMarker":
+        required = {"marker_id", "marker_name", "marker_time",
+                    "marker_color", "marker_category"}
+        if not required.issubset(operation):
+            raise PlannerError("UpdateMarker is missing required fields")
+        marker_id = resolved.get("marker_id", operation["marker_id"])
+        if marker_id not in marker_ids:
+            raise PlannerError(
+                "UpdateMarker references a marker ULID absent from the view")
+        _validate_time(operation["marker_time"], "marker_time",
+                       nonnegative=True)
+        for field in ("marker_name", "marker_color", "marker_category"):
+            if (not isinstance(operation[field], str) or
+                    not operation[field].strip()):
+                raise PlannerError(f"{field} must be a non-empty string")
+        return {
+            "type": "UpdateMarker",
+            "marker_id": marker_id,
+            "name": operation["marker_name"].strip(),
+            "time": operation["marker_time"],
+            "color": operation["marker_color"].strip(),
+            "category": operation["marker_category"].strip(),
         }
     else:
         raise PlannerError("unknown CUTMACHINE operation type")

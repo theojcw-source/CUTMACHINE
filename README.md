@@ -93,7 +93,9 @@ Un clic dans un trou borné sélectionne sa plage exacte et l'affiche en cyan.
 `Delete` ou `Backspace` raccorde alors la piste en décalant tous ses clips
 suivants vers la gauche, sans déplacer les autres pistes. Cette fermeture de
 trou est une unique `DeleteGapOperation` persistée dans l'event log ; elle est
-donc annulable et rejouable à l'octet près.
+donc annulable et rejouable à l'octet près. Lorsque **Sélection liée** est
+active et que le clip suivant possède un audio lié, la fermeture du trou
+décale ensemble les pistes image et audio de la même durée exacte.
 
 La palette en haut à gauche expose les outils Sélection (`V`), Main (`H`),
 Zoom (`Z`, avec `Option` pour dézoomer) et Lame (`C` ou `B`). La lame affiche
@@ -110,6 +112,10 @@ vidéo et `Cmd+Option+Shift+T` une piste audio. La création est atomique et
 annulable ; un clip peut ensuite être glissé vers une piste compatible avec
 l'outil Sélection. Le player résout et compose toutes les pistes vidéo du
 document, sans limite fonctionnelle fixée à deux couches.
+Un clic droit sur une piste propose **Supprimer la piste** et **Supprimer les
+pistes vides**. Une piste occupée demande confirmation ; ses clips sont inclus
+dans l'inverse de `RemoveTrackOperation`, afin que `Cmd+Z` restaure la piste et
+son contenu exacts.
 
 ## Audio
 
@@ -163,16 +169,30 @@ bandeau inférieur rappelle en permanence la grille active.
 
 ## Chutiers
 
-Le panneau **Médiathèque / Chutiers** occupe la gauche de la fenêtre, hors de
-la surface de timeline Metal. Une arborescence affiche les chutiers imbriqués,
-la racine et une vue de tous les médias. Un sélecteur propose une liste de
+Le panneau **Projet / Chutiers** occupe la gauche de la fenêtre, hors de
+la surface de timeline Metal. La séquence active y apparaît comme un objet
+adressable distinct des médias ; un double-clic revient au moniteur Programme.
+Une arborescence affiche les chutiers imbriqués, la racine et une vue de tous
+les objets. Un sélecteur propose une liste de
 métadonnées ou une grille d'icônes ; le champ de recherche filtre les deux.
 **+ Chutier** crée un enfant du chutier courant et **Supprimer** refuse un
-chutier contenant encore des médias ou des enfants. **Déplacer le média dans
-ce chutier** utilise `SetMediaBinOperation`. Toutes les mutations passent par
-l'event log et suivent donc `Cmd+Z`/`Cmd+Shift+Z`. Les champs `bins`,
+chutier contenant encore des médias ou des enfants. Les chutiers se déplacent
+et s'imbriquent par glisser-déposer, à la manière du Finder ; le dépôt sur
+**Sans chutier** les replace à la racine. Ces déplacements utilisent
+`MoveBinOperation`, rejettent les cycles et suivent donc
+`Cmd+Z`/`Cmd+Shift+Z`. Les champs `bins`,
 `parent_id` et `bin_id` sont persistés et exposés par `--describe`. Voir la
 [`spécification des chutiers`](docs/BINS_SPEC.md).
+Le menu contextuel **Nouveau chutier** crée immédiatement l'élément dans
+l'arborescence et active son renommage inline, sans ouvrir de dialogue. Un clic
+droit dans la zone vide crée à la racine ; **Renommer** édite également le nom
+directement dans la vue.
+
+**Fichier → Importer des rushes…** (`Cmd+I`) accepte plusieurs vidéos ou un
+dossier complet et range directement les nouveaux médias dans le chutier
+sélectionné. Des fichiers du Finder et des rushes déjà présents peuvent aussi
+être déposés sur un chutier. Le menu contextuel **Déplacer…** propose la même
+organisation sans drag-and-drop via `SetMediaBinOperation`.
 
 Un double-clic sur un média, ou le bouton **Source**, l'ouvre dans le moniteur
 Metal. Un drag depuis la liste ou la grille vers une piste vidéo crée une
@@ -194,8 +214,14 @@ Media Pool` des NLE classiques.
 `Operations.h` expose `InsertClipOperation`, `RemoveClipOperation`,
 `TrimClipOperation`, `MoveClipOperation`, `DeleteGapOperation` et
 `SplitClipOperation`, ainsi que les variantes liées de move, trim et remove et
-`AddTrackOperation` pour le multipiste. La feuille de route comportementale est
-décrite dans [`docs/NLE_TIMELINE_SPEC.md`](docs/NLE_TIMELINE_SPEC.md).
+`AddTrackOperation` pour le multipiste. Les marqueurs de projet sont des objets
+adressables persistants ; `AddMarkerOperation`, `RemoveMarkerOperation` et
+`UpdateMarkerOperation` passent par le même journal et apparaissent dans
+`--describe` sous les aliases `K1`, `K2`, etc. Les réglages de la séquence
+passent eux aussi par `UpdateSequenceOperation`, avec validation atomique et
+undo/redo sans remplacer son ULID ni sa timeline. La feuille de route
+comportementale est décrite dans
+[`docs/NLE_TIMELINE_SPEC.md`](docs/NLE_TIMELINE_SPEC.md).
 `JoinClipOperation` est l'inverse exact persisté d'une coupe. `EditLog::Apply`,
 `Undo` et `Redo` renvoient un `EditError` nommé et garantissent l'atomicité du
 document.
@@ -204,6 +230,13 @@ Le log conserve, dans les inverses Insert/Remove, les représentations exactes
 des `timeline_in` affectés par le ripple. Cette métadonnée est nécessaire pour
 restaurer les octets canoniques d'origine lorsque des timebases différentes
 représentent le même instant. Elle ne constitue pas une opération supplémentaire.
+
+Deux fondations restent volontairement indépendantes de l'interface :
+`ProjectRecovery` écrit et inspecte un autosave canonique dérivé sans jamais
+remplacer implicitement le document principal, et `KeyframeTrack` fournit des
+keyframes à ULID stable avec interpolation Hold/Linear. Le temps des keyframes
+reste rationnel jusqu'au calcul de la fraction d'interpolation ; seules les
+valeurs de paramètres sont flottantes.
 
 ## Commandes headless
 
@@ -215,7 +248,51 @@ décodage média :
 ./build/cutmachine --apply-op ./example-timeline.json \
   '{"type":"TrimClip","clip_id":"01K00000000000000000000003","edge":"Tail","delta":{"value":-1,"rate":25},"exact_clip":null}'
 ./build/cutmachine --ingest ./example-timeline.json ./rushes --recursive
+./build/cutmachine --export ./example-timeline.json ./film.mp4
 ```
+
+## Export vidéo final
+
+Le menu **Fichier → Exporter la vidéo finale…** ouvre le module de rendu de
+CUTMACHINE. Le preset principal produit un MP4 ou MOV HEVC/H.265
+Main10 avec audio AAC stéréo 48 kHz.
+Le dialogue privilégie quatre presets stables : **Haute qualité**, **Master
+x265**, **Web 1080p** et **Livraison UHD**. Des menus déroulants permettent de
+surcharger ponctuellement le conteneur, la résolution, la cadence ou le moteur
+d’encodage ; aucun débit ou timebase n’a besoin d’être saisi manuellement.
+**VideoToolbox** privilégie la vitesse et **x265 logiciel** la qualité constante.
+Le rendu est effectué hors du thread de l’interface, expose sa progression et
+peut être annulé.
+
+La commande headless équivalente est :
+
+```sh
+./build/cutmachine --export projet.json sortie.mp4
+./build/cutmachine --export projet.json sortie.mp4 --software
+./build/cutmachine --export projet.json sortie.mp4 --overwrite
+```
+
+L’export compose les pistes vidéo dans leur ordre, conserve les zones noires,
+respecte les rotations et le ratio des sources, puis mixe les clips audio sans
+normalisation automatique. Il écrit d’abord un fichier temporaire voisin et ne
+remplace la destination qu’après un encodage réussi. Pour les projets Sony,
+l’export construit une LUT 3D 65³ à partir des mêmes fonctions de transfert et
+matrices que le shader Metal : S-Log3/S-Gamut3.Cine → AP1 → Rec.2020 HLG. Le
+flux HEVC Main10 est marqué explicitement BT.2020 non constant, ARIB STD-B67 et
+plage légale.
+
+## Séquence
+
+La timeline possède un objet `sequence` indépendant des médias sources, avec
+un ULID, un nom, une largeur, une hauteur et une cadence rationnelle. Cet objet
+possède directement ses `tracks` et ses `markers` : aucune timeline ne flotte
+au niveau du projet sans séquence. Comme dans Premiere Pro ou Resolve, ce
+canevas pilote le moniteur et sert de base aux
+presets d’export ; une vidéo portrait ne transforme donc pas implicitement une
+séquence horizontale. **Timeline → Réglages de séquence…** propose les formats
+HD, UHD, vertical et carré ainsi que les cadences usuelles. Les documents plus
+anciens sans bloc `sequence` sont migrés en mémoire à partir de la première
+source, avec un repli 1920×1080.
 
 `--describe` écrit uniquement la vue JSON condensée sur stdout, avec les blocs
 distincts `timeline` et `library`. Les médias de bibliothèque ont des alias
@@ -230,11 +307,30 @@ présentation ne mute pas le document depuis l'interface. Les fichiers non vidé
 ou corrompus sont rapportés dans `errors` sans faire échouer le lot ; l'identité
 idempotente est le chemin absolu résolu.
 
-Le schéma courant du document est la version 2 et ajoute `library` à côté de
-`sources`. Une version 1 reste lisible : ses sources sont promues en entrées de
+Le schéma courant du document est la version 3. `library`, `bins` et `sources`
+sont des objets projet ; `tracks` et `markers` appartiennent à `sequence`.
+Les versions 1 et 2 restent lisibles et sont migrées en mémoire : leurs sources sont promues en entrées de
 bibliothèque avec les seules métadonnées historiques connues, puis enrichies
 si leurs fichiers sont ingérés. Bibliothèque et source partagent l'ULID du
 média ; l'ingest seul ne monte jamais de clip.
+
+### Gestion colorimétrique
+
+Le menu **Couleur** propose un preset direct **Sony S-Log3 → Rec.2020 HLG**
+et un panneau avancé. La chaîne est persistée dans `color_management` au
+niveau du projet : gamut et courbe d'entrée, matrice YCbCr, plage Full/Legal,
+espace de grading, puis gamut et courbe de sortie. Le preset utilise la plage
+Full imposée par la spécification Sony, S-Gamut3.Cine/S-Log3, ACEScct/AP1 comme
+espace wide gamut de grading et une sortie Rec.2020/HLG. La plage et la matrice
+peuvent aussi suivre automatiquement les métadonnées FFmpeg de chaque frame.
+
+Chaque frame YUV planaire 8 à 16 bits est d'abord normalisée selon sa profondeur
+et sa plage, puis l'IDT l'amène en ACES AP1. Le point de grading est encodé en
+ACEScct ; la composition des pistes se fait ensuite en AP1 linéaire dans
+une texture flottante 16 bits. Une seconde passe produit le signal HLG dans une
+cible XR 10 bits. La couche Core Animation est annoncée en BT.2100 HLG avec ses
+métadonnées EDR. Le blanc de l'interface est limité au blanc HDR de référence
+(signal HLG 0,75), afin que la timeline reste à un niveau SDR confortable.
 
 `--apply-op`
 réutilise le format canonique de `SerializeOperation`, remplace le document de

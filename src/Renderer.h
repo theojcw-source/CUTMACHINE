@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Document.h"
+
 #import <AppKit/AppKit.h>
 
 #include <cstdint>
@@ -20,6 +22,9 @@ struct MetalRect {
 
 struct TimelineRenderData {
     double video_height = 0.0;
+    int32_t sequence_width = 1920;
+    int32_t sequence_height = 1080;
+    ColorManagementSettings color_management;
     std::vector<int32_t> video_rotation_degrees;
     std::vector<MetalRect> rectangles;
 };

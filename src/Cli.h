@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Export.h"
+
 #include <string>
 
 class Document;
@@ -11,6 +13,10 @@ int DescribeCommand(const std::string& documentPath, std::string& output);
 int ApplyOperationCommand(const std::string& documentPath,
                           const std::string& operationJson,
                           std::string& output);
+int ExportCommand(const std::string& documentPath,
+                  const ExportSettings& settings,
+                  const ExportProgressCallback& progress,
+                  const std::atomic_bool* cancel, std::string& output);
 
 std::string EditLogPathForDocument(const std::string& documentPath);
 

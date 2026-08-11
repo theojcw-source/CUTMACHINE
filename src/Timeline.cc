@@ -10,8 +10,8 @@ std::vector<TrackResolution> Timeline::Resolve(RationalTime position) const {
         throw std::invalid_argument("timeline position rate must be positive");
     }
     std::vector<TrackResolution> result;
-    result.reserve(document_.tracks.size());
-    for (const DocumentTrack& track : document_.tracks) {
+    result.reserve(document_.sequence.tracks.size());
+    for (const DocumentTrack& track : document_.sequence.tracks) {
         result.push_back({track.id, ResolveInTrack(track, position)});
     }
     return result;
@@ -60,7 +60,7 @@ std::optional<ResolvedFrame> Timeline::ResolveInTrack(
 RationalTime Timeline::Duration() const {
     RationalTime duration{0, 1};
     RationalTime timebase{0, 1};
-    for (const DocumentTrack& track : document_.tracks) {
+    for (const DocumentTrack& track : document_.sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             timebase = timebase.add(RationalTime{0, clip.timeline_in.rate});
             timebase = timebase.add(RationalTime{0, clip.duration.rate});

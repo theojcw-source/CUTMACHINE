@@ -12,6 +12,19 @@ struct MediaRate {
     int32_t den = 1;
 };
 
+// Project-wide display pipeline. Values are deliberately named (rather than
+// opaque numeric IDs) so project files remain readable and extensible.
+struct ColorManagementSettings {
+    bool enabled = false;
+    std::string input_gamut = "rec709";
+    std::string input_transfer = "rec709";
+    std::string input_ycbcr_matrix = "auto";
+    std::string input_range = "auto";
+    std::string working_gamut = "acescct";
+    std::string output_gamut = "rec709";
+    std::string output_transfer = "rec709";
+};
+
 struct DocumentSource {
     Ulid id = GenerateUlid();
     std::string path;
@@ -26,6 +39,11 @@ struct LibraryMedia {
     std::string codec;
     int32_t width = 0;
     int32_t height = 0;
+    std::string pixel_format;
+    std::string color_range;
+    std::string color_space;
+    std::string color_transfer;
+    std::string color_primaries;
     // Counterclockwise display rotation reported by FFmpeg's display matrix.
     int32_t rotation_degrees = 0;
     MediaRate rate;
@@ -49,6 +67,17 @@ struct DocumentBin {
     std::string name;
     // Empty means a top-level bin. Bins form a project-local hierarchy.
     Ulid parent_id;
+};
+
+// A project marker is addressable independently from clips and tracks. Its
+// position remains exact in the document time domain; color and category stay
+// textual so project files remain readable and extensible.
+struct DocumentMarker {
+    Ulid id = GenerateUlid();
+    std::string name;
+    RationalTime time;
+    std::string color = "#f5c542";
+    std::string category = "note";
 };
 
 struct DocumentClip {
@@ -76,13 +105,26 @@ struct DocumentTrack {
     std::vector<DocumentClip> clips;
 };
 
+// A sequence is the addressable owner of one timeline. Project media and bins
+// remain outside it; tracks and sequence markers cannot exist without it.
+struct DocumentSequence {
+    Ulid id = GenerateUlid();
+    std::string name = "Sequence 1";
+    int32_t width = 1920;
+    int32_t height = 1080;
+    MediaRate frame_rate{25, 1};
+    std::vector<DocumentMarker> markers;
+    std::vector<DocumentTrack> tracks;
+};
+
 class Document {
 public:
-    int32_t version = 2;
+    int32_t version = 3;
+    DocumentSequence sequence;
+    ColorManagementSettings color_management;
     std::vector<LibraryMedia> library;
     std::vector<DocumentBin> bins;
     std::vector<DocumentSource> sources;
-    std::vector<DocumentTrack> tracks;
 
     static bool Load(const std::string& path, Document& output,
                      std::string& error);
@@ -98,6 +140,8 @@ public:
     LibraryMedia* FindLibraryMedia(const Ulid& id);
     const DocumentBin* FindBin(const Ulid& id) const;
     DocumentBin* FindBin(const Ulid& id);
+    const DocumentMarker* FindMarker(const Ulid& id) const;
+    DocumentMarker* FindMarker(const Ulid& id);
     const DocumentTrack* FindTrack(const Ulid& id) const;
     DocumentTrack* FindTrack(const Ulid& id);
     const DocumentClip* FindClip(const Ulid& id) const;

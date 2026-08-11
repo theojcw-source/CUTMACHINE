@@ -176,8 +176,8 @@ std::vector<double> TimelineViewport::TickXs(double width) const {
 std::vector<const DocumentTrack*> TimelineTracksInDisplayOrder(
     const Document& document) {
     std::vector<const DocumentTrack*> tracks;
-    tracks.reserve(document.tracks.size());
-    for (const DocumentTrack& track : document.tracks) tracks.push_back(&track);
+    tracks.reserve(document.sequence.tracks.size());
+    for (const DocumentTrack& track : document.sequence.tracks) tracks.push_back(&track);
     std::stable_sort(tracks.begin(), tracks.end(),
                      [](const DocumentTrack* a, const DocumentTrack* b) {
                          return a->index < b->index;
@@ -279,7 +279,7 @@ std::vector<Ulid> ExpandLinkedClipSelection(const Document& document,
                 groups.end())
             groups.push_back(clip->link_group_id);
     }
-    for (const DocumentTrack& track : document.tracks) {
+    for (const DocumentTrack& track : document.sequence.tracks) {
         for (const DocumentClip& clip : track.clips) {
             if (clip.link_group_id.empty() ||
                 std::find(groups.begin(), groups.end(), clip.link_group_id) ==

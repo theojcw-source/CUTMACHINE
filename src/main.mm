@@ -1,4 +1,5 @@
 #import <AppKit/AppKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -14,6 +15,7 @@ extern "C" {
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,6 +25,7 @@ extern "C" {
 #include "DecodeWorker.h"
 #include "Document.h"
 #include "EditLog.h"
+#include "Export.h"
 #include "FrameCache.h"
 #include "Ingest.h"
 #include "PerformanceMetrics.h"
@@ -36,6 +39,7 @@ constexpr size_t kGlobalCacheBudget = 2000000000ULL;  // 2.0 GB, all sources.
 constexpr double kAddTrackRowHeight = 24.0;
 NSPasteboardType const kCutmachineMediaPasteboardType =
     @"com.cutmachine.library-media";
+NSPasteboardType const kCutmachineBinPasteboardType = @"com.cutmachine.bin";
 
 enum class TimelineTool { Select, Hand, Zoom, Cut };
 
@@ -116,6 +120,8 @@ struct AppState {
     Ulid contextTrackId;
     RationalTime contextTime{0, 1};
     std::optional<TimelineGapSelection> contextGap;
+    std::atomic_bool exportCancel{false};
+    bool exportRunning = false;
 };
 
 std::array<float, 3> ClipColor(const Ulid& sourceId, bool audio) {
@@ -149,6 +155,55 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
         unit = "smp";
     }
     return std::string(value > 0 ? "+" : "") + std::to_string(value) + unit;
+}
+
+Operation CutOperationForClip(const Document& document,
+                              const DocumentClip& clip,
+                              const RationalTime& position,
+                              bool linkedSelection) {
+    if (linkedSelection && !clip.link_group_id.empty()) {
+        std::vector<Ulid> members =
+            ExpandLinkedClipSelection(document, {clip.id});
+        members.erase(
+            std::remove_if(members.begin(), members.end(), [&](const Ulid& id) {
+                const DocumentClip* member = document.FindClip(id);
+                return !member || position <= member->timeline_in ||
+                       position >= member->timeline_in.add(member->duration);
+            }),
+            members.end());
+        if (members.size() > 1)
+            return SplitLinkedClipsOperation{clip.link_group_id, members,
+                                             position, {}, {}, {}, {}};
+    }
+    return SplitClipOperation{clip.id, position, {}};
+}
+
+DeleteGapOperation GapDeleteOperationForSelection(
+    const Document& document, const TimelineGapSelection& gap,
+    bool linkedSelection) {
+    DeleteGapOperation operation{gap.track_id, gap.start, gap.duration, {}};
+    if (!linkedSelection) return operation;
+    const DocumentTrack* track = document.FindTrack(gap.track_id);
+    if (!track) return operation;
+    const RationalTime gapEnd = gap.start.add(gap.duration);
+    const DocumentClip* following = nullptr;
+    for (const DocumentClip& clip : track->clips) {
+        if (clip.timeline_in < gapEnd) continue;
+        if (!following || clip.timeline_in < following->timeline_in)
+            following = &clip;
+    }
+    if (!following || following->link_group_id.empty()) return operation;
+    for (const Ulid& clipId :
+         ExpandLinkedClipSelection(document, {following->id})) {
+        const DocumentTrack* linkedTrack = document.FindTrackForClip(clipId);
+        if (!linkedTrack || linkedTrack->id == gap.track_id ||
+            std::find(operation.linked_track_ids.begin(),
+                      operation.linked_track_ids.end(), linkedTrack->id) !=
+                operation.linked_track_ids.end())
+            continue;
+        operation.linked_track_ids.push_back(linkedTrack->id);
+    }
+    return operation;
 }
 
 }  // namespace
@@ -228,6 +283,17 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     if (row >= 0)
         [self selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
             byExtendingSelection:NO];
+    else {
+        for (NSInteger candidate = 0; candidate < self.numberOfRows;
+             ++candidate) {
+            if ([[self itemAtRow:candidate] isEqual:@"__root__"]) {
+                [self selectRowIndexes:
+                          [NSIndexSet indexSetWithIndex:candidate]
+                     byExtendingSelection:NO];
+                break;
+            }
+        }
+    }
     return [super menuForEvent:event];
 }
 @end
@@ -300,7 +366,8 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
                                    NSTableViewDataSource,
                                    NSTableViewDelegate,
                                    NSCollectionViewDataSource,
-                                   NSCollectionViewDelegate>
+                                   NSCollectionViewDelegate,
+                                   NSTextFieldDelegate>
 @property(nonatomic, strong) NSWindow* window;
 @property(nonatomic, strong) TimelineMetalView* metalView;
 @property(nonatomic, strong) NSView* mediaPanel;
@@ -324,6 +391,8 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 @property(nonatomic, strong) NSTimer* displayTimer;
 @property(nonatomic, copy) NSString* documentPath;
 @property(nonatomic, assign) AppState* state;
+- (BOOL)importMediaURLs:(NSArray<NSURL*>*)urls intoBin:(NSString*)binId;
+- (void)beginEditingBin:(NSString*)binId;
 @end
 
 @implementation AppDelegate
@@ -352,6 +421,20 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     appRoot.submenu = app;
     [bar addItem:appRoot];
 
+    NSMenuItem* fileRoot = [[NSMenuItem alloc] initWithTitle:@"Fichier"
+                                                      action:nil
+                                               keyEquivalent:@""];
+    NSMenu* file = [[NSMenu alloc] initWithTitle:@"Fichier"];
+    [file addItem:[self menuItem:@"Importer des rushes…"
+                          action:@selector(importMediaPressed:)
+                             key:@"i"]];
+    [file addItem:NSMenuItem.separatorItem];
+    [file addItem:[self menuItem:@"Exporter la vidéo finale…"
+                          action:@selector(exportFinalVideo:)
+                             key:@"e"]];
+    fileRoot.submenu = file;
+    [bar addItem:fileRoot];
+
     NSMenuItem* editRoot = [[NSMenuItem alloc] initWithTitle:@"Édition"
                                                       action:nil
                                                keyEquivalent:@""];
@@ -369,6 +452,12 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     [edit addItem:[self menuItem:@"Supprimer la sélection"
                           action:@selector(menuDeleteSelection:)
                              key:@"\b"]];
+    NSMenuItem* rippleDelete =
+        [self menuItem:@"Suppression ripple"
+                action:@selector(menuRippleDeleteSelection:)
+                   key:@"\b"];
+    rippleDelete.keyEquivalentModifierMask = NSEventModifierFlagShift;
+    [edit addItem:rippleDelete];
     editRoot.submenu = edit;
     [bar addItem:editRoot];
 
@@ -387,6 +476,23 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
                              key:@""]];
     clipRoot.submenu = clip;
     [bar addItem:clipRoot];
+
+    NSMenuItem* colorRoot = [[NSMenuItem alloc] initWithTitle:@"Couleur"
+                                                       action:nil
+                                                keyEquivalent:@""];
+    NSMenu* color = [[NSMenu alloc] initWithTitle:@"Couleur"];
+    [color addItem:[self menuItem:@"Preset Sony S-Log3 → Rec.2020 HLG"
+                               action:@selector(applySonyColorPreset:)
+                                  key:@""]];
+    [color addItem:[self menuItem:@"Configurer la gestion colorimétrique…"
+                               action:@selector(configureColorManagement:)
+                                  key:@""]];
+    [color addItem:NSMenuItem.separatorItem];
+    [color addItem:[self menuItem:@"Désactiver la gestion colorimétrique"
+                               action:@selector(disableColorManagement:)
+                                  key:@""]];
+    colorRoot.submenu = color;
+    [bar addItem:colorRoot];
 
     NSMenuItem* timelineRoot = [[NSMenuItem alloc] initWithTitle:@"Timeline"
                                                           action:nil
@@ -408,12 +514,18 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     [timeline addItem:[self menuItem:@"Cadrer toute la timeline"
                               action:@selector(menuFitTimeline:)
                                  key:@"f"]];
+    [timeline addItem:[self menuItem:@"Réglages de séquence…"
+                              action:@selector(configureSequence:)
+                                 key:@""]];
     [timeline addItem:NSMenuItem.separatorItem];
     [timeline addItem:[self menuItem:@"Ajouter une piste vidéo"
                               action:@selector(menuAddVideoTrack:)
                                  key:@""]];
     [timeline addItem:[self menuItem:@"Ajouter une piste audio"
                               action:@selector(menuAddAudioTrack:)
+                                 key:@""]];
+    [timeline addItem:[self menuItem:@"Supprimer les pistes vides"
+                              action:@selector(removeEmptyTracksPressed:)
                                  key:@""]];
     timelineRoot.submenu = timeline;
     [bar addItem:timelineRoot];
@@ -437,6 +549,421 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     playbackRoot.submenu = playback;
     [bar addItem:playbackRoot];
     NSApp.mainMenu = bar;
+}
+
+- (BOOL)commitColorSettings:(const ColorManagementSettings&)settings {
+    const ColorManagementSettings previous =
+        self.state->document.color_management;
+    self.state->document.color_management = settings;
+    std::string message;
+    if (![self persistEdits:message]) {
+        self.state->document.color_management = previous;
+        std::fprintf(stderr, "Unable to persist color settings: %s\n",
+                     message.c_str());
+        NSBeep();
+        return NO;
+    }
+    self.state->overlayDirty = true;
+    return YES;
+}
+
+- (void)configureSequence:(id)sender {
+    (void)sender;
+    if (!self.state) return;
+    const DocumentSequence current = self.state->document.sequence;
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = @"Réglages de séquence";
+    alert.informativeText =
+        @"Le format de séquence pilote le moniteur et les presets d’export.";
+    [alert addButtonWithTitle:@"Appliquer"];
+    [alert addButtonWithTitle:@"Annuler"];
+    NSView* accessory =
+        [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 460, 108)];
+
+    NSTextField* nameLabel = [NSTextField labelWithString:@"Nom :"];
+    nameLabel.frame = NSMakeRect(0, 79, 120, 22);
+    nameLabel.alignment = NSTextAlignmentRight;
+    [accessory addSubview:nameLabel];
+    NSTextField* name =
+        [[NSTextField alloc] initWithFrame:NSMakeRect(132, 76, 316, 24)];
+    name.stringValue = [NSString stringWithUTF8String:current.name.c_str()];
+    [accessory addSubview:name];
+
+    auto addPopup = [&](NSString* labelText, NSArray<NSString*>* choices,
+                        CGFloat y) {
+        NSTextField* label = [NSTextField labelWithString:labelText];
+        label.frame = NSMakeRect(0, y + 3, 120, 22);
+        label.alignment = NSTextAlignmentRight;
+        [accessory addSubview:label];
+        NSPopUpButton* menu = [[NSPopUpButton alloc]
+            initWithFrame:NSMakeRect(132, y, 316, 26)
+                pullsDown:NO];
+        [menu addItemsWithTitles:choices];
+        [accessory addSubview:menu];
+        return menu;
+    };
+    NSString* currentFormat = [NSString
+        stringWithFormat:@"Actuel — %d × %d", current.width, current.height];
+    NSPopUpButton* format = addPopup(
+        @"Dimensions :",
+        @[ currentFormat, @"HD — 1920 × 1080", @"UHD — 3840 × 2160",
+           @"Vertical HD — 1080 × 1920", @"Carré — 1080 × 1080" ],
+        44);
+    NSString* currentRate = [NSString
+        stringWithFormat:@"Actuelle — %d/%d i/s", current.frame_rate.num,
+                         current.frame_rate.den];
+    NSPopUpButton* cadence = addPopup(
+        @"Cadence :",
+        @[ currentRate, @"23,976 i/s", @"24 i/s", @"25 i/s",
+           @"29,97 i/s", @"50 i/s", @"59,94 i/s" ],
+        12);
+    alert.accessoryView = accessory;
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+
+    UpdateSequenceOperation updated;
+    updated.sequence_id = current.id;
+    updated.name = name.stringValue.UTF8String ?: "Sequence 1";
+    updated.width = current.width;
+    updated.height = current.height;
+    updated.frame_rate = current.frame_rate;
+    switch (format.indexOfSelectedItem) {
+        case 1: updated.width = 1920; updated.height = 1080; break;
+        case 2: updated.width = 3840; updated.height = 2160; break;
+        case 3: updated.width = 1080; updated.height = 1920; break;
+        case 4: updated.width = 1080; updated.height = 1080; break;
+        default: break;
+    }
+    switch (cadence.indexOfSelectedItem) {
+        case 1: updated.frame_rate = {24000, 1001}; break;
+        case 2: updated.frame_rate = {24, 1}; break;
+        case 3: updated.frame_rate = {25, 1}; break;
+        case 4: updated.frame_rate = {30000, 1001}; break;
+        case 5: updated.frame_rate = {50, 1}; break;
+        case 6: updated.frame_rate = {60000, 1001}; break;
+        default: break;
+    }
+    EditError editError = EditError::None;
+    std::string message;
+    if (!self.state->editLog.Apply(self.state->document,
+                                   Operation{std::move(updated)}, editError,
+                                   message)) {
+        [self showExportError:message];
+        return;
+    }
+    [self refreshTimelineAfterEditFromPosition:self.state->requestedPosition];
+    [self rebuildMediaList];
+    if (![self persistEdits:message]) {
+        [self showExportError:message];
+        return;
+    }
+    self.state->overlayDirty = true;
+}
+
+- (void)showExportError:(const std::string&)message {
+    NSAlert* alert = [NSAlert new];
+    alert.alertStyle = NSAlertStyleCritical;
+    alert.messageText = @"Export impossible";
+    alert.informativeText =
+        [NSString stringWithUTF8String:message.c_str()] ?: @"Erreur inconnue";
+    [alert beginSheetModalForWindow:self.window completionHandler:nil];
+}
+
+- (void)exportFinalVideo:(id)sender {
+    (void)sender;
+    if (!self.state || self.state->exportRunning) return;
+
+    const int32_t sequenceWidth = self.state->document.sequence.width;
+    const int32_t sequenceHeight = self.state->document.sequence.height;
+    const MediaRate sequenceRate = self.state->document.sequence.frame_rate;
+
+    NSAlert* settingsAlert = [NSAlert new];
+    settingsAlert.messageText = @"Exporter la vidéo finale";
+    settingsAlert.informativeText =
+        @"Choisissez un preset. Les autres menus servent uniquement "
+         "d’override ponctuel.";
+    [settingsAlert addButtonWithTitle:@"Choisir la destination…"];
+    [settingsAlert addButtonWithTitle:@"Annuler"];
+    NSView* accessory =
+        [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 520, 172)];
+    auto popup = [&](NSString* labelText, NSArray<NSString*>* choices,
+                     CGFloat y) {
+        NSTextField* label = [NSTextField labelWithString:labelText];
+        label.frame = NSMakeRect(0, y + 3, 132, 22);
+        label.alignment = NSTextAlignmentRight;
+        [accessory addSubview:label];
+        NSPopUpButton* menu = [[NSPopUpButton alloc]
+            initWithFrame:NSMakeRect(144, y, 364, 26)
+                pullsDown:NO];
+        [menu addItemsWithTitles:choices];
+        [accessory addSubview:menu];
+        return menu;
+    };
+
+    NSMutableArray<NSString*>* presetNames = [NSMutableArray array];
+    for (const ExportPresetDescriptor& preset : Exporter::Presets())
+        [presetNames addObject:[NSString stringWithUTF8String:preset.name]];
+    NSPopUpButton* preset = popup(@"Preset :", presetNames, 140);
+    NSPopUpButton* container =
+        popup(@"Conteneur :", @[ @"MP4", @"QuickTime MOV" ], 108);
+    NSPopUpButton* resolution = popup(
+        @"Résolution :",
+        @[ @"Selon le preset", @"Format de la séquence", @"1920 × 1080",
+           @"3840 × 2160" ],
+        76);
+    NSPopUpButton* cadence = popup(
+        @"Cadence :",
+        @[ @"Selon le preset", @"Cadence de la séquence", @"23,976 i/s",
+           @"24 i/s", @"25 i/s", @"29,97 i/s", @"50 i/s",
+           @"59,94 i/s" ],
+        44);
+    NSPopUpButton* encoder = popup(
+        @"Encodage :",
+        @[ @"Selon le preset", @"VideoToolbox — rapide",
+           @"x265 — qualité constante" ],
+        12);
+    settingsAlert.accessoryView = accessory;
+    if ([settingsAlert runModal] != NSAlertFirstButtonReturn) return;
+
+    const auto& presets = Exporter::Presets();
+    const size_t presetIndex = std::min<size_t>(
+        static_cast<size_t>(preset.indexOfSelectedItem), presets.size() - 1);
+    ExportSettings selectedSettings = Exporter::SettingsForPreset(
+        presets[presetIndex].id, "", sequenceWidth, sequenceHeight,
+        sequenceRate);
+    switch (resolution.indexOfSelectedItem) {
+        case 1:
+            selectedSettings.width = sequenceWidth + sequenceWidth % 2;
+            selectedSettings.height = sequenceHeight + sequenceHeight % 2;
+            break;
+        case 2:
+            selectedSettings.width = 1920;
+            selectedSettings.height = 1080;
+            break;
+        case 3:
+            selectedSettings.width = 3840;
+            selectedSettings.height = 2160;
+            break;
+        default:
+            break;
+    }
+    switch (cadence.indexOfSelectedItem) {
+        case 1: selectedSettings.frame_rate = sequenceRate; break;
+        case 2: selectedSettings.frame_rate = {24000, 1001}; break;
+        case 3: selectedSettings.frame_rate = {24, 1}; break;
+        case 4: selectedSettings.frame_rate = {25, 1}; break;
+        case 5: selectedSettings.frame_rate = {30000, 1001}; break;
+        case 6: selectedSettings.frame_rate = {50, 1}; break;
+        case 7: selectedSettings.frame_rate = {60000, 1001}; break;
+        default: break;
+    }
+    if (encoder.indexOfSelectedItem == 1)
+        selectedSettings.encoder = ExportEncoder::HevcVideoToolbox;
+    else if (encoder.indexOfSelectedItem == 2)
+        selectedSettings.encoder = ExportEncoder::HevcSoftware;
+
+    const BOOL mov = container.indexOfSelectedItem == 1;
+    NSSavePanel* save = [NSSavePanel savePanel];
+    save.title = @"Destination de l’export";
+    save.nameFieldStringValue = mov ? @"export.mov" : @"export.mp4";
+    save.allowedContentTypes = @[
+        [UTType typeWithFilenameExtension:(mov ? @"mov" : @"mp4")]
+    ];
+    [save beginSheetModalForWindow:self.window
+                 completionHandler:^(NSModalResponse response) {
+        if (response != NSModalResponseOK || !save.URL) return;
+
+        ExportSettings settings = selectedSettings;
+        settings.output_path = save.URL.fileSystemRepresentation ?: "";
+        settings.overwrite = true;  // NSSavePanel already confirmed this.
+
+        ExportPlan plan;
+        std::string error;
+        if (!Exporter::BuildPlan(self.state->document,
+                                 self.documentPath.UTF8String ?: "", settings,
+                                 plan, error)) {
+            [self showExportError:error];
+            return;
+        }
+
+        NSAlert* progressAlert = [NSAlert new];
+        progressAlert.messageText = @"Export HEVC en cours";
+        progressAlert.informativeText = @"Préparation du rendu…";
+        [progressAlert addButtonWithTitle:@"Annuler"];
+        NSProgressIndicator* indicator = [[NSProgressIndicator alloc]
+            initWithFrame:NSMakeRect(0, 0, 420, 20)];
+        indicator.indeterminate = NO;
+        indicator.minValue = 0.0;
+        indicator.maxValue = 100.0;
+        progressAlert.accessoryView = indicator;
+        self.state->exportCancel.store(false);
+        self.state->exportRunning = true;
+        [progressAlert beginSheetModalForWindow:self.window
+                              completionHandler:^(NSModalResponse) {
+            if (self.state && self.state->exportRunning)
+                self.state->exportCancel.store(true);
+        }];
+
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            std::string renderError;
+            const bool ok = Exporter::Run(
+                plan,
+                [&](const ExportProgress& progress) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        indicator.doubleValue = progress.fraction * 100.0;
+                        progressAlert.informativeText = [NSString
+                            stringWithFormat:@"%lld / %lld images — %.2fx",
+                            static_cast<long long>(progress.rendered_frames),
+                            static_cast<long long>(progress.total_frames),
+                            progress.speed];
+                    });
+                },
+                &self.state->exportCancel, renderError);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.state->exportRunning = false;
+                if (self.window.attachedSheet == progressAlert.window)
+                    [self.window endSheet:progressAlert.window];
+                if (!ok) {
+                    if (renderError != "export cancelled")
+                        [self showExportError:renderError];
+                    return;
+                }
+                NSAlert* complete = [NSAlert new];
+                complete.messageText = @"Export terminé";
+                complete.informativeText = save.URL.path;
+                [complete beginSheetModalForWindow:self.window
+                                  completionHandler:nil];
+            });
+        });
+    }];
+}
+
+- (void)applySonyColorPreset:(id)sender {
+    (void)sender;
+    ColorManagementSettings settings;
+    settings.enabled = true;
+    settings.input_gamut = "sony_sgamut3_cine";
+    settings.input_transfer = "sony_slog3";
+    settings.input_ycbcr_matrix = "bt709";
+    settings.input_range = "full";
+    settings.working_gamut = "acescct";
+    settings.output_gamut = "rec2020";
+    settings.output_transfer = "hlg";
+    [self commitColorSettings:settings];
+}
+
+- (void)disableColorManagement:(id)sender {
+    (void)sender;
+    ColorManagementSettings settings = self.state->document.color_management;
+    settings.enabled = false;
+    [self commitColorSettings:settings];
+}
+
+- (void)configureColorManagement:(id)sender {
+    (void)sender;
+    const ColorManagementSettings& current =
+        self.state->document.color_management;
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = @"Gestion colorimétrique du projet";
+    alert.informativeText =
+        @"Les transformations sont calculées en linéaire dans l’espace de "
+         "composition AP1, avec ACEScct pour le grading. Pour les rushes "
+         "Sony habituels, utilisez S-Gamut3.Cine / S-Log3 en plage Full, "
+         "puis Rec.2020 / HLG.";
+    [alert addButtonWithTitle:@"Appliquer"];
+    [alert addButtonWithTitle:@"Annuler"];
+
+    NSView* accessory = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 500, 264)];
+    NSButton* enabled = [NSButton checkboxWithTitle:@"Activer pour ce projet"
+                                             target:nil
+                                             action:nil];
+    enabled.frame = NSMakeRect(0, 236, 500, 24);
+    enabled.state = current.enabled ? NSControlStateValueOn
+                                    : NSControlStateValueOff;
+    [accessory addSubview:enabled];
+
+    CGFloat y = 202.0;
+    auto addPopup = [&](NSString* labelText,
+                        std::initializer_list<std::pair<NSString*, NSString*>>
+                            choices,
+                        const std::string& selected) {
+        NSTextField* label = [NSTextField labelWithString:labelText];
+        label.frame = NSMakeRect(0, y + 3.0, 175, 20);
+        label.alignment = NSTextAlignmentRight;
+        [accessory addSubview:label];
+        NSPopUpButton* popup = [[NSPopUpButton alloc]
+            initWithFrame:NSMakeRect(188, y, 300, 26)
+                pullsDown:NO];
+        for (const auto& choice : choices) {
+            [popup addItemWithTitle:choice.first];
+            popup.lastItem.representedObject = choice.second;
+            if ([choice.second isEqualToString:
+                    [NSString stringWithUTF8String:selected.c_str()]])
+                [popup selectItem:popup.lastItem];
+        }
+        [accessory addSubview:popup];
+        y -= 32.0;
+        return popup;
+    };
+    NSPopUpButton* inputGamut = addPopup(
+        @"Gamut d’entrée :", {{@"Sony S-Gamut3.Cine", @"sony_sgamut3_cine"},
+                              {@"Sony S-Gamut3", @"sony_sgamut3"},
+                              {@"Rec.709", @"rec709"},
+                              {@"Rec.2020", @"rec2020"}},
+        current.input_gamut);
+    NSPopUpButton* inputTransfer = addPopup(
+        @"Courbe d’entrée :", {{@"Sony S-Log3", @"sony_slog3"},
+                               {@"Rec.709", @"rec709"},
+                               {@"Linéaire", @"linear"}},
+        current.input_transfer);
+    NSPopUpButton* ycbcr = addPopup(
+        @"Matrice YCbCr :", {{@"Auto (métadonnées)", @"auto"},
+                             {@"BT.709", @"bt709"},
+                             {@"BT.2020 non constante", @"bt2020_ncl"}},
+        current.input_ycbcr_matrix);
+    NSPopUpButton* inputRange = addPopup(
+        @"Plage du signal :", {{@"Auto (métadonnées)", @"auto"},
+                               {@"Full / Extended", @"full"},
+                               {@"Legal / Limited", @"limited"}},
+        current.input_range);
+    NSPopUpButton* working = addPopup(
+        @"Espace de travail :", {{@"ACEScct (AP1)", @"acescct"},
+                                  {@"Rec.2020 linéaire", @"rec2020"},
+                                  {@"Rec.709 linéaire", @"rec709"}},
+        current.working_gamut);
+    NSPopUpButton* outputGamut = addPopup(
+        @"Gamut de sortie :", {{@"Rec.2020", @"rec2020"},
+                               {@"Rec.709", @"rec709"}},
+        current.output_gamut);
+    NSPopUpButton* outputTransfer = addPopup(
+        @"Courbe de sortie :", {{@"HLG", @"hlg"},
+                                {@"Rec.709", @"rec709"}},
+        current.output_transfer);
+    alert.accessoryView = accessory;
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+
+    auto value = [](NSPopUpButton* popup) {
+        NSString* string = popup.selectedItem.representedObject;
+        return std::string(string.UTF8String ?: "");
+    };
+    ColorManagementSettings settings;
+    settings.enabled = enabled.state == NSControlStateValueOn;
+    settings.input_gamut = value(inputGamut);
+    settings.input_transfer = value(inputTransfer);
+    settings.input_ycbcr_matrix = value(ycbcr);
+    settings.input_range = value(inputRange);
+    settings.working_gamut = value(working);
+    settings.output_gamut = value(outputGamut);
+    settings.output_transfer = value(outputTransfer);
+    if (settings.output_transfer == "hlg" &&
+        settings.output_gamut != "rec2020") {
+        NSAlert* invalid = [NSAlert new];
+        invalid.messageText = @"Configuration incompatible";
+        invalid.informativeText =
+            @"La sortie HLG doit utiliser le gamut Rec.2020.";
+        [invalid runModal];
+        return;
+    }
+    [self commitColorSettings:settings];
 }
 
 - (instancetype)initWithDocumentPath:(NSString*)documentPath {
@@ -500,9 +1027,14 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
                                probeError)) {
             self.state->mediaMetadata[source.id] = detected;
             std::fprintf(
-                stderr, "Media %s: %dx%d, %s, rotation %d degrees, %s\n",
+                stderr,
+                "Media %s: %dx%d, %s/%s, range=%s matrix=%s transfer=%s "
+                "primaries=%s, rotation %d degrees, %s\n",
                 detected.filename.c_str(), detected.width, detected.height,
-                detected.codec.c_str(), detected.rotation_degrees,
+                detected.codec.c_str(), detected.pixel_format.c_str(),
+                detected.color_range.c_str(), detected.color_space.c_str(),
+                detected.color_transfer.c_str(),
+                detected.color_primaries.c_str(), detected.rotation_degrees,
                 detected.orientation.c_str());
         } else {
             std::fprintf(stderr, "Metadata probe failed for %s: %s\n",
@@ -564,7 +1096,7 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 
 - (BOOL)separateEmbeddedAudioByDefault:(std::string&)message {
     std::vector<Ulid> videoClipIds;
-    for (const DocumentTrack& track : self.state->document.tracks) {
+    for (const DocumentTrack& track : self.state->document.sequence.tracks) {
         if (track.kind != "video") continue;
         for (const DocumentClip& clip : track.clips) {
             if (!clip.include_audio) continue;
@@ -599,7 +1131,7 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
         }
         if (targetTrackId.empty()) {
             int32_t index = 0;
-            for (const DocumentTrack& track : self.state->document.tracks)
+            for (const DocumentTrack& track : self.state->document.sequence.tracks)
                 index = std::max(index, track.index + 1);
             targetTrackId = GenerateUlid();
             if (!self.state->editLog.Apply(
@@ -623,14 +1155,14 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
         Ulid group;
     };
     std::vector<LegacyPair> legacyPairs;
-    for (const DocumentTrack& videoTrack : self.state->document.tracks) {
+    for (const DocumentTrack& videoTrack : self.state->document.sequence.tracks) {
         if (videoTrack.kind != "video") continue;
         for (const DocumentClip& video : videoTrack.clips) {
             if (video.include_audio || !video.sync_anchor_clip_id.empty())
                 continue;
             const DocumentClip* match = nullptr;
             for (const DocumentTrack& audioTrack :
-                 self.state->document.tracks) {
+                 self.state->document.sequence.tracks) {
                 if (audioTrack.kind != "audio") continue;
                 for (const DocumentClip& audio : audioTrack.clips) {
                     if (!audio.sync_anchor_clip_id.empty() ||
@@ -711,7 +1243,7 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     [content addSubview:self.mediaPanel];
 
     NSTextField* libraryTitle =
-        [NSTextField labelWithString:@"MÉDIATHÈQUE / CHUTIERS"];
+        [NSTextField labelWithString:@"PROJET / CHUTIERS"];
     libraryTitle.frame = NSMakeRect(14.0, windowRect.size.height - 34.0,
                                     mediaPanelWidth - 28.0, 18.0);
     libraryTitle.autoresizingMask = NSViewMinYMargin;
@@ -750,6 +1282,12 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     self.binOutline.headerView = nil;
     self.binOutline.dataSource = self;
     self.binOutline.delegate = self;
+    [self.binOutline registerForDraggedTypes:@[
+        kCutmachineMediaPasteboardType, kCutmachineBinPasteboardType,
+        NSPasteboardTypeFileURL
+    ]];
+    [self.binOutline setDraggingSourceOperationMask:NSDragOperationMove
+                                          forLocal:YES];
     NSScrollView* binScroll = [[NSScrollView alloc]
         initWithFrame:NSMakeRect(12.0, windowRect.size.height - 300.0,
                                  mediaPanelWidth - 24.0, 220.0)];
@@ -843,9 +1381,9 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
                                            forLocal:YES];
 
     self.assignMediaButton =
-        [NSButton buttonWithTitle:@"Déplacer le média dans ce chutier"
+        [NSButton buttonWithTitle:@"Importer des rushes…"
                            target:self
-                           action:@selector(assignMediaToBinPressed:)];
+                           action:@selector(importMediaPressed:)];
     self.assignMediaButton.frame = NSMakeRect(12.0, 76.0, 184.0, 28.0);
     self.assignMediaButton.autoresizingMask = NSViewMaxYMargin;
     self.assignMediaButton.bezelStyle = NSBezelStyleRounded;
@@ -863,10 +1401,10 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     [self.mediaPanel addSubview:self.sourceMonitorButton];
 
     NSMenu* binContext = [[NSMenu alloc] initWithTitle:@"Chutier"];
-    [binContext addItem:[self menuItem:@"Nouveau sous-chutier…"
+    [binContext addItem:[self menuItem:@"Nouveau chutier"
                                 action:@selector(createBinPressed:)
                                    key:@""]];
-    [binContext addItem:[self menuItem:@"Renommer…"
+    [binContext addItem:[self menuItem:@"Renommer"
                                 action:@selector(renameBinPressed:)
                                    key:@""]];
     [binContext addItem:NSMenuItem.separatorItem];
@@ -876,6 +1414,10 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     self.binOutline.menu = binContext;
 
     NSMenu* mediaContext = [[NSMenu alloc] initWithTitle:@"Média"];
+    [mediaContext addItem:[self menuItem:@"Nouveau chutier"
+                                action:@selector(createBinPressed:)
+                                   key:@""]];
+    [mediaContext addItem:NSMenuItem.separatorItem];
     [mediaContext
         addItem:[self menuItem:@"Ouvrir dans le moniteur source"
                         action:@selector(openSelectedMediaInSourceMonitor:)
@@ -1055,6 +1597,106 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
            [self childBinIds:identifier].count > 0;
 }
 
+- (id<NSPasteboardWriting>)outlineView:(NSOutlineView*)outlineView
+              pasteboardWriterForItem:(id)item {
+    (void)outlineView;
+    NSString* identifier = item;
+    if ([identifier hasPrefix:@"__"] ||
+        !self.state->document.FindBin(identifier.UTF8String ?: ""))
+        return nil;
+    NSPasteboardItem* pasteboardItem = [[NSPasteboardItem alloc] init];
+    [pasteboardItem setString:identifier forType:kCutmachineBinPasteboardType];
+    return pasteboardItem;
+}
+
+- (NSString*)dropTargetBinForItem:(id)item {
+    NSString* identifier = [item isKindOfClass:NSString.class] ? item : nil;
+    if (!identifier || [identifier isEqualToString:@"__all__"] ||
+        [identifier isEqualToString:@"__root__"])
+        return @"";
+    return self.state->document.FindBin(identifier.UTF8String ?: "")
+               ? identifier
+               : nil;
+}
+
+- (BOOL)bin:(NSString*)binId canMoveInto:(NSString*)parentId {
+    if ([binId isEqualToString:parentId]) return NO;
+    const DocumentBin* cursor = self.state->document.FindBin(
+        parentId.UTF8String ?: "");
+    while (cursor) {
+        if (cursor->id == (binId.UTF8String ?: "")) return NO;
+        cursor = self.state->document.FindBin(cursor->parent_id);
+    }
+    return YES;
+}
+
+- (NSDragOperation)outlineView:(NSOutlineView*)outlineView
+                  validateDrop:(id<NSDraggingInfo>)info
+                   proposedItem:(id)item
+             proposedChildIndex:(NSInteger)index {
+    NSString* target = [self dropTargetBinForItem:item];
+    if (!target) return NSDragOperationNone;
+    [outlineView setDropItem:item dropChildIndex:NSOutlineViewDropOnItemIndex];
+    NSPasteboard* pasteboard = info.draggingPasteboard;
+    NSString* movingBin = [pasteboard stringForType:kCutmachineBinPasteboardType];
+    if (movingBin)
+        return [self bin:movingBin canMoveInto:target] ? NSDragOperationMove
+                                                       : NSDragOperationNone;
+    if ([pasteboard stringForType:kCutmachineMediaPasteboardType])
+        return NSDragOperationMove;
+    if ([pasteboard availableTypeFromArray:@[ NSPasteboardTypeFileURL ]])
+        return NSDragOperationCopy;
+    (void)index;
+    return NSDragOperationNone;
+}
+
+- (BOOL)outlineView:(NSOutlineView*)outlineView
+         acceptDrop:(id<NSDraggingInfo>)info
+                item:(id)item
+          childIndex:(NSInteger)index {
+    (void)outlineView;
+    (void)index;
+    NSString* target = [self dropTargetBinForItem:item];
+    if (!target) return NO;
+    NSPasteboard* pasteboard = info.draggingPasteboard;
+    NSArray<NSURL*>* urls = [pasteboard readObjectsForClasses:@[ NSURL.class ]
+                                                     options:@{
+                                                         NSPasteboardURLReadingFileURLsOnlyKey : @YES
+                                                     }];
+    if (urls.count > 0) return [self importMediaURLs:urls intoBin:target];
+
+    NSString* media = [pasteboard stringForType:kCutmachineMediaPasteboardType];
+    NSString* movingBin = [pasteboard stringForType:kCutmachineBinPasteboardType];
+    Operation operation;
+    if (media)
+        operation = SetMediaBinOperation{media.UTF8String ?: "",
+                                         target.UTF8String ?: ""};
+    else if (movingBin && [self bin:movingBin canMoveInto:target])
+        operation = MoveBinOperation{movingBin.UTF8String ?: "",
+                                     target.UTF8String ?: ""};
+    else
+        return NO;
+
+    EditError error = EditError::None;
+    std::string message;
+    if (!self.state->editLog.Apply(self.state->document, std::move(operation),
+                                   error, message)) {
+        self.binSummaryLabel.stringValue = [NSString
+            stringWithFormat:@"Déplacement refusé : %s", message.c_str()];
+        return NO;
+    }
+    if (![self persistEdits:message]) {
+        self.binSummaryLabel.stringValue = [NSString
+            stringWithFormat:@"Enregistrement impossible : %s",
+                             message.c_str()];
+        return NO;
+    }
+    NSString* selected = target.length == 0 ? @"__root__" : target;
+    [self refreshBinControlsSelecting:selected];
+    if (target.length > 0) [self.binOutline expandItem:target];
+    return YES;
+}
+
 - (NSView*)outlineView:(NSOutlineView*)outlineView
     viewForTableColumn:(NSTableColumn*)tableColumn
                   item:(id)item {
@@ -1063,15 +1705,21 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     NSTextField* label = [NSTextField labelWithString:@""];
     NSString* identifier = item;
     if ([identifier isEqualToString:@"__all__"])
-        label.stringValue = @"▣ Tous les médias";
+        label.stringValue = @"▣ Tous les objets";
     else if ([identifier isEqualToString:@"__root__"])
         label.stringValue = @"⌂ Sans chutier";
     else {
         const DocumentBin* bin =
             self.state->document.FindBin(identifier.UTF8String ?: "");
         label.stringValue =
-            bin ? [NSString stringWithFormat:@"▸ %s", bin->name.c_str()]
+            bin ? [NSString stringWithUTF8String:bin->name.c_str()]
                 : @"Chutier manquant";
+        if (bin) {
+            label.editable = YES;
+            label.selectable = YES;
+            label.delegate = self;
+            label.identifier = [@"bin:" stringByAppendingString:identifier];
+        }
     }
     label.lineBreakMode = NSLineBreakByTruncatingTail;
     return label;
@@ -1086,6 +1734,16 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     self.visibleMediaIds = [NSMutableArray array];
     NSString* query = self.mediaSearchField.stringValue.lowercaseString ?: @"";
     const std::string selected(self.selectedBinId.UTF8String ?: "__all__");
+    if (selected == "__all__" || selected == "__root__") {
+        NSString* sequenceName = [NSString
+            stringWithUTF8String:self.state->document.sequence.name.c_str()];
+        if (query.length == 0 ||
+            [sequenceName.lowercaseString rangeOfString:query].location !=
+                NSNotFound) {
+            [self.visibleMediaIds addObject:[NSString
+                stringWithUTF8String:self.state->document.sequence.id.c_str()]];
+        }
+    }
     std::vector<const LibraryMedia*> mediaItems;
     for (const LibraryMedia& media : self.state->document.library) {
         if (selected != "__all__" &&
@@ -1114,11 +1772,9 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     [self.mediaCollection reloadData];
     const NSUInteger count = self.visibleMediaIds.count;
     self.binSummaryLabel.stringValue = [NSString
-        stringWithFormat:@"%lu média%@ affiché%@", (unsigned long)count,
+        stringWithFormat:@"%lu objet%@ affiché%@", (unsigned long)count,
                          count == 1 ? @"" : @"s", count == 1 ? @"" : @"s"];
-    self.assignMediaButton.enabled =
-        self.mediaTable.selectedRow >= 0 &&
-        ![self.selectedBinId isEqualToString:@"__all__"];
+    self.assignMediaButton.enabled = YES;
 }
 
 - (void)mediaViewChanged:(id)sender {
@@ -1154,8 +1810,26 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     MediaIconItem* item = [collectionView makeItemWithIdentifier:@"media-icon"
                                                     forIndexPath:indexPath];
     if (indexPath.item >= self.visibleMediaIds.count) return item;
+    NSString* identifier = self.visibleMediaIds[indexPath.item];
+    if ([identifier isEqualToString:[NSString
+            stringWithUTF8String:self.state->document.sequence.id.c_str()]]) {
+        const DocumentSequence& sequence = self.state->document.sequence;
+        item.textField.stringValue =
+            [NSString stringWithUTF8String:sequence.name.c_str()];
+        NSImage* symbol = [NSImage
+            imageWithSystemSymbolName:@"timeline.selection"
+              accessibilityDescription:@"Séquence"];
+        symbol.size = NSMakeSize(44.0, 44.0);
+        item.imageView.image = symbol;
+        item.view.toolTip = [NSString
+            stringWithFormat:@"Séquence · %dx%d · %d/%d fps · %lu pistes",
+                             sequence.width, sequence.height,
+                             sequence.frame_rate.num, sequence.frame_rate.den,
+                             (unsigned long)sequence.tracks.size()];
+        return item;
+    }
     const LibraryMedia* media = self.state->document.FindLibraryMedia(
-        self.visibleMediaIds[indexPath.item].UTF8String ?: "");
+        identifier.UTF8String ?: "");
     if (!media) return item;
     item.textField.stringValue =
         [NSString stringWithUTF8String:media->filename.c_str()];
@@ -1174,6 +1848,10 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
        pasteboardWriterForItemAtIndexPath:(NSIndexPath*)indexPath {
     (void)collectionView;
     if (indexPath.item >= self.visibleMediaIds.count) return nil;
+    if ([self.visibleMediaIds[indexPath.item]
+            isEqualToString:[NSString
+                stringWithUTF8String:self.state->document.sequence.id.c_str()]])
+        return nil;
     NSPasteboardItem* item = [[NSPasteboardItem alloc] init];
     [item setString:self.visibleMediaIds[indexPath.item]
             forType:kCutmachineMediaPasteboardType];
@@ -1186,6 +1864,10 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     if (tableView != self.mediaTable || rowIndexes.count != 1) return NO;
     const NSUInteger row = rowIndexes.firstIndex;
     if (row >= self.visibleMediaIds.count) return NO;
+    if ([self.visibleMediaIds[row]
+            isEqualToString:[NSString
+                stringWithUTF8String:self.state->document.sequence.id.c_str()]])
+        return NO;
     [pasteboard declareTypes:@[ kCutmachineMediaPasteboardType ] owner:nil];
     return [pasteboard setString:self.visibleMediaIds[row]
                          forType:kCutmachineMediaPasteboardType];
@@ -1202,11 +1884,27 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
                 [NSString stringWithUTF8String:clip->source_id.c_str()];
     }
     if (!identifier) return;
+    if ([identifier isEqualToString:[NSString
+            stringWithUTF8String:self.state->document.sequence.id.c_str()]]) {
+        [self setPlaybackDirection:0];
+        self.state->sourceMonitor = false;
+        [self requestResolvedPosition:self.state->requestedPosition];
+        self.infoLabel.stringValue = [NSString
+            stringWithFormat:@"PROGRAMME    %s    %dx%d    %d/%d fps",
+                             self.state->document.sequence.name.c_str(),
+                             self.state->document.sequence.width,
+                             self.state->document.sequence.height,
+                             self.state->document.sequence.frame_rate.num,
+                             self.state->document.sequence.frame_rate.den];
+        return;
+    }
     [self openMediaIdentifierInSourceMonitor:identifier];
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem*)item {
     const SEL action = item.action;
+    if (action == @selector(exportFinalVideo:))
+        return self.state && !self.state->exportRunning;
     if (action == @selector(menuUndo:))
         return self.state && self.state->editLog.AppliedCount() > 0;
     if (action == @selector(menuRedo:))
@@ -1230,8 +1928,19 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
                self.state->document.FindBin(self.selectedBinId.UTF8String
                                                 ?: "") != nullptr;
     if (action == @selector(assignMediaToBinPressed:))
-        return [self selectedMediaId] != nil &&
-               ![self.selectedBinId isEqualToString:@"__all__"];
+        return self.state &&
+               self.state->document.FindLibraryMedia(
+                   [self selectedMediaId].UTF8String ?: "") != nullptr;
+    if (action == @selector(removeContextTrackPressed:))
+        return self.state &&
+               self.state->document.FindTrack(self.state->contextTrackId);
+    if (action == @selector(removeEmptyTracksPressed:))
+        return self.state &&
+               std::any_of(self.state->document.sequence.tracks.begin(),
+                           self.state->document.sequence.tracks.end(),
+                           [](const DocumentTrack& track) {
+                               return track.clips.empty();
+                           });
     if (action == @selector(detachAudioButtonPressed:)) {
         if (!self.state || !self.state->interaction) return NO;
         const DocumentClip* clip = self.state->document.FindClip(
@@ -1307,7 +2016,19 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
         self.visibleMediaIds[row].UTF8String ?: "");
     NSTextField* label = [NSTextField labelWithString:@""];
     label.lineBreakMode = NSLineBreakByTruncatingTail;
-    if (!media) return label;
+    if (!media) {
+        const DocumentSequence& sequence = self.state->document.sequence;
+        if ([tableColumn.identifier isEqualToString:@"name"])
+            label.stringValue = [NSString
+                stringWithFormat:@"◫ %s", sequence.name.c_str()];
+        else if ([tableColumn.identifier isEqualToString:@"format"])
+            label.stringValue = [NSString
+                stringWithFormat:@"Séquence %dx%d", sequence.width,
+                                 sequence.height];
+        else
+            label.stringValue = TimeString(self.state->duration);
+        return label;
+    }
     if ([tableColumn.identifier isEqualToString:@"name"])
         label.stringValue =
             [NSString stringWithUTF8String:media->filename.c_str()];
@@ -1325,18 +2046,14 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 
 - (void)tableViewSelectionDidChange:(NSNotification*)notification {
     if (notification.object != self.mediaTable) return;
-    self.assignMediaButton.enabled =
-        self.mediaTable.selectedRow >= 0 &&
-        ![self.selectedBinId isEqualToString:@"__all__"];
+    (void)[self selectedMediaId];
 }
 
 - (void)collectionView:(NSCollectionView*)collectionView
     didSelectItemsAtIndexPaths:(NSSet<NSIndexPath*>*)indexPaths {
     (void)collectionView;
     (void)indexPaths;
-    self.assignMediaButton.enabled =
-        [self selectedMediaId] != nil &&
-        ![self.selectedBinId isEqualToString:@"__all__"];
+    (void)[self selectedMediaId];
 }
 
 - (void)mediaSearchChanged:(id)sender {
@@ -1344,34 +2061,185 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     [self rebuildMediaList];
 }
 
+- (void)importMediaPressed:(id)sender {
+    (void)sender;
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.title = @"Importer des rushes";
+    panel.prompt = @"Importer";
+    panel.allowsMultipleSelection = YES;
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = YES;
+    panel.resolvesAliases = YES;
+    NSString* target = self.state->document.FindBin(
+                           self.selectedBinId.UTF8String ?: "")
+                           ? self.selectedBinId
+                           : @"";
+    if ([panel runModal] == NSModalResponseOK)
+        [self importMediaURLs:panel.URLs intoBin:target];
+}
+
+- (BOOL)importMediaURLs:(NSArray<NSURL*>*)urls intoBin:(NSString*)binId {
+    const std::string targetBin(binId.UTF8String ?: "");
+    if (!targetBin.empty() && !self.state->document.FindBin(targetBin))
+        return NO;
+
+    std::vector<std::filesystem::path> candidates;
+    for (NSURL* url in urls) {
+        if (!url.isFileURL) continue;
+        std::filesystem::path path(url.path.UTF8String ?: "");
+        std::error_code error;
+        if (std::filesystem::is_directory(path, error) && !error) {
+            std::filesystem::recursive_directory_iterator iterator(
+                path, std::filesystem::directory_options::skip_permission_denied,
+                error), end;
+            for (; !error && iterator != end; iterator.increment(error)) {
+                if (iterator->is_regular_file(error) && !error)
+                    candidates.push_back(iterator->path());
+            }
+        } else if (!error && std::filesystem::is_regular_file(path, error)) {
+            candidates.push_back(path);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                     candidates.end());
+    if (candidates.empty()) {
+        self.binSummaryLabel.stringValue = @"Aucun fichier à importer.";
+        return NO;
+    }
+
+    const Document before = self.state->document;
+    const std::filesystem::path documentPath = std::filesystem::absolute(
+        std::filesystem::path(self.documentPath.UTF8String ?: ""));
+    std::map<std::string, size_t> known;
+    for (size_t index = 0; index < self.state->document.library.size(); ++index) {
+        LibraryMedia& media = self.state->document.library[index];
+        std::filesystem::path path(media.path);
+        if (path.is_relative()) path = documentPath.parent_path() / path;
+        std::error_code error;
+        const auto canonical = std::filesystem::weakly_canonical(path, error);
+        if (!error) known[canonical.string()] = index;
+    }
+
+    size_t added = 0;
+    size_t moved = 0;
+    size_t rejected = 0;
+    std::vector<std::pair<Ulid, std::filesystem::path>> addedSources;
+    for (const auto& candidate : candidates) {
+        std::error_code error;
+        const auto absolute = std::filesystem::weakly_canonical(candidate, error);
+        if (error) {
+            ++rejected;
+            continue;
+        }
+        const auto existing = known.find(absolute.string());
+        if (existing != known.end()) {
+            LibraryMedia& media = self.state->document.library[existing->second];
+            if (media.bin_id != targetBin) {
+                media.bin_id = targetBin;
+                ++moved;
+            }
+            continue;
+        }
+        LibraryMedia media;
+        media.id = GenerateUlid();
+        media.filename = absolute.filename().string();
+        media.bin_id = targetBin;
+        media.path = std::filesystem::relative(
+                         absolute, documentPath.parent_path(), error)
+                         .lexically_normal()
+                         .string();
+        if (error) media.path = absolute.string();
+        std::string probeError;
+        if (!ProbeMediaMetadata(absolute.string(), media, probeError)) {
+            ++rejected;
+            continue;
+        }
+        self.state->document.library.push_back(media);
+        self.state->document.sources.push_back(
+            {media.id, media.path, media.rate, media.duration});
+        known[absolute.string()] = self.state->document.library.size() - 1;
+        addedSources.push_back({media.id, absolute});
+        ++added;
+    }
+
+    std::string message;
+    if (added == 0 && moved == 0) {
+        self.binSummaryLabel.stringValue = [NSString
+            stringWithFormat:@"Aucun rush importé (%lu fichier%@ refusé%@).",
+                             (unsigned long)rejected, rejected == 1 ? @"" : @"s",
+                             rejected == 1 ? @"" : @"s"];
+        return NO;
+    }
+    if (!self.state->document.Validate(message) || ![self persistEdits:message]) {
+        self.state->document = before;
+        self.binSummaryLabel.stringValue = [NSString
+            stringWithFormat:@"Import impossible : %s", message.c_str()];
+        return NO;
+    }
+
+    for (const auto& source : addedSources) {
+        if (const LibraryMedia* media =
+                self.state->document.FindLibraryMedia(source.first))
+            self.state->mediaMetadata[source.first] = *media;
+        auto worker = std::make_unique<DecodeWorker>(
+            source.first, *self.state->frameCache,
+            *self.state->performanceMetrics);
+        if (worker->Open(source.second.string(), 5)) {
+            worker->Start();
+            self.state->workers.emplace(source.first, std::move(worker));
+        }
+    }
+    if (!addedSources.empty()) {
+        auto audio = std::make_unique<AudioPlayback>();
+        std::string audioError;
+        if (audio->Open(self.state->document,
+                        documentPath.parent_path().string(), audioError))
+            self.state->audioPlayback = std::move(audio);
+    }
+    NSString* selected = targetBin.empty() ? @"__root__" : binId;
+    [self refreshBinControlsSelecting:selected];
+    NSMutableArray<NSString*>* results = [NSMutableArray array];
+    if (added)
+        [results addObject:[NSString
+            stringWithFormat:@"%lu rush%@ importé%@", (unsigned long)added,
+                             added == 1 ? @"" : @"es",
+                             added == 1 ? @"" : @"s"]];
+    if (moved)
+        [results addObject:[NSString
+            stringWithFormat:@"%lu rush%@ déplacé%@", (unsigned long)moved,
+                             moved == 1 ? @"" : @"es",
+                             moved == 1 ? @"" : @"s"]];
+    if (rejected)
+        [results addObject:[NSString
+            stringWithFormat:@"%lu refusé%@", (unsigned long)rejected,
+                             rejected == 1 ? @"" : @"s"]];
+    self.binSummaryLabel.stringValue = [results componentsJoinedByString:@" · "];
+    return YES;
+}
+
 - (void)createBinPressed:(id)sender {
     (void)sender;
-    NSAlert* alert = [[NSAlert alloc] init];
-    alert.messageText = @"Nouveau chutier";
-    alert.informativeText = @"Donnez un nom au chutier de médias.";
-    [alert addButtonWithTitle:@"Créer"];
-    [alert addButtonWithTitle:@"Annuler"];
-    NSTextField* input =
-        [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 280, 24)];
-    input.placeholderString = @"Rushes, Interviews, B-roll…";
-    alert.accessoryView = input;
-    if ([alert runModal] != NSAlertFirstButtonReturn) return;
-    NSString* trimmed = [input.stringValue
-        stringByTrimmingCharactersInSet:NSCharacterSet
-                                            .whitespaceAndNewlineCharacterSet];
-    if (trimmed.length == 0) return;
-
+    const std::string parent =
+        self.state->document.FindBin(self.selectedBinId.UTF8String ?: "")
+            ? std::string(self.selectedBinId.UTF8String ?: "")
+            : std::string{};
+    std::string name = "Nouveau chutier";
+    for (int suffix = 2;; ++suffix) {
+        const bool exists = std::any_of(
+            self.state->document.bins.begin(), self.state->document.bins.end(),
+            [&](const DocumentBin& bin) {
+                return bin.parent_id == parent && bin.name == name;
+            });
+        if (!exists) break;
+        name = "Nouveau chutier " + std::to_string(suffix);
+    }
     const Ulid binId = GenerateUlid();
     EditError error = EditError::None;
     std::string message;
     if (!self.state->editLog.Apply(
             self.state->document,
-            Operation{AddBinOperation{
-                binId, trimmed.UTF8String ?: "",
-                self.state->document.FindBin(self.selectedBinId.UTF8String
-                                                 ?: "")
-                    ? std::string(self.selectedBinId.UTF8String ?: "")
-                    : std::string{}}},
+            Operation{AddBinOperation{binId, name, parent}},
             error, message)) {
         self.binSummaryLabel.stringValue = [NSString
             stringWithFormat:@"Création refusée : %s", message.c_str()];
@@ -1380,8 +2248,9 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     if (![self persistEdits:message])
         std::fprintf(stderr, "Unable to persist bin creation: %s\n",
                      message.c_str());
-    [self refreshBinControlsSelecting:[NSString
-                                          stringWithUTF8String:binId.c_str()]];
+    NSString* identifier = [NSString stringWithUTF8String:binId.c_str()];
+    [self refreshBinControlsSelecting:identifier];
+    [self beginEditingBin:identifier];
 }
 
 - (void)deleteBinPressed:(id)sender {
@@ -1405,27 +2274,43 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 
 - (void)renameBinPressed:(id)sender {
     (void)sender;
-    const std::string binId(self.selectedBinId.UTF8String ?: "");
-    const DocumentBin* bin = self.state->document.FindBin(binId);
+    if (!self.state->document.FindBin(self.selectedBinId.UTF8String ?: ""))
+        return;
+    [self beginEditingBin:self.selectedBinId];
+}
+
+- (void)beginEditingBin:(NSString*)binId {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        const NSInteger row = [self.binOutline rowForItem:binId];
+        if (row < 0) return;
+        [self.binOutline selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
+                     byExtendingSelection:NO];
+        [self.binOutline editColumn:0 row:row withEvent:nil select:YES];
+    });
+}
+
+- (void)controlTextDidEndEditing:(NSNotification*)notification {
+    NSTextField* field = notification.object;
+    if (![field isKindOfClass:NSTextField.class] ||
+        ![field.identifier hasPrefix:@"bin:"])
+        return;
+    NSString* identifier = [field.identifier substringFromIndex:4];
+    const DocumentBin* bin = self.state->document.FindBin(
+        identifier.UTF8String ?: "");
     if (!bin) return;
-    NSAlert* alert = [[NSAlert alloc] init];
-    alert.messageText = @"Renommer le chutier";
-    [alert addButtonWithTitle:@"Renommer"];
-    [alert addButtonWithTitle:@"Annuler"];
-    NSTextField* input =
-        [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 280, 24)];
-    input.stringValue = [NSString stringWithUTF8String:bin->name.c_str()];
-    alert.accessoryView = input;
-    if ([alert runModal] != NSAlertFirstButtonReturn) return;
-    NSString* name = [input.stringValue
+    NSString* name = [field.stringValue
         stringByTrimmingCharactersInSet:NSCharacterSet
                                             .whitespaceAndNewlineCharacterSet];
-    if (name.length == 0) return;
+    if (name.length == 0 || bin->name == (name.UTF8String ?: "")) {
+        [self.binOutline reloadItem:identifier];
+        return;
+    }
     EditError error = EditError::None;
     std::string message;
     if (!self.state->editLog.Apply(
             self.state->document,
-            Operation{RenameBinOperation{binId, name.UTF8String ?: ""}}, error,
+            Operation{RenameBinOperation{identifier.UTF8String ?: "",
+                                         name.UTF8String ?: ""}}, error,
             message)) {
         self.binSummaryLabel.stringValue = [NSString
             stringWithFormat:@"Renommage refusé : %s", message.c_str()];
@@ -1434,18 +2319,49 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     if (![self persistEdits:message])
         std::fprintf(stderr, "Unable to persist bin rename: %s\n",
                      message.c_str());
-    [self refreshBinControlsSelecting:self.selectedBinId];
+    [self refreshBinControlsSelecting:identifier];
 }
 
 - (void)assignMediaToBinPressed:(id)sender {
     (void)sender;
-    const NSInteger row = self.mediaTable.selectedRow;
-    if (row < 0 || row >= (NSInteger)self.visibleMediaIds.count) return;
-    NSString* media = self.visibleMediaIds[row];
-    NSString* bin = [self.selectedBinId isEqualToString:@"__root__"]
-                        ? @""
-                        : self.selectedBinId;
-    if (!media || [bin isEqualToString:@"__all__"]) return;
+    NSString* media = [self selectedMediaId];
+    const LibraryMedia* selected = self.state->document.FindLibraryMedia(
+        media.UTF8String ?: "");
+    if (!selected) return;
+
+    NSAlert* alert = [[NSAlert alloc] init];
+    alert.messageText = @"Déplacer le rush";
+    alert.informativeText = @"Choisissez son chutier de destination.";
+    [alert addButtonWithTitle:@"Déplacer"];
+    [alert addButtonWithTitle:@"Annuler"];
+    NSPopUpButton* destinations =
+        [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 320, 26)];
+    [destinations addItemWithTitle:@"Sans chutier"];
+    destinations.lastItem.representedObject = @"";
+    std::vector<const DocumentBin*> bins;
+    for (const DocumentBin& bin : self.state->document.bins) bins.push_back(&bin);
+    std::stable_sort(bins.begin(), bins.end(),
+                     [](const DocumentBin* left, const DocumentBin* right) {
+                         return left->name < right->name;
+                     });
+    for (const DocumentBin* bin : bins) {
+        std::string path = bin->name;
+        const DocumentBin* parent = self.state->document.FindBin(bin->parent_id);
+        while (parent) {
+            path = parent->name + " / " + path;
+            parent = self.state->document.FindBin(parent->parent_id);
+        }
+        [destinations addItemWithTitle:
+                          [NSString stringWithUTF8String:path.c_str()]];
+        destinations.lastItem.representedObject =
+            [NSString stringWithUTF8String:bin->id.c_str()];
+        if (bin->id == selected->bin_id)
+            [destinations selectItem:destinations.lastItem];
+    }
+    if (selected->bin_id.empty()) [destinations selectItemAtIndex:0];
+    alert.accessoryView = destinations;
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    NSString* bin = destinations.selectedItem.representedObject ?: @"";
     EditError error = EditError::None;
     std::string message;
     if (!self.state->editLog.Apply(
@@ -1478,7 +2394,7 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 - (double)timelineHeight {
     const double contentHeight =
         kTimelineRulerHeight +
-        self.state->document.tracks.size() * self.state->viewport.track_height +
+        self.state->document.sequence.tracks.size() * self.state->viewport.track_height +
         kAddTrackRowHeight;
     return std::min(contentHeight,
                     std::max(0.0, self.metalView.bounds.size.height - 160.0));
@@ -1707,10 +2623,15 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     NSString* metadataText = @"métadonnées indisponibles";
     if (media && media->metadata_complete) {
         metadataText = [NSString
-            stringWithFormat:@"%dx%d %@  rot %d°  %d/%d fps  audio %@",
+            stringWithFormat:@"%dx%d %@  %s/%s  range %s  matrix %s  rot %d°  "
+                             @"%d/%d fps  audio %@",
                              media->width, media->height,
                              [NSString stringWithUTF8String:media->orientation
                                                                 .c_str()],
+                             media->pixel_format.c_str(),
+                             media->color_transfer.c_str(),
+                             media->color_range.c_str(),
+                             media->color_space.c_str(),
                              media -> rotation_degrees, media -> rate.num,
                              media->rate.den,
                              media->has_audio ? @"oui" : @"non"];
@@ -1775,7 +2696,7 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     if (point.y < 0.0 || point.y > [self timelineHeight]) return;
     const double addTrackY =
         kTimelineRulerHeight +
-        self.state->document.tracks.size() * self.state->viewport.track_height;
+        self.state->document.sequence.tracks.size() * self.state->viewport.track_height;
     if (point.y >= addTrackY && point.y < addTrackY + kAddTrackRowHeight &&
         point.x >= 0.0 && point.x < self.state->viewport.header_width) {
         [self addTrack:(point.x >= self.state->viewport.header_width * 0.5)];
@@ -1813,10 +2734,13 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
         if (!hit) return;
         const DocumentClip* clip = self.state->document.FindClip(hit->clip_id);
         if (!clip) return;
-        Operation operation = SplitClipOperation{
-            clip->id,
+        const bool linkedCut =
+            self.state->linkedSelection &&
+            (event.modifierFlags & NSEventModifierFlagOption) == 0;
+        Operation operation = CutOperationForClip(
+            self.state->document, *clip,
             self.state->viewport.XToTime(point.x, clip->duration.rate),
-            {}};
+            linkedCut);
         EditError error = EditError::None;
         std::string message;
         const RationalTime playhead = self.state->requestedPosition;
@@ -1959,7 +2883,7 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 
 - (void)rebuildVideoTrackIds {
     std::vector<const DocumentTrack*> tracks;
-    for (const DocumentTrack& track : self.state->document.tracks)
+    for (const DocumentTrack& track : self.state->document.sequence.tracks)
         if (track.kind == "video") tracks.push_back(&track);
     std::sort(tracks.begin(), tracks.end(),
               [](const DocumentTrack* left, const DocumentTrack* right) {
@@ -1974,7 +2898,7 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 
 - (void)addTrack:(BOOL)audio {
     int32_t index = 0;
-    for (const DocumentTrack& track : self.state->document.tracks)
+    for (const DocumentTrack& track : self.state->document.sequence.tracks)
         index = std::max(index, track.index + 1);
     EditError error = EditError::None;
     std::string message;
@@ -2188,13 +3112,20 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
         const RationalTime playhead = self.state->requestedPosition;
         EditError error = EditError::None;
         std::string message;
+        const bool rippleDelete =
+            (modifiers & NSEventModifierFlagShift) != 0;
         Operation operation =
-            gap ? Operation{DeleteGapOperation{
-                      gap->track_id, gap->start, gap->duration, {}}}
-                : Operation{RemoveClipOperation{selectedClipId.empty()
-                                                    ? selectedClipIds.front()
+            gap ? Operation{GapDeleteOperationForSelection(
+                      self.state->document, *gap, self.state->linkedSelection)}
+                : (rippleDelete
+                       ? Operation{RemoveClipOperation{
+                             selectedClipId.empty() ? selectedClipIds.front()
                                                     : selectedClipId,
-                                                {}}};
+                             {}}}
+                       : Operation{ClearClipOperation{
+                             selectedClipId.empty() ? selectedClipIds.front()
+                                                    : selectedClipId,
+                             {}}});
         if (!gap && self.state->linkedSelection && selectedClipIds.size() > 1) {
             const DocumentClip* first =
                 self.state->document.FindClip(selectedClipIds.front());
@@ -2207,9 +3138,15 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
                                 return clip && clip->link_group_id ==
                                                    first->link_group_id;
                             });
-            if (oneGroup)
-                operation = RemoveLinkedClipsOperation{
-                    first->link_group_id, selectedClipIds, {}};
+            if (oneGroup) {
+                operation = rippleDelete
+                                ? Operation{RemoveLinkedClipsOperation{
+                                      first->link_group_id, selectedClipIds,
+                                      {}}}
+                                : Operation{ClearLinkedClipsOperation{
+                                      first->link_group_id, selectedClipIds,
+                                      {}}};
+            }
         }
         if (self.state->editLog.Apply(self.state->document,
                                       std::move(operation), error, message)) {
@@ -2369,19 +3306,25 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     }
 }
 
-- (BOOL)deleteCurrentTimelineSelection {
+- (BOOL)deleteCurrentTimelineSelectionRipple:(BOOL)ripple {
     const auto gap = self.state->interaction->SelectedGap();
     const std::vector<Ulid> ids = self.state->interaction->SelectedClipIds();
     if (!gap && ids.empty()) return NO;
     Operation operation =
-        gap ? Operation{DeleteGapOperation{
-                  gap->track_id, gap->start, gap->duration, {}}}
-            : Operation{RemoveClipOperation{ids.front(), {}}};
+        gap ? Operation{GapDeleteOperationForSelection(
+                  self.state->document, *gap, self.state->linkedSelection)}
+            : (ripple
+                   ? Operation{RemoveClipOperation{ids.front(), {}}}
+                   : Operation{ClearClipOperation{ids.front(), {}}});
     if (!gap && self.state->linkedSelection && ids.size() > 1) {
         const DocumentClip* first = self.state->document.FindClip(ids.front());
         if (first && !first->link_group_id.empty())
             operation =
-                RemoveLinkedClipsOperation{first->link_group_id, ids, {}};
+                ripple
+                    ? Operation{RemoveLinkedClipsOperation{
+                          first->link_group_id, ids, {}}}
+                    : Operation{ClearLinkedClipsOperation{
+                          first->link_group_id, ids, {}}};
     }
     EditError error = EditError::None;
     std::string message;
@@ -2396,12 +3339,21 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     return YES;
 }
 
+- (BOOL)deleteCurrentTimelineSelection {
+    return [self deleteCurrentTimelineSelectionRipple:NO];
+}
+
 - (void)menuDeleteSelection:(id)sender {
     (void)sender;
     if (self.window.firstResponder == self.binOutline)
         [self deleteBinPressed:nil];
     else
         [self deleteCurrentTimelineSelection];
+}
+
+- (void)menuRippleDeleteSelection:(id)sender {
+    (void)sender;
+    [self deleteCurrentTimelineSelectionRipple:YES];
 }
 
 - (void)menuCutSelectedAtPlayhead:(id)sender {
@@ -2448,6 +3400,79 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 - (void)menuAddAudioTrack:(id)sender {
     (void)sender;
     [self addTrack:YES];
+}
+
+- (void)removeContextTrackPressed:(id)sender {
+    (void)sender;
+    const DocumentTrack* track =
+        self.state->document.FindTrack(self.state->contextTrackId);
+    if (!track) return;
+    if (!track->clips.empty()) {
+        NSAlert* alert = [[NSAlert alloc] init];
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = @"Supprimer cette piste et tous ses clips ?";
+        alert.informativeText = [NSString
+            stringWithFormat:@"La piste contient %lu clip%@. Cette action "
+                             @"reste annulable avec ⌘Z.",
+                             (unsigned long)track->clips.size(),
+                             track->clips.size() == 1 ? @"" : @"s"];
+        [alert addButtonWithTitle:@"Supprimer la piste"];
+        [alert addButtonWithTitle:@"Annuler"];
+        if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    }
+    EditError error = EditError::None;
+    std::string message;
+    const RationalTime playhead = self.state->requestedPosition;
+    if (!self.state->editLog.Apply(
+            self.state->document,
+            Operation{RemoveTrackOperation{track->id}}, error, message)) {
+        self.infoLabel.stringValue = [NSString
+            stringWithFormat:@"Suppression refusée : %s", message.c_str()];
+        return;
+    }
+    self.state->interaction->SelectClip("");
+    [self refreshTimelineAfterEditFromPosition:playhead];
+    if (![self persistEdits:message])
+        std::fprintf(stderr, "Unable to persist track removal: %s\n",
+                     message.c_str());
+    [self updateSelectionInfo];
+    self.state->overlayDirty = true;
+}
+
+- (void)removeEmptyTracksPressed:(id)sender {
+    (void)sender;
+    std::vector<Ulid> emptyTrackIds;
+    for (const DocumentTrack& track : self.state->document.sequence.tracks)
+        if (track.clips.empty()) emptyTrackIds.push_back(track.id);
+    if (emptyTrackIds.empty()) return;
+
+    Document stagedDocument = self.state->document;
+    EditLog stagedLog = self.state->editLog;
+    EditError error = EditError::None;
+    std::string message;
+    for (const Ulid& trackId : emptyTrackIds) {
+        if (!stagedLog.Apply(stagedDocument,
+                             Operation{RemoveTrackOperation{trackId}}, error,
+                             message)) {
+            self.infoLabel.stringValue = [NSString
+                stringWithFormat:@"Nettoyage refusé : %s", message.c_str()];
+            return;
+        }
+    }
+    self.state->document = std::move(stagedDocument);
+    self.state->editLog = std::move(stagedLog);
+    const RationalTime playhead = self.state->requestedPosition;
+    [self refreshTimelineAfterEditFromPosition:playhead];
+    if (![self persistEdits:message])
+        std::fprintf(stderr, "Unable to persist empty track removal: %s\n",
+                     message.c_str());
+    self.infoLabel.stringValue = [NSString
+        stringWithFormat:@"%lu piste%@ vide%@ supprimée%@",
+                         (unsigned long)emptyTrackIds.size(),
+                         emptyTrackIds.size() == 1 ? @"" : @"s",
+                         emptyTrackIds.size() == 1 ? @"" : @"s",
+                         emptyTrackIds.size() == 1 ? @"" : @"s"];
+    self.state->overlayDirty = true;
 }
 - (void)menuPlayPause:(id)sender {
     (void)sender;
@@ -2507,6 +3532,13 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
         [menu addItem:[self menuItem:@"Supprimer"
                               action:@selector(contextDeleteSelection:)
                                  key:@""]];
+        [menu addItem:NSMenuItem.separatorItem];
+        [menu addItem:[self menuItem:@"Supprimer la piste"
+                              action:@selector(removeContextTrackPressed:)
+                                 key:@""]];
+        [menu addItem:[self menuItem:@"Supprimer les pistes vides"
+                              action:@selector(removeEmptyTracksPressed:)
+                                 key:@""]];
         return menu;
     }
     const auto gap = HitTestTimelineGap(
@@ -2514,8 +3546,16 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
         self.metalView.bounds.size.width, self.state->duration.rate);
     if (gap) {
         self.state->contextGap = gap;
+        self.state->contextTrackId = gap->track_id;
         [menu addItem:[self menuItem:@"Fermer le gap"
                               action:@selector(contextCloseGap:)
+                                 key:@""]];
+        [menu addItem:NSMenuItem.separatorItem];
+        [menu addItem:[self menuItem:@"Supprimer la piste"
+                              action:@selector(removeContextTrackPressed:)
+                                 key:@""]];
+        [menu addItem:[self menuItem:@"Supprimer les pistes vides"
+                              action:@selector(removeEmptyTracksPressed:)
                                  key:@""]];
         return menu;
     }
@@ -2524,6 +3564,15 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
         (timelineY - kTimelineRulerHeight) / self.state->viewport.track_height);
     if (index >= 0 && index < (NSInteger)tracks.size())
         self.state->contextTrackId = tracks[index]->id;
+    if (!self.state->contextTrackId.empty()) {
+        [menu addItem:[self menuItem:@"Supprimer la piste"
+                              action:@selector(removeContextTrackPressed:)
+                                 key:@""]];
+        [menu addItem:[self menuItem:@"Supprimer les pistes vides"
+                              action:@selector(removeEmptyTracksPressed:)
+                                 key:@""]];
+        [menu addItem:NSMenuItem.separatorItem];
+    }
     [menu addItem:[self menuItem:@"Ajouter une piste vidéo"
                           action:@selector(menuAddVideoTrack:)
                              key:@""]];
@@ -2572,8 +3621,9 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     if (!clip || self.state->contextTime <= clip->timeline_in ||
         self.state->contextTime >= clip->timeline_in.add(clip->duration))
         return;
-    Operation operation =
-        SplitClipOperation{clip->id, self.state->contextTime, {}};
+    Operation operation = CutOperationForClip(
+        self.state->document, *clip, self.state->contextTime,
+        self.state->linkedSelection);
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = self.state->requestedPosition;
@@ -2595,8 +3645,8 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
     if (!self.state->contextGap) return;
     const TimelineGapSelection gap = *self.state->contextGap;
     self.state->interaction->SelectClip("");
-    Operation operation =
-        DeleteGapOperation{gap.track_id, gap.start, gap.duration, {}};
+    Operation operation = GapDeleteOperationForSelection(
+        self.state->document, gap, self.state->linkedSelection);
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = self.state->requestedPosition;
@@ -2639,6 +3689,9 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 
 - (TimelineRenderData)timelineRenderData {
     TimelineRenderData data;
+    data.color_management = self.state->document.color_management;
+    data.sequence_width = self.state->document.sequence.width;
+    data.sequence_height = self.state->document.sequence.height;
     const double width = self.metalView.bounds.size.width;
     const double timelineHeight = [self timelineHeight];
     data.video_height = [self videoHeight];
@@ -2994,6 +4047,7 @@ std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
     (void)notification;
+    if (self.state) self.state->exportCancel.store(true);
     if (self.state->audioPlayback) self.state->audioPlayback->Stop();
     [self.displayTimer invalidate];
     self.displayTimer = nil;
@@ -3034,14 +4088,49 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if (argc >= 4 && argc <= 6 && std::string(argv[1]) == "--export") {
+        ExportSettings settings = Exporter::HevcMain10Preset(argv[3]);
+        for (int index = 4; index < argc; ++index) {
+            const std::string option(argv[index]);
+            if (option == "--software")
+                settings.encoder = ExportEncoder::HevcSoftware;
+            else if (option == "--overwrite")
+                settings.overwrite = true;
+            else {
+                std::fprintf(stderr, "Unknown export option: %s\n", argv[index]);
+                return 2;
+            }
+        }
+        std::string output;
+        int lastPercent = -1;
+        const int result = ExportCommand(
+            argv[2], settings,
+            [&](const ExportProgress& progress) {
+                const int percent = static_cast<int>(progress.fraction * 100.0);
+                if (percent != lastPercent) {
+                    lastPercent = percent;
+                    std::fprintf(stderr, "Export HEVC: %d%% (%lld/%lld images)\r",
+                                 percent,
+                                 static_cast<long long>(progress.rendered_frames),
+                                 static_cast<long long>(progress.total_frames));
+                    std::fflush(stderr);
+                }
+            },
+            nullptr, output);
+        if (lastPercent >= 0) std::fputc('\n', stderr);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
     if (argc != 2 || (argc >= 2 && argv[1][0] == '-')) {
         std::fprintf(stderr,
                      "Usage: %s /path/to/timeline.json\n"
                      "       %s --describe /path/to/timeline.json\n"
                      "       %s --apply-op /path/to/timeline.json '<op.json>'\n"
                      "       %s --ingest /path/to/timeline.json /path/to/media "
-                     "[--recursive]\n",
-                     argv[0], argv[0], argv[0], argv[0]);
+                     "[--recursive]\n"
+                     "       %s --export /path/to/timeline.json output.mp4 "
+                     "[--software] [--overwrite]\n",
+                     argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 

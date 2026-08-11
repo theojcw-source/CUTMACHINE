@@ -102,6 +102,11 @@ int main() {
               "avg_frame_rate remains the exact 30000/1001 rational");
         Check(media.width == 64 && media.height == 32,
               "stored dimensions remain the coded dimensions");
+        Check(!media.pixel_format.empty() && !media.color_range.empty() &&
+                  !media.color_space.empty() &&
+                  !media.color_transfer.empty() &&
+                  !media.color_primaries.empty(),
+              "pixel format and color signalling flow through ingest");
         Check(media.orientation == "portrait",
               "display-matrix rotation controls orientation");
         Check(std::abs(media.rotation_degrees) == 90,
@@ -114,9 +119,9 @@ int main() {
                   source->rate.den == media.rate.den &&
                   source->duration == media.duration,
               "ingest creates a source with the same stable media ULID");
-        ingested.tracks.push_back(
+        ingested.sequence.tracks.push_back(
             {"01K82000000000000000000001", "video", 0, {}});
-        Operation insert = InsertClipOperation{ingested.tracks[0].id,
+        Operation insert = InsertClipOperation{ingested.sequence.tracks[0].id,
                                                media.id,
                                                {0, media.duration.rate},
                                                media.duration,
@@ -141,7 +146,8 @@ int main() {
     std::string description;
     Check(DescribeCommand(documentPath.string(), description) == 0,
           "describe succeeds after ingest");
-    Check(description.find("{\"timeline\":") == 0 &&
+    Check(description.find("{\"sequence\":") == 0 &&
+              description.find("\"timeline\":") != std::string::npos &&
               description.find("\"library\":[") != std::string::npos &&
               description.find("\"alias\":\"M1\"") != std::string::npos &&
               description.find("\"in_use\":false") != std::string::npos,

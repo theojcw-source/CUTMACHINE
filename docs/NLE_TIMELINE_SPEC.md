@@ -65,9 +65,10 @@ Premiere distingue explicitement delete et ripple delete, ce dernier décalant
 les clips suivants pour fermer le trou :
 [documentation Adobe](https://helpx.adobe.com/au/premiere/desktop/edit-projects/change-clip-sequence/remove-clips-from-a-sequence.html).
 
-État : la fermeture de gap et la suppression liée sont atomiques. La
-séparation `Clear`/`RippleDelete`, aujourd'hui confondue par `RemoveClip`, est
-prioritaire avant les outils de trim avancés.
+État : `ClearClip`/`ClearLinkedClips` laissent un blanc, tandis que
+`RemoveClip`/`RemoveLinkedClips` effectuent une suppression ripple. Les deux
+variantes liées sont atomiques ; `Delete` déclenche Clear et `Shift+Delete`
+déclenche RippleDelete.
 
 ### Verrouillages de piste
 

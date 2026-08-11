@@ -15,6 +15,8 @@ enum class EditError {
     UnknownClip,
     UnknownSource,
     UnknownBin,
+    UnknownMarker,
+    UnknownSequence,
     UnknownMedia,
     InvalidDuration,
     InvalidTimelineIn,
@@ -73,6 +75,11 @@ struct ExactTrackState {
     std::vector<DocumentClip> clips;
 };
 
+struct ClearClipOperation {
+    Ulid clip_id;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 struct MoveClipOperation {
     Ulid clip_id;
     Ulid track_id;
@@ -116,11 +123,20 @@ struct RemoveLinkedClipsOperation {
     std::vector<ExactTrackState> exact_track_result;
 };
 
+struct ClearLinkedClipsOperation {
+    Ulid link_group_id;
+    std::vector<Ulid> clip_ids;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 struct DeleteGapOperation {
     Ulid track_id;
     RationalTime gap_start;
     RationalTime gap_duration;
     std::vector<ExactTrackState> exact_track_result;
+    // Additional tracks shifted by the same duration when linked selection is
+    // enabled. The primary track remains in track_id for compatibility.
+    std::vector<Ulid> linked_track_ids;
 };
 
 struct DetachAudioOperation {
@@ -134,6 +150,16 @@ struct AddTrackOperation {
     Ulid track_id;
     std::string kind = "video";
     int32_t index = -1;
+    // Populated by the inverse of RemoveTrack so undo restores its contents.
+    std::vector<DocumentClip> clips;
+};
+
+struct UpdateSequenceOperation {
+    Ulid sequence_id;
+    std::string name;
+    int32_t width = 1920;
+    int32_t height = 1080;
+    MediaRate frame_rate{25, 1};
 };
 
 struct RemoveTrackOperation {
@@ -158,10 +184,35 @@ struct RenameBinOperation {
     std::string name;
 };
 
+struct MoveBinOperation {
+    Ulid bin_id;
+    // Empty moves the bin to the top level.
+    Ulid parent_id;
+};
+
 struct SetMediaBinOperation {
     Ulid media_id;
     // Empty assigns the media to the project root.
     Ulid bin_id;
+};
+
+struct AddMarkerOperation {
+    DocumentMarker marker;
+    // -1 appends on first application. Exact inverse operations carry the
+    // original vector position so remove/undo restores canonical bytes.
+    int64_t insertion_index = -1;
+};
+
+struct RemoveMarkerOperation {
+    Ulid marker_id;
+};
+
+struct UpdateMarkerOperation {
+    Ulid marker_id;
+    std::string name;
+    RationalTime time;
+    std::string color;
+    std::string category;
 };
 
 struct SetClipLinkOperation {
@@ -186,6 +237,19 @@ struct SplitClipOperation {
     Ulid right_clip_id;
 };
 
+// A linked cut splits every A/V member at the same timeline position and gives
+// each resulting side its own link group. Exact snapshots keep the gesture
+// atomic and make undo/redo deterministic.
+struct SplitLinkedClipsOperation {
+    Ulid link_group_id;
+    std::vector<Ulid> clip_ids;
+    RationalTime timeline_position;
+    Ulid left_group_id;
+    Ulid right_group_id;
+    std::vector<Ulid> right_clip_ids;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 // JoinClip is the exact inverse stored by the event log for SplitClip. Keeping
 // it explicit makes persisted undo/redo deterministic across timebases.
 struct JoinClipOperation {
@@ -195,13 +259,19 @@ struct JoinClipOperation {
 };
 
 using Operation =
-    std::variant<InsertClipOperation, RemoveClipOperation, TrimClipOperation,
+    std::variant<InsertClipOperation, RemoveClipOperation, ClearClipOperation,
+                 TrimClipOperation,
                  MoveClipOperation, DeleteGapOperation, DetachAudioOperation,
                  MoveLinkedClipsOperation, TrimLinkedClipsOperation,
-                 RemoveLinkedClipsOperation, AddTrackOperation,
-                 RemoveTrackOperation, SplitClipOperation, JoinClipOperation,
+                 RemoveLinkedClipsOperation, ClearLinkedClipsOperation,
+                 AddTrackOperation,
+                 RemoveTrackOperation, UpdateSequenceOperation,
+                 SplitClipOperation, SplitLinkedClipsOperation,
+                 JoinClipOperation,
                  AddBinOperation, RemoveBinOperation, RenameBinOperation,
-                 SetMediaBinOperation, SetClipLinkOperation>;
+                 MoveBinOperation, SetMediaBinOperation, AddMarkerOperation,
+                 RemoveMarkerOperation, UpdateMarkerOperation,
+                 SetClipLinkOperation>;
 
 // On success, operation is enriched with generated IDs and exact redo state.
 // Both document and operation remain unchanged on failure.
