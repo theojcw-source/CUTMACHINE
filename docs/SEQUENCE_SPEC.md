@@ -23,12 +23,10 @@ est monté.
   pas exister au niveau racine du projet.
 - `markers` contient les marqueurs de cette séquence, avec leurs ULID et temps
   rationnels exacts.
-- un document historique sans ce bloc reçoit un format dérivé de la première
-  source complète, sinon 1920×1080 et la cadence de la première source.
+- un document sans ce bloc est invalide.
 
-Les documents de version 1 ou 2 dont `tracks` et `markers` étaient à la racine
-sont migrés en mémoire vers la séquence unique. Toute sauvegarde produit la
-version 3 imbriquée ; aucune donnée de timeline n'est dupliquée.
+Les documents de version 1 ou 2 sont refusés. Toute timeline physique utilise
+la version 3 imbriquée ; aucune collection de pistes ne vit à la racine.
 
 Les changements de nom, dimensions et cadence utilisent l'opération
 `UpdateSequence`, référencée par `sequence_id`. Son inverse conserve exactement

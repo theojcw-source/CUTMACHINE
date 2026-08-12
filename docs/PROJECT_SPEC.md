@@ -1,5 +1,9 @@
 # Objet projet
 
+La disposition des fichiers, les règles de partage, les limites de concurrence
+et la cible de portabilité sont spécifiées dans
+[`PROJECT_STORAGE_SPEC.md`](PROJECT_STORAGE_SPEC.md).
+
 `Project` est l’agrégat d’un montage, comparable au projet de Premiere ou à la
 bibliothèque de projet de Resolve. Une instance possède :
 
@@ -13,11 +17,11 @@ Les dimensions et la cadence restent des réglages de timeline : deux exports
 horizontal et vertical peuvent donc partager les mêmes rushes sans dupliquer le
 projet.
 
-Le moteur de timeline continue à éditer un `Document`, snapshot d’une timeline
+Le moteur de timeline édite un `Document`, snapshot d’une timeline
 adressée et des ressources partagées. `MakeDocument(timeline_id)` ouvre ce
 contexte ; `CommitDocument(timeline_id, document)` le valide puis le réintègre
-au projet. Les variantes historiques `MakeActiveDocument()` et
-`CommitActiveDocument()` restent disponibles pour les clients existants.
+au projet. `MakeActiveDocument()` et `CommitActiveDocument()` adressent la
+timeline active sans introduire un second format de persistance.
 
 Cette frontière est maintenant utilisée par l’application. `AppState` possède
 le `Project` complet et un `Document` focalisé. Les timelines sont affichées
@@ -28,8 +32,8 @@ timeline sont conservés séparément pendant la session.
 
 Sélectionner une timeline est une navigation, comme déplacer le playhead : ce
 n’est ni une `ProjectOperation`, ni une entrée d’undo, ni une réécriture du
-fichier projet. `active_timeline_id` reste dans le format version 1 comme choix
-d’ouverture par défaut et pour la compatibilité, mais
+fichier projet. `active_timeline_id` reste dans le format v2 comme choix
+d’ouverture par défaut, mais
 `AppState::activeTimelineId` porte la sélection de session.
 
 ## Opérations et historique projet
@@ -54,19 +58,17 @@ headless `--apply-project-op`, `--undo-project-op` et `--redo-project-op`
 emploient exactement le même moteur et le sidecar
 `<projet>.project-editlog.json`.
 
-## Persistance et migration
+## Persistance
 
-Le fichier projet utilise l’enveloppe `cutmachine-project`, version 1. Elle
+Le fichier projet utilise exclusivement l’enveloppe `cutmachine-project`,
+version 2. Elle
 conserve l’identité du projet, la timeline active, toutes les timelines, les
 métadonnées du chutier et leur placement. Chaque snapshot de timeline reste un
 `Document` canonique version 3, afin que le moteur, le CLI et l’export utilisent
 toujours le même format validé.
 
-Un ancien fichier contenant directement un `Document` est promu en mémoire en
-projet mono-timeline. Son identité projet est dérivée de façon déterministe de
-l’ULID de sa séquence. La première édition persistée écrit l’enveloppe projet ;
-les API demandant encore un `Document` lisent automatiquement sa timeline
-active.
+Les fichiers document autonomes, enveloppes projet v1 et packages v1 sont
+refusés. Il n’existe plus de promotion ni de migration implicite.
 
 Avant chaque commit, une autosave atomique du projet complet est écrite. Elle
 n’est supprimée qu’après réussite du remplacement transactionnel du projet, du

@@ -1,6 +1,7 @@
 #include "Cli.h"
 #include "Document.h"
 #include "Export.h"
+#include "ProjectStorage.h"
 #include "Ulid.h"
 
 extern "C" {
@@ -265,7 +266,13 @@ int main() {
         avformat_close_input(&hlgFormat);
     }
     std::string commandOutput;
-    Check(ExportCommand(project.string(), invalid, {}, nullptr,
+    std::string headlessProjectPath;
+    Check(CreatePortableProject(
+              (directory / "Headless.cutmachine-project").string(),
+              Project::FromDocument(document, "Headless export"),
+              headlessProjectPath, error),
+          "headless export project package saves: " + error);
+    Check(ExportCommand(headlessProjectPath, invalid, {}, nullptr,
                         commandOutput) == 1 &&
               commandOutput.find("\"error\":\"InvalidExport\"") !=
                   std::string::npos,

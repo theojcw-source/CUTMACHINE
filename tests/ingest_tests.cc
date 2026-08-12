@@ -2,6 +2,7 @@
 #include "Document.h"
 #include "Ingest.h"
 #include "Operations.h"
+#include "ProjectStorage.h"
 #include "Ulid.h"
 
 #include <cstdlib>
@@ -46,15 +47,16 @@ int main() {
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() / (GenerateUlid() + "-ingest");
     const std::filesystem::path mediaDirectory = root / "media";
-    const std::filesystem::path documentPath = root / "document.json";
     const std::filesystem::path rawPath = root / "raw.mp4";
     const std::filesystem::path videoPath = mediaDirectory / "rotated.mp4";
     std::filesystem::create_directories(mediaDirectory);
 
-    Document empty;
     std::string error;
-    Check(empty.Save(documentPath.string(), error),
-          "empty document saves: " + error);
+    std::string projectPath;
+    Check(CreatePortableProject((root / "Ingest.cutmachine-project").string(),
+                                Project("Ingest"), projectPath, error),
+          "empty project package saves: " + error);
+    const std::filesystem::path documentPath = projectPath;
 
     const std::string generate =
         Quote(FFMPEG_EXECUTABLE) +
@@ -92,9 +94,10 @@ int main() {
               output.find("corrupt.mp4") != std::string::npos,
           "both unreadable files have reported reasons");
 
-    Document ingested;
-    Check(Document::Load(documentPath.string(), ingested, error),
-          "ingested document loads: " + error);
+    Project ingestedProject;
+    Check(LoadStoredProject(documentPath.string(), ingestedProject, error),
+          "ingested project loads: " + error);
+    Document ingested = ingestedProject.MakeActiveDocument();
     Check(ingested.library.size() == 1, "library contains one media");
     if (ingested.library.size() == 1) {
         const LibraryMedia& media = ingested.library[0];

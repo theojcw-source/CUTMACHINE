@@ -174,7 +174,7 @@ int main() {
         std::filesystem::remove(second);
     });
 
-    Test("version 1 documents migrate to the version 3 sequence", [] {
+    Test("legacy document versions are rejected", [] {
         const std::string json =
             "{\"version\":1,\"sources\":[{\"id\":"
             "\"01K90000000000000000000001\",\"path\":\"legacy.mov\","
@@ -182,21 +182,13 @@ int main() {
             "{\"value\":100,\"rate\":25}}],\"tracks\":[]}";
         Document document;
         std::string error;
-        Check(Document::LoadFromString(json, document, error),
-              "version 1 must load: " + error);
-        Check(document.version == 3, "version 1 must migrate in memory");
-        Check(document.library.size() == 1,
-              "the legacy source must remain visible in the library");
-        Check(document.library[0].id == document.sources[0].id &&
-                  !document.library[0].metadata_complete,
-              "migration must preserve identity without inventing metadata");
-        Check(document.sequence.width == 1920 &&
-                  document.sequence.height == 1080 &&
-                  document.sequence.frame_rate.num == 25,
-              "legacy projects receive a deterministic sequence format");
+        Check(!Document::LoadFromString(json, document, error) &&
+                  error.find("unsupported document version 1") !=
+                      std::string::npos,
+              "version 1 must be rejected explicitly");
     });
 
-    Test("version 2 root timeline migrates under its sequence", [] {
+    Test("version 2 root timelines are rejected", [] {
         const std::string json =
             "{\"version\":2,\"sequence\":{\"id\":"
             "\"01K91000000000000000000001\",\"name\":\"Legacy edit\","
@@ -207,17 +199,10 @@ int main() {
             "\"category\":\"edit\"}],\"sources\":[],\"tracks\":[]}";
         Document document;
         std::string error;
-        Check(Document::LoadFromString(json, document, error),
-              "version 2 sequence migration must load: " + error);
-        Check(document.version == 3 && document.sequence.markers.size() == 1 &&
-                  document.sequence.markers[0].name == "Cut",
-              "root timeline objects move into the sequence");
-        const std::string canonical = document.SaveToString();
-        Check(canonical.find("\n  \"markers\":") == std::string::npos &&
-                  canonical.find("\n  \"tracks\":") == std::string::npos &&
-                  canonical.find("\"markers\":[") != std::string::npos &&
-                  canonical.find("\"tracks\":[") != std::string::npos,
-              "version 3 writes no root timeline collections");
+        Check(!Document::LoadFromString(json, document, error) &&
+                  error.find("unsupported document version 2") !=
+                      std::string::npos,
+              "version 2 must be rejected explicitly");
     });
 
     Test("sequence settings persist and validate", [] {

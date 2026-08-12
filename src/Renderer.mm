@@ -69,6 +69,11 @@ bool Renderer::Initialize(NSView* view) {
     NSError* error = nil;
     NSString* shaderPath =
         [NSString stringWithUTF8String:CUTMACHINE_SHADER_PATH];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:shaderPath]) {
+        NSString* bundled = [[NSBundle mainBundle] pathForResource:@"shader"
+                                                            ofType:@"metal"];
+        if (bundled.length > 0) shaderPath = bundled;
+    }
     NSString* shaderSource =
         [NSString stringWithContentsOfFile:shaderPath
                                   encoding:NSUTF8StringEncoding

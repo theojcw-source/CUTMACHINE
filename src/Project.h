@@ -37,8 +37,7 @@ public:
     // Timelines are first-class bin items too. Empty means project root.
     std::map<Ulid, Ulid> timeline_bin_ids;
 
-    // Project files wrap one canonical edit document per timeline. Legacy
-    // single-Document JSON remains readable and is promoted on load.
+    // In-memory construction helper; persistence accepts project v2 only.
     static Project FromDocument(Document document,
                                 std::string projectName = "Untitled Project");
     static bool Load(const std::string& path, Project& output,

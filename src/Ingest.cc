@@ -1,6 +1,7 @@
 #include "Ingest.h"
 
 #include "Document.h"
+#include "ProjectStorage.h"
 #include "Ulid.h"
 
 extern "C" {
@@ -277,34 +278,6 @@ std::string ResultJson(bool ok, size_t added, size_t skipped,
     return output.str();
 }
 
-bool AtomicSave(const Document& document, const std::filesystem::path& path,
-                std::string& reason) {
-    const std::filesystem::path temporary =
-        path.string() + ".cutmachine-" + GenerateUlid() + ".tmp";
-    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
-    if (!stream) {
-        reason = "unable to create temporary document";
-        return false;
-    }
-    stream << document.SaveToString();
-    stream.close();
-    if (!stream) {
-        reason = "unable to write temporary document";
-        std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
-        return false;
-    }
-    std::error_code error;
-    std::filesystem::rename(temporary, path, error);
-    if (error) {
-        reason = "unable to replace document: " + error.message();
-        std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
-        return false;
-    }
-    return true;
-}
-
 }  // namespace
 
 bool ProbeMediaMetadata(const std::string& path, LibraryMedia& media,
@@ -317,12 +290,13 @@ int IngestCommand(const std::string& documentPath,
                   const std::string& directoryPath, bool recursive,
                   std::string& output) {
     av_log_set_level(AV_LOG_ERROR);
-    Document document;
+    Project project;
     std::string reason;
-    if (!Document::Load(documentPath, document, reason)) {
+    if (!LoadStoredProject(documentPath, project, reason)) {
         output = ResultJson(false, 0, 0, {{documentPath, reason}});
         return 1;
     }
+    Document document = project.MakeActiveDocument();
 
     std::error_code pathError;
     const std::filesystem::path resolvedDocument =
@@ -419,9 +393,13 @@ int IngestCommand(const std::string& documentPath,
         output = ResultJson(false, added, skipped, {{documentPath, reason}});
         return 1;
     }
-    if (changed && !AtomicSave(document, resolvedDocument, reason)) {
-        output = ResultJson(false, added, skipped, {{documentPath, reason}});
-        return 1;
+    if (changed) {
+        if (!project.CommitActiveDocument(document, reason) ||
+            !CommitStoredProject(documentPath, project, reason)) {
+            output =
+                ResultJson(false, added, skipped, {{documentPath, reason}});
+            return 1;
+        }
     }
     output = ResultJson(true, added, skipped, errors);
     return 0;

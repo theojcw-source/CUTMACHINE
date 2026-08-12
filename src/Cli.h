@@ -2,7 +2,10 @@
 
 #include "Export.h"
 
+#include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 class Document;
 class EditLog;
@@ -27,18 +30,12 @@ int ExportCommand(const std::string& documentPath,
                   const ExportProgressCallback& progress,
                   const std::atomic_bool* cancel, std::string& output);
 
-std::string EditLogPathForDocument(const std::string& documentPath);
+std::string TimelineEditLogPathForProject(const std::string& projectPath,
+                                          const std::string& timelineId);
 std::string ProjectEditLogPathForProject(const std::string& projectPath);
 
-// Shared transactional persistence used by both the headless command and the
-// graphical editor after an EditLog operation succeeds.
-bool CommitDocumentAndEditLog(const std::string& documentPath,
-                              const Document& document, const EditLog& log,
-                              std::string& message);
-bool CommitProjectAndEditLog(const std::string& projectPath,
-                             const Project& project, const EditLog& log,
-                             std::string& message);
-bool CommitProjectAndLogs(const std::string& projectPath,
-                          const Project& project, const EditLog& timelineLog,
-                          const ProjectEditLog& projectLog,
-                          std::string& message);
+// Transactional primitive for storage layouts that add package-local
+// artifacts. All destinations must be regular files on the same filesystem.
+bool CommitTextArtifacts(
+    const std::vector<std::pair<std::string, std::string>>& artifacts,
+    std::string& message);

@@ -173,19 +173,10 @@ int main() {
               loaded.FindBinMetadata(source.id)->tags.size() == 2,
           "project-bin metadata round-trips");
 
-    Document legacy = stored.MakeActiveDocument();
-    const std::string legacyJson = legacy.SaveToString();
-    Project promotedA("placeholder");
-    Project promotedB("placeholder");
-    Check(Project::LoadFromString(legacyJson, promotedA, error),
-          "legacy document promotes to project: " + error);
-    Check(Project::LoadFromString(legacyJson, promotedB, error),
-          "legacy promotion repeats: " + error);
-    Check(promotedA.timelines.size() == 1 &&
-              promotedA.active_timeline_id == legacy.sequence.id,
-          "legacy promotion preserves the sequence");
-    Check(promotedA.id == promotedB.id,
-          "legacy project identity migration is deterministic");
+    Project noPromotion("placeholder");
+    Check(!Project::LoadFromString(stored.MakeActiveDocument().SaveToString(),
+                                   noPromotion, error),
+          "standalone timeline documents are not promoted to projects");
 
     Project unchanged("unchanged");
     const Ulid unchangedId = unchanged.id;

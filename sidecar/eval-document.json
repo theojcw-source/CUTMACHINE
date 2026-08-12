@@ -1,17 +1,31 @@
 {
-  "version": 1,
+  "version": 3,
+  "library": [
+    {"id":"01K40000000000000000000001","path":"interview.mov","filename":"interview.mov","rate":{"num":25,"den":1},"duration":{"value":500,"rate":25}},
+    {"id":"01K40000000000000000000002","path":"illustrations.mov","filename":"illustrations.mov","rate":{"num":25,"den":1},"duration":{"value":500,"rate":25}}
+  ],
+  "bins": [],
   "sources": [
     {"id":"01K40000000000000000000001","path":"interview.mov","rate":{"num":25,"den":1},"duration":{"value":500,"rate":25}},
     {"id":"01K40000000000000000000002","path":"illustrations.mov","rate":{"num":25,"den":1},"duration":{"value":500,"rate":25}}
   ],
-  "tracks": [
-    {"id":"01K40000000000000000000003","kind":"video","index":0,"clips":[
-      {"id":"01K40000000000000000000004","source_id":"01K40000000000000000000001","source_in":{"value":0,"rate":25},"duration":{"value":50,"rate":25},"timeline_in":{"value":0,"rate":25}},
-      {"id":"01K40000000000000000000005","source_id":"01K40000000000000000000001","source_in":{"value":100,"rate":25},"duration":{"value":25,"rate":25},"timeline_in":{"value":75,"rate":25}},
-      {"id":"01K40000000000000000000006","source_id":"01K40000000000000000000002","source_in":{"value":0,"rate":25},"duration":{"value":50,"rate":25},"timeline_in":{"value":100,"rate":25}}
-    ]},
-    {"id":"01K40000000000000000000007","kind":"video","index":1,"clips":[
-      {"id":"01K40000000000000000000008","source_id":"01K40000000000000000000002","source_in":{"value":200,"rate":25},"duration":{"value":25,"rate":25},"timeline_in":{"value":25,"rate":25}}
-    ]}
-  ]
+  "sequence": {
+    "id":"01K40000000000000000000009",
+    "name":"Evaluation",
+    "width":1920,
+    "height":1080,
+    "frame_rate":{"num":25,"den":1},
+    "markers":[],
+    "transitions":[],
+    "tracks":[
+      {"id":"01K40000000000000000000003","kind":"video","index":0,"clips":[
+        {"id":"01K40000000000000000000004","source_id":"01K40000000000000000000001","source_in":{"value":0,"rate":25},"duration":{"value":50,"rate":25},"timeline_in":{"value":0,"rate":25}},
+        {"id":"01K40000000000000000000005","source_id":"01K40000000000000000000001","source_in":{"value":100,"rate":25},"duration":{"value":25,"rate":25},"timeline_in":{"value":75,"rate":25}},
+        {"id":"01K40000000000000000000006","source_id":"01K40000000000000000000002","source_in":{"value":0,"rate":25},"duration":{"value":50,"rate":25},"timeline_in":{"value":100,"rate":25}}
+      ]},
+      {"id":"01K40000000000000000000007","kind":"video","index":1,"clips":[
+        {"id":"01K40000000000000000000008","source_id":"01K40000000000000000000002","source_in":{"value":200,"rate":25},"duration":{"value":25,"rate":25},"timeline_in":{"value":25,"rate":25}}
+      ]}
+    ]
+  }
 }

@@ -30,6 +30,7 @@ add_library(cutmachine_model
     src/Project.cc
     src/ProjectBin.cc
     src/ProjectRecovery.cc
+    src/ProjectStorage.cc
     src/Proxy.cc
     src/Relink.cc
     src/Thumbnail.cc
@@ -41,7 +42,7 @@ add_library(cutmachine_model
 target_include_directories(cutmachine_model PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(cutmachine_model PUBLIC PkgConfig::FFMPEG)
 
-add_executable(cutmachine
+set(CUTMACHINE_APP_SOURCES
     src/main.mm
     src/AudioPlayback.mm
     src/DecodeWorker.cc
@@ -50,6 +51,8 @@ add_executable(cutmachine
     src/MediaSource.mm
     src/Renderer.mm
 )
+
+add_executable(cutmachine ${CUTMACHINE_APP_SOURCES})
 target_include_directories(cutmachine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(cutmachine PRIVATE cutmachine_model)
 target_compile_options(cutmachine PRIVATE
@@ -59,6 +62,41 @@ target_compile_definitions(cutmachine PRIVATE
     CUTMACHINE_SHADER_PATH="${SHADER_RUNTIME_PATH}"
 )
 target_link_libraries(cutmachine PRIVATE
+    PkgConfig::FFMPEG
+    "-framework AppKit"
+    "-framework AVFAudio"
+    "-framework Foundation"
+    "-framework Metal"
+    "-framework QuartzCore"
+    "-framework UniformTypeIdentifiers"
+)
+
+# A regular macOS application for Finder/Dock launches. The plain `cutmachine`
+# executable remains available for the CLI commands and automated workflows.
+add_executable(cutmachine_app MACOSX_BUNDLE
+    ${CUTMACHINE_APP_SOURCES}
+    src/shader.metal
+)
+set_source_files_properties(src/shader.metal PROPERTIES
+    MACOSX_PACKAGE_LOCATION Resources
+)
+set_target_properties(cutmachine_app PROPERTIES
+    OUTPUT_NAME CUTMACHINE
+    MACOSX_BUNDLE_BUNDLE_NAME CUTMACHINE
+    MACOSX_BUNDLE_GUI_IDENTIFIER com.cutmachine.editor
+    MACOSX_BUNDLE_BUNDLE_VERSION 1
+    MACOSX_BUNDLE_SHORT_VERSION_STRING 0.1
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
+)
+target_include_directories(cutmachine_app PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(cutmachine_app PRIVATE cutmachine_model)
+target_compile_options(cutmachine_app PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+)
+target_compile_definitions(cutmachine_app PRIVATE
+    CUTMACHINE_SHADER_PATH="${SHADER_RUNTIME_PATH}"
+)
+target_link_libraries(cutmachine_app PRIVATE
     PkgConfig::FFMPEG
     "-framework AppKit"
     "-framework AVFAudio"
@@ -118,6 +156,13 @@ if(BUILD_TESTING)
     add_executable(cutmachine_project_tests tests/project_tests.cc)
     target_link_libraries(cutmachine_project_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_project_tests COMMAND cutmachine_project_tests)
+
+    add_executable(cutmachine_project_storage_tests
+                   tests/project_storage_tests.cc)
+    target_link_libraries(cutmachine_project_storage_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_project_storage_tests
+             COMMAND cutmachine_project_storage_tests)
 
     add_executable(cutmachine_project_bin_tests tests/project_bin_tests.cc)
     target_link_libraries(cutmachine_project_bin_tests PRIVATE cutmachine_model)
