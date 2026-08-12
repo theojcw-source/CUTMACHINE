@@ -33,6 +33,7 @@ extern "C" {
 #include "PerformanceMetrics.h"
 #include "Project.h"
 #include "ProjectRecovery.h"
+#include "ProjectStorage.h"
 #include "Proxy.h"
 #include "Relink.h"
 #include "Renderer.h"
@@ -345,6 +346,7 @@ std::optional<PasteClipsOperation> PasteTimelineClipboardAtMoves(
 }
 
 struct AppState {
+    std::unique_ptr<ProjectSessionLock> projectLock;
     Project project;
     ProjectEditLog projectEditLog;
     Ulid activeTimelineId;
@@ -655,7 +657,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (NSMenu*)menuForEvent:(NSEvent*)event {
     const NSInteger row = [self
         rowAtPoint:[self convertPoint:event.locationInWindow fromView:nil]];
-    if (row >= 0)
+    if (row >= 0 && ![self.selectedRowIndexes containsIndex:row])
         [self selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
             byExtendingSelection:NO];
     return [super menuForEvent:event];
@@ -669,7 +671,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
     NSIndexPath* indexPath =
         [self indexPathForItemAtPoint:[self convertPoint:event.locationInWindow
                                                 fromView:nil]];
-    if (indexPath) self.selectionIndexPaths = [NSSet setWithObject:indexPath];
+    if (indexPath && ![self.selectionIndexPaths containsObject:indexPath])
+        self.selectionIndexPaths = [NSSet setWithObject:indexPath];
     return [super menuForEvent:event];
 }
 @end
@@ -722,6 +725,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                    NSCollectionViewDelegate,
                                    NSTextFieldDelegate>
 @property(nonatomic, strong) NSWindow* window;
+@property(nonatomic, strong) NSWindow* startupWindow;
+@property(nonatomic, strong) NSPopUpButton* recentProjectsPopup;
+@property(nonatomic, assign) NSInteger startupChoice;
+@property(nonatomic, copy) NSString* startupSelectedPath;
 @property(nonatomic, strong) TimelineMetalView* metalView;
 @property(nonatomic, strong) TimelineMetalView* sourceMonitorView;
 @property(nonatomic, strong) TimelineMetalView* programMonitorView;
@@ -768,10 +775,24 @@ DeleteGapOperation GapDeleteOperationForSelection(
     NSMutableDictionary<NSString*, NSString*>* shortcutBindings;
 @property(nonatomic, strong)
     NSMutableDictionary<NSString*, NSMenuItem*>* shortcutMenuItems;
+@property(nonatomic, strong)
+    NSMutableDictionary<NSString*, NSTextField*>* keyboardEditingFields;
+@property(nonatomic, strong) NSPopUpButton* keyboardCommandPopup;
+@property(nonatomic, strong) NSButton* keyboardCommandModifier;
+@property(nonatomic, strong) NSButton* keyboardOptionModifier;
+@property(nonatomic, strong) NSButton* keyboardControlModifier;
+@property(nonatomic, strong) NSButton* keyboardShiftModifier;
 @property(nonatomic, strong) NSTimer* displayTimer;
 @property(nonatomic, copy) NSString* documentPath;
+@property(nonatomic, copy) NSString* lastProjectLoadError;
 @property(nonatomic, assign) AppState* state;
 - (BOOL)importMediaURLs:(NSArray<NSURL*>*)urls intoBin:(NSString*)binId;
+- (BOOL)chooseStartupProject;
+- (BOOL)createStartupProject;
+- (BOOL)openStartupProject;
+- (NSString*)resolvedProjectPath:(NSString*)selection;
+- (void)collectPortableProject:(id)sender;
+- (NSArray<NSString*>*)selectedMediaIds;
 - (void)beginEditingBin:(NSString*)binId;
 - (void)refreshTimelineChrome;
 - (BOOL)hasValidTimelineRange;
@@ -893,6 +914,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
             @"default" : @"F"
         },
         @{
+            @"id" : @"view.fullscreen",
+            @"title" : @"Affichage · Plein écran",
+            @"default" : @"P"
+        },
+        @{
             @"id" : @"timeline.snapping",
             @"title" : @"Timeline · Magnétisme",
             @"default" : @"N"
@@ -972,6 +998,109 @@ DeleteGapOperation GapDeleteOperationForSelection(
     return item;
 }
 
+- (void)keyboardKeyPressed:(NSButton*)sender {
+    NSString* identifier =
+        self.keyboardCommandPopup.selectedItem.representedObject;
+    NSTextField* field = self.keyboardEditingFields[identifier];
+    if (!field || sender.identifier.length == 0) return;
+    NSMutableArray<NSString*>* parts = [NSMutableArray array];
+    if (self.keyboardCommandModifier.state == NSControlStateValueOn)
+        [parts addObject:@"Cmd"];
+    if (self.keyboardOptionModifier.state == NSControlStateValueOn)
+        [parts addObject:@"Alt"];
+    if (self.keyboardControlModifier.state == NSControlStateValueOn)
+        [parts addObject:@"Ctrl"];
+    if (self.keyboardShiftModifier.state == NSControlStateValueOn)
+        [parts addObject:@"Shift"];
+    [parts addObject:sender.identifier];
+    field.stringValue = [parts componentsJoinedByString:@"+"];
+    self.infoLabel.stringValue = [NSString
+        stringWithFormat:@"%@ affecté à %@", field.stringValue,
+                         self.keyboardCommandPopup.selectedItem.title];
+}
+
+- (NSButton*)keyboardModifierButton:(NSString*)title frame:(NSRect)frame {
+    NSButton* button = [NSButton checkboxWithTitle:title target:nil action:nil];
+    button.frame = frame;
+    button.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightMedium];
+    return button;
+}
+
+- (NSView*)keyboardViewForDefinitions:(NSArray*)definitions
+                               fields:(NSMutableDictionary*)fields {
+    NSView* keyboard =
+        [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 650, 255)];
+    NSTextField* instruction = [NSTextField
+        labelWithString:@"Choisissez une commande, activez les modificateurs "
+                        @"puis cliquez sur une touche."];
+    instruction.frame = NSMakeRect(0, 229, 650, 20);
+    instruction.textColor = NSColor.secondaryLabelColor;
+    [keyboard addSubview:instruction];
+
+    self.keyboardEditingFields = fields;
+    self.keyboardCommandPopup =
+        [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 197, 315, 27)];
+    for (NSDictionary* definition in definitions) {
+        [self.keyboardCommandPopup addItemWithTitle:definition[@"title"]];
+        self.keyboardCommandPopup.lastItem.representedObject =
+            definition[@"id"];
+    }
+    [keyboard addSubview:self.keyboardCommandPopup];
+    self.keyboardCommandModifier =
+        [self keyboardModifierButton:@"⌘ Cmd"
+                               frame:NSMakeRect(330, 199, 72, 24)];
+    self.keyboardOptionModifier =
+        [self keyboardModifierButton:@"⌥ Alt"
+                               frame:NSMakeRect(402, 199, 68, 24)];
+    self.keyboardControlModifier =
+        [self keyboardModifierButton:@"⌃ Ctrl"
+                               frame:NSMakeRect(470, 199, 72, 24)];
+    self.keyboardShiftModifier =
+        [self keyboardModifierButton:@"⇧ Shift"
+                               frame:NSMakeRect(542, 199, 85, 24)];
+    for (NSButton* modifier in @[
+             self.keyboardCommandModifier, self.keyboardOptionModifier,
+             self.keyboardControlModifier, self.keyboardShiftModifier
+         ])
+        [keyboard addSubview:modifier];
+
+    NSArray<NSArray<NSString*>*>* rows = @[
+        @[
+            @"1", @"2", @"3", @"4", @"5", @"6", @"7", @"8", @"9", @"0",
+            @"Delete"
+        ],
+        @[ @"A", @"Z", @"E", @"R", @"T", @"Y", @"U", @"I", @"O", @"P" ],
+        @[ @"Q", @"S", @"D", @"F", @"G", @"H", @"J", @"K", @"L", @"M" ],
+        @[ @"W", @"X", @"C", @"V", @"B", @"N", @",", @".", @"Space" ]
+    ];
+    const CGFloat keyHeight = 35.0;
+    const CGFloat gap = 5.0;
+    for (NSUInteger row = 0; row < rows.count; ++row) {
+        CGFloat x = row == 0 ? 0.0 : row * 12.0;
+        const CGFloat y = 151.0 - row * (keyHeight + gap);
+        for (NSString* key in rows[row]) {
+            CGFloat width = [key isEqualToString:@"Space"]    ? 170.0
+                            : [key isEqualToString:@"Delete"] ? 70.0
+                                                              : 48.0;
+            NSString* title = [key isEqualToString:@"Space"]    ? @"Espace"
+                              : [key isEqualToString:@"Delete"] ? @"⌫"
+                                                                : key;
+            NSButton* button =
+                [NSButton buttonWithTitle:title
+                                   target:self
+                                   action:@selector(keyboardKeyPressed:)];
+            button.frame = NSMakeRect(x, y, width, keyHeight);
+            button.identifier = key;
+            button.bezelStyle = NSBezelStyleTexturedRounded;
+            button.font = [NSFont systemFontOfSize:12.0
+                                            weight:NSFontWeightMedium];
+            [keyboard addSubview:button];
+            x += width + gap;
+        }
+    }
+    return keyboard;
+}
+
 - (void)editKeyboardShortcuts:(id)sender {
     (void)sender;
     NSArray* definitions = [self shortcutDefinitions];
@@ -980,14 +1109,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
     const CGFloat rowHeight = 32.0;
     const CGFloat documentHeight = rowHeight * definitions.count;
     NSView* document =
-        [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 560, documentHeight)];
+        [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 650, documentHeight)];
     for (NSUInteger index = 0; index < definitions.count; ++index) {
         NSDictionary* definition = definitions[index];
         const CGFloat y = documentHeight - (index + 1) * rowHeight + 4.0;
         NSTextField* label = [NSTextField labelWithString:definition[@"title"]];
-        label.frame = NSMakeRect(8, y + 3, 315, 22);
+        label.frame = NSMakeRect(8, y + 3, 370, 22);
         NSTextField* field =
-            [[NSTextField alloc] initWithFrame:NSMakeRect(330, y, 215, 25)];
+            [[NSTextField alloc] initWithFrame:NSMakeRect(390, y, 245, 25)];
         field.stringValue = self.shortcutBindings[definition[@"id"]] ?: @"";
         field.placeholderString = @"Non assigné";
         field.toolTip = @"Exemples : V, Space, Alt+X, Cmd+Shift+L";
@@ -996,7 +1125,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         [document addSubview:field];
     }
     NSScrollView* scroll =
-        [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 560, 410)];
+        [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 650, 300)];
     scroll.hasVerticalScroller = YES;
     scroll.borderType = NSBezelBorder;
     scroll.documentView = document;
@@ -1005,9 +1134,17 @@ DeleteGapOperation GapDeleteOperationForSelection(
         NSAlert* alert = [[NSAlert alloc] init];
         alert.messageText = @"Raccourcis clavier";
         alert.informativeText =
-            @"Saisissez une combinaison, par exemple Shift+Delete, Alt+X ou "
-             "Cmd+Shift+L. Une valeur vide désactive la commande.";
-        alert.accessoryView = scroll;
+            @"Cliquez sur le clavier ou saisissez directement une combinaison. "
+             "Une valeur vide désactive la commande.";
+        NSView* accessory =
+            [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 650, 565)];
+        NSView* keyboard = [self keyboardViewForDefinitions:definitions
+                                                     fields:fields];
+        keyboard.frame = NSMakeRect(0, 310, 650, 255);
+        scroll.frame = NSMakeRect(0, 0, 650, 300);
+        [accessory addSubview:keyboard];
+        [accessory addSubview:scroll];
+        alert.accessoryView = accessory;
         [alert addButtonWithTitle:@"Enregistrer"];
         [alert addButtonWithTitle:@"Annuler"];
         [alert addButtonWithTitle:@"Valeurs par défaut"];
@@ -1109,6 +1246,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
                              key:@"i"]];
     [file addItem:[self menuItem:@"Reconnecter les médias offline…"
                           action:@selector(batchRelinkOfflineMedia:)
+                             key:@""]];
+    [file addItem:[self menuItem:@"Collecter le projet…"
+                          action:@selector(collectPortableProject:)
                              key:@""]];
     [file addItem:NSMenuItem.separatorItem];
     [file addItem:[self menuItem:@"Exporter la vidéo finale…"
@@ -1274,8 +1414,23 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                      command:@"play.forward"]];
     playbackRoot.submenu = playback;
     [bar addItem:playbackRoot];
+
+    NSMenuItem* viewRoot = [[NSMenuItem alloc] initWithTitle:@"Affichage"
+                                                      action:nil
+                                               keyEquivalent:@""];
+    NSMenu* view = [[NSMenu alloc] initWithTitle:@"Affichage"];
+    [view addItem:[self shortcutMenuItem:@"Activer/désactiver le plein écran"
+                                  action:@selector(toggleFullscreen:)
+                                 command:@"view.fullscreen"]];
+    viewRoot.submenu = view;
+    [bar addItem:viewRoot];
     NSApp.mainMenu = bar;
     [self applyShortcutBindingsToMenus];
+}
+
+- (void)toggleFullscreen:(id)sender {
+    (void)sender;
+    [self.window toggleFullScreen:nil];
 }
 
 - (BOOL)commitColorSettings:(const ColorManagementSettings&)settings {
@@ -1752,6 +1907,336 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self commitColorSettings:settings];
 }
 
+- (NSArray<NSString*>*)recentProjectPaths {
+    NSArray* stored = [NSUserDefaults.standardUserDefaults
+        arrayForKey:@"RecentProjectPaths.v2"];
+    NSMutableArray<NSString*>* available = [NSMutableArray array];
+    for (id value in stored) {
+        if (![value isKindOfClass:NSString.class]) continue;
+        BOOL directory = NO;
+        if ([NSFileManager.defaultManager fileExistsAtPath:value
+                                               isDirectory:&directory] &&
+            !directory)
+            [available addObject:value];
+        if (available.count == 8) break;
+    }
+    return available;
+}
+
+- (void)recordRecentProject:(NSString*)path {
+    if (path.length == 0) return;
+    NSString* standardized = path.stringByStandardizingPath;
+    NSMutableArray<NSString*>* recent =
+        [NSMutableArray arrayWithObject:standardized];
+    for (NSString* candidate in [self recentProjectPaths]) {
+        if (![candidate isEqualToString:standardized])
+            [recent addObject:candidate];
+        if (recent.count == 8) break;
+    }
+    [NSUserDefaults.standardUserDefaults setObject:recent
+                                            forKey:@"RecentProjectPaths.v2"];
+}
+
+- (void)startupNewPressed:(id)sender {
+    (void)sender;
+    self.startupChoice = 1;
+    [NSApp stopModal];
+    [self.startupWindow orderOut:nil];
+}
+
+- (void)startupOpenPressed:(id)sender {
+    (void)sender;
+    self.startupChoice = 2;
+    [NSApp stopModal];
+    [self.startupWindow orderOut:nil];
+}
+
+- (void)startupRecentPressed:(id)sender {
+    (void)sender;
+    NSString* path = self.recentProjectsPopup.selectedItem.representedObject;
+    if (path.length == 0) return;
+    self.startupSelectedPath = path;
+    self.startupChoice = 3;
+    [NSApp stopModal];
+    [self.startupWindow orderOut:nil];
+}
+
+- (void)startupQuitPressed:(id)sender {
+    (void)sender;
+    self.startupChoice = 0;
+    [NSApp stopModal];
+    [self.startupWindow orderOut:nil];
+}
+
+- (void)showStartupWindow {
+    const NSRect frame = NSMakeRect(0, 0, 680, 430);
+    self.startupWindow =
+        [[NSWindow alloc] initWithContentRect:frame
+                                    styleMask:NSWindowStyleMaskTitled
+                                      backing:NSBackingStoreBuffered
+                                        defer:NO];
+    self.startupWindow.title = @"Bienvenue dans CUTMACHINE";
+    self.startupWindow.releasedWhenClosed = NO;
+    [self.startupWindow center];
+
+    NSView* content = [[NSView alloc] initWithFrame:frame];
+    content.wantsLayer = YES;
+    content.layer.backgroundColor =
+        [NSColor colorWithWhite:0.075 alpha:1.0].CGColor;
+    self.startupWindow.contentView = content;
+
+    NSImageView* icon =
+        [[NSImageView alloc] initWithFrame:NSMakeRect(54, 278, 92, 92)];
+    icon.image = NSApp.applicationIconImage
+                     ?: SystemSymbol(@"scissors", @"CUTMACHINE", 64.0);
+    icon.imageScaling = NSImageScaleProportionallyUpOrDown;
+    [content addSubview:icon];
+
+    NSTextField* title = [NSTextField labelWithString:@"CUTMACHINE"];
+    title.frame = NSMakeRect(170, 325, 455, 42);
+    title.font = [NSFont systemFontOfSize:30.0 weight:NSFontWeightBold];
+    title.textColor = NSColor.labelColor;
+    [content addSubview:title];
+    NSTextField* subtitle = [NSTextField
+        labelWithString:
+            @"Commencez un nouveau montage ou reprenez un projet existant."];
+    subtitle.frame = NSMakeRect(172, 294, 445, 24);
+    subtitle.font = [NSFont systemFontOfSize:14.0];
+    subtitle.textColor = NSColor.secondaryLabelColor;
+    [content addSubview:subtitle];
+
+    NSButton* create = [NSButton buttonWithTitle:@"Nouveau projet"
+                                          target:self
+                                          action:@selector(startupNewPressed:)];
+    create.frame = NSMakeRect(54, 211, 274, 56);
+    create.bezelStyle = NSBezelStyleTexturedRounded;
+    create.font = [NSFont systemFontOfSize:15.0 weight:NSFontWeightSemibold];
+    create.image = SystemSymbol(@"plus.square", @"Nouveau projet", 20.0);
+    create.imagePosition = NSImageLeading;
+    create.keyEquivalent = @"\r";
+    [content addSubview:create];
+
+    NSButton* open = [NSButton buttonWithTitle:@"Ouvrir un projet…"
+                                        target:self
+                                        action:@selector(startupOpenPressed:)];
+    open.frame = NSMakeRect(352, 211, 274, 56);
+    open.bezelStyle = NSBezelStyleTexturedRounded;
+    open.font = [NSFont systemFontOfSize:15.0 weight:NSFontWeightSemibold];
+    open.image = SystemSymbol(@"folder", @"Ouvrir un projet", 20.0);
+    open.imagePosition = NSImageLeading;
+    [content addSubview:open];
+
+    NSTextField* recentLabel = [NSTextField labelWithString:@"Projets récents"];
+    recentLabel.frame = NSMakeRect(54, 158, 160, 22);
+    recentLabel.font = [NSFont systemFontOfSize:12.0
+                                         weight:NSFontWeightSemibold];
+    recentLabel.textColor = NSColor.secondaryLabelColor;
+    [content addSubview:recentLabel];
+    self.recentProjectsPopup =
+        [[NSPopUpButton alloc] initWithFrame:NSMakeRect(54, 116, 460, 34)];
+    NSArray<NSString*>* recentPaths = [self recentProjectPaths];
+    if (recentPaths.count == 0) {
+        [self.recentProjectsPopup addItemWithTitle:@"Aucun projet récent"];
+        self.recentProjectsPopup.enabled = NO;
+    } else {
+        for (NSString* path in recentPaths) {
+            NSString* title =
+                path.lastPathComponent.stringByDeletingPathExtension;
+            if ([title.pathExtension.lowercaseString
+                    isEqualToString:@"cutmachine"])
+                title = title.stringByDeletingPathExtension;
+            [self.recentProjectsPopup addItemWithTitle:title];
+            self.recentProjectsPopup.lastItem.representedObject = path;
+            self.recentProjectsPopup.lastItem.toolTip = path;
+        }
+    }
+    [content addSubview:self.recentProjectsPopup];
+    NSButton* recent =
+        [NSButton buttonWithTitle:@"Ouvrir"
+                           target:self
+                           action:@selector(startupRecentPressed:)];
+    recent.frame = NSMakeRect(526, 116, 100, 34);
+    recent.enabled = recentPaths.count > 0;
+    [content addSubview:recent];
+
+    NSButton* quit = [NSButton buttonWithTitle:@"Quitter"
+                                        target:self
+                                        action:@selector(startupQuitPressed:)];
+    quit.frame = NSMakeRect(526, 38, 100, 30);
+    quit.keyEquivalent = @"\e";
+    [content addSubview:quit];
+
+    [self.startupWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+    [NSApp runModalForWindow:self.startupWindow];
+}
+
+- (BOOL)createStartupProject {
+    NSAlert* nameAlert = [NSAlert new];
+    nameAlert.messageText = @"Créer un nouveau projet";
+    nameAlert.informativeText = @"Donnez un nom au projet.";
+    [nameAlert addButtonWithTitle:@"Continuer"];
+    [nameAlert addButtonWithTitle:@"Annuler"];
+    NSTextField* name =
+        [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 380, 26)];
+    name.stringValue = @"Nouveau projet";
+    name.placeholderString = @"Nom du projet";
+    nameAlert.accessoryView = name;
+    if ([nameAlert runModal] != NSAlertFirstButtonReturn) return NO;
+    NSString* projectName = [name.stringValue
+        stringByTrimmingCharactersInSet:NSCharacterSet
+                                            .whitespaceAndNewlineCharacterSet];
+    if (projectName.length == 0) projectName = @"Nouveau projet";
+
+    NSSavePanel* save = [NSSavePanel savePanel];
+    save.title = @"Enregistrer le nouveau projet";
+    save.prompt = @"Créer";
+    save.nameFieldStringValue =
+        [projectName stringByAppendingString:@".cutmachine-project"];
+    UTType* collectionType =
+        [UTType typeWithIdentifier:@"com.cutmachine.project-collection"];
+    if (collectionType) save.allowedContentTypes = @[ collectionType ];
+    save.canCreateDirectories = YES;
+    if ([save runModal] != NSModalResponseOK || !save.URL) return NO;
+
+    Project project(projectName.UTF8String ?: "Nouveau projet");
+    project.timelines.front().name = "Timeline 1";
+    std::string error;
+    std::string path;
+    if (!CreatePortableProject(save.URL.fileSystemRepresentation ?: "", project,
+                               path, error)) {
+        NSAlert* failure = [NSAlert new];
+        failure.alertStyle = NSAlertStyleCritical;
+        failure.messageText = @"Impossible de créer le projet";
+        failure.informativeText = [NSString stringWithUTF8String:error.c_str()];
+        [failure runModal];
+        return NO;
+    }
+    self.documentPath = [NSString stringWithUTF8String:path.c_str()];
+    return YES;
+}
+
+- (NSString*)resolvedProjectPath:(NSString*)selection {
+    NSString* selected = selection.stringByStandardizingPath;
+    BOOL directory = NO;
+    if ([NSFileManager.defaultManager fileExistsAtPath:selected
+                                           isDirectory:&directory] &&
+        directory)
+        selected = [selected
+            stringByAppendingPathComponent:@"project.cutmachine.json"];
+    return selected;
+}
+
+- (BOOL)openStartupProject {
+    NSOpenPanel* open = [NSOpenPanel openPanel];
+    open.title = @"Ouvrir un projet CUTMACHINE";
+    open.prompt = @"Ouvrir";
+    UTType* collectionType =
+        [UTType typeWithIdentifier:@"com.cutmachine.project-collection"];
+    if (collectionType) open.allowedContentTypes = @[ collectionType ];
+    open.allowsMultipleSelection = NO;
+    open.canChooseFiles = YES;
+    open.canChooseDirectories = YES;
+    if ([open runModal] != NSModalResponseOK || !open.URL) return NO;
+    self.documentPath = [self resolvedProjectPath:open.URL.path];
+    return YES;
+}
+
+- (void)collectPortableProject:(id)sender {
+    (void)sender;
+    if (!self.state || self.documentPath.length == 0) return;
+    NSSavePanel* save = [NSSavePanel savePanel];
+    save.title = @"Collecter le projet et ses médias";
+    save.prompt = @"Collecter";
+    save.canCreateDirectories = YES;
+    NSString* projectName =
+        [NSString stringWithUTF8String:self.state->project.name.c_str()];
+    save.nameFieldStringValue =
+        [projectName stringByAppendingString:@".cutmachine-project"];
+    [save
+        beginSheetModalForWindow:self.window
+               completionHandler:^(NSModalResponse response) {
+                 if (response != NSModalResponseOK || !save.URL) return;
+                 NSString* source = [self.documentPath copy];
+                 NSString* destination = [save.URL.path copy];
+                 NSAlert* progress = [NSAlert new];
+                 progress.messageText = @"Collecte du projet en cours";
+                 progress.informativeText =
+                     @"Copie et vérification des médias originaux…";
+                 NSProgressIndicator* indicator = [[NSProgressIndicator alloc]
+                     initWithFrame:NSMakeRect(0, 0, 420, 18)];
+                 indicator.indeterminate = YES;
+                 [indicator startAnimation:nil];
+                 progress.accessoryView = indicator;
+                 [progress beginSheetModalForWindow:self.window
+                                  completionHandler:nil];
+
+                 auto result = std::make_shared<PortableProjectResult>();
+                 auto error = std::make_shared<std::string>();
+                 dispatch_async(
+                     dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                       const bool success = CollectPortableProject(
+                           source.fileSystemRepresentation ?: "",
+                           destination.fileSystemRepresentation ?: "", *result,
+                           *error);
+                       dispatch_async(dispatch_get_main_queue(), ^{
+                         [self.window endSheet:progress.window];
+                         NSAlert* finished = [NSAlert new];
+                         if (!success) {
+                             finished.alertStyle = NSAlertStyleCritical;
+                             finished.messageText = @"Collecte impossible";
+                             finished.informativeText =
+                                 [NSString stringWithUTF8String:error->c_str()];
+                             [finished beginSheetModalForWindow:self.window
+                                              completionHandler:nil];
+                             return;
+                         }
+                         finished.messageText = @"Projet portable créé";
+                         finished.informativeText = [NSString
+                             stringWithFormat:
+                                 @"%llu média%@ · %.2f Go copiés\n%@",
+                                 static_cast<unsigned long long>(
+                                     result->media_count),
+                                 result->media_count == 1 ? @"" : @"s",
+                                 result->media_bytes / 1000000000.0,
+                                 destination];
+                         [finished
+                             addButtonWithTitle:@"Révéler dans le Finder"];
+                         [finished addButtonWithTitle:@"Fermer"];
+                         [finished
+                             beginSheetModalForWindow:self.window
+                                    completionHandler:^(
+                                        NSModalResponse choice) {
+                                      if (choice == NSAlertFirstButtonReturn)
+                                          [NSWorkspace.sharedWorkspace
+                                              activateFileViewerSelectingURLs:@[
+                                                  save.URL
+                                              ]];
+                                    }];
+                       });
+                     });
+               }];
+}
+
+- (BOOL)chooseStartupProject {
+    while (self.documentPath.length == 0) {
+        self.startupChoice = 0;
+        self.startupSelectedPath = nil;
+        [self showStartupWindow];
+        if (self.startupChoice == 0) return NO;
+        if (self.startupChoice == 1) {
+            if ([self createStartupProject]) return YES;
+        } else if (self.startupChoice == 2) {
+            if ([self openStartupProject]) return YES;
+        } else if (self.startupChoice == 3 &&
+                   self.startupSelectedPath.length > 0) {
+            self.documentPath = self.startupSelectedPath;
+            return YES;
+        }
+    }
+    return YES;
+}
+
 - (instancetype)initWithDocumentPath:(NSString*)documentPath {
     if ((self = [super init])) {
         _documentPath = [documentPath copy];
@@ -1764,6 +2249,41 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (BOOL)loadDocumentAndSources {
     const std::string documentPath(self.documentPath.UTF8String ?: "");
     std::string error;
+    self.lastProjectLoadError = nil;
+    self.state->projectLock = std::make_unique<ProjectSessionLock>();
+    std::string lockOwner;
+    if (!self.state->projectLock->Acquire(documentPath, lockOwner, error)) {
+        self.lastProjectLoadError =
+            [NSString stringWithUTF8String:error.c_str()];
+        return NO;
+    }
+    CollectionIntegrityReport integrity;
+    if (!VerifyPortableProject(documentPath, integrity, error)) {
+        self.lastProjectLoadError = [NSString
+            stringWithFormat:@"Paquet projet invalide : %s", error.c_str()];
+        return NO;
+    }
+    if (!integrity.missing_media.empty() || !integrity.modified_media.empty()) {
+        NSAlert* warning = [NSAlert new];
+        warning.alertStyle = NSAlertStyleCritical;
+        warning.messageText = @"Intégrité du projet compromise";
+        warning.informativeText = [NSString
+            stringWithFormat:@"%lu média%@ manquant%@ et %lu modifié%@. "
+                             @"Le montage peut être ouvert, mais son rendu "
+                              "n’est plus garanti identique.",
+                             (unsigned long)integrity.missing_media.size(),
+                             integrity.missing_media.size() == 1 ? @"" : @"s",
+                             integrity.missing_media.size() == 1 ? @"" : @"s",
+                             (unsigned long)integrity.modified_media.size(),
+                             integrity.modified_media.size() == 1 ? @"" : @"s"];
+        [warning addButtonWithTitle:@"Ouvrir quand même"];
+        [warning addButtonWithTitle:@"Annuler"];
+        if ([warning runModal] != NSAlertFirstButtonReturn) {
+            self.lastProjectLoadError =
+                @"Ouverture annulée après contrôle d’intégrité.";
+            return NO;
+        }
+    }
     bool recoveredAutosave = false;
     const ProjectRecoveryInfo recovery = ProjectRecovery::Inspect(documentPath);
     if (recovery.state == ProjectRecoveryState::Available) {
@@ -1776,9 +2296,17 @@ DeleteGapOperation GapDeleteOperationForSelection(
         if ([alert runModal] == NSAlertFirstButtonReturn) {
             Project recovered;
             if (!ProjectRecovery::LoadAutosave(documentPath, recovered,
-                                               error) ||
-                !CommitProjectAndLogs(documentPath, recovered, EditLog{},
-                                      ProjectEditLog{}, error)) {
+                                               error)) {
+                std::fprintf(stderr, "Unable to recover project: %s\n",
+                             error.c_str());
+                return NO;
+            }
+            std::map<std::string, EditLog> recoveredLogs;
+            for (const DocumentSequence& timeline : recovered.timelines)
+                recoveredLogs.emplace(timeline.id, EditLog{});
+            if (!CommitStoredProjectAndLogs(documentPath, recovered,
+                                            recoveredLogs, ProjectEditLog{},
+                                            error)) {
                 std::fprintf(stderr, "Unable to recover project: %s\n",
                              error.c_str());
                 return NO;
@@ -1794,21 +2322,38 @@ DeleteGapOperation GapDeleteOperationForSelection(
                      recovery.error.c_str());
     }
     if (!recoveredAutosave &&
-        !Project::Load(documentPath, self.state->project, error)) {
+        !LoadStoredProject(documentPath, self.state->project, error)) {
         std::fprintf(stderr, "Unable to load project: %s\n", error.c_str());
         return NO;
     }
     self.state->activeTimelineId = self.state->project.active_timeline_id;
     self.state->document =
         self.state->project.MakeDocument(self.state->activeTimelineId);
-    const std::string logPath = EditLogPathForDocument(documentPath);
-    std::error_code logExistsError;
     EditError editError = EditError::None;
-    if (std::filesystem::exists(logPath, logExistsError) &&
-        !EditLog::Load(logPath, self.state->editLog, editError, error)) {
-        std::fprintf(stderr, "Unable to load edit log: %s\n", error.c_str());
-        return NO;
+    for (const DocumentSequence& timeline : self.state->project.timelines) {
+        const std::string logPath =
+            TimelineEditLogPathForProject(documentPath, timeline.id);
+        std::error_code logExistsError;
+        if (std::filesystem::exists(logPath, logExistsError)) {
+            EditLog log;
+            if (!EditLog::Load(logPath, log, editError, error)) {
+                std::fprintf(stderr, "Unable to load timeline edit log: %s\n",
+                             error.c_str());
+                return NO;
+            }
+            self.state->timelineEditLogs[timeline.id] = std::move(log);
+        }
+        if (logExistsError) {
+            std::fprintf(stderr, "Unable to inspect timeline edit log: %s\n",
+                         logExistsError.message().c_str());
+            return NO;
+        }
     }
+    const auto activeLog =
+        self.state->timelineEditLogs.find(self.state->activeTimelineId);
+    self.state->editLog = activeLog == self.state->timelineEditLogs.end()
+                              ? EditLog{}
+                              : activeLog->second;
     const std::string projectLogPath =
         ProjectEditLogPathForProject(documentPath);
     std::error_code projectLogExistsError;
@@ -1830,11 +2375,6 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->targetedTrackIds.insert(track.id);
     self.state->timelineTargetTracks[self.state->activeTimelineId] =
         self.state->targetedTrackIds;
-    if (logExistsError) {
-        std::fprintf(stderr, "Unable to inspect edit log: %s\n",
-                     logExistsError.message().c_str());
-        return NO;
-    }
     self.state->viewport.view_start = {0, 1};
     self.state->viewport.pixels_per_second = 100.0;
     self.state->viewport.track_height = 34.0;
@@ -2074,12 +2614,32 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
     (void)notification;
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    [self installApplicationMenus];
-
-    if (![self loadDocumentAndSources]) {
-        [NSApp terminate:nil];
-        return;
+    const BOOL pathWasProvided = self.documentPath.length > 0;
+    while (true) {
+        if (self.documentPath.length == 0 && ![self chooseStartupProject]) {
+            [NSApp terminate:nil];
+            return;
+        }
+        if ([self loadDocumentAndSources]) break;
+        NSAlert* failure = [NSAlert new];
+        failure.alertStyle = NSAlertStyleCritical;
+        failure.messageText = @"Impossible d’ouvrir le projet";
+        failure.informativeText =
+            self.lastProjectLoadError
+                ?: @"Le fichier n’est pas un projet CUTMACHINE valide ou il "
+                   @"est inaccessible.";
+        [failure runModal];
+        if (pathWasProvided) {
+            [NSApp terminate:nil];
+            return;
+        }
+        self.documentPath = nil;
+        delete self.state;
+        self.state = new AppState();
+        self.mediaThumbnails = [NSMutableDictionary dictionary];
     }
+    [self recordRecentProject:self.documentPath];
+    [self installApplicationMenus];
 
     const NSRect windowRect = NSMakeRect(0.0, 0.0, 1600.0, 960.0);
     self.window =
@@ -2219,6 +2779,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     }
     self.mediaTable.dataSource = self;
     self.mediaTable.delegate = self;
+    self.mediaTable.allowsMultipleSelection = YES;
     self.mediaTable.usesAlternatingRowBackgroundColors = YES;
     self.mediaListScroll = [[NSScrollView alloc]
         initWithFrame:NSMakeRect(12.0, 112.0, mediaPanelWidth - 24.0,
@@ -2243,6 +2804,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaCollection.dataSource = self;
     self.mediaCollection.delegate = self;
     self.mediaCollection.selectable = YES;
+    self.mediaCollection.allowsMultipleSelection = YES;
     [self.mediaCollection setDraggingSourceOperationMask:NSDragOperationCopy
                                                 forLocal:YES];
     [self.mediaCollection registerClass:MediaIconItem.class
@@ -2691,6 +3253,25 @@ DeleteGapOperation GapDeleteOperationForSelection(
                             forMode:NSRunLoopCommonModes];
 }
 
+- (void)application:(NSApplication*)application
+          openFiles:(NSArray<NSString*>*)filenames {
+    (void)application;
+    if (filenames.count == 0) return;
+    NSString* selected = [self resolvedProjectPath:filenames.firstObject];
+    if (!self.window && self.documentPath.length == 0) {
+        self.documentPath = selected;
+        [NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
+        return;
+    }
+    [NSApp replyToOpenOrPrint:NSApplicationDelegateReplyCancel];
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = @"Un projet est déjà ouvert";
+    alert.informativeText =
+        @"Fermez la fenêtre actuelle avant d’ouvrir un autre projet.";
+    if (self.window)
+        [alert beginSheetModalForWindow:self.window completionHandler:nil];
+}
+
 - (void)requestResolvedPosition:(RationalTime)position {
     self.state->requestedPosition = position;
     self.timelineTimecodeLabel.stringValue =
@@ -3083,16 +3664,32 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 
 - (NSString*)selectedMediaId {
+    return [self selectedMediaIds].firstObject;
+}
+
+- (NSArray<NSString*>*)selectedMediaIds {
+    NSMutableArray<NSString*>* identifiers = [NSMutableArray array];
     if (self.mediaViewToggle.selectedSegment == 1) {
-        NSIndexPath* selected =
-            self.mediaCollection.selectionIndexPaths.anyObject;
-        if (!selected || selected.item >= self.visibleMediaIds.count)
-            return nil;
-        return self.visibleMediaIds[selected.item];
+        NSArray<NSIndexPath*>* paths =
+            [self.mediaCollection.selectionIndexPaths.allObjects
+                sortedArrayUsingComparator:^NSComparisonResult(
+                    NSIndexPath* left, NSIndexPath* right) {
+                  if (left.item < right.item) return NSOrderedAscending;
+                  if (left.item > right.item) return NSOrderedDescending;
+                  return NSOrderedSame;
+                }];
+        for (NSIndexPath* path in paths)
+            if (path.item < self.visibleMediaIds.count)
+                [identifiers addObject:self.visibleMediaIds[path.item]];
+    } else {
+        [self.mediaTable.selectedRowIndexes
+            enumerateIndexesUsingBlock:^(NSUInteger row, BOOL* stop) {
+              (void)stop;
+              if (row < self.visibleMediaIds.count)
+                  [identifiers addObject:self.visibleMediaIds[row]];
+            }];
     }
-    const NSInteger row = self.mediaTable.selectedRow;
-    if (row < 0 || row >= (NSInteger)self.visibleMediaIds.count) return nil;
-    return self.visibleMediaIds[row];
+    return identifiers;
 }
 
 - (NSInteger)collectionView:(NSCollectionView*)collectionView
@@ -4124,14 +4721,21 @@ DeleteGapOperation GapDeleteOperationForSelection(
 
 - (void)assignMediaToBinPressed:(id)sender {
     (void)sender;
-    NSString* media = [self selectedMediaId];
-    const LibraryMedia* selected =
-        self.state->document.FindLibraryMedia(media.UTF8String ?: "");
-    if (!selected) return;
+    NSMutableArray<NSString*>* mediaIds = [NSMutableArray array];
+    for (NSString* identifier in [self selectedMediaIds])
+        if (self.state->document.FindLibraryMedia(identifier.UTF8String ?: ""))
+            [mediaIds addObject:identifier];
+    if (mediaIds.count == 0) return;
+    const LibraryMedia* selected = self.state->document.FindLibraryMedia(
+        mediaIds.firstObject.UTF8String ?: "");
 
     NSAlert* alert = [[NSAlert alloc] init];
-    alert.messageText = @"Déplacer le rush";
-    alert.informativeText = @"Choisissez son chutier de destination.";
+    alert.messageText =
+        mediaIds.count == 1 ? @"Déplacer le rush" : @"Déplacer les rushes";
+    alert.informativeText = [NSString
+        stringWithFormat:
+            @"Choisissez le chutier de destination pour %lu rush%@.",
+            (unsigned long)mediaIds.count, mediaIds.count == 1 ? @"" : @"es"];
     [alert addButtonWithTitle:@"Déplacer"];
     [alert addButtonWithTitle:@"Annuler"];
     NSPopUpButton* destinations =
@@ -4166,14 +4770,16 @@ DeleteGapOperation GapDeleteOperationForSelection(
     NSString* bin = destinations.selectedItem.representedObject ?: @"";
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(
-            self.state->document,
-            Operation{SetMediaBinOperation{media.UTF8String ?: "",
-                                           bin.UTF8String ?: ""}},
-            error, message)) {
-        self.binSummaryLabel.stringValue = [NSString
-            stringWithFormat:@"Classement refusé : %s", message.c_str()];
-        return;
+    for (NSString* media in mediaIds) {
+        if (!self.state->editLog.Apply(
+                self.state->document,
+                Operation{SetMediaBinOperation{media.UTF8String ?: "",
+                                               bin.UTF8String ?: ""}},
+                error, message)) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Classement refusé : %s", message.c_str()];
+            return;
+        }
     }
     if (![self persistEdits:message])
         std::fprintf(stderr, "Unable to persist media bin: %s\n",
@@ -4927,8 +5533,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
     const char* path = self.documentPath.UTF8String;
     if (!ProjectRecovery::WriteAutosave(path ? path : "", project, message))
         return NO;
-    if (!CommitProjectAndLogs(path ? path : "", project, editLog, projectLog,
-                              message))
+    std::map<std::string, EditLog> timelineLogs = self.state->timelineEditLogs;
+    timelineLogs[self.state->activeTimelineId] = editLog;
+    if (!CommitStoredProjectAndLogs(path ? path : "", project, timelineLogs,
+                                    projectLog, message))
         return NO;
     std::string discardError;
     if (!ProjectRecovery::DiscardAutosave(path ? path : "", discardError))
@@ -5107,6 +5715,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
         }
     }
     NSString* characters = event.charactersIgnoringModifiers.lowercaseString;
+    if ([self event:event matchesShortcut:@"view.fullscreen"]) {
+        [self toggleFullscreen:nil];
+        return YES;
+    }
     if ([self event:event matchesShortcut:@"play.toggle"]) {
         if ([characters isEqualToString:@" "]) {
             if (!event.isARepeat) self.state->spaceUsedForPan = false;
@@ -7833,27 +8445,31 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
-    if (argc != 2 || (argc >= 2 && argv[1][0] == '-')) {
-        std::fprintf(stderr,
-                     "Usage: %s /path/to/timeline.json\n"
-                     "       %s --describe /path/to/timeline.json\n"
-                     "       %s --apply-op /path/to/timeline.json '<op.json>'\n"
-                     "       %s --apply-project-op /path/to/project.json "
-                     "'<op.json>'\n"
-                     "       %s --undo-project-op /path/to/project.json\n"
-                     "       %s --redo-project-op /path/to/project.json\n"
-                     "       %s --ingest /path/to/timeline.json /path/to/media "
-                     "[--recursive]\n"
-                     "       %s --export /path/to/timeline.json output.mp4 "
-                     "[--software] [--overwrite]\n",
-                     argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-                     argv[0], argv[0]);
+    if (argc > 2 || (argc == 2 && argv[1][0] == '-')) {
+        std::fprintf(
+            stderr,
+            "Usage: %s [/path/to/project.cutmachine.json]\n"
+            "       %s --describe /path/to/project.cutmachine.json\n"
+            "       %s --apply-op /path/to/project.cutmachine.json "
+            "'<op.json>'\n"
+            "       %s --apply-project-op /path/to/project.cutmachine.json "
+            "'<op.json>'\n"
+            "       %s --undo-project-op /path/to/project.cutmachine.json\n"
+            "       %s --redo-project-op /path/to/project.cutmachine.json\n"
+            "       %s --ingest /path/to/project.cutmachine.json "
+            "/path/to/media "
+            "[--recursive]\n"
+            "       %s --export /path/to/project.cutmachine.json output.mp4 "
+            "[--software] [--overwrite]\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
+            argv[0]);
         return 2;
     }
 
     @autoreleasepool {
         [NSApplication sharedApplication];
-        NSString* documentPath = [NSString stringWithUTF8String:argv[1]];
+        NSString* documentPath =
+            argc == 2 ? [NSString stringWithUTF8String:argv[1]] : nil;
         AppDelegate* delegate =
             [[AppDelegate alloc] initWithDocumentPath:documentPath];
         NSApp.delegate = delegate;

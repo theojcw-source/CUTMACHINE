@@ -5,6 +5,7 @@
 #include "Export.h"
 #include "Operations.h"
 #include "Project.h"
+#include "ProjectStorage.h"
 #include "Timeline.h"
 #include "Ulid.h"
 
@@ -177,14 +178,6 @@ bool CommitArtifacts(std::vector<CommitArtifact> artifacts,
     for (const CommitArtifact& artifact : artifacts)
         if (artifact.backed_up) RemoveIfPresent(artifact.backup);
     return true;
-}
-
-bool CommitPair(const std::string& documentPath,
-                const std::string& documentJson, const std::string& logJson,
-                std::string& message) {
-    return CommitArtifacts({{documentPath, documentJson},
-                            {EditLogPathForDocument(documentPath), logJson}},
-                           message);
 }
 
 std::string DecimalSeconds(const RationalTime& time) {
@@ -398,47 +391,23 @@ std::string CanonicalHash(const std::string& json) {
 
 }  // namespace
 
-std::string EditLogPathForDocument(const std::string& documentPath) {
-    return documentPath + ".editlog.json";
+std::string TimelineEditLogPathForProject(const std::string& projectPath,
+                                          const std::string& timelineId) {
+    return projectPath + ".timeline-" + timelineId + ".editlog.json";
 }
 
 std::string ProjectEditLogPathForProject(const std::string& projectPath) {
     return projectPath + ".project-editlog.json";
 }
 
-bool CommitDocumentAndEditLog(const std::string& documentPath,
-                              const Document& document, const EditLog& log,
-                              std::string& message) {
-    return CommitPair(documentPath, document.SaveToString(), log.Serialize(),
-                      message);
-}
-
-bool CommitProjectAndEditLog(const std::string& projectPath,
-                             const Project& project, const EditLog& log,
-                             std::string& message) {
-    std::string validationError;
-    if (!project.Validate(validationError)) {
-        message = validationError;
-        return false;
-    }
-    return CommitPair(projectPath, project.SaveToString(), log.Serialize(),
-                      message);
-}
-
-bool CommitProjectAndLogs(const std::string& projectPath,
-                          const Project& project, const EditLog& timelineLog,
-                          const ProjectEditLog& projectLog,
-                          std::string& message) {
-    std::string validationError;
-    if (!project.Validate(validationError)) {
-        message = validationError;
-        return false;
-    }
-    return CommitArtifacts(
-        {{projectPath, project.SaveToString()},
-         {EditLogPathForDocument(projectPath), timelineLog.Serialize()},
-         {ProjectEditLogPathForProject(projectPath), projectLog.Serialize()}},
-        message);
+bool CommitTextArtifacts(
+    const std::vector<std::pair<std::string, std::string>>& artifacts,
+    std::string& message) {
+    std::vector<CommitArtifact> prepared;
+    prepared.reserve(artifacts.size());
+    for (const auto& artifact : artifacts)
+        prepared.push_back({artifact.first, artifact.second});
+    return CommitArtifacts(std::move(prepared), message);
 }
 
 int ExportCommand(const std::string& documentPath,
@@ -447,7 +416,7 @@ int ExportCommand(const std::string& documentPath,
                   const std::atomic_bool* cancel, std::string& output) {
     Project project;
     std::string error;
-    if (!Project::Load(documentPath, project, error)) {
+    if (!LoadStoredProject(documentPath, project, error)) {
         output = "{\"ok\":false,\"error\":\"InvalidDocument\",\"detail\":\"" +
                  EscapeJson(error) + "\"}\n";
         return 1;
@@ -474,14 +443,9 @@ int ExportCommand(const std::string& documentPath,
 }
 
 int DescribeCommand(const std::string& documentPath, std::string& output) {
-    std::string json;
     std::string message;
-    if (!ReadFile(documentPath, json, message)) {
-        output = ErrorJson(EditError::IoError, message);
-        return 1;
-    }
     Project project;
-    if (!Project::LoadFromString(json, project, message)) {
+    if (!LoadStoredProject(documentPath, project, message)) {
         output = ErrorJson(EditError::ParseError, message);
         return 1;
     }
@@ -506,22 +470,19 @@ int ApplyOperationCommand(const std::string& documentPath,
         return 1;
     }
 
-    std::string documentJson;
-    if (!ReadFile(documentPath, documentJson, message)) {
-        output = ErrorJson(EditError::IoError, message);
-        return 1;
-    }
     Project project;
-    if (!Project::LoadFromString(documentJson, project, message)) {
+    if (!LoadStoredProject(documentPath, project, message)) {
         output = ErrorJson(EditError::ParseError, message);
         return 1;
     }
     Document document = project.MakeActiveDocument();
 
     EditLog log;
-    const std::string logPath = EditLogPathForDocument(documentPath);
+    const std::string timelineLogPath =
+        TimelineEditLogPathForProject(documentPath, project.active_timeline_id);
+    std::string logPath = timelineLogPath;
     std::error_code existsError;
-    const bool logExists = std::filesystem::exists(logPath, existsError);
+    bool logExists = std::filesystem::exists(logPath, existsError);
     if (existsError) {
         output = ErrorJson(EditError::IoError,
                            "unable to inspect edit log '" + logPath +
@@ -546,8 +507,12 @@ int ApplyOperationCommand(const std::string& documentPath,
     }
 
     const std::string updatedDocument = document.SaveToString();
+    std::map<std::string, EditLog> logs;
+    logs[project.active_timeline_id] = log;
+    ProjectEditLog projectLog;
     if (!project.CommitActiveDocument(document, message) ||
-        !CommitProjectAndEditLog(documentPath, project, log, message)) {
+        !CommitStoredProjectAndLogs(documentPath, project, logs, projectLog,
+                                    message)) {
         output = ErrorJson(EditError::IoError, message);
         return 1;
     }
@@ -558,11 +523,12 @@ int ApplyOperationCommand(const std::string& documentPath,
 
 namespace {
 
-bool LoadOptionalTimelineLog(const std::string& projectPath, EditLog& log,
+bool LoadOptionalTimelineLog(const std::string& projectPath,
+                             const std::string& timelineId, EditLog& log,
                              EditError& error, std::string& message) {
-    const std::string path = EditLogPathForDocument(projectPath);
+    std::string path = TimelineEditLogPathForProject(projectPath, timelineId);
     std::error_code existsError;
-    const bool exists = std::filesystem::exists(path, existsError);
+    bool exists = std::filesystem::exists(path, existsError);
     if (existsError) {
         error = EditError::IoError;
         message = "unable to inspect edit log '" + path +
@@ -595,22 +561,25 @@ bool LoadOptionalProjectLog(const std::string& projectPath, ProjectEditLog& log,
 int MutateProjectLogCommand(const std::string& projectPath,
                             const std::optional<ProjectOperation>& operation,
                             bool redo, std::string& output) {
-    std::string json;
     std::string message;
     EditError error = EditError::None;
-    if (!ReadFile(projectPath, json, message)) {
-        output = ErrorJson(EditError::IoError, message);
-        return 1;
-    }
     Project project;
-    if (!Project::LoadFromString(json, project, message)) {
+    if (!LoadStoredProject(projectPath, project, message)) {
         output = ErrorJson(EditError::ParseError, message);
         return 1;
     }
-    EditLog timelineLog;
+    std::map<std::string, EditLog> timelineLogs;
+    for (const DocumentSequence& timeline : project.timelines) {
+        EditLog timelineLog;
+        if (!LoadOptionalTimelineLog(projectPath, timeline.id, timelineLog,
+                                     error, message)) {
+            output = ErrorJson(error, message);
+            return 1;
+        }
+        timelineLogs.emplace(timeline.id, std::move(timelineLog));
+    }
     ProjectEditLog projectLog;
-    if (!LoadOptionalTimelineLog(projectPath, timelineLog, error, message) ||
-        !LoadOptionalProjectLog(projectPath, projectLog, error, message)) {
+    if (!LoadOptionalProjectLog(projectPath, projectLog, error, message)) {
         output = ErrorJson(error, message);
         return 1;
     }
@@ -625,8 +594,10 @@ int MutateProjectLogCommand(const std::string& projectPath,
         output = ErrorJson(error, message);
         return 1;
     }
-    if (!CommitProjectAndLogs(projectPath, project, timelineLog, projectLog,
-                              message)) {
+    for (const DocumentSequence& timeline : project.timelines)
+        timelineLogs.try_emplace(timeline.id, EditLog{});
+    if (!CommitStoredProjectAndLogs(projectPath, project, timelineLogs,
+                                    projectLog, message)) {
         output = ErrorJson(EditError::IoError, message);
         return 1;
     }

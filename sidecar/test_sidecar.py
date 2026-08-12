@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import json
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +23,42 @@ from sidecar.schema import PLANNER_RESPONSE_SCHEMA
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = Path(__file__).with_name("eval-document.json")
 BINARY = ROOT / "build" / "cutmachine"
+
+
+def create_project_package(parent: Path, name: str = "Fixture") -> Path:
+    document_text = FIXTURE.read_text(encoding="utf-8")
+    document = json.loads(document_text)
+    timeline_id = document["sequence"]["id"]
+    package = parent / f"{name}.cutmachine-project"
+    timelines = package / "Timelines"
+    timelines.mkdir(parents=True)
+    (timelines / f"{timeline_id}.json").write_text(
+        document_text, encoding="utf-8")
+    project = {
+        "project_format": "cutmachine-project",
+        "project_version": 2,
+        "id": "01K60000000000000000000001",
+        "name": name,
+        "active_timeline_id": timeline_id,
+        "timeline_snapshots": [document_text],
+        "bin_metadata": [],
+        "timeline_bin_ids": [],
+    }
+    project_path = package / "project.cutmachine.json"
+    project_path.write_text(json.dumps(project), encoding="utf-8")
+    manifest = {
+        "format": "cutmachine-collection",
+        "version": 2,
+        "project": "project.cutmachine.json",
+        "timelines": [{
+            "id": timeline_id,
+            "path": f"Timelines/{timeline_id}.json",
+        }],
+        "media": [],
+    }
+    (package / "manifest.json").write_text(
+        json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
+    return project_path
 
 
 class FakeResponse:
@@ -100,7 +135,11 @@ class PlannerProtocolTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         if not BINARY.exists():
             raise unittest.SkipTest("build/cutmachine is not available")
-        cls.timeline = CutmachineBinary(BINARY).describe(FIXTURE)
+        cls.fixture_directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.fixture_directory.cleanup)
+        project = create_project_package(
+            Path(cls.fixture_directory.name), "Planner")
+        cls.timeline = CutmachineBinary(BINARY).describe(project)
 
     def test_ollama_receives_shared_schema_in_format(self) -> None:
         opener = RecordingOpener({
@@ -341,8 +380,8 @@ class BinaryIntegrationTests(unittest.TestCase):
         if not BINARY.exists():
             self.skipTest("build/cutmachine is not available")
         self.directory = tempfile.TemporaryDirectory()
-        self.document = Path(self.directory.name) / "document.json"
-        shutil.copyfile(FIXTURE, self.document)
+        self.document = create_project_package(
+            Path(self.directory.name), "Integration")
         self.binary = CutmachineBinary(BINARY)
 
     def tearDown(self) -> None:
@@ -472,8 +511,8 @@ class EvaluationTests(unittest.TestCase):
         binary = CutmachineBinary(BINARY)
         with tempfile.TemporaryDirectory() as directory:
             for index, case in enumerate(CASES):
-                document = Path(directory) / f"case-{index}.json"
-                shutil.copyfile(FIXTURE, document)
+                document = create_project_package(
+                    Path(directory), f"Case-{index}")
                 result = binary.apply_operation(document, case.expected)
                 self.assertTrue(
                     result.ok,

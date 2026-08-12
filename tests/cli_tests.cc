@@ -2,6 +2,7 @@
 #include "Document.h"
 #include "EditLog.h"
 #include "Operations.h"
+#include "ProjectStorage.h"
 #include "Ulid.h"
 
 #include <filesystem>
@@ -65,9 +66,14 @@ int main() {
         std::filesystem::temp_directory_path() /
         (GenerateUlid() + "-cli-tests");
     std::filesystem::create_directory(directory);
-    const std::filesystem::path path = directory / "document.json";
     std::string error;
-    Check(Fixture().Save(path.string(), error), "fixture saves: " + error);
+    Project fixtureProject = Project::FromDocument(Fixture(), "CLI fixture");
+    std::string fixturePath;
+    Check(CreatePortableProject(
+              (directory / "Fixture.cutmachine-project").string(),
+              fixtureProject, fixturePath, error),
+          "fixture package saves: " + error);
+    const std::filesystem::path path = fixturePath;
 
     std::string firstDescription;
     std::string secondDescription;
@@ -105,8 +111,12 @@ int main() {
     EditLog log;
     EditError editError = EditError::None;
     std::string detail;
-    Check(EditLog::Load(EditLogPathForDocument(path.string()), log, editError,
-                        detail),
+    Project appliedProject;
+    Check(Project::Load(path.string(), appliedProject, detail),
+          "applied project reloads: " + detail);
+    const std::string activeTimelineLog = TimelineEditLogPathForProject(
+        path.string(), appliedProject.active_timeline_id);
+    Check(EditLog::Load(activeTimelineLog, log, editError, detail),
           "sidecar edit log loads: " + detail);
     Check(log.AppliedCount() == 1, "valid apply-op increments edit log");
 
@@ -122,8 +132,7 @@ int main() {
           "describe exposes bins created by apply-op");
     const std::string afterBin = Read(path);
 
-    const std::string logBeforeRejection =
-        Read(EditLogPathForDocument(path.string()));
+    const std::string logBeforeRejection = Read(activeTimelineLog);
     const Operation rejected =
         RemoveClipOperation{"01K39999999999999999999999", {}};
     Check(ApplyOperationCommand(path.string(), SerializeOperation(rejected),
@@ -133,7 +142,7 @@ int main() {
           "refused apply-op returns the exact operation error name");
     Check(Read(path) == afterBin,
           "refused apply-op leaves document byte-identical");
-    Check(Read(EditLogPathForDocument(path.string())) == logBeforeRejection,
+    Check(Read(activeTimelineLog) == logBeforeRejection,
           "refused apply-op leaves edit log byte-identical");
 
     Check(ApplyOperationCommand(path.string(), "{not json", result) == 1,
@@ -143,10 +152,13 @@ int main() {
     Check(Read(path) == afterBin,
           "malformed operation leaves document byte-identical");
 
-    const std::filesystem::path projectPath = directory / "project.json";
     Project project = Project::FromDocument(Fixture(), "CLI project");
-    Check(project.Save(projectPath.string(), error),
+    std::string projectPathString;
+    Check(CreatePortableProject(
+              (directory / "Project.cutmachine-project").string(), project,
+              projectPathString, error),
           "project fixture saves: " + error);
+    const std::filesystem::path projectPath = projectPathString;
     const std::string projectBefore = Read(projectPath);
     const ProjectOperation addTimeline =
         AddProjectTimelineOperation{"CLI vertical",

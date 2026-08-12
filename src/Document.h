@@ -154,6 +154,8 @@ public:
                      std::string& error);
     static bool LoadFromString(const std::string& json, Document& output,
                                std::string& error);
+    static bool LoadFromString(const std::string& json, Document& output,
+                               std::string& error, bool validate);
     bool Save(const std::string& path, std::string& error) const;
     std::string SaveToString() const;
     bool Validate(std::string& error) const;

@@ -388,23 +388,6 @@ void WriteTime(std::ostringstream& output, const RationalTime& time) {
     output << "{\"value\":" << time.value << ",\"rate\":" << time.rate << "}";
 }
 
-Ulid MigratedSequenceId(const std::vector<DocumentSource>& sources) {
-    uint64_t hash = UINT64_C(1469598103934665603);
-    for (const DocumentSource& source : sources) {
-        for (const unsigned char byte : source.id) {
-            hash ^= byte;
-            hash *= UINT64_C(1099511628211);
-        }
-    }
-    static constexpr char alphabet[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    std::string suffix(13, '0');
-    for (size_t index = suffix.size(); index-- > 0;) {
-        suffix[index] = alphabet[hash & 31U];
-        hash >>= 5;
-    }
-    return "0000000000000" + suffix;
-}
-
 bool RegisterId(const Ulid& id, const std::string& context, std::set<Ulid>& ids,
                 std::string& error) {
     if (!IsValidUlid(id)) {
@@ -469,23 +452,11 @@ bool Project::LoadFromString(const std::string& json, Project& output,
         const JsonValue root = JsonParser(json).Parse();
         const JsonValue* format = Optional(root, "project_format",
                                            JsonValue::Type::String, "project");
-        if (!format) {
-            Document legacy;
-            if (!Document::LoadFromString(json, legacy, error)) return false;
-            std::string projectName = legacy.sequence.name.empty()
-                                          ? "Untitled Project"
-                                          : legacy.sequence.name;
-            Project promoted = Project::FromDocument(std::move(legacy),
-                                                     std::move(projectName));
-            if (!promoted.Validate(error)) return false;
-            output = std::move(promoted);
-            error.clear();
-            return true;
-        }
+        if (!format) throw std::runtime_error("missing project format");
         if (format->string != "cutmachine-project")
             throw std::runtime_error("unsupported project format '" +
                                      format->string + "'");
-        if (Int32(root, "project_version", "project") != 1)
+        if (Int32(root, "project_version", "project") != 2)
             throw std::runtime_error("unsupported project version");
 
         Project parsed(
@@ -497,7 +468,7 @@ bool Project::LoadFromString(const std::string& json, Project& output,
                                         .string;
         parsed.timelines.clear();
 
-        const JsonValue& documents = Require(root, "timeline_documents",
+        const JsonValue& documents = Require(root, "timeline_snapshots",
                                              JsonValue::Type::Array, "project");
         if (documents.array.empty())
             throw std::runtime_error("project has no timeline documents");
@@ -505,7 +476,7 @@ bool Project::LoadFromString(const std::string& json, Project& output,
         for (size_t index = 0; index < documents.array.size(); ++index) {
             const JsonValue& value = documents.array[index];
             if (value.type != JsonValue::Type::String)
-                throw std::runtime_error("project.timeline_documents[" +
+                throw std::runtime_error("project.timeline_snapshots[" +
                                          std::to_string(index) +
                                          "] has the wrong JSON type");
             Document document;
@@ -624,10 +595,10 @@ bool Project::Save(const std::string& path, std::string& error) const {
 std::string Project::SaveToString() const {
     std::ostringstream output;
     output << "{\n  \"project_format\":\"cutmachine-project\","
-           << "\n  \"project_version\":1," << "\n  \"id\":\"" << Escape(id)
+           << "\n  \"project_version\":2," << "\n  \"id\":\"" << Escape(id)
            << "\"," << "\n  \"name\":\"" << Escape(name) << "\","
            << "\n  \"active_timeline_id\":\"" << Escape(active_timeline_id)
-           << "\"," << "\n  \"timeline_documents\":[";
+           << "\"," << "\n  \"timeline_snapshots\":[";
     for (size_t index = 0; index < timelines.size(); ++index) {
         Document document;
         document.sequence = timelines[index];
@@ -684,19 +655,16 @@ bool Document::Load(const std::string& path, Document& output,
 
 bool Document::LoadFromString(const std::string& json, Document& output,
                               std::string& error) {
+    return LoadFromString(json, output, error, true);
+}
+
+bool Document::LoadFromString(const std::string& json, Document& output,
+                              std::string& error, bool validate) {
     try {
         const JsonValue root = JsonParser(json).Parse();
-        if (Optional(root, "project_format", JsonValue::Type::String,
-                     "document")) {
-            Project project;
-            if (!Project::LoadFromString(json, project, error)) return false;
-            output = project.MakeActiveDocument();
-            error.clear();
-            return true;
-        }
         Document parsed;
         parsed.version = Int32(root, "version", "document");
-        if (parsed.version != 1 && parsed.version != 2 && parsed.version != 3) {
+        if (parsed.version != 3) {
             throw std::runtime_error("unsupported document version " +
                                      std::to_string(parsed.version));
         }
@@ -736,18 +704,10 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     .string;
         }
 
-        const bool hasSequence =
-            Optional(root, "sequence", JsonValue::Type::Object, "document") !=
-            nullptr;
-        if (parsed.version == 3 && !hasSequence) {
-            throw std::runtime_error(
-                "version 3 document is missing its sequence object");
-        }
-        const JsonValue* sequenceValue = nullptr;
-        if (hasSequence) {
-            const JsonValue& sequence =
-                Require(root, "sequence", JsonValue::Type::Object, "document");
-            sequenceValue = &sequence;
+        const JsonValue& sequence =
+            Require(root, "sequence", JsonValue::Type::Object, "document");
+        const JsonValue* sequenceValue = &sequence;
+        {
             const std::string context = "document.sequence";
             parsed.sequence.id =
                 Require(sequence, "id", JsonValue::Type::String, context)
@@ -764,7 +724,7 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                 Int32(rate, "den", context + ".frame_rate")};
         }
 
-        if (parsed.version >= 2) {
+        {
             const JsonValue& library =
                 Require(root, "library", JsonValue::Type::Array, "document");
             for (size_t index = 0; index < library.array.size(); ++index) {
@@ -860,10 +820,8 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     parsed.bins.push_back(std::move(bin));
                 }
             }
-            const JsonValue& timelineOwner =
-                parsed.version == 3 ? *sequenceValue : root;
-            const std::string markerRoot =
-                parsed.version == 3 ? "document.sequence" : "document";
+            const JsonValue& timelineOwner = *sequenceValue;
+            const std::string markerRoot = "document.sequence";
             if (const JsonValue* markers =
                     Optional(timelineOwner, "markers", JsonValue::Type::Array,
                              markerRoot)) {
@@ -961,40 +919,8 @@ bool Document::LoadFromString(const std::string& json, Document& output,
             parsed.sources.push_back(std::move(source));
         }
 
-        if (parsed.version == 1) {
-            parsed.version = 3;
-            for (const DocumentSource& source : parsed.sources) {
-                LibraryMedia media;
-                media.id = source.id;
-                media.path = source.path;
-                media.filename =
-                    std::filesystem::path(source.path).filename().string();
-                media.rate = source.rate;
-                media.duration = source.duration;
-                media.metadata_complete = false;
-                parsed.library.push_back(std::move(media));
-            }
-        }
-
-        if (!hasSequence) {
-            parsed.sequence.id = MigratedSequenceId(parsed.sources);
-            if (!parsed.sources.empty())
-                parsed.sequence.frame_rate = parsed.sources.front().rate;
-            if (!parsed.library.empty() &&
-                parsed.library.front().metadata_complete) {
-                const LibraryMedia& media = parsed.library.front();
-                parsed.sequence.width = media.width;
-                parsed.sequence.height = media.height;
-                if (std::abs(media.rotation_degrees) == 90)
-                    std::swap(parsed.sequence.width, parsed.sequence.height);
-            }
-        }
-
-        const JsonValue& timelineOwner =
-            parsed.version == 3 && sequenceValue ? *sequenceValue : root;
-        const std::string tracksRoot = parsed.version == 3 && sequenceValue
-                                           ? "document.sequence"
-                                           : "document";
+        const JsonValue& timelineOwner = *sequenceValue;
+        const std::string tracksRoot = "document.sequence";
         const JsonValue& tracks = Require(timelineOwner, "tracks",
                                           JsonValue::Type::Array, tracksRoot);
         for (size_t trackIndex = 0; trackIndex < tracks.array.size();
@@ -1062,8 +988,7 @@ bool Document::LoadFromString(const std::string& json, Document& output,
             parsed.sequence.tracks.push_back(std::move(track));
         }
 
-        parsed.version = 3;
-        if (!parsed.Validate(error)) {
+        if (validate && !parsed.Validate(error)) {
             return false;
         }
         output = std::move(parsed);

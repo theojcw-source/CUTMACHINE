@@ -1,6 +1,6 @@
 # CUTMACHINE
 
-CUTMACHINE charge un document JSON de timeline, ouvre chaque source média par
+CUTMACHINE charge un package projet v2, ouvre chaque source média par
 son ULID, puis résout le scrub en clés de cache `(source_id, source_frame)`.
 Les intervalles des clips sont semi-ouverts : `[timeline_in, timeline_in +
 duration)`. Un trou ne déclenche aucun décodage et est rendu en noir.
@@ -18,11 +18,44 @@ ctest --test-dir build --output-on-failure
 
 ## Lancement
 
-Placez `C8022.MP4` à côté de `example-timeline.json`, ou adaptez son champ
-`path`, puis lancez :
+La compilation produit une application macOS dans `build/CUTMACHINE.app`.
+Ouvrez-la par double-clic dans le Finder, depuis Spotlight après l’avoir copiée
+dans Applications, ou avec :
 
 ```sh
-./build/cutmachine ./example-timeline.json
+open build/CUTMACHINE.app
+```
+
+Le binaire en ligne de commande reste également disponible et peut être lancé
+sans argument :
+
+```sh
+./build/cutmachine
+```
+
+Une page d’accueil permet de créer un projet, d’ouvrir un fichier existant ou
+de reprendre l’un des huit projets récents. La création demande le nom et
+l’emplacement du package `.cutmachine-project`, initialise une première timeline,
+puis ouvre directement l’espace de montage.
+
+Pour le stockage, les sauvegardes, les médias liés et le partage entre machines,
+voir la [spécification de stockage des projets](docs/PROJECT_STORAGE_SPEC.md).
+**Fichier → Collecter le projet…** crée un package `.cutmachine-project`
+autonome contenant une copie vérifiée des originaux, un manifeste SHA-256 et
+un historique distinct par timeline. Ce package peut être transféré puis ouvert
+directement par CUTMACHINE sur un autre Mac. À l’ouverture, les empreintes sont
+revérifiées et tout original manquant ou modifié déclenche un avertissement.
+Un verrou de session empêche également deux instances d’écrire simultanément
+le même projet. Dans le package v2, chaque timeline vit dans son propre fichier
+`Timelines/<ULID>.json` et est sauvegardée transactionnellement avec le snapshot
+projet et les historiques. Les anciens fichiers JSON et packages v1 ne sont
+plus acceptés.
+
+Il reste possible d’ouvrir directement un projet depuis la ligne de commande en
+visant son fichier interne :
+
+```sh
+./build/cutmachine ./Film.cutmachine-project/project.cutmachine.json
 ```
 
 Les chemins relatifs des sources sont résolus relativement au fichier JSON,
@@ -140,13 +173,15 @@ son contenu exacts.
 Le menu **CUTMACHINE > Raccourcis clavier…** (`Cmd+,`) permet de réassigner les
 outils, la lecture J/K/L, les points In/Out, delete/ripple delete, le fondu
 enchaîné, le magnétisme, la sélection liée, le cadrage et les commandes Source
-vers Record.
-Les combinaisons s'écrivent sous une forme comme `V`, `Space`, `Alt+X` ou
-`Cmd+Shift+L`. Une valeur vide désactive la commande. Les doublons et les
+vers Record. Un clavier AZERTY visuel permet de choisir une commande, ses
+modificateurs, puis de cliquer directement sur la touche à lui affecter. La
+saisie textuelle reste disponible pour les combinaisons comme `V`, `Space`,
+`Alt+X` ou `Cmd+Shift+L`. Une valeur vide désactive la commande. Les doublons et les
 conflits avec les raccourcis système fixes sont refusés ; un bouton restaure
 les valeurs par défaut. La configuration est globale à l'application,
 persistée dans les préférences macOS, et les menus sont actualisés
-immédiatement.
+immédiatement. Le plein écran est affecté à `P` par défaut et reste
+réassignable dans cette même fenêtre.
 
 Le cadenas dans chaque en-tête verrouille la piste via une opération persistée
 et annulable. Une piste verrouillée reste rendue et lisible, mais toute mutation
@@ -215,6 +250,9 @@ adressable distinct des médias ; un double-clic revient au moniteur Programme.
 Une arborescence affiche les chutiers imbriqués, la racine et une vue de tous
 les objets. Un sélecteur propose une liste de
 métadonnées ou une grille d'icônes ; le champ de recherche filtre les deux.
+Dans les deux vues, `Cmd+clic` ajoute ou retire un objet de la sélection et
+`Shift+clic` sélectionne une plage, comme dans le Finder. Le clic droit conserve
+la multisélection et **Déplacer…** classe ensemble tous les rushes sélectionnés.
 **+ Chutier** crée un enfant du chutier courant et **Supprimer** refuse un
 chutier contenant encore des médias ou des enfants. Les chutiers se déplacent
 et s'imbriquent par glisser-déposer, à la manière du Finder ; le dépôt sur
@@ -337,15 +375,15 @@ Ces commandes s'exécutent avant toute initialisation d'AppKit, de Metal ou du
 décodage média :
 
 ```sh
-./build/cutmachine --describe ./example-timeline.json
-./build/cutmachine --apply-op ./example-timeline.json \
+./build/cutmachine --describe ./Film.cutmachine-project/project.cutmachine.json
+./build/cutmachine --apply-op ./Film.cutmachine-project/project.cutmachine.json \
   '{"type":"TrimClip","clip_id":"01K00000000000000000000003","edge":"Tail","delta":{"value":-1,"rate":25},"exact_clip":null}'
-./build/cutmachine --apply-project-op ./example-timeline.json \
+./build/cutmachine --apply-project-op ./Film.cutmachine-project/project.cutmachine.json \
   '{"type":"AddProjectTimeline","name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1},"timeline_id":"","video_track_id":"","audio_track_id":"","exact_project_hex":null}'
-./build/cutmachine --undo-project-op ./example-timeline.json
-./build/cutmachine --redo-project-op ./example-timeline.json
-./build/cutmachine --ingest ./example-timeline.json ./rushes --recursive
-./build/cutmachine --export ./example-timeline.json ./film.mp4
+./build/cutmachine --undo-project-op ./Film.cutmachine-project/project.cutmachine.json
+./build/cutmachine --redo-project-op ./Film.cutmachine-project/project.cutmachine.json
+./build/cutmachine --ingest ./Film.cutmachine-project/project.cutmachine.json ./rushes --recursive
+./build/cutmachine --export ./Film.cutmachine-project/project.cutmachine.json ./film.mp4
 ```
 
 ## Export vidéo final
@@ -364,9 +402,9 @@ peut être annulé.
 La commande headless équivalente est :
 
 ```sh
-./build/cutmachine --export projet.json sortie.mp4
-./build/cutmachine --export projet.json sortie.mp4 --software
-./build/cutmachine --export projet.json sortie.mp4 --overwrite
+./build/cutmachine --export Projet.cutmachine-project/project.cutmachine.json sortie.mp4
+./build/cutmachine --export Projet.cutmachine-project/project.cutmachine.json sortie.mp4 --software
+./build/cutmachine --export Projet.cutmachine-project/project.cutmachine.json sortie.mp4 --overwrite
 ```
 
 L’export compose les pistes vidéo dans leur ordre, conserve les zones noires,
@@ -388,15 +426,12 @@ canevas pilote le moniteur et sert de base aux
 presets d’export ; une vidéo portrait ne transforme donc pas implicitement une
 séquence horizontale. **Timeline → Réglages de séquence…** propose les formats
 HD, UHD, vertical et carré ainsi que les cadences usuelles. Les documents plus
-anciens sans bloc `sequence` sont migrés en mémoire à partir de la première
-source, avec un repli 1920×1080.
+anciens sans bloc `sequence` ou antérieurs à la version 3 sont refusés.
 
 L’application charge désormais un `Project` complet autour de ce document
 actif. Toutes ses timelines apparaissent dans le chutier ; un double-clic en
-active une et `Cmd+Option+N` en crée une nouvelle. Les anciens JSON
-mono-séquence restent lisibles et sont promus automatiquement lors de leur
-première sauvegarde. Une autosave du projet complet protège chaque commit
-atomique et peut être récupérée au lancement.
+active une et `Cmd+Option+N` en crée une nouvelle. Une autosave du projet
+complet protège chaque commit atomique et peut être récupérée au lancement.
 
 `--describe` écrit uniquement la vue JSON condensée sur stdout, avec les blocs
 distincts `timeline` et `library`. Les médias de bibliothèque ont des alias
@@ -413,9 +448,7 @@ idempotente est le chemin absolu résolu.
 
 Le schéma courant du document est la version 3. `library`, `bins` et `sources`
 sont des objets projet ; `tracks` et `markers` appartiennent à `sequence`.
-Les versions 1 et 2 restent lisibles et sont migrées en mémoire : leurs sources sont promues en entrées de
-bibliothèque avec les seules métadonnées historiques connues, puis enrichies
-si leurs fichiers sont ingérés. Bibliothèque et source partagent l'ULID du
+Les versions 1 et 2 sont refusées. Bibliothèque et source partagent l'ULID du
 média ; l'ingest seul ne monte jamais de clip.
 
 ### Gestion colorimétrique
@@ -456,13 +489,13 @@ sélectionné sans modifier le REPL :
 # Ollama local
 export CUTMACHINE_BACKEND=ollama
 export CUTMACHINE_MODEL=qwen3:8b
-python3 -m sidecar.repl ./example-timeline.json
+python3 -m sidecar.repl ./Film.cutmachine-project/project.cutmachine.json
 
 # API Anthropic
 export CUTMACHINE_BACKEND=anthropic
 export CUTMACHINE_MODEL=claude-sonnet-4-5
 export ANTHROPIC_API_KEY=...
-python3 -m sidecar.repl ./example-timeline.json
+python3 -m sidecar.repl ./Film.cutmachine-project/project.cutmachine.json
 ```
 
 Le sidecar charge aussi automatiquement le fichier `.env` à la racine du
