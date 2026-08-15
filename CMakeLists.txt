@@ -47,6 +47,8 @@ configure_file(src/shader.metal "${SHADER_RUNTIME_PATH}" COPYONLY)
 
 add_library(cutmachine_model
     src/BeatDetection.cc
+    src/ChatLlmClient.cc
+    src/ChatSession.cc
     src/Cli.cc
     src/ColorEffects.cc
     src/ColorManagement.cc
@@ -59,6 +61,7 @@ add_library(cutmachine_model
     src/EditLog.cc
     src/Export.cc
     src/Keyframes.cc
+    src/McpLiveBackend.cc
     src/McpProjectBackend.cc
     src/McpServer.cc
     src/McpTools.cc
@@ -94,6 +97,11 @@ set(CUTMACHINE_APP_SOURCES
     src/UiPreferences.mm
     src/UiComponents.mm
     src/PanelHostView.mm
+    # F2.4 -- chat panel (ROADMAP.md). ChatLlmClient.cc/ChatSession.cc/
+    # McpLiveBackend.cc are plain C++ and already part of cutmachine_model
+    # above (see tests/chat_llm_client_tests.cc, tests/chat_session_tests.cc);
+    # this is only the AppKit view that wires them to the live document.
+    src/ChatPanelView.mm
 )
 
 add_executable(cutmachine ${CUTMACHINE_APP_SOURCES})
@@ -307,6 +315,23 @@ if(BUILD_TESTING)
     add_executable(cutmachine_relink_tests tests/relink_tests.cc)
     target_link_libraries(cutmachine_relink_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_relink_tests COMMAND cutmachine_relink_tests)
+
+    # F2.4 -- chat panel (ROADMAP.md). Both pure C++ (Json/McpTools/
+    # ChatLlmClient/ChatSession only), no AppKit -- see each file's own
+    # header comment for what they prove, in particular that a chat-driven
+    # tool call dispatches through the real McpToolRegistry::Call and
+    # EditLog::Apply, not a parallel mutation path.
+    add_executable(cutmachine_chat_llm_client_tests
+                   tests/chat_llm_client_tests.cc)
+    target_link_libraries(cutmachine_chat_llm_client_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_chat_llm_client_tests
+             COMMAND cutmachine_chat_llm_client_tests)
+
+    add_executable(cutmachine_chat_session_tests tests/chat_session_tests.cc)
+    target_link_libraries(cutmachine_chat_session_tests PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_chat_session_tests
+             COMMAND cutmachine_chat_session_tests)
 
     add_executable(cutmachine_audio_playback_tests
         tests/audio_playback_tests.mm

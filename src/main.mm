@@ -34,6 +34,7 @@ extern "C" {
 #include "Export.h"
 #include "FrameCache.h"
 #include "Ingest.h"
+#include "McpLiveBackend.h"
 #include "McpProjectBackend.h"
 #include "McpServer.h"
 #include "MediaTaskManager.h"
@@ -52,10 +53,12 @@ extern "C" {
 #include "Waveform.h"
 
 // F2.1 -- ROADMAP.md design system: reusable AppKit chrome and the fixed
-// right-hand panel host that F2.2 (Inspector) and F2.4 (Chat) will each
-// install their content into (see PanelHostView.h). Objective-C++
-// declarations, so #import rather than #include, matching AppKit/Foundation
-// above.
+// right-hand panel host that F2.2 (Inspector) and F2.4 (Chat) install their
+// content into (see PanelHostView.h). ChatPanelView.h is F2.4's actual
+// content view -- the chat transcript + input this file installs into the
+// dock's Chat slot below. Objective-C++ declarations, so #import rather
+// than #include, matching AppKit/Foundation above.
+#import "ChatPanelView.h"
 #import "PanelHostView.h"
 #import "UiComponents.h"
 #import "UiThemeAppKit.h"
@@ -766,6 +769,16 @@ DeleteGapOperation GapDeleteOperationForSelection(
 // Chat (F2.4) tabs. See PanelHostView.h -- the set of tabs and their order
 // are fixed at construction time, never user-rearrangeable.
 @property(nonatomic, strong) CMPanelHostView* rightDockPanel;
+// F2.4 -- the Chat tab's actual content (ChatPanelView.h), installed into
+// rightDockPanel's PanelSlot::Chat once at startup (see
+// -applicationDidFinishLaunching:). `chatBackend` wraps
+// `self.state->document`/`self.state->editLog`
+// by reference (McpLiveBackend.h) -- allocated once, alongside the view,
+// and never freed or reassigned for the life of the window, the same
+// "assign, never explicitly torn down" convention `state` below already
+// uses.
+@property(nonatomic, strong) CMChatPanelView* chatPanelView;
+@property(nonatomic, assign) McpLiveBackend* chatBackend;
 @property(nonatomic, strong) NSPopUpButton* binPopup;
 @property(nonatomic, strong) NSPopUpButton* mediaPopup;
 @property(nonatomic, strong) NSTextField* binSummaryLabel;
@@ -3060,6 +3073,40 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.rightDockPanel.autoresizingMask =
         NSViewWidthSizable | NSViewHeightSizable;
     [self.workspaceSplitView addArrangedSubview:self.rightDockPanel];
+
+    // F2.4 -- ROADMAP.md: chat panel, wired to the exact same in-memory
+    // Document/EditLog `self.state->editLog.Apply(self.state->document, ...)`
+    // already mutates everywhere else in this file, through
+    // McpLiveBackend -> McpToolRegistry::Call -- the identical dispatcher
+    // McpServer.cc's `tools/call` uses for an external MCP client. No
+    // second edit path: see McpLiveBackend.h/ChatSession.h for why. `state`
+    // is allocated once, above, and never reallocated after the window is
+    // built (only its fields are mutated in place by ordinary edits and
+    // project loads), so the reference this backend holds stays valid for
+    // the window's lifetime.
+    __weak AppDelegate* weakSelf = self;
+    self.chatBackend = new McpLiveBackend(
+        self.state->document, self.state->editLog, [weakSelf]() {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) return;
+            // Same sequence every other in-app edit handler runs after a
+            // successful `self.state->editLog.Apply(...)` -- see e.g.
+            // -addTrack: -- so a chat-driven edit is saved and reflected on
+            // screen exactly like a mouse-driven one.
+            const RationalTime playhead = strongSelf.state->requestedPosition;
+            [strongSelf refreshTimelineAfterEditFromPosition:playhead];
+            [strongSelf rebuildMediaList];
+            std::string persistMessage;
+            if (![strongSelf persistEdits:persistMessage]) {
+                std::fprintf(stderr, "Unable to persist chat-driven edit: %s\n",
+                             persistMessage.c_str());
+            }
+        });
+    self.chatPanelView = [[CMChatPanelView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];
+    [self.chatPanelView configureWithBackend:*self.chatBackend];
+    [self.rightDockPanel setContentView:self.chatPanelView
+                                forSlot:ui::PanelSlot::Chat];
 
     [self.workspaceSplitView setHoldingPriority:NSLayoutPriorityDefaultHigh
                               forSubviewAtIndex:0];

@@ -391,6 +391,16 @@ std::string CanonicalHash(const std::string& json) {
 
 }  // namespace
 
+// F2.4 -- ROADMAP.md chat panel. Exposes the same JSON view DescribeCommand
+// serializes from a project file path, directly on an in-memory Document,
+// for a backend (McpLiveBackend.h) that already holds the app's live
+// document instead of a path to reload from disk. Same serialization, same
+// aliasing scheme (A1/A2.../K1... the chat and MCP tool catalog both rely
+// on) -- just skipping the project-file round trip DescribeCommand does.
+std::string DescribeDocument(const Document& document) {
+    return Describe(document);
+}
+
 std::string TimelineEditLogPathForProject(const std::string& projectPath,
                                           const std::string& timelineId) {
     return projectPath + ".timeline-" + timelineId + ".editlog.json";
