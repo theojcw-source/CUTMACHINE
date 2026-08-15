@@ -132,5 +132,11 @@ une fois F0 mergé.
 | F2.1 | fait (design system minimal, AppKit non vérifiable hors macOS) |
 | F2.2 | fait (propriétés clip + 8 sliders de grading F1.3, AppKit non vérifiable hors macOS ; roues/courbes non implémentées côté moteur, donc hors scope ici — voir ColorEffects.h) |
 | F2.3 | fait (panneau média Média/Audio/Légendes, AppKit non vérifiable hors macOS) |
-| F2.4 | à faire, débloqué |
+| F2.4 | fait (chat branché sur le même dispatcher McpTools que le serveur MCP, BYOK) |
 | F2.5 | fait (transport : lecture/pause, scrub bar, timecode) |
+
+Toutes les phases (0, 1, 2) sont closes. Reste hors roadmap : validation
+visuelle réelle sur macOS (AppKit/Metal non compilables dans ce
+sandbox Linux) et le fossé `ProjectStorage.cc`/CommonCrypto qui bloque
+la compilation CMake complète hors macOS (préexistant, sans rapport
+avec ce chantier).
