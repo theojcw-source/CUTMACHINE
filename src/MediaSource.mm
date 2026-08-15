@@ -8,8 +8,6 @@ extern "C" {
 }
 
 #include <algorithm>
-#include <cassert>
-#include <cmath>
 #include <cstdio>
 
 namespace {
@@ -44,8 +42,10 @@ MediaSource::~MediaSource() {
     delete impl_;
 }
 
-bool MediaSource::Open(const std::string& path, int threadCount, int threadType) {
-    int result = avformat_open_input(&impl_->format, path.c_str(), nullptr, nullptr);
+bool MediaSource::Open(const std::string& path, int threadCount,
+                       int threadType) {
+    int result =
+        avformat_open_input(&impl_->format, path.c_str(), nullptr, nullptr);
     if (result < 0) {
         LogAvError("avformat_open_input", result);
         return false;
@@ -57,7 +57,8 @@ bool MediaSource::Open(const std::string& path, int threadCount, int threadType)
         return false;
     }
 
-    result = av_find_best_stream(impl_->format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    result = av_find_best_stream(impl_->format, AVMEDIA_TYPE_VIDEO, -1, -1,
+                                 nullptr, 0);
     if (result < 0) {
         LogAvError("av_find_best_stream(video)", result);
         return false;
@@ -65,7 +66,8 @@ bool MediaSource::Open(const std::string& path, int threadCount, int threadType)
     impl_->streamIndex = result;
     impl_->stream = impl_->format->streams[impl_->streamIndex];
 
-    const AVCodec* codec = avcodec_find_decoder(impl_->stream->codecpar->codec_id);
+    const AVCodec* codec =
+        avcodec_find_decoder(impl_->stream->codecpar->codec_id);
     if (!codec) {
         std::fprintf(stderr, "No FFmpeg decoder for codec id %d\n",
                      impl_->stream->codecpar->codec_id);
@@ -77,17 +79,18 @@ bool MediaSource::Open(const std::string& path, int threadCount, int threadType)
         std::fprintf(stderr, "avcodec_alloc_context3 failed\n");
         return false;
     }
-    result = avcodec_parameters_to_context(impl_->decoder, impl_->stream->codecpar);
+    result =
+        avcodec_parameters_to_context(impl_->decoder, impl_->stream->codecpar);
     if (result < 0) {
         LogAvError("avcodec_parameters_to_context", result);
         return false;
     }
 
-    // Required for software decoding performance. These must be set before open2.
+    // Required for software decoding performance. These must be set before
+    // open2.
     impl_->decoder->thread_count = threadCount;
-    impl_->decoder->thread_type = threadType < 0
-        ? FF_THREAD_SLICE | FF_THREAD_FRAME
-        : threadType;
+    impl_->decoder->thread_type =
+        threadType < 0 ? FF_THREAD_SLICE | FF_THREAD_FRAME : threadType;
 
     result = avcodec_open2(impl_->decoder, codec, nullptr);
     if (result < 0) {
@@ -106,7 +109,8 @@ bool MediaSource::Open(const std::string& path, int threadCount, int threadType)
         return false;
     }
 
-    impl_->frameRate = av_guess_frame_rate(impl_->format, impl_->stream, nullptr);
+    impl_->frameRate =
+        av_guess_frame_rate(impl_->format, impl_->stream, nullptr);
     if (impl_->frameRate.num <= 0 || impl_->frameRate.den <= 0) {
         std::fprintf(stderr, "Unable to determine video frame rate\n");
         return false;
@@ -115,28 +119,42 @@ bool MediaSource::Open(const std::string& path, int threadCount, int threadType)
     if (impl_->stream->nb_frames > 0) {
         impl_->frameCount = impl_->stream->nb_frames;
     } else {
-        double duration = 0.0;
+        int64_t duration = 0;
+        AVRational durationTimeBase = {0, 1};
         if (impl_->stream->duration != AV_NOPTS_VALUE) {
-            duration = impl_->stream->duration * av_q2d(impl_->stream->time_base);
+            duration = impl_->stream->duration;
+            durationTimeBase = impl_->stream->time_base;
         } else if (impl_->format->duration != AV_NOPTS_VALUE) {
-            duration = static_cast<double>(impl_->format->duration) / AV_TIME_BASE;
+            duration = impl_->format->duration;
+            durationTimeBase = AVRational{1, AV_TIME_BASE};
         }
-        impl_->frameCount = std::max<int64_t>(1, std::llround(duration * FrameRate()));
+        impl_->frameCount =
+            duration > 0 && durationTimeBase.num > 0
+                ? std::max<int64_t>(1,
+                                    av_rescale_q_rnd(duration, durationTimeBase,
+                                                     av_inv_q(impl_->frameRate),
+                                                     AV_ROUND_NEAR_INF))
+                : 1;
     }
 
-    std::fprintf(stderr, "Opened %dx%d, %.3f fps, %lld frames (software decode)\n",
-                 Width(), Height(), FrameRate(), static_cast<long long>(impl_->frameCount));
+    std::fprintf(stderr,
+                 "Opened %dx%d, %d/%d fps, %lld frames (software decode)\n",
+                 Width(), Height(), impl_->frameRate.num, impl_->frameRate.den,
+                 static_cast<long long>(impl_->frameCount));
     return true;
 }
 
-bool MediaSource::DecodeFrame(int64_t frameIndex, const AVFrame*& outFrame, int64_t& outPts) {
+bool MediaSource::DecodeFrame(int64_t frameIndex, const AVFrame*& outFrame,
+                              int64_t& outPts) {
     outFrame = nullptr;
     outPts = AV_NOPTS_VALUE;
-    if (!impl_->format || !impl_->decoder || !impl_->stream || !impl_->packet || !impl_->frame) {
+    if (!impl_->format || !impl_->decoder || !impl_->stream || !impl_->packet ||
+        !impl_->frame) {
         return false;
     }
 
-    frameIndex = std::clamp<int64_t>(frameIndex, 0, std::max<int64_t>(0, impl_->frameCount - 1));
+    frameIndex = std::clamp<int64_t>(
+        frameIndex, 0, std::max<int64_t>(0, impl_->frameCount - 1));
     int64_t targetPts = av_rescale_q(frameIndex, av_inv_q(impl_->frameRate),
                                      impl_->stream->time_base);
     if (impl_->stream->start_time != AV_NOPTS_VALUE) {
@@ -172,15 +190,18 @@ bool MediaSource::DecodeNextFrame(const AVFrame*& outFrame, int64_t& outPts) {
     while (true) {
         int result = avcodec_receive_frame(impl_->decoder, impl_->frame);
         if (result >= 0) {
-            if (impl_->frame->format != AV_PIX_FMT_YUV422P10LE) {
-                const char* actual = av_get_pix_fmt_name(
-                    static_cast<AVPixelFormat>(impl_->frame->format));
-                std::fprintf(stderr,
-                             "FATAL: expected yuv422p10le, decoder returned %s (%d)\n",
-                             actual ? actual : "unknown", impl_->frame->format);
-                assert(impl_->frame->format == AV_PIX_FMT_YUV422P10LE);
-                return false;
-            }
+            // Some containers signal colour only at stream level. Preserve it
+            // on every cached frame so the renderer never has to rediscover or
+            // guess metadata that FFmpeg already parsed.
+            const AVCodecParameters* parameters = impl_->stream->codecpar;
+            if (impl_->frame->color_range == AVCOL_RANGE_UNSPECIFIED)
+                impl_->frame->color_range = parameters->color_range;
+            if (impl_->frame->colorspace == AVCOL_SPC_UNSPECIFIED)
+                impl_->frame->colorspace = parameters->color_space;
+            if (impl_->frame->color_trc == AVCOL_TRC_UNSPECIFIED)
+                impl_->frame->color_trc = parameters->color_trc;
+            if (impl_->frame->color_primaries == AVCOL_PRI_UNSPECIFIED)
+                impl_->frame->color_primaries = parameters->color_primaries;
             outPts = impl_->frame->best_effort_timestamp;
             if (outPts == AV_NOPTS_VALUE) {
                 outPts = impl_->frame->pts;
@@ -226,10 +247,17 @@ bool MediaSource::DecodeNextFrame(const AVFrame*& outFrame, int64_t& outPts) {
     }
 }
 
-int MediaSource::Width() const { return impl_->decoder ? impl_->decoder->width : 0; }
-int MediaSource::Height() const { return impl_->decoder ? impl_->decoder->height : 0; }
+int MediaSource::Width() const {
+    return impl_->decoder ? impl_->decoder->width : 0;
+}
+int MediaSource::Height() const {
+    return impl_->decoder ? impl_->decoder->height : 0;
+}
 int64_t MediaSource::FrameCount() const { return impl_->frameCount; }
-double MediaSource::FrameRate() const { return av_q2d(impl_->frameRate); }
+int32_t MediaSource::FrameRateNumerator() const { return impl_->frameRate.num; }
+int32_t MediaSource::FrameRateDenominator() const {
+    return impl_->frameRate.den;
+}
 int64_t MediaSource::FrameIndexForPts(int64_t pts) const {
     if (!impl_->stream || pts == AV_NOPTS_VALUE) {
         return -1;
@@ -237,6 +265,7 @@ int64_t MediaSource::FrameIndexForPts(int64_t pts) const {
     if (impl_->stream->start_time != AV_NOPTS_VALUE) {
         pts -= impl_->stream->start_time;
     }
-    return av_rescale_q_rnd(pts, impl_->stream->time_base, av_inv_q(impl_->frameRate),
-                            static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+    return av_rescale_q_rnd(
+        pts, impl_->stream->time_base, av_inv_q(impl_->frameRate),
+        static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
 }

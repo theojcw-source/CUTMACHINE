@@ -6,7 +6,6 @@ extern "C" {
 
 #include <algorithm>
 #include <cstdlib>
-#include <cmath>
 
 namespace {
 
@@ -63,7 +62,8 @@ void FrameCache::EvictToBudget() {
     }
 }
 
-bool FrameCache::Put(SourceId sourceId, int64_t frameIndex, const AVFrame* frame) {
+bool FrameCache::Put(const SourceId& sourceId, int64_t frameIndex,
+                     const AVFrame* frame) {
     if (!frame) {
         return false;
     }
@@ -91,7 +91,7 @@ bool FrameCache::Put(SourceId sourceId, int64_t frameIndex, const AVFrame* frame
     return entries_.find(key) != entries_.end();
 }
 
-AVFrame* FrameCache::GetExact(SourceId sourceId, int64_t frameIndex) {
+AVFrame* FrameCache::GetExact(const SourceId& sourceId, int64_t frameIndex) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto entry = entries_.find(Key{sourceId, frameIndex});
     if (entry == entries_.end()) {
@@ -101,7 +101,7 @@ AVFrame* FrameCache::GetExact(SourceId sourceId, int64_t frameIndex) {
     return RetainFrame(entry->second.frame);
 }
 
-AVFrame* FrameCache::GetNearest(SourceId sourceId, int64_t frameIndex,
+AVFrame* FrameCache::GetNearest(const SourceId& sourceId, int64_t frameIndex,
                                 int64_t& outFrameIndex) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto next = entries_.lower_bound(Key{sourceId, frameIndex});
@@ -129,12 +129,12 @@ AVFrame* FrameCache::GetNearest(SourceId sourceId, int64_t frameIndex,
     return RetainFrame(best->second.frame);
 }
 
-bool FrameCache::Contains(SourceId sourceId, int64_t frameIndex) const {
+bool FrameCache::Contains(const SourceId& sourceId, int64_t frameIndex) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return entries_.find(Key{sourceId, frameIndex}) != entries_.end();
 }
 
-bool FrameCache::TouchFrame(SourceId sourceId, int64_t frameIndex) {
+bool FrameCache::TouchFrame(const SourceId& sourceId, int64_t frameIndex) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto entry = entries_.find(Key{sourceId, frameIndex});
     if (entry == entries_.end()) {
@@ -144,17 +144,33 @@ bool FrameCache::TouchFrame(SourceId sourceId, int64_t frameIndex) {
     return true;
 }
 
-void FrameCache::RegisterSource(SourceId sourceId) {
+void FrameCache::RegisterSource(const SourceId& sourceId) {
     std::lock_guard<std::mutex> lock(mutex_);
     activeSources_.insert(sourceId);
 }
 
-void FrameCache::UnregisterSource(SourceId sourceId) {
+void FrameCache::UnregisterSource(const SourceId& sourceId) {
     std::lock_guard<std::mutex> lock(mutex_);
     activeSources_.erase(sourceId);
 }
 
-FrameCache::PrefetchWindow FrameCache::WindowForSource(SourceId sourceId) const {
+void FrameCache::ClearSource(const SourceId& sourceId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto entry = entries_.begin(); entry != entries_.end();) {
+        if (entry->first.sourceId != sourceId) {
+            ++entry;
+            continue;
+        }
+        totalBytes_ -= entry->second.bytes;
+        lru_.erase(entry->second.lruPosition);
+        av_frame_free(&entry->second.frame);
+        entry = entries_.erase(entry);
+    }
+    sourceFrameBytes_.erase(sourceId);
+}
+
+FrameCache::PrefetchWindow FrameCache::WindowForSource(
+    const SourceId& sourceId) const {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto bytes = sourceFrameBytes_.find(sourceId);
     if (bytes == sourceFrameBytes_.end() || bytes->second == 0) {
@@ -162,14 +178,15 @@ FrameCache::PrefetchWindow FrameCache::WindowForSource(SourceId sourceId) const 
     }
 
     const size_t sourceCount = std::max<size_t>(1, activeSources_.size());
-    const double framesFunded = static_cast<double>(byteBudget_) / bytes->second;
+    const __int128 numerator = static_cast<__int128>(byteBudget_) * 70;
+    const __int128 denominator =
+        static_cast<__int128>(bytes->second) * 100 * sourceCount;
     const size_t total = std::max<size_t>(
-        1, static_cast<size_t>(std::ceil(framesFunded * 0.70 / sourceCount)));
+        1, static_cast<size_t>((numerator + denominator - 1) / denominator));
     if (total == 1) {
         return {};
     }
-    const size_t ahead = std::min<size_t>(
-        total - 1, static_cast<size_t>(std::lround(total * 0.75)));
+    const size_t ahead = std::min<size_t>(total - 1, (total * 3 + 2) / 4);
     return PrefetchWindow{ahead, total - 1 - ahead, total};
 }
 
