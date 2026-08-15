@@ -9,21 +9,19 @@
 
 namespace {
 
-CGFloat CGF(double value) {
-    return static_cast<CGFloat>(value);
-}
+CGFloat CGF(double value) { return static_cast<CGFloat>(value); }
 
 NSAttributedString* CMTabTitle(NSString* title, NSColor* color) {
     NSMutableParagraphStyle* style = [[NSMutableParagraphStyle alloc] init];
     style.alignment = NSTextAlignmentCenter;
     NSDictionary* attributes = @{
         NSForegroundColorAttributeName : color,
-        NSFontAttributeName : CMFont(ui::theme::kFontSizeSmall,
-                                     NSFontWeightMedium),
+        NSFontAttributeName :
+            CMFont(ui::theme::kFontSizeSmall, NSFontWeightMedium),
         NSParagraphStyleAttributeName : style,
     };
     return [[NSAttributedString alloc] initWithString:title ?: @""
-                                            attributes:attributes];
+                                           attributes:attributes];
 }
 
 }  // namespace
@@ -110,9 +108,9 @@ NSAttributedString* CMTabTitle(NSString* title, NSColor* color) {
     NSView* placeholder = [[NSView alloc] initWithFrame:NSZeroRect];
     NSTextField* label = [NSTextField
         labelWithString:[NSString stringWithFormat:@"%s — à venir",
-                                                    descriptor->title]];
+                                                   descriptor->title]];
     label.font = CMFont(ui::theme::kFontSizeSmall, NSFontWeightRegular);
-    label.textColor = CMColor(ui::theme::kTextTertiary);
+    label.textColor = CMThemeColor(ui::theme::kTextTertiary);
     label.alignment = NSTextAlignmentCenter;
     label.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     label.frame = placeholder.bounds;
@@ -122,9 +120,8 @@ NSAttributedString* CMTabTitle(NSString* title, NSColor* color) {
 
 - (void)cmLayoutHostForSize:(NSSize)size {
     const CGFloat tabStripHeight = CGF(ui::theme::kTabStripHeight);
-    _tabStrip.frame =
-        NSMakeRect(0.0, size.height - tabStripHeight, size.width,
-                   tabStripHeight);
+    _tabStrip.frame = NSMakeRect(0.0, size.height - tabStripHeight, size.width,
+                                 tabStripHeight);
     _contentContainer.frame =
         NSMakeRect(0.0, 0.0, size.width,
                    std::max<CGFloat>(0.0, size.height - tabStripHeight));
@@ -153,11 +150,11 @@ NSAttributedString* CMTabTitle(NSString* title, NSColor* color) {
         const BOOL active = descriptor->slot == _selectedSlot;
         button.wantsLayer = YES;
         button.layer.backgroundColor =
-            active ? CMColor(ui::theme::kSurfaceControlActive).CGColor
+            active ? CMThemeColor(ui::theme::kSurfaceControlActive).CGColor
                    : NSColor.clearColor.CGColor;
-        button.attributedTitle = CMTabTitle(
-            [NSString stringWithUTF8String:descriptor->title],
-            active ? CMAccentBlueColor() : CMTextSecondaryColor());
+        button.attributedTitle =
+            CMTabTitle([NSString stringWithUTF8String:descriptor->title],
+                       active ? CMAccentBlueColor() : CMTextSecondaryColor());
     }
 }
 
@@ -197,9 +194,8 @@ NSAttributedString* CMTabTitle(NSString* title, NSColor* color) {
     [self cmUpdateContentVisibility];
     [CMUiPreferences.sharedPreferences
         setLastActiveIdentifier:[NSString
-                                     stringWithUTF8String:descriptor
-                                                              ->identifier]
-                         forDock:_dock];
+                                    stringWithUTF8String:descriptor->identifier]
+                        forDock:_dock];
 }
 
 - (ui::PanelSlot)selectedSlot {

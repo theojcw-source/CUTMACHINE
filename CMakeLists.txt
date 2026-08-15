@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(CUTMACHINE LANGUAGES C CXX OBJCXX)
+project(CUTMACHINE LANGUAGES C CXX OBJC OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,6 +41,19 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(whispercpp)
+
+# Treat whisper.cpp's headers as system headers. Without this they are
+# ordinary includes, so every translation unit that pulls in whisper.h
+# inherits ggml's warnings -- and .clang-tidy's HeaderFilterRegex
+# ('.*/src/.*') matches build/_deps/whispercpp-src/ggml/src/... just as
+# happily as this project's own src/, burying real findings under hundreds
+# of lines about a dependency we do not maintain.
+get_target_property(WHISPER_INTERFACE_INCLUDES whisper
+                    INTERFACE_INCLUDE_DIRECTORIES)
+if(WHISPER_INTERFACE_INCLUDES)
+    set_target_properties(whisper PROPERTIES
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${WHISPER_INTERFACE_INCLUDES}")
+endif()
 
 set(SHADER_RUNTIME_PATH "${CMAKE_CURRENT_BINARY_DIR}/shader.metal")
 configure_file(src/shader.metal "${SHADER_RUNTIME_PATH}" COPYONLY)

@@ -13,9 +13,7 @@
 
 namespace {
 
-CGFloat CGF(double value) {
-    return static_cast<CGFloat>(value);
-}
+CGFloat CGF(double value) { return static_cast<CGFloat>(value); }
 
 // Section headers (CMMakeSectionHeader) get a slightly taller slot than a
 // CMControlRowView row so the caption-sized text has breathing room above
@@ -73,13 +71,13 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
 
 @interface CMInspectorView ()
 - (CMControlRowView*)cmAddPropertyRowWithLabel:(NSString*)labelText
-                                     valueField:(NSTextField* __strong*)
-                                                    outValueField;
-- (CMControlRowView*)
-    cmAddGradeRowForSpec:(const ui::inspector::GradeControlSpec&)spec
-                   index:(NSInteger)index
-                  slider:(NSSlider* __strong*)outSlider
-              valueLabel:(NSTextField* __strong*)outValueLabel;
+                                    valueField:
+                                        (NSTextField* __strong*)outValueField;
+- (CMControlRowView*)cmAddGradeRowForSpec:
+                         (const ui::inspector::GradeControlSpec&)spec
+                                    index:(NSInteger)index
+                                   slider:(NSSlider* __strong*)outSlider
+                               valueLabel:(NSTextField* __strong*)outValueLabel;
 - (void)cmLayoutForSize:(NSSize)size;
 - (void)cmGradeSliderChanged:(NSSlider*)sender;
 - (void)cmScheduleGradeCommitAtIndex:(NSInteger)index value:(float)value;
@@ -130,7 +128,7 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
             [NSTextField labelWithString:@"Aucun clip sélectionné"];
         _placeholderLabel.font =
             CMFont(ui::theme::kFontSizeSmall, NSFontWeightRegular);
-        _placeholderLabel.textColor = CMColor(ui::theme::kTextTertiary);
+        _placeholderLabel.textColor = CMThemeColor(ui::theme::kTextTertiary);
         _placeholderLabel.alignment = NSTextAlignmentCenter;
         _placeholderLabel.lineBreakMode = NSLineBreakByWordWrapping;
         [self addSubview:_placeholderLabel];
@@ -141,13 +139,13 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
         NSTextField* propertiesHeader = CMMakeSectionHeader(@"Propriétés");
         [_body addSubview:propertiesHeader];
         _nameRow = [self cmAddPropertyRowWithLabel:@"Nom"
-                                         valueField:&_nameValueField];
+                                        valueField:&_nameValueField];
         _trackRow = [self cmAddPropertyRowWithLabel:@"Piste"
-                                          valueField:&_trackValueField];
+                                         valueField:&_trackValueField];
         _startRow = [self cmAddPropertyRowWithLabel:@"Début"
-                                          valueField:&_startValueField];
+                                         valueField:&_startValueField];
         _durationRow = [self cmAddPropertyRowWithLabel:@"Durée"
-                                             valueField:&_durationValueField];
+                                            valueField:&_durationValueField];
 
         NSTextField* gradeHeader =
             CMMakeSectionHeader(@"Correction colorimétrique");
@@ -202,11 +200,10 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
 }
 
 - (CMControlRowView*)cmAddPropertyRowWithLabel:(NSString*)labelText
-                                     valueField:(NSTextField* __strong*)
-                                                    outValueField {
-    CMControlRowView* row =
-        [[CMControlRowView alloc] initWithFrame:NSZeroRect
-                                       labelText:labelText];
+                                    valueField:
+                                        (NSTextField* __strong*)outValueField {
+    CMControlRowView* row = [[CMControlRowView alloc] initWithFrame:NSZeroRect
+                                                          labelText:labelText];
     // Property rows show a free-form string (a filename, a timecode) wider
     // than the fixed 56pt valueLabel column comfortably fits, so they use
     // the wider controlContainer instead and leave valueLabel empty/hidden
@@ -232,9 +229,8 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
     CMControlRowView* row = [[CMControlRowView alloc]
         initWithFrame:NSZeroRect
             labelText:[NSString stringWithUTF8String:spec.label]];
-    NSSlider* slider =
-        CMMakeStyledSlider(spec.min_value, spec.max_value, self,
-                           @selector(cmGradeSliderChanged:));
+    NSSlider* slider = CMMakeStyledSlider(spec.min_value, spec.max_value, self,
+                                          @selector(cmGradeSliderChanged:));
     slider.tag = index;
     // Continuous: the action fires on every drag tick, not only on mouse
     // up. -cmGradeSliderChanged: uses that to keep the value label live
@@ -285,13 +281,14 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
 }
 
 - (void)reloadWithDocument:(const Document&)document
-             selectedClipId:(const Ulid&)clipId {
+            selectedClipId:(const Ulid&)clipId {
     // Any grading commit still debounced against the *previous* selection
     // must not land on whatever clip happens to be selected when its timer
     // fires.
     [self cmInvalidateAllGradeTimers];
 
-    const DocumentClip* clip = clipId.empty() ? nullptr : document.FindClip(clipId);
+    const DocumentClip* clip =
+        clipId.empty() ? nullptr : document.FindClip(clipId);
     if (!clip) {
         _clipId = Ulid{};
         _effects.clear();
@@ -308,13 +305,13 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
     const DocumentSource* source = document.FindSource(clip->source_id);
     _nameValueField.stringValue =
         source ? CMBasename(source->path)
-              : [NSString stringWithUTF8String:clip->id.c_str()];
+               : [NSString stringWithUTF8String:clip->id.c_str()];
 
     const DocumentTrack* track = document.FindTrackForClip(clip->id);
     if (track) {
         NSString* kind = track->kind == "audio" ? @"Audio" : @"Vidéo";
-        _trackValueField.stringValue = [NSString
-            stringWithFormat:@"%@ · piste %d", kind, track->index];
+        _trackValueField.stringValue =
+            [NSString stringWithFormat:@"%@ · piste %d", kind, track->index];
     } else {
         _trackValueField.stringValue = @"—";
     }
@@ -359,12 +356,12 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
     __weak CMInspectorView* weakSelf = self;
     NSTimer* timer = [NSTimer
         scheduledTimerWithTimeInterval:kGradeCommitDebounceSeconds
-                                repeats:NO
-                                  block:^(NSTimer* _Nonnull firedTimer) {
-                                    (void)firedTimer;
-                                    [weakSelf cmCommitGradeAtIndex:index
-                                                              value:value];
-                                  }];
+                               repeats:NO
+                                 block:^(NSTimer* _Nonnull firedTimer) {
+                                   (void)firedTimer;
+                                   [weakSelf cmCommitGradeAtIndex:index
+                                                            value:value];
+                                 }];
     _gradeDebounceTimers[static_cast<NSUInteger>(index)] = timer;
 }
 
@@ -387,7 +384,8 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
     SetClipEffectsOperation operation;
     operation.clip_id = _clipId;
     operation.effects = _effects;
-    [self.delegate inspectorView:self didCommitClipEffects:std::move(operation)];
+    [self.delegate inspectorView:self
+            didCommitClipEffects:std::move(operation)];
 }
 
 - (void)cmInvalidateAllGradeTimers {

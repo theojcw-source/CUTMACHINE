@@ -1,10 +1,9 @@
 #pragma once
 
-// AppKit-only. This sandbox has no Xcode/AppKit toolchain, so this file and
-// ChatPanelView.mm are unverified beyond a manual read -- see the F2.1
-// report (UiComponents.h) for exactly what that means, and this ticket's
-// own report for what *is* verified (ChatLlmClient.h/ChatSession.h/
-// McpLiveBackend.h, all plain C++).
+// AppKit-only. This file and ChatPanelView.mm compile against a real macOS
+// SDK but have not been exercised at runtime -- see VISUAL_QA_CHECKLIST.md.
+// The logic underneath them is covered by tests and does not depend on
+// AppKit (ChatLlmClient.h/ChatSession.h/McpLiveBackend.h, all plain C++).
 //
 // The chat panel (ROADMAP.md F2.4): a message transcript plus a text input
 // and send button, installed into PanelLayout.h's PanelSlot::Chat via

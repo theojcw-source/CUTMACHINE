@@ -3,6 +3,7 @@
 #include "whisper.h"
 
 #include <poll.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>

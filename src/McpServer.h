@@ -20,6 +20,12 @@
 //     that is what lets the calling agent see and react to the failure.
 //     JSON-RPC error responses are reserved for envelope-level problems:
 //     malformed JSON, an unknown method, or malformed `tools/call` params.
+//
+// Every `tools/call` that reaches this server is executed with the full
+// authority of the user's project -- there is no authentication, consent
+// prompt or audit gate in front of it. That is only tenable because
+// HttpServer.h binds loopback and nothing else. Read the warning at the top
+// of HttpServer.h before changing how this server is reached.
 
 #include "HttpServer.h"
 #include "McpBackend.h"

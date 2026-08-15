@@ -58,6 +58,11 @@ std::string Read(const std::filesystem::path& path) {
 
 Document Fixture() {
     Document document;
+    // Pinned, not left to default to a fresh GenerateUlid(): the assertions
+    // below compare two independently-built copies of this fixture
+    // byte-for-byte after the same edit, so every ID the serializer writes
+    // has to be fixed up front or the comparison can never hold.
+    document.sequence.id = "01K30000000000000000000005";
     document.sources = {
         {"01K30000000000000000000001", "folder/A.MP4", {25, 1}, {1000, 25}},
     };
@@ -294,10 +299,37 @@ int main() {
     Check(badResponse.find("\"isError\":true") != std::string::npos,
           "an unknown clip_id is reported as isError, not a JSON-RPC "
           "protocol error");
-    Check(badResponse.find("UnknownClip") != std::string::npos,
-          "the error names the exact EditError, matching --apply-op");
+    // An ID that resolves to nothing never reaches the engine: IdResolver
+    // rejects it first, so the reported error is ValidationFailed naming the
+    // offending argument, not the engine's UnknownClip. That is the more
+    // precise of the two -- it tells the agent *which* argument was wrong --
+    // so the resolver deliberately owns this case.
+    Check(badResponse.find("ValidationFailed") != std::string::npos &&
+              badResponse.find("trim_clip.clip_id") != std::string::npos,
+          "an unresolvable id is refused by the resolver, naming the "
+          "offending argument");
     Check(Read(mcpPath) == beforeError,
           "a refused tool call leaves the project file byte-identical");
+
+    // ...but an operation the resolver accepts and the *engine* refuses
+    // still reports the engine's own EditError name verbatim, which is what
+    // keeps MCP error reporting indistinguishable from `--apply-op`. The
+    // clip_id here is real, so resolution succeeds and the refusal comes
+    // from ApplyOperation: trimming far more off the tail than the clip has
+    // left would drive its duration to zero or below.
+    const std::string badTrimRequest =
+        R"({"jsonrpc":"2.0","id":6,"method":"tools/call",)"
+        R"("params":{"name":"trim_clip","arguments":)"
+        R"({"clip_id":"01K30000000000000000000003","edge":"Tail",)"
+        R"("delta":{"value":-500,"rate":25}}}})";
+    const std::string badTrimResponse =
+        HttpPostJson(server.Port(), "/mcp", badTrimRequest);
+    Check(badTrimResponse.find("InvalidDuration") != std::string::npos,
+          "an engine-level refusal names the exact EditError, matching "
+          "--apply-op");
+    Check(Read(mcpPath) == beforeError,
+          "an engine-refused tool call also leaves the project file "
+          "byte-identical");
 
     server.Stop();
     std::filesystem::remove_all(directory);

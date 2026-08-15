@@ -3,7 +3,7 @@
 // sockets, no real network -- so it builds and runs on a plain Linux host,
 // the same way tests/mcp_tools_tests.cc does for the MCP tool dispatcher.
 // The real HTTPS transport (NSURLSession-backed) lives in ChatPanelView.mm
-// and is AppKit-only, unverified beyond a manual read; everything this file
+// and is AppKit-only, not exercised at runtime yet; everything this file
 // exercises -- request assembly, response parsing, error handling -- is
 // exactly what that transport is a thin, swappable I/O shim around.
 

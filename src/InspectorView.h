@@ -1,9 +1,9 @@
 #pragma once
 
-// AppKit-only. This sandbox has no Xcode/AppKit toolchain, so this file
-// (and InspectorView.mm) is unverified beyond a manual read -- same
-// disclaimer as UiComponents.h/PanelHostView.h carry for F2.1. See the
-// F2.2 report for exactly what "unverified" covers here.
+// AppKit-only. This file (and InspectorView.mm) compiles against a real
+// macOS SDK but has not been exercised at runtime -- same caveat as
+// UiComponents.h/PanelHostView.h carry for F2.1. See
+// VISUAL_QA_CHECKLIST.md for what still needs walking through.
 //
 // F2.2 -- ROADMAP.md: the Inspector panel's content view, installed into
 // PanelSlot::Inspector via CMPanelHostView's -setContentView:forSlot: (see
@@ -59,6 +59,6 @@
 // current state for `clipId`. Pass an empty Ulid (or the id of a clip the
 // document no longer has) to show the "no selection" placeholder instead.
 - (void)reloadWithDocument:(const Document&)document
-             selectedClipId:(const Ulid&)clipId;
+            selectedClipId:(const Ulid&)clipId;
 
 @end

@@ -21,7 +21,7 @@
 // with g++ -- see that file's header comment). The one real transport --
 // NSURLSession-backed, since this project has no other outbound-HTTPS
 // dependency to reach for -- lives in ChatPanelView.mm and is AppKit-only,
-// unverified beyond a manual read like the rest of this project's AppKit
+// not exercised at runtime yet like the rest of this project's AppKit
 // surface.
 
 #include "Json.h"

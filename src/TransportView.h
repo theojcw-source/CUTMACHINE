@@ -1,8 +1,8 @@
 #pragma once
 
-// AppKit-only. This sandbox has no macOS/Xcode/AppKit/Metal toolchain, so
-// this file is unverified beyond a manual read -- see the F2.5 report for
-// exactly what that means (same caveat as PanelHostView.h/UiComponents.h).
+// AppKit-only. This compiles against a real macOS SDK, but nothing here has
+// been exercised at runtime yet -- see VISUAL_QA_CHECKLIST.md for what still
+// needs walking through (same caveat as PanelHostView.h/UiComponents.h).
 //
 // The playback transport for ROADMAP.md F2.5: play/pause, frame step,
 // scrub bar, current/total timecode. Installed into PanelLayout.h's

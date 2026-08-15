@@ -1,10 +1,10 @@
 #import "UiThemeAppKit.h"
 
-NSColor* CMColor(const ui::theme::Color& color) {
+NSColor* CMThemeColor(const ui::theme::Color& color) {
     return [NSColor colorWithSRGBRed:color.r
-                                green:color.g
-                                 blue:color.b
-                                alpha:color.a];
+                               green:color.g
+                                blue:color.b
+                               alpha:color.a];
 }
 
 NSFont* CMFont(double pointSize, NSFontWeight weight) {
@@ -12,29 +12,29 @@ NSFont* CMFont(double pointSize, NSFontWeight weight) {
 }
 
 NSColor* CMSurfacePanelColor(void) {
-    return CMColor(ui::theme::kSurfacePanel);
+    return CMThemeColor(ui::theme::kSurfacePanel);
 }
 
 NSColor* CMSurfaceRaisedColor(void) {
-    return CMColor(ui::theme::kSurfaceRaised);
+    return CMThemeColor(ui::theme::kSurfaceRaised);
 }
 
 NSColor* CMSurfaceControlColor(void) {
-    return CMColor(ui::theme::kSurfaceControl);
+    return CMThemeColor(ui::theme::kSurfaceControl);
 }
 
 NSColor* CMBorderSubtleColor(void) {
-    return CMColor(ui::theme::kBorderSubtle);
+    return CMThemeColor(ui::theme::kBorderSubtle);
 }
 
 NSColor* CMTextPrimaryColor(void) {
-    return CMColor(ui::theme::kTextPrimary);
+    return CMThemeColor(ui::theme::kTextPrimary);
 }
 
 NSColor* CMTextSecondaryColor(void) {
-    return CMColor(ui::theme::kTextSecondary);
+    return CMThemeColor(ui::theme::kTextSecondary);
 }
 
 NSColor* CMAccentBlueColor(void) {
-    return CMColor(ui::theme::kAccentBlue);
+    return CMThemeColor(ui::theme::kAccentBlue);
 }

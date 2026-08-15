@@ -4,14 +4,13 @@
 
 #include "Timecode.h"
 #include "TransportBar.h"
+#include "UiComponents.h"
 #include "UiTheme.h"
 #include "UiThemeAppKit.h"
 
 namespace {
 
-CGFloat CGF(double value) {
-    return static_cast<CGFloat>(value);
-}
+CGFloat CGF(double value) { return static_cast<CGFloat>(value); }
 
 }  // namespace
 
@@ -48,7 +47,7 @@ CGFloat CGF(double value) {
         _currentTimecodeLabel = [NSTextField labelWithString:@"00:00:00:00"];
         _currentTimecodeLabel.font = [NSFont
             monospacedDigitSystemFontOfSize:CGF(ui::theme::kFontSizeBody)
-                                      weight:NSFontWeightMedium];
+                                     weight:NSFontWeightMedium];
         _currentTimecodeLabel.textColor = CMTextPrimaryColor();
         _currentTimecodeLabel.alignment = NSTextAlignmentCenter;
         [self addSubview:_currentTimecodeLabel];
@@ -60,7 +59,7 @@ CGFloat CGF(double value) {
         _totalTimecodeLabel = [NSTextField labelWithString:@"00:00:00:00"];
         _totalTimecodeLabel.font = [NSFont
             monospacedDigitSystemFontOfSize:CGF(ui::theme::kFontSizeBody)
-                                      weight:NSFontWeightRegular];
+                                     weight:NSFontWeightRegular];
         _totalTimecodeLabel.textColor = CMTextSecondaryColor();
         _totalTimecodeLabel.alignment = NSTextAlignmentCenter;
         [self addSubview:_totalTimecodeLabel];
@@ -88,8 +87,7 @@ CGFloat CGF(double value) {
     _stepForwardButton.frame = NSMakeRect(x, rowY, stepButtonSize, rowHeight);
     x += stepButtonSize + gap * 2.0;
 
-    _currentTimecodeLabel.frame =
-        NSMakeRect(x, rowY, timecodeWidth, rowHeight);
+    _currentTimecodeLabel.frame = NSMakeRect(x, rowY, timecodeWidth, rowHeight);
     x += timecodeWidth + gap;
 
     const CGFloat totalX =
@@ -125,10 +123,10 @@ CGFloat CGF(double value) {
 - (void)setPosition:(RationalTime)position
            duration:(RationalTime)duration
                rate:(MediaRate)rate {
-    _currentTimecodeLabel.stringValue = [NSString
-        stringWithUTF8String:FormatTimecode(position, rate).c_str()];
-    _totalTimecodeLabel.stringValue = [NSString
-        stringWithUTF8String:FormatTimecode(duration, rate).c_str()];
+    _currentTimecodeLabel.stringValue =
+        [NSString stringWithUTF8String:FormatTimecode(position, rate).c_str()];
+    _totalTimecodeLabel.stringValue =
+        [NSString stringWithUTF8String:FormatTimecode(duration, rate).c_str()];
     const ScrubBarRange range{duration};
     _scrubSlider.doubleValue = range.TimeToFraction(position);
 }

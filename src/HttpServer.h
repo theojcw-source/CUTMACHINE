@@ -12,6 +12,25 @@
 //     JSON-RPC call at a time does not need any of that.
 //   - Plain POSIX sockets only (sys/socket.h, not AppKit/Metal/FFmpeg), so
 //     it builds and is testable on a plain Linux host as well as macOS.
+//
+// !! DO NOT EXPOSE THIS BEYOND LOOPBACK AS IT STANDS. !!
+//
+// Loopback-only binding is the *only* thing protecting the tool surface
+// today. Anything that widens reach -- binding a non-loopback address,
+// forwarding the port, tunnelling it, putting a proxy in front -- has to
+// land together with the following, none of which exists yet:
+//
+//   - Authentication. There is none. Every request that reaches the handler
+//     is fully trusted and can mutate the user's project.
+//   - Origin/Content-Type validation. There is none, so a web page the user
+//     merely visits can already drive real edits: a cross-origin POST with
+//     Content-Type: text/plain is a CORS "simple request", so it is sent
+//     without a preflight the server could refuse. The attacker cannot read
+//     the reply, but the mutation still happens. Worth fixing even while
+//     loopback-only.
+//   - Request limits. The accept loop is strictly serial with no socket
+//     timeouts, so one connection that opens and never sends wedges the
+//     server for everyone and makes Stop() block forever on its join().
 
 #include <atomic>
 #include <functional>

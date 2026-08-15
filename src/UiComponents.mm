@@ -7,9 +7,7 @@
 
 namespace {
 
-CGFloat CGF(double value) {
-    return static_cast<CGFloat>(value);
-}
+CGFloat CGF(double value) { return static_cast<CGFloat>(value); }
 
 }  // namespace
 
@@ -40,8 +38,8 @@ CGFloat CGF(double value) {
         [_headerView addSubview:headerBorder];
 
         _titleLabel = [NSTextField labelWithString:title ?: @""];
-        _titleLabel.font = CMFont(ui::theme::kFontSizeSection,
-                                  NSFontWeightSemibold);
+        _titleLabel.font =
+            CMFont(ui::theme::kFontSizeSection, NSFontWeightSemibold);
         _titleLabel.textColor = CMTextSecondaryColor();
         _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
         [_headerView addSubview:_titleLabel];
@@ -57,8 +55,8 @@ CGFloat CGF(double value) {
 - (void)layoutChromeForSize:(NSSize)size {
     const CGFloat headerHeight = CGF(ui::theme::kPanelHeaderHeight);
     const CGFloat inset = CGF(ui::theme::kSpaceM);
-    _headerView.frame = NSMakeRect(0.0, size.height - headerHeight,
-                                   size.width, headerHeight);
+    _headerView.frame =
+        NSMakeRect(0.0, size.height - headerHeight, size.width, headerHeight);
     for (NSView* subview in _headerView.subviews) {
         if ([subview.identifier isEqualToString:@"CMPanelChromeHeaderBorder"])
             subview.frame = NSMakeRect(0.0, 0.0, size.width, 1.0);
@@ -109,9 +107,9 @@ CGFloat CGF(double value) {
         [self addSubview:_label];
 
         _valueLabel = [NSTextField labelWithString:@""];
-        _valueLabel.font =
-            [NSFont monospacedDigitSystemFontOfSize:CGF(ui::theme::kFontSizeBody)
-                                              weight:NSFontWeightRegular];
+        _valueLabel.font = [NSFont
+            monospacedDigitSystemFontOfSize:CGF(ui::theme::kFontSizeBody)
+                                     weight:NSFontWeightRegular];
         _valueLabel.textColor = CMTextSecondaryColor();
         _valueLabel.alignment = NSTextAlignmentRight;
         [self addSubview:_valueLabel];
@@ -134,10 +132,9 @@ CGFloat CGF(double value) {
     _valueLabel.frame =
         NSMakeRect(inset + kLabelWidth, 0.0, kValueWidth, size.height);
     const CGFloat controlX = inset + kLabelWidth + kValueWidth + gap;
-    _controlContainer.frame =
-        NSMakeRect(controlX, 0.0,
-                   std::max<CGFloat>(0.0, size.width - controlX - inset),
-                   size.height);
+    _controlContainer.frame = NSMakeRect(
+        controlX, 0.0, std::max<CGFloat>(0.0, size.width - controlX - inset),
+        size.height);
 }
 
 - (void)setFrameSize:(NSSize)newSize {
@@ -163,14 +160,14 @@ NSTextField* CMMakeSectionHeader(NSString* title) {
     NSTextField* header =
         [NSTextField labelWithString:title.uppercaseString ?: @""];
     header.font = CMFont(ui::theme::kFontSizeCaption, NSFontWeightSemibold);
-    header.textColor = CMColor(ui::theme::kTextTertiary);
+    header.textColor = CMThemeColor(ui::theme::kTextTertiary);
     return header;
 }
 
 NSButton* CMMakeStyledButton(NSString* title, id target, SEL action) {
     NSButton* button = [NSButton buttonWithTitle:title
-                                           target:target
-                                           action:action];
+                                          target:target
+                                          action:action];
     button.bezelStyle = NSBezelStyleRounded;
     button.controlSize = NSControlSizeSmall;
     button.font = CMFont(ui::theme::kFontSizeSmall, NSFontWeightMedium);
@@ -211,10 +208,10 @@ NSSlider* CMMakeStyledSlider(double minValue, double maxValue, id target,
 
         _buttons = [NSMutableArray array];
         for (NSString* title in titles) {
-            NSButton* button = [NSButton buttonWithTitle:title ?: @""
-                                                   target:self
-                                                   action:@selector
-                                                   (cmButtonPressed:)];
+            NSButton* button =
+                [NSButton buttonWithTitle:title ?: @""
+                                   target:self
+                                   action:@selector(cmButtonPressed:)];
             button.bordered = NO;
             button.tag = static_cast<NSInteger>(_buttons.count);
             [self addSubview:button];
@@ -232,9 +229,8 @@ NSSlider* CMMakeStyledSlider(double minValue, double maxValue, id target,
         _buttons.count == 0 ? 0.0
                             : size.width / static_cast<CGFloat>(_buttons.count);
     for (NSUInteger index = 0; index < _buttons.count; ++index) {
-        _buttons[index].frame =
-            NSMakeRect(static_cast<CGFloat>(index) * tabWidth, 0.0, tabWidth,
-                      size.height);
+        _buttons[index].frame = NSMakeRect(
+            static_cast<CGFloat>(index) * tabWidth, 0.0, tabWidth, size.height);
     }
 }
 
@@ -249,18 +245,19 @@ NSSlider* CMMakeStyledSlider(double minValue, double maxValue, id target,
         const BOOL active = static_cast<NSInteger>(index) == _selectedIndex;
         button.wantsLayer = YES;
         button.layer.backgroundColor =
-            active ? CMColor(ui::theme::kSurfaceControlActive).CGColor
+            active ? CMThemeColor(ui::theme::kSurfaceControlActive).CGColor
                    : NSColor.clearColor.CGColor;
         NSMutableParagraphStyle* style = [[NSMutableParagraphStyle alloc] init];
         style.alignment = NSTextAlignmentCenter;
         button.attributedTitle = [[NSAttributedString alloc]
             initWithString:button.title
                 attributes:@{
-                  NSForegroundColorAttributeName :
-                      active ? CMAccentBlueColor() : CMTextSecondaryColor(),
-                  NSFontAttributeName : CMFont(ui::theme::kFontSizeSmall,
-                                              NSFontWeightMedium),
-                  NSParagraphStyleAttributeName : style,
+                    NSForegroundColorAttributeName : active
+                        ? CMAccentBlueColor()
+                        : CMTextSecondaryColor(),
+                    NSFontAttributeName :
+                        CMFont(ui::theme::kFontSizeSmall, NSFontWeightMedium),
+                    NSParagraphStyleAttributeName : style,
                 }];
     }
 }
