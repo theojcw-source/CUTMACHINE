@@ -18,6 +18,7 @@ set(SHADER_RUNTIME_PATH "${CMAKE_CURRENT_BINARY_DIR}/shader.metal")
 configure_file(src/shader.metal "${SHADER_RUNTIME_PATH}" COPYONLY)
 
 add_library(cutmachine_model
+    src/BeatDetection.cc
     src/Cli.cc
     src/ColorManagement.cc
     src/Document.cc
@@ -206,6 +207,20 @@ if(BUILD_TESTING)
     target_compile_definitions(cutmachine_thumbnail_tests PRIVATE
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
     add_test(NAME cutmachine_thumbnail_tests COMMAND cutmachine_thumbnail_tests)
+
+    add_executable(cutmachine_fft_tests tests/fft_tests.cc)
+    target_include_directories(cutmachine_fft_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME cutmachine_fft_tests COMMAND cutmachine_fft_tests)
+
+    add_executable(cutmachine_beat_detection_tests
+                   tests/beat_detection_tests.cc)
+    target_link_libraries(cutmachine_beat_detection_tests
+                          PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_beat_detection_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_beat_detection_tests
+             COMMAND cutmachine_beat_detection_tests)
 
     add_executable(cutmachine_relink_tests tests/relink_tests.cc)
     target_link_libraries(cutmachine_relink_tests PRIVATE cutmachine_model)
