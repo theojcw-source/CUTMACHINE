@@ -129,4 +129,5 @@ une fois F0 mergé.
 | F1.4 | fait (transcription whisper.cpp + coupe par mot) |
 | F1.5 | fait (multicam) |
 | F1.6 | fait (détection de beats, DSP spectral flux) |
-| F2.1–F2.5 | à faire, débloqué |
+| F2.1 | fait (design system minimal, AppKit non vérifiable hors macOS) |
+| F2.2–F2.5 | à faire, débloqué |

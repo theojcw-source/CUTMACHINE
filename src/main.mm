@@ -37,6 +37,7 @@ extern "C" {
 #include "McpProjectBackend.h"
 #include "McpServer.h"
 #include "MediaTaskManager.h"
+#include "PanelLayout.h"
 #include "PerformanceMetrics.h"
 #include "Project.h"
 #include "ProjectRecovery.h"
@@ -47,7 +48,17 @@ extern "C" {
 #include "Thumbnail.h"
 #include "Timeline.h"
 #include "TimelineView.h"
+#include "UiTheme.h"
 #include "Waveform.h"
+
+// F2.1 -- ROADMAP.md design system: reusable AppKit chrome and the fixed
+// right-hand panel host that F2.2 (Inspector) and F2.4 (Chat) will each
+// install their content into (see PanelHostView.h). Objective-C++
+// declarations, so #import rather than #include, matching AppKit/Foundation
+// above.
+#import "PanelHostView.h"
+#import "UiComponents.h"
+#import "UiThemeAppKit.h"
 
 namespace {
 
@@ -751,6 +762,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, strong) NSSplitView* workspaceSplitView;
 @property(nonatomic, strong) NSSplitView* editorSplitView;
 @property(nonatomic, strong) NSSplitView* monitorSplitView;
+// F2.1 design system: fixed right-hand dock hosting the Inspector (F2.2) and
+// Chat (F2.4) tabs. See PanelHostView.h -- the set of tabs and their order
+// are fixed at construction time, never user-rearrangeable.
+@property(nonatomic, strong) CMPanelHostView* rightDockPanel;
 @property(nonatomic, strong) NSPopUpButton* binPopup;
 @property(nonatomic, strong) NSPopUpButton* mediaPopup;
 @property(nonatomic, strong) NSTextField* binSummaryLabel;
@@ -2673,6 +2688,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
     NSView* content = [[NSView alloc] initWithFrame:windowRect];
     self.window.contentView = content;
     constexpr double mediaPanelWidth = 320.0;
+    // F2.1 design system: fixed-width right dock (Inspector/Chat tabs).
+    // Fixed, not user-resized-and-remembered, on purpose -- see
+    // PanelHostView.h.
+    constexpr double rightDockWidth = 300.0;
     const double workspaceHeight = windowRect.size.height - 42.0;
     self.workspaceSplitView = [[CutmachineSplitView alloc]
         initWithFrame:NSMakeRect(0.0, 42.0, windowRect.size.width,
@@ -2688,8 +2707,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
         initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth, workspaceHeight)];
     self.mediaPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.mediaPanel.wantsLayer = YES;
-    self.mediaPanel.layer.backgroundColor =
-        [NSColor colorWithWhite:0.075 alpha:1.0].CGColor;
+    // Same surface token as the new right dock (UiTheme.h kSurfacePanel) --
+    // both are side panels of the same visual kind.
+    self.mediaPanel.layer.backgroundColor = CMSurfacePanelColor().CGColor;
     [self.workspaceSplitView addArrangedSubview:self.mediaPanel];
 
     NSTextField* libraryTitle =
@@ -2959,7 +2979,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaTaskCancelButton.enabled = NO;
     [self.mediaPanel addSubview:self.mediaTaskCancelButton];
 
-    const double editorWidth = windowRect.size.width - mediaPanelWidth - 1.0;
+    const double editorWidth =
+        windowRect.size.width - mediaPanelWidth - rightDockWidth - 2.0;
     self.editorSplitView = [[CutmachineSplitView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, editorWidth, workspaceHeight)];
     self.editorSplitView.vertical = NO;
@@ -3027,9 +3048,26 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self.editorSplitView setPosition:workspaceHeight * 0.56
                      ofDividerAtIndex:0];
     [self.workspaceSplitView addArrangedSubview:self.editorSplitView];
+
+    // F2.1 design system: fixed right dock, tabs = FixedPanelLayout()'s
+    // PanelDock::Right slots (Inspector, Chat), in that fixed order. F2.2
+    // and F2.4 will each call -setContentView:forSlot: once at startup to
+    // replace their placeholder with real content; nothing else about this
+    // dock's shape changes at runtime.
+    self.rightDockPanel = [[CMPanelHostView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)
+                 dock:ui::PanelDock::Right];
+    self.rightDockPanel.autoresizingMask =
+        NSViewWidthSizable | NSViewHeightSizable;
+    [self.workspaceSplitView addArrangedSubview:self.rightDockPanel];
+
     [self.workspaceSplitView setHoldingPriority:NSLayoutPriorityDefaultHigh
                               forSubviewAtIndex:0];
+    [self.workspaceSplitView setHoldingPriority:NSLayoutPriorityDefaultHigh
+                              forSubviewAtIndex:2];
     [self.workspaceSplitView setPosition:mediaPanelWidth ofDividerAtIndex:0];
+    [self.workspaceSplitView setPosition:mediaPanelWidth + editorWidth
+                        ofDividerAtIndex:1];
 
     self.infoLabel = [NSTextField labelWithString:@"Aucun clip sélectionné"];
     self.infoLabel.frame =
@@ -3220,10 +3258,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         icon.image =
             SystemSymbol(toolSymbols[index], toolDescriptions[index], 11.0);
         icon.imageScaling = NSImageScaleProportionallyUpOrDown;
-        icon.contentTintColor = index == 0 ? [NSColor colorWithRed:0.24
-                                                             green:0.82
-                                                              blue:1.0
-                                                             alpha:1.0]
+        icon.contentTintColor = index == 0 ? CMAccentBlueColor()
                                            : NSColor.secondaryLabelColor;
         icon.autoresizingMask = NSViewMinYMargin;
         icon.toolTip = toolDescriptions[index];
@@ -4857,7 +4892,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     for (NSInteger index = 0; index < self.timelineToolIcons.count; ++index) {
         self.timelineToolIcons[index].contentTintColor =
             index == static_cast<NSInteger>(tool)
-                ? [NSColor colorWithRed:0.24 green:0.82 blue:1.0 alpha:1.0]
+                ? CMAccentBlueColor()
                 : NSColor.secondaryLabelColor;
     }
     self.state->interaction->CancelDrag();
@@ -7817,21 +7852,27 @@ DeleteGapOperation GapDeleteOperationForSelection(
                 0.28f, 0.42f, 0.12f);
         }
         if (rawIn >= self.state->viewport.header_width && rawIn <= width)
-            add(rawIn, top, 2.0, timelineHeight, 0.20f, 0.88f, 0.52f);
+            add(rawIn, top, 2.0, timelineHeight, ui::theme::kAccentGreen.r,
+                ui::theme::kAccentGreen.g, ui::theme::kAccentGreen.b);
         if (rawOut >= self.state->viewport.header_width && rawOut <= width)
-            add(rawOut - 2.0, top, 2.0, timelineHeight, 1.0f, 0.42f, 0.24f);
+            add(rawOut - 2.0, top, 2.0, timelineHeight,
+                ui::theme::kAccentOrange.r, ui::theme::kAccentOrange.g,
+                ui::theme::kAccentOrange.b);
     } else {
         if (self.state->timelineIn) {
             const double x =
                 self.state->viewport.TimeToX(*self.state->timelineIn);
             if (x >= self.state->viewport.header_width && x <= width)
-                add(x, top, 2.0, timelineHeight, 0.20f, 0.88f, 0.52f);
+                add(x, top, 2.0, timelineHeight, ui::theme::kAccentGreen.r,
+                    ui::theme::kAccentGreen.g, ui::theme::kAccentGreen.b);
         }
         if (self.state->timelineOut) {
             const double x =
                 self.state->viewport.TimeToX(*self.state->timelineOut);
             if (x >= self.state->viewport.header_width && x <= width)
-                add(x - 2.0, top, 2.0, timelineHeight, 1.0f, 0.42f, 0.24f);
+                add(x - 2.0, top, 2.0, timelineHeight,
+                    ui::theme::kAccentOrange.r, ui::theme::kAccentOrange.g,
+                    ui::theme::kAccentOrange.b);
         }
     }
     const auto tracks = TimelineTracksInDisplayOrder(self.state->document);
@@ -7852,9 +7893,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
             trackShade + 0.002f, trackShade + 0.004f);
         add(0.0, y, self.state->viewport.header_width,
             self.state->viewport.track_height, 0.090f, 0.093f, 0.097f);
-        add(0.0, y, 3.0, self.state->viewport.track_height,
-            video ? 0.12f : 0.13f, video ? 0.43f : 0.48f,
-            video ? 0.67f : 0.28f);
+        {
+            const ui::theme::Color kindTint = ui::theme::TrackTint(video);
+            add(0.0, y, 3.0, self.state->viewport.track_height, kindTint.r,
+                kindTint.g, kindTint.b);
+        }
         // Resolve-like patch/target cells and compact track controls.
         add(50.0, y + 7.0, 24.0, 20.0, 0.070f, 0.073f, 0.077f);
         add(50.0, y + 7.0, 2.0, 20.0, video ? 0.18f : 0.20f,
@@ -7957,11 +8000,15 @@ DeleteGapOperation GapDeleteOperationForSelection(
             if (right > left && y < top + timelineHeight) {
                 const double height = self.state->viewport.track_height;
                 add(left, y, right - left, height, 0.10f, 0.34f, 0.48f, 0.42f);
-                add(left, y, right - left, 2.0, 0.24f, 0.82f, 1.0f);
-                add(left, y + height - 2.0, right - left, 2.0, 0.24f, 0.82f,
-                    1.0f);
-                add(left, y, 2.0, height, 0.24f, 0.82f, 1.0f);
-                add(right - 2.0, y, 2.0, height, 0.24f, 0.82f, 1.0f);
+                add(left, y, right - left, 2.0, ui::theme::kAccentBlue.r,
+                    ui::theme::kAccentBlue.g, ui::theme::kAccentBlue.b);
+                add(left, y + height - 2.0, right - left, 2.0,
+                    ui::theme::kAccentBlue.r, ui::theme::kAccentBlue.g,
+                    ui::theme::kAccentBlue.b);
+                add(left, y, 2.0, height, ui::theme::kAccentBlue.r,
+                    ui::theme::kAccentBlue.g, ui::theme::kAccentBlue.b);
+                add(right - 2.0, y, 2.0, height, ui::theme::kAccentBlue.r,
+                    ui::theme::kAccentBlue.g, ui::theme::kAccentBlue.b);
                 for (double stripe = left + 8.0; stripe < right; stripe += 12.0)
                     add(stripe, y + 5.0, 1.0, std::max(0.0, height - 10.0),
                         0.20f, 0.58f, 0.72f, 0.55f);
@@ -7992,12 +8039,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
             0.015f, 0.018f, 0.022f, 0.65f);
         if (clip.moving) {
             add(left - 2.0, y - 2.0, right - left + 4.0, clip.height + 4.0,
-                0.86f, 0.16f, 0.12f, 0.82f);
+                ui::theme::kAccentRed.r, ui::theme::kAccentRed.g,
+                ui::theme::kAccentRed.b, 0.82f);
         }
         if (clip.selected) {
             add(left - 2.0, y - 2.0, right - left + 4.0, clip.height + 4.0,
-                clip.valid ? 0.95f : 1.0f, clip.valid ? 0.78f : 0.16f,
-                clip.valid ? 0.18f : 0.12f);
+                clip.valid ? ui::theme::kAccentAmber.r : 1.0f,
+                clip.valid ? ui::theme::kAccentAmber.g : 0.16f,
+                clip.valid ? ui::theme::kAccentAmber.b : 0.12f);
         }
         const auto color = ClipColor(clip.source_id, clip.audio);
         if (!clip.valid)
