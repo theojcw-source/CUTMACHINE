@@ -193,3 +193,94 @@ NSSlider* CMMakeStyledSlider(double minValue, double maxValue, id target,
     slider.controlSize = NSControlSizeSmall;
     return slider;
 }
+
+@interface CMTabStripView ()
+- (void)cmLayoutStripForSize:(NSSize)size;
+- (void)cmUpdateHighlighting;
+- (void)cmButtonPressed:(NSButton*)sender;
+@end
+
+@implementation CMTabStripView {
+    NSMutableArray<NSButton*>* _buttons;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame titles:(NSArray<NSString*>*)titles {
+    if ((self = [super initWithFrame:frame])) {
+        self.wantsLayer = YES;
+        self.layer.backgroundColor = CMSurfaceRaisedColor().CGColor;
+
+        _buttons = [NSMutableArray array];
+        for (NSString* title in titles) {
+            NSButton* button = [NSButton buttonWithTitle:title ?: @""
+                                                   target:self
+                                                   action:@selector
+                                                   (cmButtonPressed:)];
+            button.bordered = NO;
+            button.tag = static_cast<NSInteger>(_buttons.count);
+            [self addSubview:button];
+            [_buttons addObject:button];
+        }
+        _selectedIndex = 0;
+        [self cmLayoutStripForSize:frame.size];
+        [self cmUpdateHighlighting];
+    }
+    return self;
+}
+
+- (void)cmLayoutStripForSize:(NSSize)size {
+    const CGFloat tabWidth =
+        _buttons.count == 0 ? 0.0
+                            : size.width / static_cast<CGFloat>(_buttons.count);
+    for (NSUInteger index = 0; index < _buttons.count; ++index) {
+        _buttons[index].frame =
+            NSMakeRect(static_cast<CGFloat>(index) * tabWidth, 0.0, tabWidth,
+                      size.height);
+    }
+}
+
+- (void)setFrameSize:(NSSize)newSize {
+    [super setFrameSize:newSize];
+    [self cmLayoutStripForSize:newSize];
+}
+
+- (void)cmUpdateHighlighting {
+    for (NSUInteger index = 0; index < _buttons.count; ++index) {
+        NSButton* button = _buttons[index];
+        const BOOL active = static_cast<NSInteger>(index) == _selectedIndex;
+        button.wantsLayer = YES;
+        button.layer.backgroundColor =
+            active ? CMColor(ui::theme::kSurfaceControlActive).CGColor
+                   : NSColor.clearColor.CGColor;
+        NSMutableParagraphStyle* style = [[NSMutableParagraphStyle alloc] init];
+        style.alignment = NSTextAlignmentCenter;
+        button.attributedTitle = [[NSAttributedString alloc]
+            initWithString:button.title
+                attributes:@{
+                  NSForegroundColorAttributeName :
+                      active ? CMAccentBlueColor() : CMTextSecondaryColor(),
+                  NSFontAttributeName : CMFont(ui::theme::kFontSizeSmall,
+                                              NSFontWeightMedium),
+                  NSParagraphStyleAttributeName : style,
+                }];
+    }
+}
+
+- (void)cmButtonPressed:(NSButton*)sender {
+    [self selectIndex:sender.tag];
+}
+
+- (void)selectIndex:(NSInteger)index {
+    if (index < 0 || index >= static_cast<NSInteger>(_buttons.count)) return;
+    if (index == _selectedIndex) return;
+    _selectedIndex = index;
+    [self cmUpdateHighlighting];
+    if (self.target && self.action &&
+        [self.target respondsToSelector:self.action]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [self.target performSelector:self.action withObject:self];
+#pragma clang diagnostic pop
+    }
+}
+
+@end

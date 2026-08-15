@@ -330,6 +330,18 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME cutmachine_timecode_tests COMMAND cutmachine_timecode_tests)
 
+    # F2.3 -- Media panel view-model (ROADMAP.md). MediaPanelModel.h depends
+    # on Document.h/Operations.h (GenerateUlid needs Ulid.cc), so unlike
+    # UiTheme.h/PanelLayout.h above it links cutmachine_model, but it is
+    # still plain C++ with no AppKit dependency and runs on a plain Linux
+    # host the same way cutmachine_project_bin_tests does.
+    add_executable(cutmachine_media_panel_model_tests
+                   tests/media_panel_model_tests.cc)
+    target_link_libraries(cutmachine_media_panel_model_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_media_panel_model_tests
+             COMMAND cutmachine_media_panel_model_tests)
+
     add_executable(cutmachine_beat_detection_tests
                    tests/beat_detection_tests.cc)
     target_link_libraries(cutmachine_beat_detection_tests
