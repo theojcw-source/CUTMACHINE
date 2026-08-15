@@ -2,11 +2,12 @@
 
 // Prefix-based short-ID resolution for the MCP surface (ROADMAP.md F1.2).
 //
-// Conceptually the same idea Palmier Pro's MCP surface uses -- an agent
-// sees and sends short unique prefixes of ULIDs instead of full 26-
-// character IDs, and an ambiguous prefix is an explicit error rather than a
-// silent guess -- but written from that description, not from their (GPLv3)
-// source. See ROADMAP.md guard-rail 7.
+// Conceptually the same idea a comparable agent-native editor's MCP surface
+// uses -- an agent sees and sends short unique prefixes of ULIDs instead of
+// full 26-character IDs, and an ambiguous prefix is an explicit error
+// rather than a silent guess -- but written from that description, not
+// from any specific implementation's (GPLv3) source. See ROADMAP.md
+// guard-rail 7.
 //
 // The resolver itself is deliberately kind-agnostic: it just answers
 // "which full ID in this document does this string identify". A prefix

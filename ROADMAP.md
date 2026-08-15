@@ -1,9 +1,9 @@
-# Roadmap : combler l'écart avec Palmier Pro
+# Roadmap : combler l'écart avec un éditeur concurrent agent-natif
 
 Ce document découpe en tickets exécutables le travail identifié en comparant
-CUTMACHINE à [Palmier Pro](https://github.com/palmier-io/palmier-pro)
-(GPLv3, macOS 26 Tahoe/Apple Silicon uniquement, éditeur Swift-natif avec
-serveur MCP intégré et génération IA payante). Le constat de départ : le
+CUTMACHINE à un éditeur concurrent agent-natif récemment sorti (GPLv3, macOS
+26 Tahoe/Apple Silicon uniquement, éditeur Swift-natif avec serveur MCP
+intégré et génération IA payante). Le constat de départ : le
 moteur pur de CUTMACHINE (`Operations.h`) est déjà proche en richesse de leur
 surface d'édition ; l'écart réel est dans la surface exposée à l'agent, le
 grading créatif, quelques sous-systèmes de perception (transcription, beats),
@@ -39,7 +39,7 @@ avant de coder, et respecter :
 6. **Pas de service central (non-but conservé).** Toute intégration de
    modèle distant (LLM, génération, transcription cloud) utilise la clé de
    l'utilisateur. Aucun compte, aucun crédit, aucune facturation CUTMACHINE.
-7. **Référence à Palmier Pro : conceptuelle uniquement.** Leur code (GPLv3)
+7. **Référence au concurrent étudié : conceptuelle uniquement.** Leur code (GPLv3)
    sert à comprendre un problème ou une architecture, jamais à être copié,
    transposé ligne à ligne, ou traduit mécaniquement de Swift vers C++.
    Écrire l'implémentation à partir de la compréhension du besoin, pas en

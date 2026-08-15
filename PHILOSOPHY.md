@@ -16,8 +16,8 @@ surfaces interchangeables — reste le cœur du projet et ne se négocie pas.
 
 Mais un moteur sans surface crédible ne se fait pas adopter, même s'il a
 raison sur le fond. Depuis que l'espace existe des éditeurs pensés pour être
-pilotés par un agent — Palmier Pro en est un exemple concret, pas open source
-sur sa partie génération, verrouillé à une seule plateforme, mais avec une
+pilotés par un agent — un concurrent récent en est un exemple concret, pas
+open source sur sa partie génération, verrouillé à une seule plateforme, mais avec une
 interface et une surface d'opérations que CUTMACHINE n'a pas encore — la
 parité fonctionnelle et une interface soignée ne sont plus écartées par
 principe. Elles servent l'adoption du moteur, exactement comme un temps exact
