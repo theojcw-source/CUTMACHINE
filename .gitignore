@@ -3,6 +3,10 @@
 .firecrawl/
 .env
 
+# Claude Code agent worktree scratch space (per-agent repo checkouts,
+# not project history)
+.claude/
+
 # CMake build trees
 build/
 cmake-build-*/
