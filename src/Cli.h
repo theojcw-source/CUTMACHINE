@@ -15,6 +15,12 @@ class Project;
 // Headless command entry points. These functions depend only on the model
 // library and never initialize AppKit, Metal, media decoding, or rendering.
 int DescribeCommand(const std::string& documentPath, std::string& output);
+
+// The same JSON view DescribeCommand produces (sequence/tracks/library/bins/
+// markers, with the A1/A2.../K1... aliases the MCP tool catalog's ID
+// resolver and the chat panel both key off), computed directly from an
+// in-memory Document instead of a project file path. See McpLiveBackend.h.
+std::string DescribeDocument(const Document& document);
 int ApplyOperationCommand(const std::string& documentPath,
                           const std::string& operationJson,
                           std::string& output);
