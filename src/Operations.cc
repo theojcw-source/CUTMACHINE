@@ -2025,26 +2025,115 @@ bool ApplySetClipCaption(Document& candidate, SetClipCaptionOperation& operation
     return true;
 }
 
-// Schema and serialization for multicam groups (ROADMAP.md F0.3) are
-// complete and tested. Real apply logic — creating a group, changing the
-// active angle — belongs to ticket F1.5 ("Multicam"), which also owns the
-// UI/agent gestures that drive it; wiring it here would preempt that ticket.
-bool ApplyAddMulticamGroup(AddMulticamGroupOperation&, Operation&,
-                           EditError& error, std::string& message) {
-    Fail(EditError::InvalidOperation,
-         "AddMulticamGroup is not implemented yet; see ROADMAP.md ticket "
-         "F1.5",
-         error, message);
-    return false;
+// F1.5 ("Multicam"). Registers a new multicam group and its angles. Angle
+// clip existence, video-track membership, no-clip-reused-within-group and
+// active_angle_id membership are all schema-level invariants already
+// enforced by Document::Validate (see MulticamGroup validation), so this
+// only owns the operation's own precondition: a fresh, collision-free group
+// id and a well-formed insertion_index, mirroring
+// ApplyAddTransition/ApplyAddCaptionStyle.
+bool ApplyAddMulticamGroup(Document& candidate,
+                           AddMulticamGroupOperation& operation,
+                           Operation& inverse, EditError& error,
+                           std::string& message) {
+    if (operation.group.id.empty()) operation.group.id = GenerateUlid();
+    const Ulid& id = operation.group.id;
+    const bool collision =
+        id == candidate.sequence.id || candidate.FindMulticamGroup(id) ||
+        candidate.FindCaptionStyle(id) || candidate.FindMarker(id) ||
+        candidate.FindTransition(id) || candidate.FindBin(id) ||
+        candidate.FindLibraryMedia(id) || candidate.FindSource(id) ||
+        candidate.FindTrack(id) || candidate.FindClip(id);
+    if (!IsValidUlid(id) || collision) {
+        Fail(EditError::DuplicateId,
+             "multicam group id is invalid or already exists: '" + id + "'",
+             error, message);
+        return false;
+    }
+    for (MulticamAngle& angle : operation.group.angles) {
+        if (angle.id.empty()) angle.id = GenerateUlid();
+    }
+    if (operation.insertion_index < -1 ||
+        (operation.insertion_index >= 0 &&
+         static_cast<uint64_t>(operation.insertion_index) >
+             candidate.sequence.multicam_groups.size())) {
+        Fail(EditError::InvalidOperation,
+             "multicam group insertion_index is outside the group list",
+             error, message);
+        return false;
+    }
+    if (operation.insertion_index < 0)
+        operation.insertion_index =
+            static_cast<int64_t>(candidate.sequence.multicam_groups.size());
+    candidate.sequence.multicam_groups.insert(
+        candidate.sequence.multicam_groups.begin() + operation.insertion_index,
+        operation.group);
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = RemoveMulticamGroupOperation{id};
+    return true;
 }
 
-bool ApplySetMulticamActiveAngle(SetMulticamActiveAngleOperation&, Operation&,
-                                 EditError& error, std::string& message) {
-    Fail(EditError::InvalidOperation,
-         "SetMulticamActiveAngle is not implemented yet; see ROADMAP.md "
-         "ticket F1.5",
-         error, message);
-    return false;
+// Exact inverse of ApplyAddMulticamGroup. No other schema field references a
+// multicam group by id, so unlike caption styles there is no "still in use"
+// precondition to check here.
+bool ApplyRemoveMulticamGroup(Document& candidate,
+                              RemoveMulticamGroupOperation& operation,
+                              Operation& inverse, EditError& error,
+                              std::string& message) {
+    auto& groups = candidate.sequence.multicam_groups;
+    const auto found =
+        std::find_if(groups.begin(), groups.end(), [&](const auto& group) {
+            return group.id == operation.group_id;
+        });
+    if (found == groups.end()) {
+        Fail(EditError::UnknownMulticamGroup,
+             "unknown multicam group_id '" + operation.group_id + "'", error,
+             message);
+        return false;
+    }
+    const int64_t index =
+        static_cast<int64_t>(std::distance(groups.begin(), found));
+    const MulticamGroup removed = *found;
+    groups.erase(found);
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = AddMulticamGroupOperation{removed, index};
+    return true;
+}
+
+// Changes the active angle of an existing group. The group itself must
+// exist (EditError::UnknownMulticamGroup); a non-empty active_angle_id must
+// name one of that group's own angles (EditError::UnknownMulticamAngle) —
+// Document::Validate would also catch a dangling active_angle_id, but only
+// as a generic ValidationFailed, so this checks it directly for an exact
+// error the way UpdateMarker/SetClipLink check their own references.
+bool ApplySetMulticamActiveAngle(Document& candidate,
+                                 SetMulticamActiveAngleOperation& operation,
+                                 Operation& inverse, EditError& error,
+                                 std::string& message) {
+    MulticamGroup* group = candidate.FindMulticamGroup(operation.group_id);
+    if (!group) {
+        Fail(EditError::UnknownMulticamGroup,
+             "unknown multicam group_id '" + operation.group_id + "'", error,
+             message);
+        return false;
+    }
+    if (!operation.active_angle_id.empty() &&
+        std::none_of(group->angles.begin(), group->angles.end(),
+                     [&](const MulticamAngle& angle) {
+                         return angle.id == operation.active_angle_id;
+                     })) {
+        Fail(EditError::UnknownMulticamAngle,
+             "active_angle_id '" + operation.active_angle_id +
+                 "' is not an angle of multicam group '" +
+                 operation.group_id + "'",
+             error, message);
+        return false;
+    }
+    const Ulid before = group->active_angle_id;
+    group->active_angle_id = operation.active_angle_id;
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = SetMulticamActiveAngleOperation{group->id, before};
+    return true;
 }
 
 bool ApplyAddTransition(Document& candidate, AddTransitionOperation& operation,
@@ -2780,6 +2869,8 @@ const char* EditErrorName(EditError error) {
             return "UnknownCaptionStyle";
         case EditError::UnknownMulticamGroup:
             return "UnknownMulticamGroup";
+        case EditError::UnknownMulticamAngle:
+            return "UnknownMulticamAngle";
         case EditError::UnknownSequence:
             return "UnknownSequence";
         case EditError::UnknownMedia:
@@ -2980,14 +3071,19 @@ bool ApplyOperation(Document& document, Operation& operation,
                                           generatedInverse, error, message);
         } else if (auto* addMulticam =
                        std::get_if<AddMulticamGroupOperation>(&normalized)) {
-            applied = ApplyAddMulticamGroup(*addMulticam, generatedInverse,
-                                            error, message);
+            applied = ApplyAddMulticamGroup(candidate, *addMulticam,
+                                            generatedInverse, error, message);
+        } else if (auto* removeMulticam =
+                       std::get_if<RemoveMulticamGroupOperation>(
+                           &normalized)) {
+            applied = ApplyRemoveMulticamGroup(candidate, *removeMulticam,
+                                               generatedInverse, error,
+                                               message);
         } else if (auto* setActiveAngle =
                        std::get_if<SetMulticamActiveAngleOperation>(
                            &normalized)) {
-            applied = ApplySetMulticamActiveAngle(*setActiveAngle,
-                                                  generatedInverse, error,
-                                                  message);
+            applied = ApplySetMulticamActiveAngle(
+                candidate, *setActiveAngle, generatedInverse, error, message);
         }
         if (!applied) return false;
     } catch (const std::exception& exception) {
@@ -3459,6 +3555,11 @@ std::string SerializeOperation(const Operation& operation) {
         WriteString(output, value.active_angle_id);
         output << "},\"insertion_index\":" << addMulticam->insertion_index
                << '}';
+    } else if (const auto* removeMulticam =
+                   std::get_if<RemoveMulticamGroupOperation>(&operation)) {
+        output << "{\"type\":\"RemoveMulticamGroup\",\"group_id\":";
+        WriteString(output, removeMulticam->group_id);
+        output << '}';
     } else if (const auto* setActiveAngle =
                    std::get_if<SetMulticamActiveAngleOperation>(&operation)) {
         output << "{\"type\":\"SetMulticamActiveAngle\",\"group_id\":";
@@ -4198,6 +4299,12 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             value.group.active_angle_id = reader.String();
             reader.Expect("},\"insertion_index\":");
             value.insertion_index = reader.Integer();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "RemoveMulticamGroup") {
+            RemoveMulticamGroupOperation value;
+            reader.Expect(",\"group_id\":");
+            value.group_id = reader.String();
             reader.Expect("}");
             operation = std::move(value);
         } else if (type == "SetMulticamActiveAngle") {

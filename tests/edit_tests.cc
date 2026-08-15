@@ -1356,13 +1356,14 @@ int main() {
         });
 
     Test(
-        "multicam group operations are schema-complete but rejected "
-        "pending F1.5",
+        "multicam group operations are addressable, serializable and "
+        "byte-exactly reversible",
         [] {
             Document document = EditDocument();
             const Ulid clipA = document.sequence.tracks[0].clips[0].id;
             const Ulid clipB = document.sequence.tracks[0].clips[1].id;
             const std::string original = document.SaveToString();
+            EditLog log;
             EditError error = EditError::None;
             std::string message;
 
@@ -1372,31 +1373,113 @@ int main() {
                  {{{}, "Wide", clipA}, {{}, "Close", clipB}},
                  {}},
                 -1};
-            const std::string addGroupJson = SerializeOperation(addGroup);
+            Check(Apply(log, document, addGroup, "add multicam group"),
+                  "multicam group addition succeeds");
+            const auto& storedAdd = std::get<AddMulticamGroupOperation>(
+                log.AppliedEntries().back().op);
+            const Ulid groupId = storedAdd.group.id;
+            const Ulid wideAngleId = storedAdd.group.angles[0].id;
+            const Ulid closeAngleId = storedAdd.group.angles[1].id;
+            Check(IsValidUlid(groupId) && document.FindMulticamGroup(groupId),
+                  "AddMulticamGroup receives and retains a stable ULID");
+            Check(IsValidUlid(wideAngleId) && IsValidUlid(closeAngleId) &&
+                      wideAngleId != closeAngleId,
+                  "AddMulticamGroup assigns stable ULIDs to each angle");
+            Check(storedAdd.insertion_index == 0,
+                  "AddMulticamGroup records its exact canonical position");
+            Check(document.FindMulticamGroup(groupId)->angles.size() == 2 &&
+                      document.FindMulticamGroup(groupId)
+                              ->active_angle_id.empty(),
+                  "AddMulticamGroup starts with no active angle selected");
+            const std::string withGroup = document.SaveToString();
+            const std::string addJson = SerializeOperation(storedAdd);
             Operation parsed = RemoveClipOperation{};
-            Check(
-                DeserializeOperation(addGroupJson, parsed, error, message) &&
-                    SerializeOperation(parsed) == addGroupJson,
-                "AddMulticamGroup JSON round-trips canonically even though "
-                "apply is stubbed");
-            ExpectRejected(document, addGroup, EditError::InvalidOperation,
-                           "AddMulticamGroup is rejected pending "
-                           "ROADMAP.md F1.5");
+            Check(DeserializeOperation(addJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == addJson,
+                  "AddMulticamGroup JSON round-trips canonically");
 
-            SetMulticamActiveAngleOperation setActive{
-                "01K88000000000000000000001",
-                "01K88000000000000000000002"};
-            const std::string setActiveJson = SerializeOperation(setActive);
-            Check(
-                DeserializeOperation(setActiveJson, parsed, error, message) &&
-                    SerializeOperation(parsed) == setActiveJson,
-                "SetMulticamActiveAngle JSON round-trips canonically even "
-                "though apply is stubbed");
-            ExpectRejected(document, setActive, EditError::InvalidOperation,
-                           "SetMulticamActiveAngle is rejected pending "
-                           "ROADMAP.md F1.5");
-            Check(document.SaveToString() == original,
-                  "no multicam operation left any trace on the document");
+            SetMulticamActiveAngleOperation setActive{groupId, wideAngleId};
+            Check(Apply(log, document, setActive, "set active angle"),
+                  "active angle change succeeds");
+            const std::string withActive = document.SaveToString();
+            const std::string setJson =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Check(DeserializeOperation(setJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == setJson,
+                  "SetMulticamActiveAngle JSON round-trips canonically");
+            Check(document.FindMulticamGroup(groupId)->active_angle_id ==
+                      wideAngleId,
+                  "SetMulticamActiveAngle keeps the exact selected angle");
+
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == withGroup,
+                  "SetMulticamActiveAngle undo restores the pre-selection "
+                  "bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withActive,
+                  "SetMulticamActiveAngle redo restores the selection bytes");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == withGroup,
+                  "second SetMulticamActiveAngle undo is byte-exact");
+
+            ExpectRejected(
+                document,
+                SetMulticamActiveAngleOperation{
+                    "01K88000000000000000000001", wideAngleId},
+                EditError::UnknownMulticamGroup,
+                "unknown multicam group_id for SetMulticamActiveAngle");
+            ExpectRejected(
+                document,
+                SetMulticamActiveAngleOperation{
+                    groupId, "01K88000000000000000000002"},
+                EditError::UnknownMulticamAngle,
+                "active_angle_id outside the group's own angles");
+            ExpectRejected(
+                document,
+                AddMulticamGroupOperation{
+                    {groupId, "Duplicate", {{{}, "Wide", clipA}}, {}}, -1},
+                EditError::DuplicateId,
+                "AddMulticamGroup rejects a group_id already in use");
+            ExpectRejected(
+                document,
+                AddMulticamGroupOperation{
+                    {{},
+                     "Bad angle",
+                     {{{}, "Wide", "01K20000000000000000000099"}},
+                     {}},
+                    -1},
+                EditError::ValidationFailed,
+                "AddMulticamGroup angle clip_id must resolve to a video "
+                "clip");
+            ExpectRejected(
+                document,
+                AddMulticamGroupOperation{
+                    {{},
+                     "Same clip twice",
+                     {{{}, "Wide", clipA}, {{}, "Close", clipA}},
+                     {}},
+                    -1},
+                EditError::ValidationFailed,
+                "AddMulticamGroup rejects a clip reused within one group");
+            ExpectRejected(
+                document,
+                RemoveMulticamGroupOperation{"01K88000000000000000000099"},
+                EditError::UnknownMulticamGroup,
+                "unknown multicam group_id for RemoveMulticamGroup");
+
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "AddMulticamGroup undo restores original bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withGroup,
+                  "AddMulticamGroup redo restores the group bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withActive,
+                  "AddMulticamGroup redo chain restores the selection bytes");
+            Check(log.Undo(document, error, message) &&
+                      log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "full multicam undo chain is byte-exact");
         });
 
     if (failures) {
