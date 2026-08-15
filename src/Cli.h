@@ -25,6 +25,15 @@ int UndoProjectOperationCommand(const std::string& projectPath,
                                 std::string& output);
 int RedoProjectOperationCommand(const std::string& projectPath,
                                 std::string& output);
+
+// Timeline-level undo/redo counterparts to ApplyOperationCommand. Operate on
+// the active timeline's own EditLog, the same log --apply-op appends to, so
+// an MCP undo/redo tool call is indistinguishable on disk from a human
+// triggering undo/redo in the app. There is no CLI flag for these yet; they
+// exist so the MCP server (Operations.h ticket F1.1) can reuse this exact
+// path instead of duplicating EditLog::Undo/Redo call sites.
+int UndoOperationCommand(const std::string& documentPath, std::string& output);
+int RedoOperationCommand(const std::string& documentPath, std::string& output);
 int ExportCommand(const std::string& documentPath,
                   const ExportSettings& settings,
                   const ExportProgressCallback& progress,

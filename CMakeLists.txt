@@ -13,6 +13,9 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavutil
     libswresample
 )
+# The MCP server (HttpServer.cc/McpServer.cc) uses std::thread for its
+# accept loop.
+find_package(Threads REQUIRED)
 
 # F1.4 -- local transcription. Fetched, not vendored, following this
 # project's general preference for build-time dependencies over committed
@@ -48,11 +51,17 @@ add_library(cutmachine_model
     src/ColorEffects.cc
     src/ColorManagement.cc
     src/Document.cc
+    src/HttpServer.cc
+    src/IdResolver.cc
     src/Ingest.cc
+    src/Json.cc
     src/MediaTaskManager.cc
     src/EditLog.cc
     src/Export.cc
     src/Keyframes.cc
+    src/McpProjectBackend.cc
+    src/McpServer.cc
+    src/McpTools.cc
     src/Operations.cc
     src/Project.cc
     src/ProjectBin.cc
@@ -68,7 +77,7 @@ add_library(cutmachine_model
     src/Waveform.cc
 )
 target_include_directories(cutmachine_model PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(cutmachine_model PUBLIC PkgConfig::FFMPEG whisper)
+target_link_libraries(cutmachine_model PUBLIC PkgConfig::FFMPEG whisper Threads::Threads)
 
 set(CUTMACHINE_APP_SOURCES
     src/main.mm
@@ -162,6 +171,19 @@ if(BUILD_TESTING)
     add_executable(cutmachine_cli_tests tests/cli_tests.cc)
     target_link_libraries(cutmachine_cli_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_cli_tests COMMAND cutmachine_cli_tests)
+
+    # Pure-C++ MCP tool-dispatch/HTTP/JSON-RPC test (ROADMAP.md F1.1/F1.2):
+    # no ProjectStorage, so it also builds and runs on a plain Linux host --
+    # see tests/mcp_tools_tests.cc for details.
+    add_executable(cutmachine_mcp_tools_tests tests/mcp_tools_tests.cc)
+    target_link_libraries(cutmachine_mcp_tools_tests PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_mcp_tools_tests COMMAND cutmachine_mcp_tools_tests)
+
+    # Integration test against the real project-file backend
+    # (McpProjectBackend/ProjectStorage) -- macOS only, like cutmachine_cli_tests.
+    add_executable(cutmachine_mcp_tests tests/mcp_tests.cc)
+    target_link_libraries(cutmachine_mcp_tests PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_mcp_tests COMMAND cutmachine_mcp_tests)
 
     add_test(
         NAME cutmachine_architecture_tests
