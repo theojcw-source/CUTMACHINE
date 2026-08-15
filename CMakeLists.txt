@@ -20,6 +20,7 @@ configure_file(src/shader.metal "${SHADER_RUNTIME_PATH}" COPYONLY)
 add_library(cutmachine_model
     src/BeatDetection.cc
     src/Cli.cc
+    src/ColorEffects.cc
     src/ColorManagement.cc
     src/Document.cc
     src/Ingest.cc
@@ -146,6 +147,11 @@ if(BUILD_TESTING)
     add_executable(cutmachine_keyframe_tests tests/keyframe_tests.cc)
     target_link_libraries(cutmachine_keyframe_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_keyframe_tests COMMAND cutmachine_keyframe_tests)
+
+    add_executable(cutmachine_color_effects_tests tests/color_effects_tests.cc)
+    target_link_libraries(cutmachine_color_effects_tests PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_color_effects_tests
+             COMMAND cutmachine_color_effects_tests)
 
     add_executable(cutmachine_project_recovery_tests
                    tests/project_recovery_tests.cc)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ColorEffects.h"
 #include "Document.h"
 
 #import <AppKit/AppKit.h>
@@ -30,6 +31,13 @@ struct TimelineRenderData {
     ColorManagementSettings color_management;
     std::vector<int32_t> video_rotation_degrees;
     std::vector<float> video_opacities;
+    // Parallel to the frames passed to RenderFrames: the resolved color.*
+    // grade stack (F1.3, see ColorEffects.h) for the clip each frame came
+    // from. A slot beyond this vector's size, or a default-constructed
+    // (count == 0) entry, renders with no grading applied. Renderer.mm is a
+    // read-only consumer here -- it never looks at DocumentClip/ClipEffect
+    // itself, only this already-resolved, already-float form.
+    std::vector<ResolvedColorGrade> video_color_grades;
     std::vector<MetalRect> rectangles;
 };
 
