@@ -51,3 +51,25 @@ NSButton* CMMakeStyledButton(NSString* title, id target, SEL action);
 NSButton* CMMakeStyledToggle(NSString* title, id target, SEL action);
 NSSlider* CMMakeStyledSlider(double minValue, double maxValue, id target,
                              SEL action);
+
+// A lightweight, non-dock-bound tab strip: an ordered list of titles, evenly
+// divided across the strip's width, styled the same way CMPanelHostView
+// (PanelHostView.h) highlights its active dock-level tab. Unlike
+// CMPanelHostView, this is not tied to PanelLayout.h's fixed dock/slot
+// registry -- it is for tabs *within* a single already-fixed panel slot
+// (e.g. ROADMAP.md F2.3's Media/Audio/Captions tabs, all inside the one
+// PanelSlot::Media the Left dock reserves -- see PanelLayout.h's file
+// comment on why that slot does not use CMPanelHostView's own tab chrome).
+@interface CMTabStripView : NSView
+
+@property(nonatomic, readonly) NSInteger selectedIndex;
+@property(nonatomic, weak) id target;
+// Invoked with `self` as the sole argument on every tab change, mouse or
+// programmatic (-selectIndex:), mirroring CMPanelHostView's target/action
+// shape for its own tab buttons.
+@property(nonatomic) SEL action;
+
+- (instancetype)initWithFrame:(NSRect)frame titles:(NSArray<NSString*>*)titles;
+- (void)selectIndex:(NSInteger)index;
+
+@end

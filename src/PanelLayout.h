@@ -42,6 +42,10 @@ struct PanelSlotDescriptor {
 // registry and its local-preference keys stay complete and every panel
 // slot -- present or future -- is described in exactly one place, even
 // though F2.3 does not need CMPanelHostView's tab chrome to be reachable.
+// F2.3 landed its own Media/Audio/Captions sub-tabs *inside* this one slot
+// (MediaPanelModel.h, UiComponents.h's CMTabStripView) -- a second, smaller
+// tab strip that switches content within PanelSlot::Media, not a second
+// dock-level slot of its own.
 inline const std::array<PanelSlotDescriptor, 4>& FixedPanelLayout() {
     static const std::array<PanelSlotDescriptor, 4> kLayout{{
         {PanelSlot::Media, "media", "Médiathèque", PanelDock::Left, 0},
