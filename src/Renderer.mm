@@ -357,6 +357,20 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
                                                                         : 0);
         parameters.useAcescct =
             timeline.color_management.working_gamut == "acescct" ? 1 : 0;
+        // Mirrors shader.metal's ClipGradeParameters/GradeEntry by hand (see
+        // that file's comment on why this project keeps such structs
+        // hand-synced rather than shared). Renderer.mm never interprets a
+        // grade entry's `kind`; it only repacks whatever ColorEffects.h's
+        // ResolveColorGrade already resolved per clip.
+        struct GradeEntry {
+            int32_t kind;
+            float amount;
+        };
+        struct ClipGradeParameters {
+            int32_t count;
+            int32_t padding[3];
+            GradeEntry entries[kMaxColorEffectsPerClip];
+        };
         for (size_t frameIndex = 0; frameIndex < frames.size(); ++frameIndex) {
             const AVFrame* frame = frames[frameIndex];
             if (!frame) continue;
@@ -444,6 +458,22 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             [workingEncoder setFragmentBytes:&parameters
                                       length:sizeof(parameters)
                                      atIndex:0];
+            ClipGradeParameters gradeParameters = {};
+            if (frameIndex < timeline.video_color_grades.size()) {
+                const ResolvedColorGrade& grade =
+                    timeline.video_color_grades[frameIndex];
+                gradeParameters.count = grade.count;
+                for (int32_t entryIndex = 0; entryIndex < grade.count;
+                     ++entryIndex) {
+                    gradeParameters.entries[entryIndex].kind =
+                        grade.entries[entryIndex].kind;
+                    gradeParameters.entries[entryIndex].amount =
+                        grade.entries[entryIndex].amount;
+                }
+            }
+            [workingEncoder setFragmentBytes:&gradeParameters
+                                      length:sizeof(gradeParameters)
+                                     atIndex:1];
             [workingEncoder setFragmentSamplerState:impl_->sampler atIndex:0];
             [workingEncoder drawPrimitives:MTLPrimitiveTypeTriangle
                                vertexStart:0

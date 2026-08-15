@@ -23,6 +23,7 @@ extern "C" {
 
 #include "AudioPlayback.h"
 #include "Cli.h"
+#include "ColorEffects.h"
 #include "DecodeWorker.h"
 #include "Document.h"
 #include "EditLog.h"
@@ -155,6 +156,10 @@ struct ResolvedSlot {
     Ulid sourceId;
     int64_t frame = -1;
     float opacity = 1.0f;
+    // The DocumentClip currently occupying this slot. Used only to look up
+    // that clip's color.* effects stack for F1.3 grading; see
+    // presentNearestFrameAtDeadline.
+    Ulid clipId;
 };
 
 struct RenderedSlot {
@@ -162,10 +167,12 @@ struct RenderedSlot {
     Ulid sourceId;
     int64_t frame = -1;
     float opacity = 1.0f;
+    Ulid clipId;
 
     bool operator==(const RenderedSlot& other) const {
         return active == other.active && sourceId == other.sourceId &&
-               frame == other.frame && opacity == other.opacity;
+               frame == other.frame && opacity == other.opacity &&
+               clipId == other.clipId;
     }
 };
 
@@ -3280,9 +3287,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
     for (const Ulid& trackId : self.state->videoTrackIds) {
         for (const ResolvedLayer& layer :
              self.state->timeline->ResolveTrackLayers(trackId, position)) {
-            self.state->requested.push_back({true, layer.frame.source_id,
-                                             layer.frame.source_frame,
-                                             layer.opacity});
+            self.state->requested.push_back(
+                {true, layer.frame.source_id, layer.frame.source_frame,
+                 layer.opacity, layer.frame.clip_id});
             const auto worker = self.state->workers.find(layer.frame.source_id);
             if (worker != self.state->workers.end())
                 worker->second->RequestFrame(layer.frame.source_frame);
@@ -8201,7 +8208,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         frames[slot] = self.state->frameCache->GetNearest(
             requested.sourceId, requested.frame, cachedFrame);
         candidates[slot] = {true, requested.sourceId, cachedFrame,
-                            requested.opacity};
+                            requested.opacity, requested.clipId};
         if (!frames[slot] || cachedFrame != requested.frame) {
             missing = true;
         }
@@ -8219,9 +8226,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
         programData.video_zoom = self.state->programMonitorZoom;
         programData.video_rotation_degrees.resize(candidates.size(), 0);
         programData.video_opacities.resize(candidates.size(), 1.0f);
+        // F1.3: read-only render-time consumer of DocumentClip::effects.
+        // Resolving here (rather than in Renderer.mm) keeps the renderer
+        // generic over Document/ClipEffect -- it only ever sees the already
+        // -resolved, already-float ResolvedColorGrade.
+        programData.video_color_grades.resize(candidates.size());
         for (size_t slot = 0; slot < candidates.size(); ++slot) {
             if (!candidates[slot].active) continue;
             programData.video_opacities[slot] = candidates[slot].opacity;
+            if (const DocumentClip* clip =
+                    self.state->document.FindClip(candidates[slot].clipId)) {
+                programData.video_color_grades[slot] =
+                    ResolveColorGrade(clip->effects);
+            }
             const auto media =
                 self.state->mediaMetadata.find(candidates[slot].sourceId);
             if (media != self.state->mediaMetadata.end() &&
