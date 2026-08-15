@@ -46,8 +46,10 @@ extern "C" {
 #include "Relink.h"
 #include "Renderer.h"
 #include "Thumbnail.h"
+#include "Timecode.h"
 #include "Timeline.h"
 #include "TimelineView.h"
+#include "TransportBar.h"
 #include "UiTheme.h"
 #include "Waveform.h"
 
@@ -59,6 +61,9 @@ extern "C" {
 #import "PanelHostView.h"
 #import "UiComponents.h"
 #import "UiThemeAppKit.h"
+// F2.5 -- ROADMAP.md playback transport: installs into PanelSlot::Transport
+// the same way the F2.1 imports above install into the other docks.
+#import "TransportView.h"
 
 namespace {
 
@@ -489,17 +494,11 @@ NSString* TimeString(const RationalTime& time) {
                                       time.rate];
 }
 
+// Delegates to Timecode.h's plain-C++ FormatTimecode so this label and the
+// new Transport panel (TransportView.mm) format HH:MM:SS:FF identically
+// instead of maintaining two copies of the same rule.
 NSString* TimelineTimecode(const RationalTime& time, MediaRate rate) {
-    if (rate.num <= 0 || rate.den <= 0) return @"00:00:00:00";
-    const int64_t absoluteFrames =
-        std::max<int64_t>(0, time.to_frames(rate.num, rate.den));
-    const int64_t nominalFps =
-        std::max<int64_t>(1, (rate.num + rate.den - 1) / rate.den);
-    const int64_t frames = absoluteFrames % nominalFps;
-    const int64_t totalSeconds = absoluteFrames / nominalFps;
-    return [NSString
-        stringWithFormat:@"%02lld:%02lld:%02lld:%02lld", totalSeconds / 3600,
-                         (totalSeconds / 60) % 60, totalSeconds % 60, frames];
+    return [NSString stringWithUTF8String:FormatTimecode(time, rate).c_str()];
 }
 
 std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
@@ -766,6 +765,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
 // Chat (F2.4) tabs. See PanelHostView.h -- the set of tabs and their order
 // are fixed at construction time, never user-rearrangeable.
 @property(nonatomic, strong) CMPanelHostView* rightDockPanel;
+// F2.5 design system: fixed bottom dock hosting the Transport panel (play/
+// pause, scrub bar, timecode, frame step). One slot, same fixed-tab host as
+// rightDockPanel -- see PanelHostView.h.
+@property(nonatomic, strong) CMPanelHostView* bottomDockPanel;
+@property(nonatomic, strong) CMTransportView* transportView;
 @property(nonatomic, strong) NSPopUpButton* binPopup;
 @property(nonatomic, strong) NSPopUpButton* mediaPopup;
 @property(nonatomic, strong) NSTextField* binSummaryLabel;
@@ -2692,10 +2696,17 @@ DeleteGapOperation GapDeleteOperationForSelection(
     // Fixed, not user-resized-and-remembered, on purpose -- see
     // PanelHostView.h.
     constexpr double rightDockWidth = 300.0;
-    const double workspaceHeight = windowRect.size.height - 42.0;
+    // F2.5 design system: fixed-height bottom dock (Transport panel: play/
+    // pause, scrub bar, timecode, frame step). Sits directly above the
+    // existing status bar, below the Metal-drawn timeline -- see
+    // PanelHostView.h for why this height is fixed rather than
+    // user-resizable.
+    constexpr double bottomDockHeight = 84.0;
+    const double workspaceHeight =
+        windowRect.size.height - 42.0 - bottomDockHeight;
     self.workspaceSplitView = [[CutmachineSplitView alloc]
-        initWithFrame:NSMakeRect(0.0, 42.0, windowRect.size.width,
-                                 workspaceHeight)];
+        initWithFrame:NSMakeRect(0.0, 42.0 + bottomDockHeight,
+                                 windowRect.size.width, workspaceHeight)];
     self.workspaceSplitView.vertical = YES;
     self.workspaceSplitView.dividerStyle = NSSplitViewDividerStyleThin;
     self.workspaceSplitView.delegate = self;
@@ -3069,6 +3080,41 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self.workspaceSplitView setPosition:mediaPanelWidth + editorWidth
                         ofDividerAtIndex:1];
 
+    // F2.5 design system: fixed bottom dock (Transport panel), full window
+    // width, pinned just above the status bar -- see PanelHostView.h for why
+    // this is a fixed slot rather than a user-rearrangeable one.
+    // NSViewWidthSizable only (no height/min-Y flex): stays a fixed height
+    // at a fixed distance from the window's bottom edge as the window
+    // resizes, the same way mediaPanel/rightDockPanel stay pinned to their
+    // edges via workspaceSplitView.
+    self.bottomDockPanel = [[CMPanelHostView alloc]
+        initWithFrame:NSMakeRect(0.0, 42.0, windowRect.size.width,
+                                 bottomDockHeight)
+                 dock:ui::PanelDock::Bottom];
+    self.bottomDockPanel.autoresizingMask = NSViewWidthSizable;
+    [content addSubview:self.bottomDockPanel];
+
+    self.transportView = [[CMTransportView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, windowRect.size.width,
+                                 bottomDockHeight -
+                                     ui::theme::kTabStripHeight)];
+    [self.bottomDockPanel setContentView:self.transportView
+                                  forSlot:ui::PanelSlot::Transport];
+    // Every position change still funnels through -requestTimelinePosition:
+    // (quantized via TimelineView.h's QuantizePlayheadPosition, same as the
+    // main timeline's own scrub/step/edit paths) -- these actions never
+    // touch self.state->requestedPosition directly. See
+    // -stepPlayheadFrames:/-transportScrubChanged:.
+    self.transportView.playPauseButton.target = self;
+    self.transportView.playPauseButton.action = @selector(menuPlayPause:);
+    self.transportView.stepBackButton.target = self;
+    self.transportView.stepBackButton.action = @selector(transportStepBack:);
+    self.transportView.stepForwardButton.target = self;
+    self.transportView.stepForwardButton.action =
+        @selector(transportStepForward:);
+    self.transportView.scrubSlider.target = self;
+    self.transportView.scrubSlider.action = @selector(transportScrubChanged:);
+
     self.infoLabel = [NSTextField labelWithString:@"Aucun clip sélectionné"];
     self.infoLabel.frame =
         NSMakeRect(20.0, 12.0, windowRect.size.width - 225.0, 18.0);
@@ -3324,6 +3370,13 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->requestedPosition = position;
     self.timelineTimecodeLabel.stringValue =
         TimelineTimecode(position, [self playheadFrameRate]);
+    // F2.5: single choke point for every playhead move (scrub, playback
+    // tick, arrow keys, edits all funnel through here already) -- the
+    // Transport panel reads the same requestedPosition/duration this label
+    // does, never a second notion of "now".
+    [self.transportView setPosition:position
+                            duration:self.state->duration
+                                rate:[self playheadFrameRate]];
     self.state->requested.clear();
     for (const Ulid& trackId : self.state->videoTrackIds) {
         for (const ResolvedLayer& layer :
@@ -4908,6 +4961,21 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->overlayDirty = true;
 }
 
+// Moves the playhead by `amount` frames (or samples, in Sample resolution)
+// from its current position. Shared by the Left/Right-arrow keyboard
+// shortcut and the Transport panel's frame-step buttons (F2.5) so both
+// paths compute the same delta and land on the same
+// -requestTimelinePosition: -> QuantizePlayheadPosition machinery every
+// other playhead move already uses.
+- (void)stepPlayheadFrames:(int64_t)amount {
+    const RationalTime delta =
+        self.state->playheadResolution == PlayheadResolution::Sample
+            ? RationalTime{amount, 48000}
+            : RationalTime{amount * [self playheadFrameRate].den,
+                          [self playheadFrameRate].num};
+    [self requestTimelinePosition:self.state->requestedPosition.add(delta)];
+}
+
 - (void)requestTimelinePosition:(RationalTime)position {
     if (position < RationalTime{0, 1}) position = {0, position.rate};
     if (position > self.state->duration) position = self.state->duration;
@@ -5076,6 +5144,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->playbackDirection = std::clamp(direction, -1, 1);
     self.state->playbackAnchor = self.state->requestedPosition;
     self.state->playbackStarted = std::chrono::steady_clock::now();
+    [self.transportView setPlaying:self.state->playbackDirection != 0];
     if (self.state->audioPlayback) {
         self.state->audioPlayback->Stop();
         if (self.state->playbackDirection != 0) {
@@ -5910,13 +5979,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         const int64_t amount =
             (modifiers & NSEventModifierFlagShift) != 0 ? 10 : 1;
         const int64_t direction = event.keyCode == 123 ? -1 : 1;
-        const RationalTime delta =
-            self.state->playheadResolution == PlayheadResolution::Sample
-                ? RationalTime{direction * amount, 48000}
-                : RationalTime{
-                      direction * amount * [self playheadFrameRate].den,
-                      [self playheadFrameRate].num};
-        [self requestTimelinePosition:self.state->requestedPosition.add(delta)];
+        [self stepPlayheadFrames:direction * amount];
         return YES;
     }
     if (event.keyCode == 53) {  // Escape
@@ -6692,6 +6755,26 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)menuPlayForward:(id)sender {
     (void)sender;
     [self setPlaybackDirection:1];
+}
+
+// F2.5 -- Transport panel actions. Frame-step reuses -stepPlayheadFrames:,
+// the same helper the Left/Right-arrow shortcut calls. Play/pause reuses
+// -menuPlayPause: directly (wired as the transport button's action in
+// -applicationDidFinishLaunching:), so there is exactly one play/pause
+// implementation, not two.
+- (void)transportStepBack:(id)sender {
+    (void)sender;
+    [self stepPlayheadFrames:-1];
+}
+- (void)transportStepForward:(id)sender {
+    (void)sender;
+    [self stepPlayheadFrames:1];
+}
+- (void)transportScrubChanged:(NSSlider*)sender {
+    const ScrubBarRange range{self.state->duration};
+    const RationalTime target =
+        range.FractionToTime(sender.doubleValue, [self playheadInputRate]);
+    [self requestTimelinePosition:target];
 }
 
 - (NSMenu*)timelineMenuForEvent:(NSEvent*)event {
