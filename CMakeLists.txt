@@ -87,6 +87,13 @@ set(CUTMACHINE_APP_SOURCES
     src/PerformanceMetrics.cc
     src/MediaSource.mm
     src/Renderer.mm
+    # F2.1 -- design system (ROADMAP.md). UiTheme.h/PanelLayout.h are plain
+    # C++ (see tests/ui_theme_tests.cc, tests/panel_layout_tests.cc) and
+    # need no .cc of their own; everything below is AppKit/Foundation-only.
+    src/UiThemeAppKit.mm
+    src/UiPreferences.mm
+    src/UiComponents.mm
+    src/PanelHostView.mm
 )
 
 add_executable(cutmachine ${CUTMACHINE_APP_SOURCES})
@@ -273,6 +280,20 @@ if(BUILD_TESTING)
     target_include_directories(cutmachine_fft_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME cutmachine_fft_tests COMMAND cutmachine_fft_tests)
+
+    # F2.1 -- design system (ROADMAP.md). UiTheme.h and PanelLayout.h are
+    # plain C++, no AppKit dependency, so -- like Fft.h above -- these build
+    # and run on a plain Linux host.
+    add_executable(cutmachine_ui_theme_tests tests/ui_theme_tests.cc)
+    target_include_directories(cutmachine_ui_theme_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME cutmachine_ui_theme_tests COMMAND cutmachine_ui_theme_tests)
+
+    add_executable(cutmachine_panel_layout_tests tests/panel_layout_tests.cc)
+    target_include_directories(cutmachine_panel_layout_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME cutmachine_panel_layout_tests
+             COMMAND cutmachine_panel_layout_tests)
 
     add_executable(cutmachine_beat_detection_tests
                    tests/beat_detection_tests.cc)
