@@ -39,10 +39,11 @@ enum class ColorEffectKind : int32_t {
 };
 
 struct ColorEffectRegistryEntry {
-    const char* type;         // Matches ClipEffect::type, e.g. "color.exposure".
-    ColorEffectKind kind;      // GPU-side dispatch id (shader.metal switch).
-    const char* param_name;    // The one numeric knob, read from ClipEffect::params.
-    float default_value;       // Used when the named param is absent.
+    const char* type;      // Matches ClipEffect::type, e.g. "color.exposure".
+    ColorEffectKind kind;  // GPU-side dispatch id (shader.metal switch).
+    const char*
+        param_name;       // The one numeric knob, read from ClipEffect::params.
+    float default_value;  // Used when the named param is absent.
 };
 
 // The registry: every color.* type this build knows how to render, in no

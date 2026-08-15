@@ -53,15 +53,16 @@ int main() {
                    "1s of 4s should be fraction 0.25 regardless of rate");
          });
 
-    Test("TimeToFraction clamps out-of-range positions instead of "
-         "extrapolating",
-         [] {
-             const ScrubBarRange range{RationalTime{100, 25}};
-             Check(range.TimeToFraction({-25, 25}) == 0.0,
-                   "negative time clamps to 0.0");
-             Check(range.TimeToFraction({200, 25}) == 1.0,
-                   "past-duration time clamps to 1.0");
-         });
+    Test(
+        "TimeToFraction clamps out-of-range positions instead of "
+        "extrapolating",
+        [] {
+            const ScrubBarRange range{RationalTime{100, 25}};
+            Check(range.TimeToFraction({-25, 25}) == 0.0,
+                  "negative time clamps to 0.0");
+            Check(range.TimeToFraction({200, 25}) == 1.0,
+                  "past-duration time clamps to 1.0");
+        });
 
     Test("TimeToFraction on a zero-duration sequence is always 0", [] {
         const ScrubBarRange range{RationalTime{0, 25}};
@@ -84,29 +85,29 @@ int main() {
               "fraction past 1.0 clamps to duration");
     });
 
-    Test("FractionToTime rounds to the nearest tick at the requested rate",
-         [] {
-             const ScrubBarRange range{RationalTime{3, 1}};  // 3 seconds
-             const RationalTime quarter = range.FractionToTime(0.5, 2);
-             // 1.5s at rate 2 is exactly value 3.
-             Check(quarter == RationalTime(3, 2),
-                   "half of 3s at rate 2 should be exactly 1.5s");
-         });
+    Test("FractionToTime rounds to the nearest tick at the requested rate", [] {
+        const ScrubBarRange range{RationalTime{3, 1}};  // 3 seconds
+        const RationalTime quarter = range.FractionToTime(0.5, 2);
+        // 1.5s at rate 2 is exactly value 3.
+        Check(quarter == RationalTime(3, 2),
+              "half of 3s at rate 2 should be exactly 1.5s");
+    });
 
-    Test("round-tripping TimeToFraction -> FractionToTime is stable at the "
-         "duration's own rate",
-         [] {
-             const ScrubBarRange range{RationalTime{48000, 48000}};  // 1s
-             for (int64_t sample : {0LL, 12000LL, 24000LL, 36000LL, 48000LL}) {
-                 const RationalTime original{sample, 48000};
-                 const double fraction = range.TimeToFraction(original);
-                 const RationalTime roundTripped =
-                     range.FractionToTime(fraction, 48000);
-                 Check(roundTripped == original,
-                       "round trip through a fraction must land back on the "
-                       "same sample-accurate time");
-             }
-         });
+    Test(
+        "round-tripping TimeToFraction -> FractionToTime is stable at the "
+        "duration's own rate",
+        [] {
+            const ScrubBarRange range{RationalTime{48000, 48000}};  // 1s
+            for (int64_t sample : {0LL, 12000LL, 24000LL, 36000LL, 48000LL}) {
+                const RationalTime original{sample, 48000};
+                const double fraction = range.TimeToFraction(original);
+                const RationalTime roundTripped =
+                    range.FractionToTime(fraction, 48000);
+                Check(roundTripped == original,
+                      "round trip through a fraction must land back on the "
+                      "same sample-accurate time");
+            }
+        });
 
     Test("FractionToTime rejects a non-finite fraction", [] {
         const ScrubBarRange range{RationalTime{100, 25}};

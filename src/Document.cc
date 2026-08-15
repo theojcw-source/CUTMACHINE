@@ -906,10 +906,9 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                         std::move(transition));
                 }
             }
-            if (const JsonValue* styles = Optional(timelineOwner,
-                                                    "caption_styles",
-                                                    JsonValue::Type::Array,
-                                                    markerRoot)) {
+            if (const JsonValue* styles =
+                    Optional(timelineOwner, "caption_styles",
+                             JsonValue::Type::Array, markerRoot)) {
                 for (size_t index = 0; index < styles->array.size(); ++index) {
                     const JsonValue& item = styles->array[index];
                     const std::string context = markerRoot +
@@ -919,28 +918,24 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     style.id =
                         Require(item, "id", JsonValue::Type::String, context)
                             .string;
-                    style.font_family = Require(item, "font_family",
-                                                JsonValue::Type::String,
-                                                context)
-                                            .string;
+                    style.font_family =
+                        Require(item, "font_family", JsonValue::Type::String,
+                                context)
+                            .string;
                     style.font_size = Int32(item, "font_size", context);
                     style.color =
-                        Require(item, "color", JsonValue::Type::String,
-                                context)
+                        Require(item, "color", JsonValue::Type::String, context)
                             .string;
                     style.position = Require(item, "position",
                                              JsonValue::Type::String, context)
                                          .string;
-                    parsed.sequence.caption_styles.push_back(
-                        std::move(style));
+                    parsed.sequence.caption_styles.push_back(std::move(style));
                 }
             }
-            if (const JsonValue* groups = Optional(timelineOwner,
-                                                    "multicam_groups",
-                                                    JsonValue::Type::Array,
-                                                    markerRoot)) {
-                for (size_t index = 0; index < groups->array.size();
-                     ++index) {
+            if (const JsonValue* groups =
+                    Optional(timelineOwner, "multicam_groups",
+                             JsonValue::Type::Array, markerRoot)) {
+                for (size_t index = 0; index < groups->array.size(); ++index) {
                     const JsonValue& item = groups->array[index];
                     const std::string context = markerRoot +
                                                 ".multicam_groups[" +
@@ -950,8 +945,7 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                         Require(item, "id", JsonValue::Type::String, context)
                             .string;
                     group.name =
-                        Require(item, "name", JsonValue::Type::String,
-                                context)
+                        Require(item, "name", JsonValue::Type::String, context)
                             .string;
                     if (const JsonValue* active =
                             Optional(item, "active_angle_id",
@@ -963,25 +957,24 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                          angleIndex < angles.array.size(); ++angleIndex) {
                         const JsonValue& angleValue = angles.array[angleIndex];
                         const std::string angleContext =
-                            context + ".angles[" +
-                            std::to_string(angleIndex) + "]";
+                            context + ".angles[" + std::to_string(angleIndex) +
+                            "]";
                         MulticamAngle angle;
-                        angle.id = Require(angleValue, "id",
-                                           JsonValue::Type::String,
-                                           angleContext)
-                                       .string;
-                        angle.name = Require(angleValue, "name",
-                                             JsonValue::Type::String,
-                                             angleContext)
-                                         .string;
-                        angle.clip_id = Require(angleValue, "clip_id",
-                                                JsonValue::Type::String,
-                                                angleContext)
-                                            .string;
+                        angle.id =
+                            Require(angleValue, "id", JsonValue::Type::String,
+                                    angleContext)
+                                .string;
+                        angle.name =
+                            Require(angleValue, "name", JsonValue::Type::String,
+                                    angleContext)
+                                .string;
+                        angle.clip_id =
+                            Require(angleValue, "clip_id",
+                                    JsonValue::Type::String, angleContext)
+                                .string;
                         group.angles.push_back(std::move(angle));
                     }
-                    parsed.sequence.multicam_groups.push_back(
-                        std::move(group));
+                    parsed.sequence.multicam_groups.push_back(std::move(group));
                 }
             }
         }
@@ -1071,9 +1064,9 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                                           JsonValue::Type::Object, clipContext),
                                   clipContext + ".sync_reference_delta");
                 }
-                if (const JsonValue* effects = Optional(
-                        clipValue, "effects", JsonValue::Type::Array,
-                        clipContext)) {
+                if (const JsonValue* effects =
+                        Optional(clipValue, "effects", JsonValue::Type::Array,
+                                 clipContext)) {
                     for (size_t effectIndex = 0;
                          effectIndex < effects->array.size(); ++effectIndex) {
                         const JsonValue& effectValue =
@@ -1082,14 +1075,14 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                             clipContext + ".effects[" +
                             std::to_string(effectIndex) + "]";
                         ClipEffect effect;
-                        effect.id = Require(effectValue, "id",
-                                            JsonValue::Type::String,
-                                            effectContext)
-                                        .string;
-                        effect.type = Require(effectValue, "type",
-                                              JsonValue::Type::String,
-                                              effectContext)
-                                          .string;
+                        effect.id =
+                            Require(effectValue, "id", JsonValue::Type::String,
+                                    effectContext)
+                                .string;
+                        effect.type =
+                            Require(effectValue, "type",
+                                    JsonValue::Type::String, effectContext)
+                                .string;
                         const JsonValue& params =
                             Require(effectValue, "params",
                                     JsonValue::Type::Object, effectContext);
@@ -1102,9 +1095,8 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                             effect.params.emplace(
                                 entry.first,
                                 ParseEffectParamValue(
-                                    entry.second,
-                                    effectContext + ".params['" + entry.first +
-                                        "']"));
+                                    entry.second, effectContext + ".params['" +
+                                                      entry.first + "']"));
                         }
                         clip.effects.push_back(std::move(effect));
                     }
@@ -1113,10 +1105,10 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                         Optional(clipValue, "caption_group_id",
                                  JsonValue::Type::String, clipContext)) {
                     clip.caption_group_id = captionGroup->string;
-                    clip.caption_text = Require(clipValue, "caption_text",
-                                                JsonValue::Type::String,
-                                                clipContext)
-                                             .string;
+                    clip.caption_text =
+                        Require(clipValue, "caption_text",
+                                JsonValue::Type::String, clipContext)
+                            .string;
                 }
                 track.clips.push_back(std::move(clip));
             }
@@ -1225,9 +1217,10 @@ std::string Document::SaveToString() const {
             for (size_t effectIndex = 0; effectIndex < clip.effects.size();
                  ++effectIndex) {
                 const ClipEffect& effect = clip.effects[effectIndex];
-                output << (effectIndex == 0 ? "\n" : ",\n") << "        {\"id\":\""
-                       << Escape(effect.id) << "\",\"type\":\""
-                       << Escape(effect.type) << "\",\"params\":{";
+                output << (effectIndex == 0 ? "\n" : ",\n")
+                       << "        {\"id\":\"" << Escape(effect.id)
+                       << "\",\"type\":\"" << Escape(effect.type)
+                       << "\",\"params\":{";
                 size_t paramIndex = 0;
                 for (const auto& param : effect.params) {
                     output << (paramIndex++ == 0 ? "\n" : ",\n")
@@ -1242,8 +1235,8 @@ std::string Document::SaveToString() const {
             if (!clip.caption_group_id.empty())
                 output << ",\"caption_group_id\":\""
                        << Escape(clip.caption_group_id)
-                       << "\",\"caption_text\":\""
-                       << Escape(clip.caption_text) << "\"";
+                       << "\",\"caption_text\":\"" << Escape(clip.caption_text)
+                       << "\"";
             output << "}";
         }
         if (!track.clips.empty()) output << '\n';
@@ -1271,15 +1264,14 @@ std::string Document::SaveToString() const {
              ++angleIndex) {
             const MulticamAngle& angle = group.angles[angleIndex];
             output << (angleIndex == 0 ? "\n" : ",\n") << "      {\"id\":\""
-                   << Escape(angle.id) << "\",\"name\":\""
-                   << Escape(angle.name) << "\",\"clip_id\":\""
-                   << Escape(angle.clip_id) << "\"}";
+                   << Escape(angle.id) << "\",\"name\":\"" << Escape(angle.name)
+                   << "\",\"clip_id\":\"" << Escape(angle.clip_id) << "\"}";
         }
         if (!group.angles.empty()) output << '\n' << "    ";
         output << "]";
         if (!group.active_angle_id.empty())
-            output << ",\"active_angle_id\":\""
-                   << Escape(group.active_angle_id) << "\"";
+            output << ",\"active_angle_id\":\"" << Escape(group.active_angle_id)
+                   << "\"";
         output << "}";
     }
     if (!sequence.multicam_groups.empty()) output << '\n';
@@ -1756,8 +1748,7 @@ bool Document::Validate(std::string& error) const {
         const std::string context = "caption style " + std::to_string(index);
         if (!RegisterId(style.id, context, ids, error)) return false;
         if (!validCaptionStyleText(style.font_family, 128) ||
-            style.font_size <= 0 ||
-            !validCaptionStyleText(style.color, 64) ||
+            style.font_size <= 0 || !validCaptionStyleText(style.color, 64) ||
             !validCaptionStyleText(style.position, 64)) {
             error = context +
                     " has an invalid font_family, font_size, color or "
@@ -1785,8 +1776,7 @@ bool Document::Validate(std::string& error) const {
             if (!RegisterId(angle.id, angleContext, ids, error)) return false;
             angleIds.insert(angle.id);
             if (!angleClipIds.insert(angle.clip_id).second) {
-                error = angleContext +
-                        " ('" + angle.id +
+                error = angleContext + " ('" + angle.id +
                         "') references a clip_id already used by another "
                         "angle in this group";
                 return false;

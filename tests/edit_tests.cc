@@ -1320,8 +1320,7 @@ int main() {
             Check(DeserializeOperation(setJson, parsed, error, message) &&
                       SerializeOperation(parsed) == setJson,
                   "SetClipCaption JSON round-trips canonically");
-            Check(document.FindClip(clipId)->caption_text ==
-                      "Bonjour le monde",
+            Check(document.FindClip(clipId)->caption_text == "Bonjour le monde",
                   "SetClipCaption keeps the exact per-clip text");
 
             Check(log.Undo(document, error, message) &&
@@ -1337,13 +1336,12 @@ int main() {
             ExpectRejected(
                 document,
                 RemoveCaptionStyleOperation{"01K87000000000000000000099"},
-                EditError::UnknownCaptionStyle,
-                "unknown caption style_id");
-            ExpectRejected(
-                document,
-                SetClipCaptionOperation{"01K20000000000000000000099",
-                                        styleId, "x"},
-                EditError::UnknownClip, "unknown clip_id for SetClipCaption");
+                EditError::UnknownCaptionStyle, "unknown caption style_id");
+            ExpectRejected(document,
+                           SetClipCaptionOperation{"01K20000000000000000000099",
+                                                   styleId, "x"},
+                           EditError::UnknownClip,
+                           "unknown clip_id for SetClipCaption");
 
             Check(log.Undo(document, error, message) &&
                       document.SaveToString() == original,
@@ -1389,7 +1387,7 @@ int main() {
                   "AddMulticamGroup records its exact canonical position");
             Check(document.FindMulticamGroup(groupId)->angles.size() == 2 &&
                       document.FindMulticamGroup(groupId)
-                              ->active_angle_id.empty(),
+                          ->active_angle_id.empty(),
                   "AddMulticamGroup starts with no active angle selected");
             const std::string withGroup = document.SaveToString();
             const std::string addJson = SerializeOperation(storedAdd);
@@ -1424,16 +1422,15 @@ int main() {
 
             ExpectRejected(
                 document,
-                SetMulticamActiveAngleOperation{
-                    "01K88000000000000000000001", wideAngleId},
+                SetMulticamActiveAngleOperation{"01K88000000000000000000001",
+                                                wideAngleId},
                 EditError::UnknownMulticamGroup,
                 "unknown multicam group_id for SetMulticamActiveAngle");
-            ExpectRejected(
-                document,
-                SetMulticamActiveAngleOperation{
-                    groupId, "01K88000000000000000000002"},
-                EditError::UnknownMulticamAngle,
-                "active_angle_id outside the group's own angles");
+            ExpectRejected(document,
+                           SetMulticamActiveAngleOperation{
+                               groupId, "01K88000000000000000000002"},
+                           EditError::UnknownMulticamAngle,
+                           "active_angle_id outside the group's own angles");
             ExpectRejected(
                 document,
                 AddMulticamGroupOperation{

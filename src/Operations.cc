@@ -1977,10 +1977,10 @@ bool ApplyRemoveCaptionStyle(Document& candidate,
                              Operation& inverse, EditError& error,
                              std::string& message) {
     auto& styles = candidate.sequence.caption_styles;
-    const auto found = std::find_if(
-        styles.begin(), styles.end(), [&](const CaptionStyle& style) {
-            return style.id == operation.style_id;
-        });
+    const auto found = std::find_if(styles.begin(), styles.end(),
+                                    [&](const CaptionStyle& style) {
+                                        return style.id == operation.style_id;
+                                    });
     if (found == styles.end()) {
         Fail(EditError::UnknownCaptionStyle,
              "unknown caption style_id '" + operation.style_id + "'", error,
@@ -2012,9 +2012,9 @@ bool ApplyRemoveCaptionStyle(Document& candidate,
     return true;
 }
 
-bool ApplySetClipCaption(Document& candidate, SetClipCaptionOperation& operation,
-                         Operation& inverse, EditError& error,
-                         std::string& message) {
+bool ApplySetClipCaption(Document& candidate,
+                         SetClipCaptionOperation& operation, Operation& inverse,
+                         EditError& error, std::string& message) {
     DocumentClip* clip = candidate.FindClip(operation.clip_id);
     if (!clip) {
         Fail(EditError::UnknownClip,
@@ -2063,8 +2063,8 @@ bool ApplyAddMulticamGroup(Document& candidate,
          static_cast<uint64_t>(operation.insertion_index) >
              candidate.sequence.multicam_groups.size())) {
         Fail(EditError::InvalidOperation,
-             "multicam group insertion_index is outside the group list",
-             error, message);
+             "multicam group insertion_index is outside the group list", error,
+             message);
         return false;
     }
     if (operation.insertion_index < 0)
@@ -2086,10 +2086,9 @@ bool ApplyRemoveMulticamGroup(Document& candidate,
                               Operation& inverse, EditError& error,
                               std::string& message) {
     auto& groups = candidate.sequence.multicam_groups;
-    const auto found =
-        std::find_if(groups.begin(), groups.end(), [&](const auto& group) {
-            return group.id == operation.group_id;
-        });
+    const auto found = std::find_if(
+        groups.begin(), groups.end(),
+        [&](const auto& group) { return group.id == operation.group_id; });
     if (found == groups.end()) {
         Fail(EditError::UnknownMulticamGroup,
              "unknown multicam group_id '" + operation.group_id + "'", error,
@@ -2129,8 +2128,8 @@ bool ApplySetMulticamActiveAngle(Document& candidate,
                      })) {
         Fail(EditError::UnknownMulticamAngle,
              "active_angle_id '" + operation.active_angle_id +
-                 "' is not an angle of multicam group '" +
-                 operation.group_id + "'",
+                 "' is not an angle of multicam group '" + operation.group_id +
+                 "'",
              error, message);
         return false;
     }
@@ -2297,9 +2296,9 @@ bool ApplySetClipLink(Document& candidate, SetClipLinkOperation& operation,
     return ValidateResult(candidate, error, message);
 }
 
-bool ApplySetClipEffects(Document& candidate, SetClipEffectsOperation& operation,
-                         Operation& inverse, EditError& error,
-                         std::string& message) {
+bool ApplySetClipEffects(Document& candidate,
+                         SetClipEffectsOperation& operation, Operation& inverse,
+                         EditError& error, std::string& message) {
     DocumentClip* clip = candidate.FindClip(operation.clip_id);
     if (!clip) {
         Fail(EditError::UnknownClip,
@@ -2897,8 +2896,8 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
         const std::vector<ExactTrackState> before = snapshots(trackIds);
         if (before.size() != operation.exact_track_result.size()) {
             Fail(EditError::UnknownTrack,
-                 "exact word removal state references an unknown track",
-                 error, message);
+                 "exact word removal state references an unknown track", error,
+                 message);
             return false;
         }
         for (const ExactTrackState& state : operation.exact_track_result)
@@ -2933,8 +2932,8 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
         if (index > 0 &&
             range.source_start < operation.ranges[index - 1].source_end) {
             Fail(EditError::InvalidOperation,
-                 "RemoveWords ranges must be sorted and non-overlapping",
-                 error, message);
+                 "RemoveWords ranges must be sorted and non-overlapping", error,
+                 message);
             return false;
         }
     }
@@ -2952,7 +2951,8 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
         static_cast<size_t>(std::distance(track->clips.begin(), found));
     const DocumentClip original = *found;
     const RationalTime clipSourceStart = original.source_in;
-    const RationalTime clipSourceEnd = original.source_in.add(original.duration);
+    const RationalTime clipSourceEnd =
+        original.source_in.add(original.duration);
     for (const WordRemovalRange& range : operation.ranges) {
         if (range.source_start < clipSourceStart ||
             range.source_end > clipSourceEnd) {
@@ -3016,9 +3016,9 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
             track->clips[next].timeline_in.add(shiftDelta);
     track->clips.erase(track->clips.begin() +
                        static_cast<std::ptrdiff_t>(index));
-    track->clips.insert(track->clips.begin() +
-                            static_cast<std::ptrdiff_t>(index),
-                        newClips.begin(), newClips.end());
+    track->clips.insert(
+        track->clips.begin() + static_cast<std::ptrdiff_t>(index),
+        newClips.begin(), newClips.end());
     for (const Ulid& id : operation.sync_track_ids) {
         if (id == track->id) continue;
         DocumentTrack* syncTrack = candidate.FindTrack(id);
@@ -3035,8 +3035,8 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
                  message);
             return false;
         }
-        if (!ValidateSourceRange(*source, fragment.source_in,
-                                 fragment.duration, error, message)) {
+        if (!ValidateSourceRange(*source, fragment.source_in, fragment.duration,
+                                 error, message)) {
             return false;
         }
     }
@@ -3275,11 +3275,9 @@ bool ApplyOperation(Document& document, Operation& operation,
             applied = ApplyAddMulticamGroup(candidate, *addMulticam,
                                             generatedInverse, error, message);
         } else if (auto* removeMulticam =
-                       std::get_if<RemoveMulticamGroupOperation>(
-                           &normalized)) {
-            applied = ApplyRemoveMulticamGroup(candidate, *removeMulticam,
-                                               generatedInverse, error,
-                                               message);
+                       std::get_if<RemoveMulticamGroupOperation>(&normalized)) {
+            applied = ApplyRemoveMulticamGroup(
+                candidate, *removeMulticam, generatedInverse, error, message);
         } else if (auto* setActiveAngle =
                        std::get_if<SetMulticamActiveAngleOperation>(
                            &normalized)) {

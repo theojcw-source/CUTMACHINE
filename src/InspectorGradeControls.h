@@ -89,7 +89,7 @@ inline const GradeControlSpec* FindGradeControlSpec(const std::string& type) {
 // stray float) never becomes a stored value the knob's own range wouldn't
 // already cover.
 inline float ClampToGradeControlRange(const GradeControlSpec& spec,
-                                       float value) {
+                                      float value) {
     return std::clamp(value, spec.min_value, spec.max_value);
 }
 
@@ -102,7 +102,7 @@ inline float ClampToGradeControlRange(const GradeControlSpec& spec,
 // load/save, which is what makes this the correct side of the exact<->
 // float boundary (PHILOSOPHY.md principle 4) rather than the wrong one.
 inline EffectParamValue QuantizeGradeControlValue(const GradeControlSpec& spec,
-                                                   float sliderValue) {
+                                                  float sliderValue) {
     const float clamped = ClampToGradeControlRange(spec, sliderValue);
     const int32_t den = spec.precision_den > 0 ? spec.precision_den : 1;
     const double scaled = static_cast<double>(clamped) * den;
@@ -116,7 +116,7 @@ inline EffectParamValue QuantizeGradeControlValue(const GradeControlSpec& spec,
 // kept consistent here so a freshly opened Inspector's slider position
 // always matches what the renderer is already drawing.
 inline float CurrentGradeControlValue(const std::vector<ClipEffect>& effects,
-                                       const GradeControlSpec& spec) {
+                                      const GradeControlSpec& spec) {
     const ColorEffectRegistryEntry* entry =
         FindColorEffectRegistryEntry(spec.type);
     const float fallback = entry ? entry->default_value : 0.0f;

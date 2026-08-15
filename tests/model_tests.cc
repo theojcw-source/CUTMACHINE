@@ -578,8 +578,7 @@ int main() {
              angleAId},
         };
         std::string error;
-        Check(document.Validate(error),
-              "multicam fixture validates: " + error);
+        Check(document.Validate(error), "multicam fixture validates: " + error);
         const std::string canonical = document.SaveToString();
         Document loaded;
         Check(Document::LoadFromString(canonical, loaded, error),

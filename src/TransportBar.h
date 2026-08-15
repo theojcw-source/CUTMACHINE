@@ -43,8 +43,7 @@ struct ScrubBarRange {
 
 inline double ScrubBarRange::TimeToFraction(RationalTime time) const {
     if (duration.rate <= 0)
-        throw std::invalid_argument(
-            "scrub bar duration rate must be positive");
+        throw std::invalid_argument("scrub bar duration rate must be positive");
     if (time.rate <= 0)
         throw std::invalid_argument("time rate must be positive");
     if (duration.value <= 0) return 0.0;
@@ -57,10 +56,9 @@ inline double ScrubBarRange::TimeToFraction(RationalTime time) const {
 }
 
 inline RationalTime ScrubBarRange::FractionToTime(double fraction,
-                                                   int32_t rate) const {
+                                                  int32_t rate) const {
     if (duration.rate <= 0)
-        throw std::invalid_argument(
-            "scrub bar duration rate must be positive");
+        throw std::invalid_argument("scrub bar duration rate must be positive");
     if (rate <= 0)
         throw std::invalid_argument("requested rate must be positive");
     if (!std::isfinite(fraction))
@@ -71,10 +69,8 @@ inline RationalTime ScrubBarRange::FractionToTime(double fraction,
         static_cast<long double>(duration.value) / duration.rate;
     const long double value = durationSeconds * clamped * rate;
     if (!std::isfinite(value) ||
-        value <
-            static_cast<long double>(std::numeric_limits<int64_t>::min()) ||
-        value >
-            static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+        value < static_cast<long double>(std::numeric_limits<int64_t>::min()) ||
+        value > static_cast<long double>(std::numeric_limits<int64_t>::max())) {
         throw std::overflow_error("scrub bar position exceeds int64 range");
     }
     // Round to nearest frame/tick at `rate`, halfway away from zero -- same

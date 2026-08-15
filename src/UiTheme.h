@@ -47,11 +47,16 @@ inline constexpr Color kTextTertiary{0.420f, 0.430f, 0.450f, 1.0f};
 // Same numbers as the timeline's in/out markers, snap guide and selection
 // highlight, so a panel's "selected" or "recording" state reads as the same
 // color the timeline already uses for the same meaning.
-inline constexpr Color kAccentBlue{0.240f, 0.820f, 1.000f, 1.0f};    // focus / snap / active tab
-inline constexpr Color kAccentGreen{0.200f, 0.880f, 0.520f, 1.0f};   // in-point / positive
-inline constexpr Color kAccentOrange{1.000f, 0.420f, 0.240f, 1.0f};  // out-point
-inline constexpr Color kAccentAmber{0.950f, 0.780f, 0.180f, 1.0f};   // valid selection
-inline constexpr Color kAccentRed{0.860f, 0.160f, 0.120f, 1.0f};     // moving / error
+inline constexpr Color kAccentBlue{0.240f, 0.820f, 1.000f,
+                                   1.0f};  // focus / snap / active tab
+inline constexpr Color kAccentGreen{0.200f, 0.880f, 0.520f,
+                                    1.0f};  // in-point / positive
+inline constexpr Color kAccentOrange{1.000f, 0.420f, 0.240f,
+                                     1.0f};  // out-point
+inline constexpr Color kAccentAmber{0.950f, 0.780f, 0.180f,
+                                    1.0f};  // valid selection
+inline constexpr Color kAccentRed{0.860f, 0.160f, 0.120f,
+                                  1.0f};  // moving / error
 
 inline constexpr Color kVideoTrackTint{0.120f, 0.430f, 0.670f, 1.0f};
 inline constexpr Color kAudioTrackTint{0.130f, 0.480f, 0.280f, 1.0f};

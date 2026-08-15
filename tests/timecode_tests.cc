@@ -51,11 +51,9 @@ int main() {
         // {N * den, num} -- the same convention TimelineView.cc's
         // QuantizePlayheadPosition uses to build one.
         const MediaRate ntsc{30000, 1001};
-        Check(FormatTimecode({29 * ntsc.den, ntsc.num}, ntsc) ==
-                  "00:00:00:29",
+        Check(FormatTimecode({29 * ntsc.den, ntsc.num}, ntsc) == "00:00:00:29",
               "frame 29 of 30 should still read as second 0, frame 29");
-        Check(FormatTimecode({30 * ntsc.den, ntsc.num}, ntsc) ==
-                  "00:00:01:00",
+        Check(FormatTimecode({30 * ntsc.den, ntsc.num}, ntsc) == "00:00:01:00",
               "frame 30 (the nominal fps count) should roll into second 1, "
               "frame 0");
     });

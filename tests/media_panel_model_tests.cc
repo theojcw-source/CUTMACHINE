@@ -81,8 +81,7 @@ int main() {
                                     /*wantRoot=*/false, /*wantBinId=*/{}, "");
              Check(result.size() == 2, "expected 2 audio-capable entries");
              for (const LibraryMedia* media : result)
-                 Check(media->has_audio,
-                       "every result must carry audio");
+                 Check(media->has_audio, "every result must carry audio");
          });
 
     Test("FilterAudioSources honors bin membership", [] {
@@ -104,18 +103,17 @@ int main() {
         Check(everywhere.size() == 3, "anyBin=true should ignore bin_id");
     });
 
-    Test("FilterAudioSources search is a case-insensitive substring match",
-         [] {
-             std::vector<LibraryMedia> library{
-                 MakeMedia("Interview_Take1.mp4", true),
-                 MakeMedia("broll.mp4", true),
-             };
-             const auto result =
-                 FilterAudioSources(library, true, false, {}, "interview");
-             Check(result.size() == 1, "expected exactly one match");
-             Check(result.front()->filename == "Interview_Take1.mp4",
-                   "the matching filename should survive the filter");
-         });
+    Test("FilterAudioSources search is a case-insensitive substring match", [] {
+        std::vector<LibraryMedia> library{
+            MakeMedia("Interview_Take1.mp4", true),
+            MakeMedia("broll.mp4", true),
+        };
+        const auto result =
+            FilterAudioSources(library, true, false, {}, "interview");
+        Check(result.size() == 1, "expected exactly one match");
+        Check(result.front()->filename == "Interview_Take1.mp4",
+              "the matching filename should survive the filter");
+    });
 
     Test("FilterAudioSources returns results sorted by filename", [] {
         std::vector<LibraryMedia> library{
@@ -126,31 +124,33 @@ int main() {
         const auto result = FilterAudioSources(library, true, false, {}, "");
         Check(result.size() == 3, "expected all three entries");
         if (result.size() == 3) {
-            Check(result[0]->filename == "apple.mp4", "apple should sort first");
-            Check(result[1]->filename == "mango.mp4", "mango should sort second");
-            Check(result[2]->filename == "zebra.mp4", "zebra should sort third");
+            Check(result[0]->filename == "apple.mp4",
+                  "apple should sort first");
+            Check(result[1]->filename == "mango.mp4",
+                  "mango should sort second");
+            Check(result[2]->filename == "zebra.mp4",
+                  "zebra should sort third");
         }
     });
 
-    Test("DescribeCaptionStyle is deterministic and includes every field",
-         [] {
-             CaptionStyle style;
-             style.font_family = "Helvetica";
-             style.font_size = 36;
-             style.color = "#00ff00";
-             style.position = "top";
-             const std::string first = DescribeCaptionStyle(style);
-             const std::string second = DescribeCaptionStyle(style);
-             Check(first == second, "must be a pure, deterministic function");
-             Check(first.find("Helvetica") != std::string::npos,
-                   "description must mention the font family");
-             Check(first.find("36") != std::string::npos,
-                   "description must mention the font size");
-             Check(first.find("top") != std::string::npos,
-                   "description must mention the position");
-             Check(first.find("#00ff00") != std::string::npos,
-                   "description must mention the color");
-         });
+    Test("DescribeCaptionStyle is deterministic and includes every field", [] {
+        CaptionStyle style;
+        style.font_family = "Helvetica";
+        style.font_size = 36;
+        style.color = "#00ff00";
+        style.position = "top";
+        const std::string first = DescribeCaptionStyle(style);
+        const std::string second = DescribeCaptionStyle(style);
+        Check(first == second, "must be a pure, deterministic function");
+        Check(first.find("Helvetica") != std::string::npos,
+              "description must mention the font family");
+        Check(first.find("36") != std::string::npos,
+              "description must mention the font size");
+        Check(first.find("top") != std::string::npos,
+              "description must mention the position");
+        Check(first.find("#00ff00") != std::string::npos,
+              "description must mention the color");
+    });
 
     Test("SummarizeCaptionStyles preserves caption_styles order", [] {
         DocumentSequence sequence;
@@ -169,60 +169,55 @@ int main() {
         }
     });
 
-    Test("SummarizeCaptionStyles counts clips per caption group correctly",
-         [] {
-             DocumentSequence sequence;
-             CaptionStyle styleA;
-             CaptionStyle styleB;
-             sequence.caption_styles = {styleA, styleB};
+    Test("SummarizeCaptionStyles counts clips per caption group correctly", [] {
+        DocumentSequence sequence;
+        CaptionStyle styleA;
+        CaptionStyle styleB;
+        sequence.caption_styles = {styleA, styleB};
 
-             DocumentTrack track;
-             track.kind = "video";
-             DocumentClip clipUsingA1;
-             clipUsingA1.caption_group_id = styleA.id;
-             DocumentClip clipUsingA2;
-             clipUsingA2.caption_group_id = styleA.id;
-             DocumentClip clipUsingNone;
-             DocumentClip clipUsingB;
-             clipUsingB.caption_group_id = styleB.id;
-             track.clips = {clipUsingA1, clipUsingA2, clipUsingNone,
-                            clipUsingB};
-             sequence.tracks = {track};
+        DocumentTrack track;
+        track.kind = "video";
+        DocumentClip clipUsingA1;
+        clipUsingA1.caption_group_id = styleA.id;
+        DocumentClip clipUsingA2;
+        clipUsingA2.caption_group_id = styleA.id;
+        DocumentClip clipUsingNone;
+        DocumentClip clipUsingB;
+        clipUsingB.caption_group_id = styleB.id;
+        track.clips = {clipUsingA1, clipUsingA2, clipUsingNone, clipUsingB};
+        sequence.tracks = {track};
 
-             const auto summary = SummarizeCaptionStyles(sequence);
-             Check(summary.size() == 2, "expected two style summaries");
-             if (summary.size() == 2) {
-                 Check(summary[0].clip_count == 2,
-                       "style A should be used by exactly 2 clips");
-                 Check(summary[1].clip_count == 1,
-                       "style B should be used by exactly 1 clip");
-             }
-         });
+        const auto summary = SummarizeCaptionStyles(sequence);
+        Check(summary.size() == 2, "expected two style summaries");
+        if (summary.size() == 2) {
+            Check(summary[0].clip_count == 2,
+                  "style A should be used by exactly 2 clips");
+            Check(summary[1].clip_count == 1,
+                  "style B should be used by exactly 1 clip");
+        }
+    });
 
-    Test("SummarizeCaptionStyles returns zero counts for an unused style",
-         [] {
-             DocumentSequence sequence;
-             CaptionStyle unused;
-             sequence.caption_styles = {unused};
-             const auto summary = SummarizeCaptionStyles(sequence);
-             Check(summary.size() == 1, "expected one summary");
-             if (summary.size() == 1)
-                 Check(summary.front().clip_count == 0,
-                       "an unreferenced style must report zero clips");
-         });
+    Test("SummarizeCaptionStyles returns zero counts for an unused style", [] {
+        DocumentSequence sequence;
+        CaptionStyle unused;
+        sequence.caption_styles = {unused};
+        const auto summary = SummarizeCaptionStyles(sequence);
+        Check(summary.size() == 1, "expected one summary");
+        if (summary.size() == 1)
+            Check(summary.front().clip_count == 0,
+                  "an unreferenced style must report zero clips");
+    });
 
-    Test("JoinClipToCaptionStyle builds the exact join operation",
-         [] {
-             const Ulid clipId = GenerateUlid();
-             const Ulid styleId = GenerateUlid();
-             const SetClipCaptionOperation op =
-                 JoinClipToCaptionStyle(clipId, styleId, "Bonjour");
-             Check(op.clip_id == clipId, "clip_id must round-trip");
-             Check(op.caption_group_id == styleId,
-                   "caption_group_id must be the target style");
-             Check(op.caption_text == "Bonjour",
-                   "caption_text must round-trip");
-         });
+    Test("JoinClipToCaptionStyle builds the exact join operation", [] {
+        const Ulid clipId = GenerateUlid();
+        const Ulid styleId = GenerateUlid();
+        const SetClipCaptionOperation op =
+            JoinClipToCaptionStyle(clipId, styleId, "Bonjour");
+        Check(op.clip_id == clipId, "clip_id must round-trip");
+        Check(op.caption_group_id == styleId,
+              "caption_group_id must be the target style");
+        Check(op.caption_text == "Bonjour", "caption_text must round-trip");
+    });
 
     Test("ClearClipCaption clears both group and text", [] {
         const Ulid clipId = GenerateUlid();

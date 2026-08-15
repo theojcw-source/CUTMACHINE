@@ -30,7 +30,7 @@
 // pointless, since CMPanelHostView only ever asks for identifiers that are
 // already in the fixed layout.
 - (void)setLastActiveIdentifier:(NSString*)identifier
-                         forDock:(ui::PanelDock)dock;
+                        forDock:(ui::PanelDock)dock;
 
 // Returns nil when no preference has been recorded yet (fresh install, or a
 // project opened on a machine that never touched this dock before) --

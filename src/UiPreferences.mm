@@ -23,7 +23,7 @@
 }
 
 - (void)setLastActiveIdentifier:(NSString*)identifier
-                         forDock:(ui::PanelDock)dock {
+                        forDock:(ui::PanelDock)dock {
     [NSUserDefaults.standardUserDefaults
         setObject:identifier
            forKey:[self defaultsKeyForDock:dock]];

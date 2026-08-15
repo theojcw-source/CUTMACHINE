@@ -35,8 +35,7 @@ ResolvedFrame Timeline::ResolveClipAt(const DocumentClip& clip,
     if (!source)
         throw std::logic_error("validated clip references an unknown source");
     return {source->id,
-            sourceTime.to_frames(source->rate.num, source->rate.den),
-            clip.id};
+            sourceTime.to_frames(source->rate.num, source->rate.den), clip.id};
 }
 
 std::vector<ResolvedLayer> Timeline::ResolveTrackLayers(

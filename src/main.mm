@@ -2778,21 +2778,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
     for (ui::media_panel::Tab tab : ui::media_panel::AllTabs())
         [mediaTabTitles
             addObject:[NSString
-                          stringWithUTF8String:ui::media_panel::TabTitle(
-                                                   tab)]];
+                          stringWithUTF8String:ui::media_panel::TabTitle(tab)]];
     self.mediaTabStrip = [[CMTabStripView alloc]
         initWithFrame:NSMakeRect(0.0, mediaContentHeight, mediaPanelWidth,
                                  ui::theme::kTabStripHeight)
-                titles:mediaTabTitles];
-    self.mediaTabStrip.autoresizingMask =
-        NSViewMinYMargin | NSViewWidthSizable;
+               titles:mediaTabTitles];
+    self.mediaTabStrip.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     self.mediaTabStrip.target = self;
     self.mediaTabStrip.action = @selector(mediaTabChanged:);
     [self.mediaPanel addSubview:self.mediaTabStrip];
 
-    self.mediaTabContentMedia = [[NSView alloc]
-        initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth,
-                                 mediaContentHeight)];
+    self.mediaTabContentMedia =
+        [[NSView alloc] initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth,
+                                                 mediaContentHeight)];
     self.mediaTabContentMedia.autoresizingMask =
         NSViewWidthSizable | NSViewHeightSizable;
     [self.mediaPanel addSubview:self.mediaTabContentMedia];
@@ -3066,9 +3064,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self.mediaTabContentMedia addSubview:self.mediaTaskCancelButton];
 
     [self buildAudioTabContentWithWidth:mediaPanelWidth
-                                  height:mediaContentHeight];
+                                 height:mediaContentHeight];
     [self buildCaptionsTabContentWithWidth:mediaPanelWidth
-                                     height:mediaContentHeight];
+                                    height:mediaContentHeight];
     self.mediaTabContentAudio.hidden = YES;
     self.mediaTabContentCaptions.hidden = YES;
     const NSInteger rememberedMediaTab = [NSUserDefaults.standardUserDefaults
@@ -3232,11 +3230,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [content addSubview:self.bottomDockPanel];
 
     self.transportView = [[CMTransportView alloc]
-        initWithFrame:NSMakeRect(0.0, 0.0, windowRect.size.width,
-                                 bottomDockHeight -
-                                     ui::theme::kTabStripHeight)];
+        initWithFrame:NSMakeRect(
+                          0.0, 0.0, windowRect.size.width,
+                          bottomDockHeight - ui::theme::kTabStripHeight)];
     [self.bottomDockPanel setContentView:self.transportView
-                                  forSlot:ui::PanelSlot::Transport];
+                                 forSlot:ui::PanelSlot::Transport];
     // Every position change still funnels through -requestTimelinePosition:
     // (quantized via TimelineView.h's QuantizePlayheadPosition, same as the
     // main timeline's own scrub/step/edit paths) -- these actions never
@@ -3441,8 +3439,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
         icon.image =
             SystemSymbol(toolSymbols[index], toolDescriptions[index], 11.0);
         icon.imageScaling = NSImageScaleProportionallyUpOrDown;
-        icon.contentTintColor = index == 0 ? CMAccentBlueColor()
-                                           : NSColor.secondaryLabelColor;
+        icon.contentTintColor =
+            index == 0 ? CMAccentBlueColor() : NSColor.secondaryLabelColor;
         icon.autoresizingMask = NSViewMinYMargin;
         icon.toolTip = toolDescriptions[index];
         [self.metalView addSubview:icon];
@@ -3512,8 +3510,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
     // Transport panel reads the same requestedPosition/duration this label
     // does, never a second notion of "now".
     [self.transportView setPosition:position
-                            duration:self.state->duration
-                                rate:[self playheadFrameRate]];
+                           duration:self.state->duration
+                               rate:[self playheadFrameRate]];
     self.state->requested.clear();
     for (const Ulid& trackId : self.state->videoTrackIds) {
         for (const ResolvedLayer& layer :
@@ -3947,11 +3945,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
     const ui::media_panel::Tab tab = tabs[index];
     self.mediaTabContentMedia.hidden = tab != ui::media_panel::Tab::Media;
     self.mediaTabContentAudio.hidden = tab != ui::media_panel::Tab::Audio;
-    self.mediaTabContentCaptions.hidden =
-        tab != ui::media_panel::Tab::Captions;
+    self.mediaTabContentCaptions.hidden = tab != ui::media_panel::Tab::Captions;
     [NSUserDefaults.standardUserDefaults setInteger:index
-                                              forKey:@"ui.mediaPanel."
-                                                     @"lastActiveTab"];
+                                             forKey:@"ui.mediaPanel."
+                                                    @"lastActiveTab"];
     switch (tab) {
         case ui::media_panel::Tab::Media:
             [self rebuildMediaList];
@@ -3995,10 +3992,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
         NSViewMinYMargin | NSViewWidthSizable;
     [self.mediaTabContentAudio addSubview:self.audioSearchField];
 
-    self.audioTable =
-        [[ContextTableView alloc] initWithFrame:NSMakeRect(0.0, 0.0,
-                                                            width - 24.0,
-                                                            500.0)];
+    self.audioTable = [[ContextTableView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, width - 24.0, 500.0)];
     for (NSArray<NSString*>* definition in @[
              @[ @"name", @"Nom", @"140" ], @[ @"format", @"Format", @"90" ],
              @[ @"duration", @"Durée", @"60" ]
@@ -4028,8 +4023,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     NSButton* openAudioButton =
         [NSButton buttonWithTitle:@"Source"
                            target:self
-                           action:@selector
-                           (openSelectedAudioInSourceMonitor:)];
+                           action:@selector(openSelectedAudioInSourceMonitor:)];
     openAudioButton.frame = NSMakeRect(12.0, 44.0, 140.0, 28.0);
     openAudioButton.autoresizingMask = NSViewMaxYMargin;
     openAudioButton.bezelStyle = NSBezelStyleRounded;
@@ -4051,8 +4045,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self.mediaTabContentAudio addSubview:assignAudioButton];
 
     self.audioSummaryLabel = [NSTextField labelWithString:@""];
-    self.audioSummaryLabel.frame =
-        NSMakeRect(14.0, 12.0, width - 28.0, 24.0);
+    self.audioSummaryLabel.frame = NSMakeRect(14.0, 12.0, width - 28.0, 24.0);
     self.audioSummaryLabel.autoresizingMask =
         NSViewMaxYMargin | NSViewWidthSizable;
     self.audioSummaryLabel.font = [NSFont systemFontOfSize:11.0];
@@ -4072,8 +4065,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
     const bool anyBin = selected == "__all__";
     const bool wantRoot = selected == "__root__";
     const Ulid wantBinId = anyBin || wantRoot ? Ulid{} : selected;
-    const std::string search(
-        self.audioSearchField.stringValue.UTF8String ?: "");
+    const std::string search(self.audioSearchField.stringValue.UTF8String
+                                 ?: "");
     const auto matches = ui::media_panel::FilterAudioSources(
         self.state->document.library, anyBin, wantRoot, wantBinId, search);
     self.visibleAudioIds = [NSMutableArray array];
@@ -4082,9 +4075,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
             addObject:[NSString stringWithUTF8String:media->id.c_str()]];
     [self.audioTable reloadData];
     const NSUInteger count = self.visibleAudioIds.count;
-    self.audioSummaryLabel.stringValue = [NSString
-        stringWithFormat:@"%lu source%@ audio", (unsigned long)count,
-                         count == 1 ? @"" : @"s"];
+    self.audioSummaryLabel.stringValue =
+        [NSString stringWithFormat:@"%lu source%@ audio", (unsigned long)count,
+                                   count == 1 ? @"" : @"s"];
 }
 
 - (NSString*)selectedAudioId {
@@ -4137,9 +4130,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
 
     self.captionStyleTable = [[ContextTableView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, width - 24.0, 220.0)];
-    for (NSArray<NSString*>* definition in @[
-             @[ @"style", @"Style", @"200" ], @[ @"clips", @"Clips", @"56" ]
-         ]) {
+    for (NSArray<NSString*>* definition in
+         @[ @[ @"style", @"Style", @"200" ], @[ @"clips", @"Clips", @"56" ] ]) {
         NSTableColumn* column =
             [[NSTableColumn alloc] initWithIdentifier:definition[0]];
         column.title = definition[1];
@@ -4186,8 +4178,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self.mediaTabContentCaptions addSubview:self.removeCaptionStyleButton];
 
     NSTextField* selectionTitle = CMMakeSectionHeader(@"Sélection timeline");
-    selectionTitle.frame =
-        NSMakeRect(14.0, height - 320.0, width - 28.0, 18.0);
+    selectionTitle.frame = NSMakeRect(14.0, height - 320.0, width - 28.0, 18.0);
     selectionTitle.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [self.mediaTabContentCaptions addSubview:selectionTitle];
 
@@ -4232,21 +4223,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
 
 - (void)rebuildCaptionStylesList {
     if (!self.state) return;
-    const auto summaries = ui::media_panel::SummarizeCaptionStyles(
-        self.state->document.sequence);
+    const auto summaries =
+        ui::media_panel::SummarizeCaptionStyles(self.state->document.sequence);
     self.visibleCaptionStyleIds = [NSMutableArray array];
     for (const auto& summary : summaries)
         [self.visibleCaptionStyleIds
-            addObject:[NSString
-                          stringWithUTF8String:summary.style_id.c_str()]];
+            addObject:[NSString stringWithUTF8String:summary.style_id.c_str()]];
     [self.captionStyleTable reloadData];
     [self updateCaptionSelectionLabel];
 }
 
 - (void)updateCaptionSelectionLabel {
     if (!self.state || !self.state->interaction) {
-        self.captionSelectionLabel.stringValue =
-            @"Aucune timeline chargée.";
+        self.captionSelectionLabel.stringValue = @"Aucune timeline chargée.";
         return;
     }
     const std::vector<Ulid>& selected =
@@ -4271,8 +4260,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
 
 - (Ulid)selectedCaptionStyleId {
     const NSInteger row = self.captionStyleTable.selectedRow;
-    if (row < 0 || row >= static_cast<NSInteger>(
-                              self.visibleCaptionStyleIds.count))
+    if (row < 0 ||
+        row >= static_cast<NSInteger>(self.visibleCaptionStyleIds.count))
         return {};
     return Ulid(self.visibleCaptionStyleIds[row].UTF8String ?: "");
 }
@@ -4305,8 +4294,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     std::string message;
     if (!self.state->editLog.Apply(
             self.state->document,
-            Operation{RemoveCaptionStyleOperation{styleId}}, error,
-            message)) {
+            Operation{RemoveCaptionStyleOperation{styleId}}, error, message)) {
         self.captionSelectionLabel.stringValue = [NSString
             stringWithFormat:@"Suppression refusée : %s", message.c_str()];
         return;
@@ -4332,15 +4320,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
         const DocumentClip* clip = self.state->document.FindClip(clipId);
         const std::string existingText =
             (clip && clip->caption_group_id == styleId) ? clip->caption_text
-                                                         : std::string{};
+                                                        : std::string{};
         if (!self.state->editLog.Apply(
                 self.state->document,
                 Operation{ui::media_panel::JoinClipToCaptionStyle(
                     clipId, styleId, existingText)},
                 error, message)) {
             self.captionSelectionLabel.stringValue = [NSString
-                stringWithFormat:@"Application refusée : %s",
-                                 message.c_str()];
+                stringWithFormat:@"Application refusée : %s", message.c_str()];
             return;
         }
     }
@@ -5038,8 +5025,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     viewForTableColumn:(NSTableColumn*)tableColumn
                    row:(NSInteger)row {
     if (tableView == self.audioTable) {
-        if (row < 0 || row >= (NSInteger)self.visibleAudioIds.count)
-            return nil;
+        if (row < 0 || row >= (NSInteger)self.visibleAudioIds.count) return nil;
         const LibraryMedia* media = self.state->document.FindLibraryMedia(
             self.visibleAudioIds[row].UTF8String ?: "");
         NSTextField* label = [NSTextField labelWithString:@""];
@@ -5049,16 +5035,15 @@ DeleteGapOperation GapDeleteOperationForSelection(
             label.stringValue =
                 [NSString stringWithUTF8String:media->filename.c_str()];
         else if ([tableColumn.identifier isEqualToString:@"format"])
-            label.stringValue = [NSString
-                stringWithFormat:@"%s · %d ch", media->codec.c_str(),
-                                 media->audio_channels];
+            label.stringValue =
+                [NSString stringWithFormat:@"%s · %d ch", media->codec.c_str(),
+                                           media->audio_channels];
         else
             label.stringValue = TimeString(media->duration);
         return label;
     }
     if (tableView == self.captionStyleTable) {
-        if (row < 0 ||
-            row >= (NSInteger)self.visibleCaptionStyleIds.count)
+        if (row < 0 || row >= (NSInteger)self.visibleCaptionStyleIds.count)
             return nil;
         const CaptionStyle* style = self.state->document.FindCaptionStyle(
             self.visibleCaptionStyleIds[row].UTF8String ?: "");
@@ -5068,8 +5053,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
         if ([tableColumn.identifier isEqualToString:@"style"]) {
             label.stringValue = [NSString
                 stringWithUTF8String:ui::media_panel::DescribeCaptionStyle(
-                                          *style)
-                                          .c_str()];
+                                         *style)
+                                         .c_str()];
         } else {
             const auto summaries = ui::media_panel::SummarizeCaptionStyles(
                 self.state->document.sequence);
@@ -5587,9 +5572,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->tool = tool;
     for (NSInteger index = 0; index < self.timelineToolIcons.count; ++index) {
         self.timelineToolIcons[index].contentTintColor =
-            index == static_cast<NSInteger>(tool)
-                ? CMAccentBlueColor()
-                : NSColor.secondaryLabelColor;
+            index == static_cast<NSInteger>(tool) ? CMAccentBlueColor()
+                                                  : NSColor.secondaryLabelColor;
     }
     self.state->interaction->CancelDrag();
     self.state->navigationDragging = false;
@@ -5615,7 +5599,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->playheadResolution == PlayheadResolution::Sample
             ? RationalTime{amount, 48000}
             : RationalTime{amount * [self playheadFrameRate].den,
-                          [self playheadFrameRate].num};
+                           [self playheadFrameRate].num};
     [self requestTimelinePosition:self.state->requestedPosition.add(delta)];
 }
 
@@ -5808,9 +5792,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
     // method's call sites), so it doubles as the Inspector's refresh
     // trigger. SelectedClipId() is empty for zero or multiple selected
     // clips, which CMInspectorView already renders as "no selection".
-    [self.inspectorView reloadWithDocument:self.state->document
-                            selectedClipId:self.state->interaction
-                                               ->SelectedClipId()];
+    [self.inspectorView
+        reloadWithDocument:self.state->document
+            selectedClipId:self.state->interaction->SelectedClipId()];
     // F2.3 -- keep the Captions tab's "current timeline selection" summary
     // live even when that tab is not the one on screen; it is cheap (one
     // label update) and avoids a stale summary the moment the user switches

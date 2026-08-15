@@ -63,7 +63,7 @@ inline std::string Lower(std::string value) {
 }
 
 inline bool ContainsInsensitive(const std::string& haystack,
-                                 const std::string& needleLower) {
+                                const std::string& needleLower) {
     if (needleLower.empty()) return true;
     return Lower(haystack).find(needleLower) != std::string::npos;
 }

@@ -156,11 +156,9 @@ int main() {
         Check(updated.size() == 2, "updating in place does not add a stage");
         Check(updated[0].id == exposureId && updated[1].id == contrastId,
               "identity and stack order are preserved across an update");
-        Check(EffectParamValueToFloat(updated[0].params.at("amount")) ==
-                  -0.8f,
+        Check(EffectParamValueToFloat(updated[0].params.at("amount")) == -0.8f,
               "the targeted knob's value changed");
-        Check(EffectParamValueToFloat(updated[1].params.at("amount")) ==
-                  -0.2f,
+        Check(EffectParamValueToFloat(updated[1].params.at("amount")) == -0.2f,
               "every other knob's value is untouched");
     }
     {

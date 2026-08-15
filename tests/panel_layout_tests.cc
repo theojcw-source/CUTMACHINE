@@ -33,8 +33,7 @@ int main() {
         const auto& layout = ui::FixedPanelLayout();
         Check(layout.size() == 4, "expected exactly 4 fixed panel slots");
         std::set<ui::PanelSlot> seenSlots;
-        for (const auto& descriptor : layout)
-            seenSlots.insert(descriptor.slot);
+        for (const auto& descriptor : layout) seenSlots.insert(descriptor.slot);
         Check(seenSlots.size() == layout.size(),
               "every PanelSlot value must appear exactly once");
     });
@@ -50,18 +49,16 @@ int main() {
               "identifiers must be unique across slots");
     });
 
-    Test("within each dock, order values are unique -- no tab-order ties",
-         [] {
-             for (ui::PanelDock dock :
-                  {ui::PanelDock::Left, ui::PanelDock::Right,
-                   ui::PanelDock::Bottom}) {
-                 std::set<int> orders;
-                 for (const auto* descriptor : ui::PanelSlotsInDock(dock))
-                     orders.insert(descriptor->order);
-                 Check(orders.size() == ui::PanelSlotsInDock(dock).size(),
-                       "duplicate `order` within one dock");
-             }
-         });
+    Test("within each dock, order values are unique -- no tab-order ties", [] {
+        for (ui::PanelDock dock : {ui::PanelDock::Left, ui::PanelDock::Right,
+                                   ui::PanelDock::Bottom}) {
+            std::set<int> orders;
+            for (const auto* descriptor : ui::PanelSlotsInDock(dock))
+                orders.insert(descriptor->order);
+            Check(orders.size() == ui::PanelSlotsInDock(dock).size(),
+                  "duplicate `order` within one dock");
+        }
+    });
 
     Test("PanelSlotsInDock returns only that dock's slots, sorted by order",
          [] {
@@ -111,9 +108,8 @@ int main() {
 
     Test("local-preference keys are stable and unique per dock", [] {
         std::set<std::string> keys;
-        for (ui::PanelDock dock :
-             {ui::PanelDock::Left, ui::PanelDock::Right,
-              ui::PanelDock::Bottom}) {
+        for (ui::PanelDock dock : {ui::PanelDock::Left, ui::PanelDock::Right,
+                                   ui::PanelDock::Bottom}) {
             const std::string key = ui::LastActiveTabPreferenceKey(dock);
             Check(key == ui::LastActiveTabPreferenceKey(dock),
                   "the same dock must always produce the same key");

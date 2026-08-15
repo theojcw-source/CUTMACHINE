@@ -41,16 +41,25 @@ bool IsValidColor(const Color& color) {
 int main() {
     Test("every named surface/border/text/accent token is a valid color", [] {
         const std::vector<Color> tokens{
-            ui::theme::kSurfaceBase,     ui::theme::kSurfacePanel,
-            ui::theme::kSurfaceRaised,   ui::theme::kSurfaceRowEven,
-            ui::theme::kSurfaceRowOdd,   ui::theme::kSurfaceControl,
+            ui::theme::kSurfaceBase,
+            ui::theme::kSurfacePanel,
+            ui::theme::kSurfaceRaised,
+            ui::theme::kSurfaceRowEven,
+            ui::theme::kSurfaceRowOdd,
+            ui::theme::kSurfaceControl,
             ui::theme::kSurfaceControlActive,
-            ui::theme::kBorderSubtle,    ui::theme::kBorderStrong,
-            ui::theme::kTextPrimary,     ui::theme::kTextSecondary,
-            ui::theme::kTextTertiary,    ui::theme::kAccentBlue,
-            ui::theme::kAccentGreen,     ui::theme::kAccentOrange,
-            ui::theme::kAccentAmber,     ui::theme::kAccentRed,
-            ui::theme::kVideoTrackTint,  ui::theme::kAudioTrackTint,
+            ui::theme::kBorderSubtle,
+            ui::theme::kBorderStrong,
+            ui::theme::kTextPrimary,
+            ui::theme::kTextSecondary,
+            ui::theme::kTextTertiary,
+            ui::theme::kAccentBlue,
+            ui::theme::kAccentGreen,
+            ui::theme::kAccentOrange,
+            ui::theme::kAccentAmber,
+            ui::theme::kAccentRed,
+            ui::theme::kVideoTrackTint,
+            ui::theme::kAudioTrackTint,
         };
         for (const Color& token : tokens)
             Check(IsValidColor(token), "token channel outside [0, 1]");
@@ -69,18 +78,15 @@ int main() {
             "interactive control wells should stand out from raised chrome");
     });
 
-    Test("text hierarchy goes primary > secondary > tertiary in luminance",
-         [] {
-             const auto luma = [](const Color& color) {
-                 return color.r + color.g + color.b;
-             };
-             Check(luma(ui::theme::kTextSecondary) <
-                       luma(ui::theme::kTextPrimary),
-                   "secondary text should be dimmer than primary");
-             Check(luma(ui::theme::kTextTertiary) <
-                       luma(ui::theme::kTextSecondary),
-                   "tertiary text should be dimmer than secondary");
-         });
+    Test("text hierarchy goes primary > secondary > tertiary in luminance", [] {
+        const auto luma = [](const Color& color) {
+            return color.r + color.g + color.b;
+        };
+        Check(luma(ui::theme::kTextSecondary) < luma(ui::theme::kTextPrimary),
+              "secondary text should be dimmer than primary");
+        Check(luma(ui::theme::kTextTertiary) < luma(ui::theme::kTextSecondary),
+              "tertiary text should be dimmer than secondary");
+    });
 
     Test("WithAlpha changes only the alpha channel", [] {
         const Color faded = ui::theme::WithAlpha(ui::theme::kAccentBlue, 0.3f);
@@ -140,7 +146,7 @@ int main() {
     Test("the type scale is strictly increasing", [] {
         const std::vector<double> sizes{
             ui::theme::kFontSizeCaption, ui::theme::kFontSizeSmall,
-            ui::theme::kFontSizeBody, ui::theme::kFontSizeSection,
+            ui::theme::kFontSizeBody,    ui::theme::kFontSizeSection,
             ui::theme::kFontSizeTitle,
         };
         for (size_t index = 1; index < sizes.size(); ++index)
