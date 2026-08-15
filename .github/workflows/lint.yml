@@ -39,7 +39,7 @@ jobs:
           fetch-depth: 0
 
       - name: Cache Homebrew downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/Library/Caches/Homebrew
           key: brew-macos-lint-${{ hashFiles('Brewfile') }}
