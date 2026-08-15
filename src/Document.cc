@@ -346,6 +346,11 @@ RationalTime ParseTime(const JsonValue& value, const std::string& context) {
             Int32(value, "rate", context)};
 }
 
+EffectParamValue ParseEffectParamValue(const JsonValue& value,
+                                       const std::string& context) {
+    return {Int32(value, "num", context), Int32(value, "den", context)};
+}
+
 std::string Escape(const std::string& input) {
     std::ostringstream output;
     for (const unsigned char character : input) {
@@ -386,6 +391,11 @@ std::string Escape(const std::string& input) {
 
 void WriteTime(std::ostringstream& output, const RationalTime& time) {
     output << "{\"value\":" << time.value << ",\"rate\":" << time.rate << "}";
+}
+
+void WriteEffectParamValue(std::ostringstream& output,
+                           const EffectParamValue& value) {
+    output << "{\"num\":" << value.num << ",\"den\":" << value.den << "}";
 }
 
 bool RegisterId(const Ulid& id, const std::string& context, std::set<Ulid>& ids,
@@ -664,7 +674,7 @@ bool Document::LoadFromString(const std::string& json, Document& output,
         const JsonValue root = JsonParser(json).Parse();
         Document parsed;
         parsed.version = Int32(root, "version", "document");
-        if (parsed.version != 3) {
+        if (parsed.version != 4) {
             throw std::runtime_error("unsupported document version " +
                                      std::to_string(parsed.version));
         }
@@ -896,6 +906,84 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                         std::move(transition));
                 }
             }
+            if (const JsonValue* styles = Optional(timelineOwner,
+                                                    "caption_styles",
+                                                    JsonValue::Type::Array,
+                                                    markerRoot)) {
+                for (size_t index = 0; index < styles->array.size(); ++index) {
+                    const JsonValue& item = styles->array[index];
+                    const std::string context = markerRoot +
+                                                ".caption_styles[" +
+                                                std::to_string(index) + "]";
+                    CaptionStyle style;
+                    style.id =
+                        Require(item, "id", JsonValue::Type::String, context)
+                            .string;
+                    style.font_family = Require(item, "font_family",
+                                                JsonValue::Type::String,
+                                                context)
+                                            .string;
+                    style.font_size = Int32(item, "font_size", context);
+                    style.color =
+                        Require(item, "color", JsonValue::Type::String,
+                                context)
+                            .string;
+                    style.position = Require(item, "position",
+                                             JsonValue::Type::String, context)
+                                         .string;
+                    parsed.sequence.caption_styles.push_back(
+                        std::move(style));
+                }
+            }
+            if (const JsonValue* groups = Optional(timelineOwner,
+                                                    "multicam_groups",
+                                                    JsonValue::Type::Array,
+                                                    markerRoot)) {
+                for (size_t index = 0; index < groups->array.size();
+                     ++index) {
+                    const JsonValue& item = groups->array[index];
+                    const std::string context = markerRoot +
+                                                ".multicam_groups[" +
+                                                std::to_string(index) + "]";
+                    MulticamGroup group;
+                    group.id =
+                        Require(item, "id", JsonValue::Type::String, context)
+                            .string;
+                    group.name =
+                        Require(item, "name", JsonValue::Type::String,
+                                context)
+                            .string;
+                    if (const JsonValue* active =
+                            Optional(item, "active_angle_id",
+                                     JsonValue::Type::String, context))
+                        group.active_angle_id = active->string;
+                    const JsonValue& angles = Require(
+                        item, "angles", JsonValue::Type::Array, context);
+                    for (size_t angleIndex = 0;
+                         angleIndex < angles.array.size(); ++angleIndex) {
+                        const JsonValue& angleValue = angles.array[angleIndex];
+                        const std::string angleContext =
+                            context + ".angles[" +
+                            std::to_string(angleIndex) + "]";
+                        MulticamAngle angle;
+                        angle.id = Require(angleValue, "id",
+                                           JsonValue::Type::String,
+                                           angleContext)
+                                       .string;
+                        angle.name = Require(angleValue, "name",
+                                             JsonValue::Type::String,
+                                             angleContext)
+                                         .string;
+                        angle.clip_id = Require(angleValue, "clip_id",
+                                                JsonValue::Type::String,
+                                                angleContext)
+                                            .string;
+                        group.angles.push_back(std::move(angle));
+                    }
+                    parsed.sequence.multicam_groups.push_back(
+                        std::move(group));
+                }
+            }
         }
 
         const JsonValue& sources =
@@ -982,6 +1070,53 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                         ParseTime(Require(clipValue, "sync_reference_delta",
                                           JsonValue::Type::Object, clipContext),
                                   clipContext + ".sync_reference_delta");
+                }
+                if (const JsonValue* effects = Optional(
+                        clipValue, "effects", JsonValue::Type::Array,
+                        clipContext)) {
+                    for (size_t effectIndex = 0;
+                         effectIndex < effects->array.size(); ++effectIndex) {
+                        const JsonValue& effectValue =
+                            effects->array[effectIndex];
+                        const std::string effectContext =
+                            clipContext + ".effects[" +
+                            std::to_string(effectIndex) + "]";
+                        ClipEffect effect;
+                        effect.id = Require(effectValue, "id",
+                                            JsonValue::Type::String,
+                                            effectContext)
+                                        .string;
+                        effect.type = Require(effectValue, "type",
+                                              JsonValue::Type::String,
+                                              effectContext)
+                                          .string;
+                        const JsonValue& params =
+                            Require(effectValue, "params",
+                                    JsonValue::Type::Object, effectContext);
+                        for (const auto& entry : params.object) {
+                            if (entry.second.type != JsonValue::Type::Object) {
+                                throw std::runtime_error(
+                                    effectContext + ".params['" + entry.first +
+                                    "'] has the wrong JSON type");
+                            }
+                            effect.params.emplace(
+                                entry.first,
+                                ParseEffectParamValue(
+                                    entry.second,
+                                    effectContext + ".params['" + entry.first +
+                                        "']"));
+                        }
+                        clip.effects.push_back(std::move(effect));
+                    }
+                }
+                if (const JsonValue* captionGroup =
+                        Optional(clipValue, "caption_group_id",
+                                 JsonValue::Type::String, clipContext)) {
+                    clip.caption_group_id = captionGroup->string;
+                    clip.caption_text = Require(clipValue, "caption_text",
+                                                JsonValue::Type::String,
+                                                clipContext)
+                                             .string;
                 }
                 track.clips.push_back(std::move(clip));
             }
@@ -1086,12 +1221,68 @@ std::string Document::SaveToString() const {
                        << "\",\"sync_reference_delta\":";
                 WriteTime(output, clip.sync_reference_delta);
             }
+            output << ",\"effects\":[";
+            for (size_t effectIndex = 0; effectIndex < clip.effects.size();
+                 ++effectIndex) {
+                const ClipEffect& effect = clip.effects[effectIndex];
+                output << (effectIndex == 0 ? "\n" : ",\n") << "        {\"id\":\""
+                       << Escape(effect.id) << "\",\"type\":\""
+                       << Escape(effect.type) << "\",\"params\":{";
+                size_t paramIndex = 0;
+                for (const auto& param : effect.params) {
+                    output << (paramIndex++ == 0 ? "\n" : ",\n")
+                           << "          \"" << Escape(param.first) << "\":";
+                    WriteEffectParamValue(output, param.second);
+                }
+                if (!effect.params.empty()) output << '\n' << "        ";
+                output << "}}";
+            }
+            if (!clip.effects.empty()) output << '\n' << "      ";
+            output << "]";
+            if (!clip.caption_group_id.empty())
+                output << ",\"caption_group_id\":\""
+                       << Escape(clip.caption_group_id)
+                       << "\",\"caption_text\":\""
+                       << Escape(clip.caption_text) << "\"";
             output << "}";
         }
         if (!track.clips.empty()) output << '\n';
         output << "    ]}";
     }
     if (!sequence.tracks.empty()) output << '\n';
+    output << "  ],\"caption_styles\":[";
+    for (size_t index = 0; index < sequence.caption_styles.size(); ++index) {
+        const CaptionStyle& style = sequence.caption_styles[index];
+        output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(style.id) << "\",\"font_family\":\""
+               << Escape(style.font_family)
+               << "\",\"font_size\":" << style.font_size << ",\"color\":\""
+               << Escape(style.color) << "\",\"position\":\""
+               << Escape(style.position) << "\"}";
+    }
+    if (!sequence.caption_styles.empty()) output << '\n';
+    output << "  ],\"multicam_groups\":[";
+    for (size_t index = 0; index < sequence.multicam_groups.size(); ++index) {
+        const MulticamGroup& group = sequence.multicam_groups[index];
+        output << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
+               << Escape(group.id) << "\",\"name\":\"" << Escape(group.name)
+               << "\",\"angles\":[";
+        for (size_t angleIndex = 0; angleIndex < group.angles.size();
+             ++angleIndex) {
+            const MulticamAngle& angle = group.angles[angleIndex];
+            output << (angleIndex == 0 ? "\n" : ",\n") << "      {\"id\":\""
+                   << Escape(angle.id) << "\",\"name\":\""
+                   << Escape(angle.name) << "\",\"clip_id\":\""
+                   << Escape(angle.clip_id) << "\"}";
+        }
+        if (!group.angles.empty()) output << '\n' << "    ";
+        output << "]";
+        if (!group.active_angle_id.empty())
+            output << ",\"active_angle_id\":\""
+                   << Escape(group.active_angle_id) << "\"";
+        output << "}";
+    }
+    if (!sequence.multicam_groups.empty()) output << '\n';
     output << "  ]}" << ",\n  \"color_management\":{\"enabled\":"
            << (color_management.enabled ? "true" : "false")
            << ",\"input_gamut\":\"" << Escape(color_management.input_gamut)
@@ -1169,7 +1360,7 @@ std::string Document::SaveToString() const {
 }
 
 bool Document::Validate(std::string& error) const {
-    if (version != 3) {
+    if (version != 4) {
         error = "unsupported document version " + std::to_string(version);
         return false;
     }
@@ -1430,6 +1621,53 @@ bool Document::Validate(std::string& error) const {
                         exception.what();
                 return false;
             }
+            for (size_t effectIndex = 0; effectIndex < clip.effects.size();
+                 ++effectIndex) {
+                const ClipEffect& effect = clip.effects[effectIndex];
+                const std::string effectContext =
+                    context + " effect " + std::to_string(effectIndex);
+                if (!RegisterId(effect.id, effectContext, ids, error))
+                    return false;
+                if (track.kind != "video") {
+                    error = effectContext + " ('" + effect.id +
+                            "') is on a non-video track";
+                    return false;
+                }
+                if (effect.type.rfind("color.", 0) != 0 ||
+                    effect.type.size() <= 6 || effect.type.size() > 128) {
+                    error = effectContext + " ('" + effect.id +
+                            "') has an unsupported effect type '" +
+                            effect.type + "'";
+                    return false;
+                }
+                for (const auto& param : effect.params) {
+                    if (param.first.empty() || param.first.size() > 64) {
+                        error = effectContext + " ('" + effect.id +
+                                "') has an invalid parameter name";
+                        return false;
+                    }
+                    if (param.second.den <= 0) {
+                        error = effectContext + " ('" + effect.id +
+                                "') parameter '" + param.first +
+                                "' has a non-positive denominator";
+                        return false;
+                    }
+                }
+            }
+            if (!clip.caption_group_id.empty()) {
+                if (!IsValidUlid(clip.caption_group_id)) {
+                    error = context + " ('" + clip.id +
+                            "') has invalid caption_group_id '" +
+                            clip.caption_group_id + "'";
+                    return false;
+                }
+                if (!FindCaptionStyle(clip.caption_group_id)) {
+                    error = context + " ('" + clip.id +
+                            "') references unknown caption_group_id '" +
+                            clip.caption_group_id + "'";
+                    return false;
+                }
+            }
             previous = &clip;
         }
     }
@@ -1506,6 +1744,68 @@ bool Document::Validate(std::string& error) const {
             return false;
         }
     }
+    const auto validCaptionStyleText = [](const std::string& value,
+                                          size_t maximum) {
+        if (value.empty() || value.size() > maximum) return false;
+        return std::none_of(value.begin(), value.end(), [](unsigned char byte) {
+            return byte < 0x20 || byte == 0x7f;
+        });
+    };
+    for (size_t index = 0; index < sequence.caption_styles.size(); ++index) {
+        const CaptionStyle& style = sequence.caption_styles[index];
+        const std::string context = "caption style " + std::to_string(index);
+        if (!RegisterId(style.id, context, ids, error)) return false;
+        if (!validCaptionStyleText(style.font_family, 128) ||
+            style.font_size <= 0 ||
+            !validCaptionStyleText(style.color, 64) ||
+            !validCaptionStyleText(style.position, 64)) {
+            error = context +
+                    " has an invalid font_family, font_size, color or "
+                    "position";
+            return false;
+        }
+    }
+    for (size_t groupIndex = 0; groupIndex < sequence.multicam_groups.size();
+         ++groupIndex) {
+        const MulticamGroup& group = sequence.multicam_groups[groupIndex];
+        const std::string groupContext =
+            "multicam group " + std::to_string(groupIndex);
+        if (!RegisterId(group.id, groupContext, ids, error)) return false;
+        if (group.name.empty()) {
+            error = groupContext + " has an empty name";
+            return false;
+        }
+        std::set<Ulid> angleIds;
+        std::set<Ulid> angleClipIds;
+        for (size_t angleIndex = 0; angleIndex < group.angles.size();
+             ++angleIndex) {
+            const MulticamAngle& angle = group.angles[angleIndex];
+            const std::string angleContext =
+                groupContext + " angle " + std::to_string(angleIndex);
+            if (!RegisterId(angle.id, angleContext, ids, error)) return false;
+            angleIds.insert(angle.id);
+            if (!angleClipIds.insert(angle.clip_id).second) {
+                error = angleContext +
+                        " ('" + angle.id +
+                        "') references a clip_id already used by another "
+                        "angle in this group";
+                return false;
+            }
+            const DocumentTrack* angleTrack = FindTrackForClip(angle.clip_id);
+            if (!angleTrack || angleTrack->kind != "video") {
+                error = angleContext + " ('" + angle.id +
+                        "') must reference a clip on a video track";
+                return false;
+            }
+        }
+        if (!group.active_angle_id.empty() &&
+            angleIds.find(group.active_angle_id) == angleIds.end()) {
+            error = groupContext + " active_angle_id '" +
+                    group.active_angle_id +
+                    "' does not reference one of its own angles";
+            return false;
+        }
+    }
     error.clear();
     return true;
 }
@@ -1576,6 +1876,34 @@ const DocumentTransition* Document::FindTransition(const Ulid& id) const {
 DocumentTransition* Document::FindTransition(const Ulid& id) {
     for (DocumentTransition& transition : sequence.transitions) {
         if (transition.id == id) return &transition;
+    }
+    return nullptr;
+}
+
+const CaptionStyle* Document::FindCaptionStyle(const Ulid& id) const {
+    for (const CaptionStyle& style : sequence.caption_styles) {
+        if (style.id == id) return &style;
+    }
+    return nullptr;
+}
+
+CaptionStyle* Document::FindCaptionStyle(const Ulid& id) {
+    for (CaptionStyle& style : sequence.caption_styles) {
+        if (style.id == id) return &style;
+    }
+    return nullptr;
+}
+
+const MulticamGroup* Document::FindMulticamGroup(const Ulid& id) const {
+    for (const MulticamGroup& group : sequence.multicam_groups) {
+        if (group.id == id) return &group;
+    }
+    return nullptr;
+}
+
+MulticamGroup* Document::FindMulticamGroup(const Ulid& id) {
+    for (MulticamGroup& group : sequence.multicam_groups) {
+        if (group.id == id) return &group;
     }
     return nullptr;
 }

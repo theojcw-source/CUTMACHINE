@@ -18,6 +18,8 @@ enum class EditError {
     UnknownBin,
     UnknownMarker,
     UnknownTransition,
+    UnknownCaptionStyle,
+    UnknownMulticamGroup,
     UnknownSequence,
     UnknownMedia,
     InvalidDuration,
@@ -341,6 +343,48 @@ struct JoinClipOperation {
     ExactClipTimes joined_times;
 };
 
+// Replaces a clip's entire color-grade stack. Full-vector replacement keeps
+// the operation trivially invertible, the same shape as UpdateMarker.
+struct SetClipEffectsOperation {
+    Ulid clip_id;
+    std::vector<ClipEffect> effects;
+};
+
+struct AddCaptionStyleOperation {
+    CaptionStyle style;
+    // -1 appends on first application. Exact inverse operations carry the
+    // original vector position so remove/undo restores canonical bytes.
+    int64_t insertion_index = -1;
+};
+
+struct RemoveCaptionStyleOperation {
+    Ulid style_id;
+};
+
+// Joins or removes a clip from a caption run. An empty caption_group_id
+// clears the clip's caption.
+struct SetClipCaptionOperation {
+    Ulid clip_id;
+    Ulid caption_group_id;
+    std::string caption_text;
+};
+
+// Schema and serialization for F0.3 are complete and tested; ApplyOperation
+// currently rejects both multicam operations below with
+// EditError::InvalidOperation. ROADMAP.md ticket F1.5 ("Multicam") owns
+// wiring their real apply logic, so a second agent does not collide with
+// this one over the same code path.
+struct AddMulticamGroupOperation {
+    MulticamGroup group;
+    // -1 appends on first application, mirroring AddMarker/AddTransition.
+    int64_t insertion_index = -1;
+};
+
+struct SetMulticamActiveAngleOperation {
+    Ulid group_id;
+    Ulid active_angle_id;
+};
+
 using Operation = std::variant<
     InsertClipOperation, RemoveClipOperation, ClearClipOperation,
     PasteClipsOperation, TrimClipOperation, MoveClipOperation,
@@ -353,7 +397,10 @@ using Operation = std::variant<
     RemoveBinOperation, RenameBinOperation, MoveBinOperation,
     SetMediaBinOperation, AddMarkerOperation, RemoveMarkerOperation,
     UpdateMarkerOperation, AddTransitionOperation, RemoveTransitionOperation,
-    UpdateTransitionOperation, SetClipLinkOperation>;
+    UpdateTransitionOperation, SetClipLinkOperation, SetClipEffectsOperation,
+    AddCaptionStyleOperation, RemoveCaptionStyleOperation,
+    SetClipCaptionOperation, AddMulticamGroupOperation,
+    SetMulticamActiveAngleOperation>;
 
 struct ExactProjectState {
     std::string canonical_json;

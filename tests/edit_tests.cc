@@ -1227,6 +1227,178 @@ int main() {
                        "slip rejects a locked track");
     });
 
+    Test(
+        "clip color effects are addressable, serializable and byte-exactly "
+        "reversible",
+        [] {
+            Document document = EditDocument();
+            const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+            const std::string original = document.SaveToString();
+            EditLog log;
+            EditError error = EditError::None;
+            std::string message;
+
+            SetClipEffectsOperation setEffects{
+                clipId,
+                {{{}, "color.exposure", {{"amount", {35, 100}}}},
+                 {{}, "color.contrast", {{"amount", {10, 100}}}}}};
+            Check(Apply(log, document, setEffects, "set clip effects"),
+                  "clip effects apply succeeds");
+            const auto& stored = std::get<SetClipEffectsOperation>(
+                log.AppliedEntries().back().op);
+            Check(stored.effects.size() == 2 &&
+                      IsValidUlid(stored.effects[0].id) &&
+                      IsValidUlid(stored.effects[1].id),
+                  "SetClipEffects fills in stable ULIDs for new effects");
+            const std::string withEffects = document.SaveToString();
+            const std::string effectsJson = SerializeOperation(stored);
+            Operation parsed = RemoveClipOperation{};
+            Check(DeserializeOperation(effectsJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == effectsJson,
+                  "SetClipEffects JSON round-trips canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "SetClipEffects undo restores original bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withEffects,
+                  "SetClipEffects redo restores the effect stack and bytes");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "second SetClipEffects undo is byte-exact");
+
+            ExpectRejected(
+                document,
+                SetClipEffectsOperation{"01K20000000000000000000099", {}},
+                EditError::UnknownClip, "unknown clip_id for SetClipEffects");
+            ExpectRejected(
+                document,
+                SetClipEffectsOperation{clipId, {{{}, "brightness", {}}}},
+                EditError::ValidationFailed,
+                "effect type outside the color.* family");
+
+            document.sequence.tracks[0].locked = true;
+            ExpectRejected(document, setEffects, EditError::LockedTrack,
+                           "clip effects reject a locked track");
+        });
+
+    Test(
+        "caption styles and per-clip captions are addressable, "
+        "serializable and byte-exactly reversible",
+        [] {
+            Document document = EditDocument();
+            const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+            const std::string original = document.SaveToString();
+            EditLog log;
+            EditError error = EditError::None;
+            std::string message;
+
+            AddCaptionStyleOperation addStyle{
+                {{}, "Inter", 64, "#ffffff", "bottom"}, -1};
+            Check(Apply(log, document, addStyle, "add caption style"),
+                  "caption style addition succeeds");
+            const auto& storedAdd = std::get<AddCaptionStyleOperation>(
+                log.AppliedEntries().back().op);
+            const Ulid styleId = storedAdd.style.id;
+            Check(IsValidUlid(styleId) && document.FindCaptionStyle(styleId),
+                  "AddCaptionStyle receives and retains a stable ULID");
+            Check(storedAdd.insertion_index == 0,
+                  "AddCaptionStyle records its exact canonical position");
+            const std::string withStyle = document.SaveToString();
+            const std::string addJson = SerializeOperation(storedAdd);
+            Operation parsed = RemoveClipOperation{};
+            Check(DeserializeOperation(addJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == addJson,
+                  "AddCaptionStyle JSON round-trips canonically");
+
+            SetClipCaptionOperation setCaption{clipId, styleId,
+                                               "Bonjour le monde"};
+            Check(Apply(log, document, setCaption, "set clip caption"),
+                  "clip caption assignment succeeds");
+            const std::string withCaption = document.SaveToString();
+            const std::string setJson =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Check(DeserializeOperation(setJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == setJson,
+                  "SetClipCaption JSON round-trips canonically");
+            Check(document.FindClip(clipId)->caption_text ==
+                      "Bonjour le monde",
+                  "SetClipCaption keeps the exact per-clip text");
+
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == withStyle,
+                  "SetClipCaption undo restores the pre-caption bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withCaption,
+                  "SetClipCaption redo restores caption bytes");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == withStyle,
+                  "second SetClipCaption undo is byte-exact");
+
+            ExpectRejected(
+                document,
+                RemoveCaptionStyleOperation{"01K87000000000000000000099"},
+                EditError::UnknownCaptionStyle,
+                "unknown caption style_id");
+            ExpectRejected(
+                document,
+                SetClipCaptionOperation{"01K20000000000000000000099",
+                                        styleId, "x"},
+                EditError::UnknownClip, "unknown clip_id for SetClipCaption");
+
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "AddCaptionStyle undo restores original bytes");
+
+            document.sequence.tracks[0].locked = true;
+            ExpectRejected(document, SetClipCaptionOperation{clipId, "", ""},
+                           EditError::LockedTrack,
+                           "clip caption rejects a locked track");
+        });
+
+    Test(
+        "multicam group operations are schema-complete but rejected "
+        "pending F1.5",
+        [] {
+            Document document = EditDocument();
+            const Ulid clipA = document.sequence.tracks[0].clips[0].id;
+            const Ulid clipB = document.sequence.tracks[0].clips[1].id;
+            const std::string original = document.SaveToString();
+            EditError error = EditError::None;
+            std::string message;
+
+            AddMulticamGroupOperation addGroup{
+                {{},
+                 "Interview",
+                 {{{}, "Wide", clipA}, {{}, "Close", clipB}},
+                 {}},
+                -1};
+            const std::string addGroupJson = SerializeOperation(addGroup);
+            Operation parsed = RemoveClipOperation{};
+            Check(
+                DeserializeOperation(addGroupJson, parsed, error, message) &&
+                    SerializeOperation(parsed) == addGroupJson,
+                "AddMulticamGroup JSON round-trips canonically even though "
+                "apply is stubbed");
+            ExpectRejected(document, addGroup, EditError::InvalidOperation,
+                           "AddMulticamGroup is rejected pending "
+                           "ROADMAP.md F1.5");
+
+            SetMulticamActiveAngleOperation setActive{
+                "01K88000000000000000000001",
+                "01K88000000000000000000002"};
+            const std::string setActiveJson = SerializeOperation(setActive);
+            Check(
+                DeserializeOperation(setActiveJson, parsed, error, message) &&
+                    SerializeOperation(parsed) == setActiveJson,
+                "SetMulticamActiveAngle JSON round-trips canonically even "
+                "though apply is stubbed");
+            ExpectRejected(document, setActive, EditError::InvalidOperation,
+                           "SetMulticamActiveAngle is rejected pending "
+                           "ROADMAP.md F1.5");
+            Check(document.SaveToString() == original,
+                  "no multicam operation left any trace on the document");
+        });
+
     if (failures) {
         std::cerr << failures << " assertion(s) failed\n";
         return 1;

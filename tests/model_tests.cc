@@ -478,6 +478,159 @@ int main() {
         }
     });
 
+    Test("clip color effects persist and validate", [] {
+        Document document = ValidDocument();
+        document.sequence.tracks[0].clips[0].effects = {
+            {"01K84000000000000000000001",
+             "color.exposure",
+             {{"amount", {35, 100}}}},
+            {"01K84000000000000000000002",
+             "color.temperature",
+             {{"kelvin", {5600, 1}}, {"tint", {-5, 100}}}},
+        };
+        std::string error;
+        Check(document.Validate(error), "effect fixture validates: " + error);
+        const std::string canonical = document.SaveToString();
+        Document loaded;
+        Check(Document::LoadFromString(canonical, loaded, error),
+              "clip effects load from canonical JSON: " + error);
+        Check(loaded.SaveToString() == canonical,
+              "clip effect document JSON round-trips byte-identically");
+        Check(loaded.sequence.tracks[0].clips[0].effects.size() == 2 &&
+                  loaded.sequence.tracks[0].clips[0].effects[0].type ==
+                      "color.exposure",
+              "effect stack keeps its order and type");
+
+        loaded = document;
+        loaded.sequence.tracks[0].clips[0].effects[0].type = "brightness";
+        Check(!loaded.Validate(error) &&
+                  error.find("unsupported effect type") != std::string::npos,
+              "effect types outside the color.* family are rejected");
+
+        loaded = document;
+        loaded.sequence.tracks[0].clips[0].effects[0].params["amount"].den = 0;
+        Check(!loaded.Validate(error) &&
+                  error.find("non-positive denominator") != std::string::npos,
+              "effect parameters must have a positive denominator");
+
+        loaded = document;
+        loaded.sequence.tracks[1].clips[0].effects =
+            document.sequence.tracks[0].clips[0].effects;
+        Check(!loaded.Validate(error) &&
+                  error.find("duplicate ID") != std::string::npos,
+              "effect IDs participate in global identity validation");
+
+        loaded = document;
+        loaded.sequence.tracks[1].kind = "audio";
+        loaded.sequence.tracks[1].clips[0].effects = {
+            {"01K84000000000000000000003", "color.exposure", {}}};
+        Check(!loaded.Validate(error) &&
+                  error.find("non-video track") != std::string::npos,
+              "color effects are rejected on non-video tracks");
+    });
+
+    Test("caption schema persists and validates", [] {
+        Document document = ValidDocument();
+        const Ulid styleId = "01K85000000000000000000001";
+        document.sequence.caption_styles = {
+            {styleId, "Inter", 64, "#ffffff", "bottom"},
+        };
+        document.sequence.tracks[0].clips[0].caption_group_id = styleId;
+        document.sequence.tracks[0].clips[0].caption_text = "Bonjour";
+        std::string error;
+        Check(document.Validate(error), "caption fixture validates: " + error);
+        const std::string canonical = document.SaveToString();
+        Document loaded;
+        Check(Document::LoadFromString(canonical, loaded, error),
+              "caption document loads from canonical JSON: " + error);
+        Check(loaded.SaveToString() == canonical,
+              "caption document JSON round-trips byte-identically");
+        Check(loaded.FindCaptionStyle(styleId) &&
+                  loaded.sequence.tracks[0].clips[0].caption_text == "Bonjour",
+              "caption style and per-clip text round-trip");
+
+        loaded = document;
+        loaded.sequence.tracks[0].clips[0].caption_group_id =
+            "01K85000000000000000000099";
+        Check(!loaded.Validate(error) &&
+                  error.find("unknown caption_group_id") != std::string::npos,
+              "a clip referencing an unknown caption style is rejected");
+
+        loaded = document;
+        loaded.sequence.caption_styles[0].font_size = 0;
+        Check(!loaded.Validate(error) &&
+                  error.find("caption style") != std::string::npos,
+              "an invalid caption style is rejected");
+    });
+
+    Test("multicam group schema persists and validates", [] {
+        Document document = ValidDocument();
+        const Ulid groupId = "01K86000000000000000000001";
+        const Ulid angleAId = "01K86000000000000000000002";
+        const Ulid angleBId = "01K86000000000000000000003";
+        document.sequence.multicam_groups = {
+            {groupId,
+             "Interview",
+             {
+                 {angleAId, "Wide", document.sequence.tracks[0].clips[0].id},
+                 {angleBId, "Close", document.sequence.tracks[0].clips[1].id},
+             },
+             angleAId},
+        };
+        std::string error;
+        Check(document.Validate(error),
+              "multicam fixture validates: " + error);
+        const std::string canonical = document.SaveToString();
+        Document loaded;
+        Check(Document::LoadFromString(canonical, loaded, error),
+              "multicam document loads from canonical JSON: " + error);
+        Check(loaded.SaveToString() == canonical,
+              "multicam document JSON round-trips byte-identically");
+        Check(loaded.FindMulticamGroup(groupId) &&
+                  loaded.FindMulticamGroup(groupId)->angles.size() == 2,
+              "multicam group and its angles round-trip");
+
+        loaded = document;
+        loaded.sequence.multicam_groups[0].active_angle_id =
+            "01K86000000000000000000099";
+        Check(!loaded.Validate(error) &&
+                  error.find("does not reference one of its own angles") !=
+                      std::string::npos,
+              "an active angle outside the group is rejected");
+
+        loaded = document;
+        loaded.sequence.multicam_groups[0].angles[1].clip_id =
+            document.sequence.tracks[0].clips[0].id;
+        Check(!loaded.Validate(error) &&
+                  error.find("already used by another angle") !=
+                      std::string::npos,
+              "two angles cannot reference the same clip");
+
+        loaded = document;
+        loaded.sequence.multicam_groups[0].angles[0].clip_id =
+            "01K86000000000000000000098";
+        Check(!loaded.Validate(error) &&
+                  error.find("must reference a clip on a video track") !=
+                      std::string::npos,
+              "an angle must reference an existing clip on a video track");
+    });
+
+    Test("document schema version 3 is rejected without migration", [] {
+        const std::string json =
+            "{\"version\":3,\"sequence\":{\"id\":"
+            "\"01K92000000000000000000001\",\"name\":\"Legacy sequence\","
+            "\"width\":1920,\"height\":1080,\"frame_rate\":{\"num\":25,"
+            "\"den\":1}},\"library\":[],\"bins\":[],\"markers\":[],"
+            "\"transitions\":[],\"tracks\":[],\"sources\":[]}";
+        Document document;
+        std::string error;
+        Check(!Document::LoadFromString(json, document, error) &&
+                  error.find("unsupported document version 3") !=
+                      std::string::npos,
+              "version 3 (pre-effects/caption/multicam schema) must be "
+              "rejected explicitly, like v1 and v2");
+    });
+
     Test("track lock state persists", [] {
         Document document = ValidDocument();
         document.sequence.tracks[0].locked = true;
