@@ -58,6 +58,7 @@ extern "C" {
 // install their content into (see PanelHostView.h). Objective-C++
 // declarations, so #import rather than #include, matching AppKit/Foundation
 // above.
+#import "InspectorView.h"
 #import "PanelHostView.h"
 #import "UiComponents.h"
 #import "UiThemeAppKit.h"
@@ -746,7 +747,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                    NSTableViewDelegate,
                                    NSCollectionViewDataSource,
                                    NSCollectionViewDelegate,
-                                   NSTextFieldDelegate>
+                                   NSTextFieldDelegate,
+                                   CMInspectorViewDelegate>
 @property(nonatomic, strong) NSWindow* window;
 @property(nonatomic, strong) NSWindow* startupWindow;
 @property(nonatomic, strong) NSPopUpButton* recentProjectsPopup;
@@ -770,6 +772,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
 // rightDockPanel -- see PanelHostView.h.
 @property(nonatomic, strong) CMPanelHostView* bottomDockPanel;
 @property(nonatomic, strong) CMTransportView* transportView;
+// F2.2 -- Inspector content installed into rightDockPanel's Inspector slot
+// (see -applicationDidFinishLaunching below).
+@property(nonatomic, strong) CMInspectorView* inspectorView;
 @property(nonatomic, strong) NSPopUpButton* binPopup;
 @property(nonatomic, strong) NSPopUpButton* mediaPopup;
 @property(nonatomic, strong) NSTextField* binSummaryLabel;
@@ -3072,6 +3077,21 @@ DeleteGapOperation GapDeleteOperationForSelection(
         NSViewWidthSizable | NSViewHeightSizable;
     [self.workspaceSplitView addArrangedSubview:self.rightDockPanel];
 
+    // F2.2 -- Inspector: clip properties + the eight F1.3 color.* grading
+    // knobs (ColorEffects.h), sliders built on CMControlRowView. Every
+    // slider edit becomes a SetClipEffectsOperation, delivered here via
+    // -inspectorView:didCommitClipEffects: (below) and applied through
+    // self.state->editLog -- the same EditLog::Apply path CLI/MCP already
+    // use for this operation (PHILOSOPHY.md principle 3, "aucune surface
+    // n'est privilégiée"). See InspectorView.h/.mm for the view itself.
+    self.inspectorView = [[CMInspectorView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];
+    self.inspectorView.delegate = self;
+    self.inspectorView.autoresizingMask =
+        NSViewWidthSizable | NSViewHeightSizable;
+    [self.rightDockPanel setContentView:self.inspectorView
+                                forSlot:ui::PanelSlot::Inspector];
+
     [self.workspaceSplitView setHoldingPriority:NSLayoutPriorityDefaultHigh
                               forSubviewAtIndex:0];
     [self.workspaceSplitView setHoldingPriority:NSLayoutPriorityDefaultHigh
@@ -5160,6 +5180,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 
 - (void)updateSelectionInfo {
+    // F2.2 -- this is the one hook already fired after every selection
+    // change and every edit that could touch the selected clip (see this
+    // method's call sites), so it doubles as the Inspector's refresh
+    // trigger. SelectedClipId() is empty for zero or multiple selected
+    // clips, which CMInspectorView already renders as "no selection".
+    [self.inspectorView reloadWithDocument:self.state->document
+                            selectedClipId:self.state->interaction
+                                               ->SelectedClipId()];
     const size_t selectionCount =
         self.state->interaction->SelectedClipIds().size();
     if (selectionCount > 1) {
@@ -5255,6 +5283,33 @@ DeleteGapOperation GapDeleteOperationForSelection(
             roleText, syncText, sourceText, metadataText,
             TimeString(clip->source_in), TimeString(clip->duration),
             TimeString(clip->timeline_in)];
+}
+
+// F2.2 -- CMInspectorViewDelegate. Every grading slider commit arrives
+// here as a ready-to-apply SetClipEffectsOperation; this is the only place
+// that actually calls EditLog::Apply for it, matching every other edit in
+// this file (e.g. -menuAddCrossDissolve: above) -- CMInspectorView itself
+// never touches Document/DocumentClip directly (PHILOSOPHY.md principle
+// 2/3). No refreshTimelineAfterEditFromPosition here: a grade change
+// leaves every clip's position/duration untouched, it only changes what
+// the next render composites (see main.mm's ResolveColorGrade call site),
+// so marking overlayDirty is the only redraw trigger this edit needs.
+- (void)inspectorView:(CMInspectorView*)inspectorView
+    didCommitClipEffects:(SetClipEffectsOperation)operation {
+    (void)inspectorView;
+    EditError error = EditError::None;
+    std::string message;
+    if (!self.state->editLog.Apply(self.state->document,
+                                   Operation{std::move(operation)}, error,
+                                   message)) {
+        std::fprintf(stderr, "Grading edit rejected (%s): %s\n",
+                     EditErrorName(error), message.c_str());
+        return;
+    }
+    self.state->overlayDirty = true;
+    if (![self persistEdits:message])
+        std::fprintf(stderr, "Unable to persist grading edit: %s\n",
+                     message.c_str());
 }
 
 - (void)linkedSelectionPressed:(NSButton*)sender {

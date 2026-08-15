@@ -130,4 +130,5 @@ une fois F0 mergé.
 | F1.5 | fait (multicam) |
 | F1.6 | fait (détection de beats, DSP spectral flux) |
 | F2.1 | fait (design system minimal, AppKit non vérifiable hors macOS) |
-| F2.2–F2.5 | à faire, débloqué |
+| F2.2 | fait (propriétés clip + 8 sliders de grading F1.3, AppKit non vérifiable hors macOS ; roues/courbes non implémentées côté moteur, donc hors scope ici — voir ColorEffects.h) |
+| F2.3–F2.5 | à faire, débloqué |
