@@ -123,6 +123,10 @@ une fois F0 mergé.
 
 | Ticket | Statut |
 |---|---|
-| F0.1–F0.4 | à faire |
-| F1.1–F1.6 | à faire, bloqué sur F0 |
-| F2.1–F2.5 | à faire, bloqué sur F1 |
+| F0.1–F0.4 | fait |
+| F1.1–F1.2 | fait (serveur MCP natif + 38 tools) |
+| F1.3 | fait (grading couleur, rendu Metal non vérifiable hors macOS) |
+| F1.4 | fait (transcription whisper.cpp + coupe par mot) |
+| F1.5 | fait (multicam) |
+| F1.6 | fait (détection de beats, DSP spectral flux) |
+| F2.1–F2.5 | à faire, débloqué |
