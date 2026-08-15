@@ -94,6 +94,11 @@ set(CUTMACHINE_APP_SOURCES
     src/UiPreferences.mm
     src/UiComponents.mm
     src/PanelHostView.mm
+    # F2.2 -- Inspector (ROADMAP.md). InspectorGradeControls.h is plain
+    # C++ (see tests/inspector_grade_controls_tests.cc) and needs no .cc of
+    # its own; InspectorView.mm is AppKit-only, same as the rest of this
+    # block.
+    src/InspectorView.mm
 )
 
 add_executable(cutmachine ${CUTMACHINE_APP_SOURCES})
@@ -207,6 +212,16 @@ if(BUILD_TESTING)
     target_link_libraries(cutmachine_color_effects_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_color_effects_tests
              COMMAND cutmachine_color_effects_tests)
+
+    # F2.2 -- Inspector (ROADMAP.md). InspectorGradeControls.h is plain
+    # C++, no AppKit dependency -- like UiTheme.h/PanelLayout.h above -- so
+    # this builds and runs on a plain Linux host too.
+    add_executable(cutmachine_inspector_grade_controls_tests
+                   tests/inspector_grade_controls_tests.cc)
+    target_link_libraries(cutmachine_inspector_grade_controls_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_inspector_grade_controls_tests
+             COMMAND cutmachine_inspector_grade_controls_tests)
 
     add_executable(cutmachine_project_recovery_tests
                    tests/project_recovery_tests.cc)
