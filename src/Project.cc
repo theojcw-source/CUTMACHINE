@@ -191,6 +191,27 @@ bool Project::Validate(std::string& error) const {
                 return false;
             }
         }
+        for (const CaptionStyle& style : timeline.caption_styles) {
+            if (!registerId(style.id)) {
+                error =
+                    "duplicate object ID across timelines '" + style.id + "'";
+                return false;
+            }
+        }
+        for (const MulticamGroup& group : timeline.multicam_groups) {
+            if (!registerId(group.id)) {
+                error =
+                    "duplicate object ID across timelines '" + group.id + "'";
+                return false;
+            }
+            for (const MulticamAngle& angle : group.angles) {
+                if (!registerId(angle.id)) {
+                    error = "duplicate object ID across timelines '" +
+                            angle.id + "'";
+                    return false;
+                }
+            }
+        }
         for (const DocumentTrack& track : timeline.tracks) {
             if (!registerId(track.id)) {
                 error =

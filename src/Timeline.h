@@ -9,6 +9,11 @@
 struct ResolvedFrame {
     Ulid source_id;
     int64_t source_frame = 0;
+    // The DocumentClip this frame came from. Render-time color grading
+    // (F1.3, see ColorEffects.h) reads this clip's `effects` stack; nothing
+    // else in Timeline uses clip identity, so this stays a plain lookup key
+    // rather than a reference into the document.
+    Ulid clip_id;
 };
 
 struct ResolvedLayer {

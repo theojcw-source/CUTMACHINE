@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "library": [
     {"id":"01K40000000000000000000001","path":"interview.mov","filename":"interview.mov","rate":{"num":25,"den":1},"duration":{"value":500,"rate":25}},
     {"id":"01K40000000000000000000002","path":"illustrations.mov","filename":"illustrations.mov","rate":{"num":25,"den":1},"duration":{"value":500,"rate":25}}

@@ -4,6 +4,7 @@
 #include "Ulid.h"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,27 @@ struct DocumentMarker {
     std::string category = "note";
 };
 
+// An exact fraction for a continuous effect knob (exposure amount, mix,
+// etc.). Values stay num/den pairs for the same reason RationalTime never
+// carries a float: the canonical JSON parser rejects floating-point number
+// literals outright, and a knob dragged in the UI must still read back the
+// same bytes it was saved with. F1.3 is the single explicit boundary where
+// this becomes a float for the Metal kernel that consumes it.
+struct EffectParamValue {
+    int32_t num = 0;
+    int32_t den = 1;
+};
+
+// One stage in a clip's ordered color-grade stack. `type` is a dotted knob
+// family ("color.exposure", "color.contrast", "color.saturation", ...);
+// `params` holds its numeric knobs. Restricted to the "color.*" family for
+// now (see ROADMAP.md F0.1); F1.3 interprets these into Metal filters.
+struct ClipEffect {
+    Ulid id = GenerateUlid();
+    std::string type;
+    std::map<std::string, EffectParamValue> params;
+};
+
 struct DocumentClip {
     Ulid id = GenerateUlid();
     Ulid source_id;
@@ -99,6 +121,14 @@ struct DocumentClip {
     // (timeline_in-source_in) relative to the anchor, minus this reference.
     Ulid sync_anchor_clip_id;
     RationalTime sync_reference_delta{0, 1};
+    // Ordered color-grade stack. Video-track clips only; see ClipEffect.
+    std::vector<ClipEffect> effects;
+    // Clips that make up one on-screen caption run share this ID, which must
+    // reference a DocumentSequence::caption_styles entry. Empty means the
+    // clip carries no caption.
+    Ulid caption_group_id;
+    // This clip's slice of the caption run's text.
+    std::string caption_text;
 };
 
 enum class TransitionAlignment { Center, StartAtCut, EndAtCut };
@@ -114,6 +144,36 @@ struct DocumentTransition {
     std::string type = "cross_dissolve";
     RationalTime duration;
     TransitionAlignment alignment = TransitionAlignment::Center;
+};
+
+// Shared presentation for one caption run. Clips join the run by setting
+// their caption_group_id to this style's id; the text itself stays per-clip
+// on DocumentClip so a run can span several underlying media clips.
+struct CaptionStyle {
+    Ulid id = GenerateUlid();
+    std::string font_family = "system";
+    int32_t font_size = 48;
+    std::string color = "#ffffff";
+    std::string position = "bottom";
+};
+
+// One camera's take within a multicam group. The angle's alignment to the
+// other angles is not duplicated here: it lives on the referenced clip's
+// existing sync_anchor_clip_id/sync_reference_delta (see DocumentClip),
+// the same primitive used for ordinary A/V link groups.
+struct MulticamAngle {
+    Ulid id = GenerateUlid();
+    std::string name;
+    Ulid clip_id;
+};
+
+struct MulticamGroup {
+    Ulid id = GenerateUlid();
+    std::string name = "Multicam 1";
+    std::vector<MulticamAngle> angles;
+    // Empty means no angle is currently selected; otherwise references one
+    // of angles[].id.
+    Ulid active_angle_id;
 };
 
 struct DocumentTrack {
@@ -139,11 +199,13 @@ struct DocumentSequence {
     std::vector<DocumentMarker> markers;
     std::vector<DocumentTransition> transitions;
     std::vector<DocumentTrack> tracks;
+    std::vector<CaptionStyle> caption_styles;
+    std::vector<MulticamGroup> multicam_groups;
 };
 
 class Document {
 public:
-    int32_t version = 3;
+    int32_t version = 4;
     DocumentSequence sequence;
     ColorManagementSettings color_management;
     std::vector<LibraryMedia> library;
@@ -170,6 +232,10 @@ public:
     DocumentMarker* FindMarker(const Ulid& id);
     const DocumentTransition* FindTransition(const Ulid& id) const;
     DocumentTransition* FindTransition(const Ulid& id);
+    const CaptionStyle* FindCaptionStyle(const Ulid& id) const;
+    CaptionStyle* FindCaptionStyle(const Ulid& id);
+    const MulticamGroup* FindMulticamGroup(const Ulid& id) const;
+    MulticamGroup* FindMulticamGroup(const Ulid& id);
     const DocumentTrack* FindTrack(const Ulid& id) const;
     DocumentTrack* FindTrack(const Ulid& id);
     const DocumentClip* FindClip(const Ulid& id) const;

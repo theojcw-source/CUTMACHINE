@@ -391,6 +391,16 @@ std::string CanonicalHash(const std::string& json) {
 
 }  // namespace
 
+// F2.4 -- ROADMAP.md chat panel. Exposes the same JSON view DescribeCommand
+// serializes from a project file path, directly on an in-memory Document,
+// for a backend (McpLiveBackend.h) that already holds the app's live
+// document instead of a path to reload from disk. Same serialization, same
+// aliasing scheme (A1/A2.../K1... the chat and MCP tool catalog both rely
+// on) -- just skipping the project-file round trip DescribeCommand does.
+std::string DescribeDocument(const Document& document) {
+    return Describe(document);
+}
+
 std::string TimelineEditLogPathForProject(const std::string& projectPath,
                                           const std::string& timelineId) {
     return projectPath + ".timeline-" + timelineId + ".editlog.json";
@@ -630,4 +640,61 @@ int UndoProjectOperationCommand(const std::string& projectPath,
 int RedoProjectOperationCommand(const std::string& projectPath,
                                 std::string& output) {
     return MutateProjectLogCommand(projectPath, std::nullopt, true, output);
+}
+
+namespace {
+
+// Shared tail of UndoOperationCommand/RedoOperationCommand: identical to the
+// load/mutate/commit shape of ApplyOperationCommand above, but drives the
+// active timeline's EditLog::Undo/Redo instead of EditLog::Apply. Kept
+// separate from ApplyOperationCommand rather than folded into it so neither
+// entry point grows a branch the other doesn't need.
+int MutateTimelineLogCommand(const std::string& documentPath, bool redo,
+                             std::string& output) {
+    std::string message;
+    EditError error = EditError::None;
+    Project project;
+    if (!LoadStoredProject(documentPath, project, message)) {
+        output = ErrorJson(EditError::ParseError, message);
+        return 1;
+    }
+    Document document = project.MakeActiveDocument();
+
+    EditLog log;
+    if (!LoadOptionalTimelineLog(documentPath, project.active_timeline_id, log,
+                                 error, message)) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+
+    const bool changed = redo ? log.Redo(document, error, message)
+                              : log.Undo(document, error, message);
+    if (!changed) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+
+    const std::string updatedDocument = document.SaveToString();
+    std::map<std::string, EditLog> logs;
+    logs[project.active_timeline_id] = log;
+    ProjectEditLog projectLog;
+    if (!project.CommitActiveDocument(document, message) ||
+        !CommitStoredProjectAndLogs(documentPath, project, logs, projectLog,
+                                    message)) {
+        output = ErrorJson(EditError::IoError, message);
+        return 1;
+    }
+    output = "{\"ok\":true,\"doc_hash\":\"" + CanonicalHash(updatedDocument) +
+             "\"}\n";
+    return 0;
+}
+
+}  // namespace
+
+int UndoOperationCommand(const std::string& documentPath, std::string& output) {
+    return MutateTimelineLogCommand(documentPath, false, output);
+}
+
+int RedoOperationCommand(const std::string& documentPath, std::string& output) {
+    return MutateTimelineLogCommand(documentPath, true, output);
 }

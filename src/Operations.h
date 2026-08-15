@@ -18,6 +18,9 @@ enum class EditError {
     UnknownBin,
     UnknownMarker,
     UnknownTransition,
+    UnknownCaptionStyle,
+    UnknownMulticamGroup,
+    UnknownMulticamAngle,
     UnknownSequence,
     UnknownMedia,
     InvalidDuration,
@@ -341,6 +344,84 @@ struct JoinClipOperation {
     ExactClipTimes joined_times;
 };
 
+// Replaces a clip's entire color-grade stack. Full-vector replacement keeps
+// the operation trivially invertible, the same shape as UpdateMarker.
+struct SetClipEffectsOperation {
+    Ulid clip_id;
+    std::vector<ClipEffect> effects;
+};
+
+struct AddCaptionStyleOperation {
+    CaptionStyle style;
+    // -1 appends on first application. Exact inverse operations carry the
+    // original vector position so remove/undo restores canonical bytes.
+    int64_t insertion_index = -1;
+};
+
+struct RemoveCaptionStyleOperation {
+    Ulid style_id;
+};
+
+// Joins or removes a clip from a caption run. An empty caption_group_id
+// clears the clip's caption.
+struct SetClipCaptionOperation {
+    Ulid clip_id;
+    Ulid caption_group_id;
+    std::string caption_text;
+};
+
+// F1.5 ("Multicam"): register a new multicam group and its angles.
+struct AddMulticamGroupOperation {
+    MulticamGroup group;
+    // -1 appends on first application, mirroring AddMarker/AddTransition.
+    int64_t insertion_index = -1;
+};
+
+// Exact inverse of AddMulticamGroupOperation, following the Add/Remove
+// convention used by markers, transitions and caption styles.
+struct RemoveMulticamGroupOperation {
+    Ulid group_id;
+};
+
+struct SetMulticamActiveAngleOperation {
+    Ulid group_id;
+    Ulid active_angle_id;
+};
+
+// One exact, already-resolved span to cut from a clip's own source range.
+// [source_start, source_end) in the clip's own time domain (the same domain
+// as DocumentClip::source_in/duration). Never built from a raw frame number
+// a caller invented: see Transcription.h's ResolveWordRemoval, which is the
+// only intended producer -- it turns transcript word indices (what an agent
+// or UI can name) into these exact ranges (what the engine can cut),
+// mirroring PHILOSOPHY.md principle 7.
+struct WordRemovalRange {
+    RationalTime source_start;
+    RationalTime source_end;
+};
+
+// Removes one or more word-derived spans from a single clip's own source
+// range and ripple-closes each cut, splitting the clip into the fragments
+// that remain. See ApplyRemoveWords in Operations.cc for the exact fragment
+// placement and padding rule (documented once, at the implementation).
+struct RemoveWordsOperation {
+    Ulid clip_id;
+    // Sorted, non-overlapping, each fully inside the clip's own
+    // [source_in, source_in+duration) span. ApplyOperation validates this
+    // itself rather than trusting the resolver that built it.
+    std::vector<WordRemovalRange> ranges;
+    // Extra timeline space left unfilled between two fragments of this same
+    // clip that used to be separated only by a removed range. Zero means the
+    // fragments butt together exactly. Never applied at the clip's own head
+    // or tail edge (see ApplyRemoveWords) -- there is no fragment on the
+    // other side of those cuts to pad against.
+    RationalTime gap_padding{0, 1};
+    // Other tracks ripple-shifted by this clip's same total delta, beyond
+    // its own track. Mirrors RippleTrimOperation::sync_track_ids.
+    std::vector<Ulid> sync_track_ids;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 using Operation = std::variant<
     InsertClipOperation, RemoveClipOperation, ClearClipOperation,
     PasteClipsOperation, TrimClipOperation, MoveClipOperation,
@@ -353,7 +434,11 @@ using Operation = std::variant<
     RemoveBinOperation, RenameBinOperation, MoveBinOperation,
     SetMediaBinOperation, AddMarkerOperation, RemoveMarkerOperation,
     UpdateMarkerOperation, AddTransitionOperation, RemoveTransitionOperation,
-    UpdateTransitionOperation, SetClipLinkOperation>;
+    UpdateTransitionOperation, SetClipLinkOperation, SetClipEffectsOperation,
+    AddCaptionStyleOperation, RemoveCaptionStyleOperation,
+    SetClipCaptionOperation, AddMulticamGroupOperation,
+    RemoveMulticamGroupOperation, SetMulticamActiveAngleOperation,
+    RemoveWordsOperation>;
 
 struct ExactProjectState {
     std::string canonical_json;

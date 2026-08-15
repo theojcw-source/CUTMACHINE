@@ -130,6 +130,8 @@ def main() -> int:
             "FindBin",
         "FindMarker",
         "FindTransition",
+        "FindCaptionStyle",
+        "FindMulticamGroup",
             "FindTrack",
             "FindClip",
             "FindTrackForClip",

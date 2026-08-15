@@ -11,12 +11,21 @@ toutes sont remplaçables. Le modèle et l'algèbre ne le sont pas.
 
 ## Ce que ce n'est pas
 
-Un meilleur Kdenlive. Un meilleur Shotcut. Les logiciels de montage libres
-existants ont quinze ans d'avance sur le montage lui-même, et rattraper cette
-avance fonctionnalité par fonctionnalité n'a aucun intérêt.
+Une copie de Premiere. Le moteur adressable — document, algèbre d'opérations,
+surfaces interchangeables — reste le cœur du projet et ne se négocie pas.
 
-CUTMACHINE occupe une autre place : le montage que l'on peut scripter,
-versionner, inspecter et brancher sur autre chose.
+Mais un moteur sans surface crédible ne se fait pas adopter, même s'il a
+raison sur le fond. Depuis que l'espace existe des éditeurs pensés pour être
+pilotés par un agent — un concurrent récent en est un exemple concret, pas
+open source sur sa partie génération, verrouillé à une seule plateforme, mais avec une
+interface et une surface d'opérations que CUTMACHINE n'a pas encore — la
+parité fonctionnelle et une interface soignée ne sont plus écartées par
+principe. Elles servent l'adoption du moteur, exactement comme un temps exact
+sert la fiabilité d'un raccord.
+
+CUTMACHINE occupe toujours une autre place : le montage que l'on peut
+scripter, versionner, inspecter et brancher sur autre chose — mais avec une
+interface qui n'oblige plus à choisir entre les deux.
 
 ---
 
@@ -122,12 +131,16 @@ Un bug qui ne provoque ni crash ni erreur ne se trouve pas en relisant le code.
 Du travail écarté parce qu'il est ennuyeux ou imitatif, pas des portes fermées.
 Aucune de ces lignes n'interdit d'essayer quelque chose.
 
-- **Pas de parité fonctionnelle** avec les suites commerciales. Une fonction
-  entre si elle sert la visibilité sur l'état du projet ou la capacité à
-  intervenir dessus.
-- **Pas d'état d'interface persistant.** Thèmes, dispositions, panneaux
-  déplaçables et préférences donnent l'apparence d'un logiciel abouti sans
-  changer ce qu'il permet de faire.
+- **Pas de parité fonctionnelle par imitation.** Une fonction entre parce
+  qu'elle sert la visibilité sur l'état du projet, la capacité à intervenir
+  dessus, ou la crédibilité du produit face aux alternatives existantes — pas
+  parce qu'un concurrent l'a. La nuance compte : la fonction est toujours
+  justifiée, la liste de fonctions ne l'est jamais par elle-même.
+- **L'état d'interface persistant est une préférence locale, jamais une
+  vérité.** Thèmes, dispositions, panneaux déplaçables peuvent être
+  mémorisés pour le confort d'usage, mais ne vivent jamais dans le document
+  projet. Rouvrir un projet sur une autre machine, avec des préférences
+  d'interface différentes, doit produire le même montage.
 - **Pas de format propriétaire.** Si le document cesse d'être lisible et
   modifiable à la main, le projet a perdu sa raison d'être.
 - **Pas de service central.** Les modèles distants s'utilisent avec la clé de

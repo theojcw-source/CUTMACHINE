@@ -1227,6 +1227,258 @@ int main() {
                        "slip rejects a locked track");
     });
 
+    Test(
+        "clip color effects are addressable, serializable and byte-exactly "
+        "reversible",
+        [] {
+            Document document = EditDocument();
+            const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+            const std::string original = document.SaveToString();
+            EditLog log;
+            EditError error = EditError::None;
+            std::string message;
+
+            SetClipEffectsOperation setEffects{
+                clipId,
+                {{{}, "color.exposure", {{"amount", {35, 100}}}},
+                 {{}, "color.contrast", {{"amount", {10, 100}}}}}};
+            Check(Apply(log, document, setEffects, "set clip effects"),
+                  "clip effects apply succeeds");
+            const auto& stored = std::get<SetClipEffectsOperation>(
+                log.AppliedEntries().back().op);
+            Check(stored.effects.size() == 2 &&
+                      IsValidUlid(stored.effects[0].id) &&
+                      IsValidUlid(stored.effects[1].id),
+                  "SetClipEffects fills in stable ULIDs for new effects");
+            const std::string withEffects = document.SaveToString();
+            const std::string effectsJson = SerializeOperation(stored);
+            Operation parsed = RemoveClipOperation{};
+            Check(DeserializeOperation(effectsJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == effectsJson,
+                  "SetClipEffects JSON round-trips canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "SetClipEffects undo restores original bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withEffects,
+                  "SetClipEffects redo restores the effect stack and bytes");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "second SetClipEffects undo is byte-exact");
+
+            ExpectRejected(
+                document,
+                SetClipEffectsOperation{"01K20000000000000000000099", {}},
+                EditError::UnknownClip, "unknown clip_id for SetClipEffects");
+            ExpectRejected(
+                document,
+                SetClipEffectsOperation{clipId, {{{}, "brightness", {}}}},
+                EditError::ValidationFailed,
+                "effect type outside the color.* family");
+
+            document.sequence.tracks[0].locked = true;
+            ExpectRejected(document, setEffects, EditError::LockedTrack,
+                           "clip effects reject a locked track");
+        });
+
+    Test(
+        "caption styles and per-clip captions are addressable, "
+        "serializable and byte-exactly reversible",
+        [] {
+            Document document = EditDocument();
+            const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+            const std::string original = document.SaveToString();
+            EditLog log;
+            EditError error = EditError::None;
+            std::string message;
+
+            AddCaptionStyleOperation addStyle{
+                {{}, "Inter", 64, "#ffffff", "bottom"}, -1};
+            Check(Apply(log, document, addStyle, "add caption style"),
+                  "caption style addition succeeds");
+            const auto& storedAdd = std::get<AddCaptionStyleOperation>(
+                log.AppliedEntries().back().op);
+            const Ulid styleId = storedAdd.style.id;
+            Check(IsValidUlid(styleId) && document.FindCaptionStyle(styleId),
+                  "AddCaptionStyle receives and retains a stable ULID");
+            Check(storedAdd.insertion_index == 0,
+                  "AddCaptionStyle records its exact canonical position");
+            const std::string withStyle = document.SaveToString();
+            const std::string addJson = SerializeOperation(storedAdd);
+            Operation parsed = RemoveClipOperation{};
+            Check(DeserializeOperation(addJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == addJson,
+                  "AddCaptionStyle JSON round-trips canonically");
+
+            SetClipCaptionOperation setCaption{clipId, styleId,
+                                               "Bonjour le monde"};
+            Check(Apply(log, document, setCaption, "set clip caption"),
+                  "clip caption assignment succeeds");
+            const std::string withCaption = document.SaveToString();
+            const std::string setJson =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Check(DeserializeOperation(setJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == setJson,
+                  "SetClipCaption JSON round-trips canonically");
+            Check(document.FindClip(clipId)->caption_text == "Bonjour le monde",
+                  "SetClipCaption keeps the exact per-clip text");
+
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == withStyle,
+                  "SetClipCaption undo restores the pre-caption bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withCaption,
+                  "SetClipCaption redo restores caption bytes");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == withStyle,
+                  "second SetClipCaption undo is byte-exact");
+
+            ExpectRejected(
+                document,
+                RemoveCaptionStyleOperation{"01K87000000000000000000099"},
+                EditError::UnknownCaptionStyle, "unknown caption style_id");
+            ExpectRejected(document,
+                           SetClipCaptionOperation{"01K20000000000000000000099",
+                                                   styleId, "x"},
+                           EditError::UnknownClip,
+                           "unknown clip_id for SetClipCaption");
+
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "AddCaptionStyle undo restores original bytes");
+
+            document.sequence.tracks[0].locked = true;
+            ExpectRejected(document, SetClipCaptionOperation{clipId, "", ""},
+                           EditError::LockedTrack,
+                           "clip caption rejects a locked track");
+        });
+
+    Test(
+        "multicam group operations are addressable, serializable and "
+        "byte-exactly reversible",
+        [] {
+            Document document = EditDocument();
+            const Ulid clipA = document.sequence.tracks[0].clips[0].id;
+            const Ulid clipB = document.sequence.tracks[0].clips[1].id;
+            const std::string original = document.SaveToString();
+            EditLog log;
+            EditError error = EditError::None;
+            std::string message;
+
+            AddMulticamGroupOperation addGroup{
+                {{},
+                 "Interview",
+                 {{{}, "Wide", clipA}, {{}, "Close", clipB}},
+                 {}},
+                -1};
+            Check(Apply(log, document, addGroup, "add multicam group"),
+                  "multicam group addition succeeds");
+            const auto& storedAdd = std::get<AddMulticamGroupOperation>(
+                log.AppliedEntries().back().op);
+            const Ulid groupId = storedAdd.group.id;
+            const Ulid wideAngleId = storedAdd.group.angles[0].id;
+            const Ulid closeAngleId = storedAdd.group.angles[1].id;
+            Check(IsValidUlid(groupId) && document.FindMulticamGroup(groupId),
+                  "AddMulticamGroup receives and retains a stable ULID");
+            Check(IsValidUlid(wideAngleId) && IsValidUlid(closeAngleId) &&
+                      wideAngleId != closeAngleId,
+                  "AddMulticamGroup assigns stable ULIDs to each angle");
+            Check(storedAdd.insertion_index == 0,
+                  "AddMulticamGroup records its exact canonical position");
+            Check(document.FindMulticamGroup(groupId)->angles.size() == 2 &&
+                      document.FindMulticamGroup(groupId)
+                          ->active_angle_id.empty(),
+                  "AddMulticamGroup starts with no active angle selected");
+            const std::string withGroup = document.SaveToString();
+            const std::string addJson = SerializeOperation(storedAdd);
+            Operation parsed = RemoveClipOperation{};
+            Check(DeserializeOperation(addJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == addJson,
+                  "AddMulticamGroup JSON round-trips canonically");
+
+            SetMulticamActiveAngleOperation setActive{groupId, wideAngleId};
+            Check(Apply(log, document, setActive, "set active angle"),
+                  "active angle change succeeds");
+            const std::string withActive = document.SaveToString();
+            const std::string setJson =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Check(DeserializeOperation(setJson, parsed, error, message) &&
+                      SerializeOperation(parsed) == setJson,
+                  "SetMulticamActiveAngle JSON round-trips canonically");
+            Check(document.FindMulticamGroup(groupId)->active_angle_id ==
+                      wideAngleId,
+                  "SetMulticamActiveAngle keeps the exact selected angle");
+
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == withGroup,
+                  "SetMulticamActiveAngle undo restores the pre-selection "
+                  "bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withActive,
+                  "SetMulticamActiveAngle redo restores the selection bytes");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == withGroup,
+                  "second SetMulticamActiveAngle undo is byte-exact");
+
+            ExpectRejected(
+                document,
+                SetMulticamActiveAngleOperation{"01K88000000000000000000001",
+                                                wideAngleId},
+                EditError::UnknownMulticamGroup,
+                "unknown multicam group_id for SetMulticamActiveAngle");
+            ExpectRejected(document,
+                           SetMulticamActiveAngleOperation{
+                               groupId, "01K88000000000000000000002"},
+                           EditError::UnknownMulticamAngle,
+                           "active_angle_id outside the group's own angles");
+            ExpectRejected(
+                document,
+                AddMulticamGroupOperation{
+                    {groupId, "Duplicate", {{{}, "Wide", clipA}}, {}}, -1},
+                EditError::DuplicateId,
+                "AddMulticamGroup rejects a group_id already in use");
+            ExpectRejected(
+                document,
+                AddMulticamGroupOperation{
+                    {{},
+                     "Bad angle",
+                     {{{}, "Wide", "01K20000000000000000000099"}},
+                     {}},
+                    -1},
+                EditError::ValidationFailed,
+                "AddMulticamGroup angle clip_id must resolve to a video "
+                "clip");
+            ExpectRejected(
+                document,
+                AddMulticamGroupOperation{
+                    {{},
+                     "Same clip twice",
+                     {{{}, "Wide", clipA}, {{}, "Close", clipA}},
+                     {}},
+                    -1},
+                EditError::ValidationFailed,
+                "AddMulticamGroup rejects a clip reused within one group");
+            ExpectRejected(
+                document,
+                RemoveMulticamGroupOperation{"01K88000000000000000000099"},
+                EditError::UnknownMulticamGroup,
+                "unknown multicam group_id for RemoveMulticamGroup");
+
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "AddMulticamGroup undo restores original bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withGroup,
+                  "AddMulticamGroup redo restores the group bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == withActive,
+                  "AddMulticamGroup redo chain restores the selection bytes");
+            Check(log.Undo(document, error, message) &&
+                      log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "full multicam undo chain is byte-exact");
+        });
+
     if (failures) {
         std::cerr << failures << " assertion(s) failed\n";
         return 1;

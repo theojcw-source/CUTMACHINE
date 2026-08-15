@@ -7,29 +7,39 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "AudioPlayback.h"
 #include "Cli.h"
+#include "ColorEffects.h"
 #include "DecodeWorker.h"
 #include "Document.h"
 #include "EditLog.h"
 #include "Export.h"
 #include "FrameCache.h"
 #include "Ingest.h"
+#include "McpLiveBackend.h"
+#include "McpProjectBackend.h"
+#include "McpServer.h"
+#include "MediaPanelModel.h"
 #include "MediaTaskManager.h"
+#include "PanelLayout.h"
 #include "PerformanceMetrics.h"
 #include "Project.h"
 #include "ProjectRecovery.h"
@@ -38,9 +48,27 @@ extern "C" {
 #include "Relink.h"
 #include "Renderer.h"
 #include "Thumbnail.h"
+#include "Timecode.h"
 #include "Timeline.h"
 #include "TimelineView.h"
+#include "TransportBar.h"
+#include "UiTheme.h"
 #include "Waveform.h"
+
+// F2.1 -- ROADMAP.md design system: reusable AppKit chrome and the fixed
+// right-hand panel host that F2.2 (Inspector) and F2.4 (Chat) install their
+// content into (see PanelHostView.h). ChatPanelView.h is F2.4's actual
+// content view -- the chat transcript + input this file installs into the
+// dock's Chat slot below. Objective-C++ declarations, so #import rather
+// than #include, matching AppKit/Foundation above.
+#import "ChatPanelView.h"
+#import "InspectorView.h"
+#import "PanelHostView.h"
+#import "UiComponents.h"
+#import "UiThemeAppKit.h"
+// F2.5 -- ROADMAP.md playback transport: installs into PanelSlot::Transport
+// the same way the F2.1 imports above install into the other docks.
+#import "TransportView.h"
 
 namespace {
 
@@ -155,6 +183,10 @@ struct ResolvedSlot {
     Ulid sourceId;
     int64_t frame = -1;
     float opacity = 1.0f;
+    // The DocumentClip currently occupying this slot. Used only to look up
+    // that clip's color.* effects stack for F1.3 grading; see
+    // presentNearestFrameAtDeadline.
+    Ulid clipId;
 };
 
 struct RenderedSlot {
@@ -162,10 +194,12 @@ struct RenderedSlot {
     Ulid sourceId;
     int64_t frame = -1;
     float opacity = 1.0f;
+    Ulid clipId;
 
     bool operator==(const RenderedSlot& other) const {
         return active == other.active && sourceId == other.sourceId &&
-               frame == other.frame && opacity == other.opacity;
+               frame == other.frame && opacity == other.opacity &&
+               clipId == other.clipId;
     }
 };
 
@@ -465,17 +499,11 @@ NSString* TimeString(const RationalTime& time) {
                                       time.rate];
 }
 
+// Delegates to Timecode.h's plain-C++ FormatTimecode so this label and the
+// new Transport panel (TransportView.mm) format HH:MM:SS:FF identically
+// instead of maintaining two copies of the same rule.
 NSString* TimelineTimecode(const RationalTime& time, MediaRate rate) {
-    if (rate.num <= 0 || rate.den <= 0) return @"00:00:00:00";
-    const int64_t absoluteFrames =
-        std::max<int64_t>(0, time.to_frames(rate.num, rate.den));
-    const int64_t nominalFps =
-        std::max<int64_t>(1, (rate.num + rate.den - 1) / rate.den);
-    const int64_t frames = absoluteFrames % nominalFps;
-    const int64_t totalSeconds = absoluteFrames / nominalFps;
-    return [NSString
-        stringWithFormat:@"%02lld:%02lld:%02lld:%02lld", totalSeconds / 3600,
-                         (totalSeconds / 60) % 60, totalSeconds % 60, frames];
+    return [NSString stringWithUTF8String:FormatTimecode(time, rate).c_str()];
 }
 
 std::string SyncDriftLabel(const RationalTime& drift, MediaRate frameRate) {
@@ -723,7 +751,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                    NSTableViewDelegate,
                                    NSCollectionViewDataSource,
                                    NSCollectionViewDelegate,
-                                   NSTextFieldDelegate>
+                                   NSTextFieldDelegate,
+                                   CMInspectorViewDelegate>
 @property(nonatomic, strong) NSWindow* window;
 @property(nonatomic, strong) NSWindow* startupWindow;
 @property(nonatomic, strong) NSPopUpButton* recentProjectsPopup;
@@ -738,6 +767,28 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, strong) NSSplitView* workspaceSplitView;
 @property(nonatomic, strong) NSSplitView* editorSplitView;
 @property(nonatomic, strong) NSSplitView* monitorSplitView;
+// F2.1 design system: fixed right-hand dock hosting the Inspector (F2.2) and
+// Chat (F2.4) tabs. See PanelHostView.h -- the set of tabs and their order
+// are fixed at construction time, never user-rearrangeable.
+@property(nonatomic, strong) CMPanelHostView* rightDockPanel;
+// F2.5 design system: fixed bottom dock hosting the Transport panel (play/
+// pause, scrub bar, timecode, frame step). One slot, same fixed-tab host as
+// rightDockPanel -- see PanelHostView.h.
+@property(nonatomic, strong) CMPanelHostView* bottomDockPanel;
+@property(nonatomic, strong) CMTransportView* transportView;
+// F2.2 -- Inspector content installed into rightDockPanel's Inspector slot
+// (see -applicationDidFinishLaunching below).
+@property(nonatomic, strong) CMInspectorView* inspectorView;
+// F2.4 -- the Chat tab's actual content (ChatPanelView.h), installed into
+// rightDockPanel's PanelSlot::Chat once at startup (see
+// -applicationDidFinishLaunching:). `chatBackend` wraps
+// `self.state->document`/`self.state->editLog`
+// by reference (McpLiveBackend.h) -- allocated once, alongside the view,
+// and never freed or reassigned for the life of the window, the same
+// "assign, never explicitly torn down" convention `state` below already
+// uses.
+@property(nonatomic, strong) CMChatPanelView* chatPanelView;
+@property(nonatomic, assign) McpLiveBackend* chatBackend;
 @property(nonatomic, strong) NSPopUpButton* binPopup;
 @property(nonatomic, strong) NSPopUpButton* mediaPopup;
 @property(nonatomic, strong) NSTextField* binSummaryLabel;
@@ -758,6 +809,29 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, strong) NSScrollView* mediaIconScroll;
 @property(nonatomic, strong) NSSegmentedControl* mediaViewToggle;
 @property(nonatomic, strong) NSButton* sourceMonitorButton;
+// F2.3 -- ROADMAP.md Media panel: Media/Audio/Captions sub-tabs living
+// inside the single PanelSlot::Media the Left dock already reserves (see
+// PanelLayout.h and MediaPanelModel.h). `mediaTabStrip` switches which of
+// the three content containers below is visible; nothing here is project
+// state, only which already-existing tab is on screen (see UiPreferences.h
+// for the same rule applied to the dock-level tabs).
+@property(nonatomic, strong) CMTabStripView* mediaTabStrip;
+@property(nonatomic, strong) NSView* mediaTabContentMedia;
+@property(nonatomic, strong) NSView* mediaTabContentAudio;
+@property(nonatomic, strong) NSView* mediaTabContentCaptions;
+@property(nonatomic, strong) NSTableView* audioTable;
+@property(nonatomic, strong) NSScrollView* audioScroll;
+@property(nonatomic, strong) NSSearchField* audioSearchField;
+@property(nonatomic, strong) NSMutableArray<NSString*>* visibleAudioIds;
+@property(nonatomic, strong) NSTextField* audioSummaryLabel;
+@property(nonatomic, strong) NSTableView* captionStyleTable;
+@property(nonatomic, strong) NSScrollView* captionStyleScroll;
+@property(nonatomic, strong) NSMutableArray<NSString*>* visibleCaptionStyleIds;
+@property(nonatomic, strong) NSTextField* captionSelectionLabel;
+@property(nonatomic, strong) NSButton* addCaptionStyleButton;
+@property(nonatomic, strong) NSButton* removeCaptionStyleButton;
+@property(nonatomic, strong) NSButton* applyCaptionStyleButton;
+@property(nonatomic, strong) NSButton* clearCaptionButton;
 @property(nonatomic, strong) NSTextField* infoLabel;
 @property(nonatomic, strong) NSTextField* offlineMediaLabel;
 @property(nonatomic, strong) NSTextField* sourceOfflineMediaLabel;
@@ -2660,10 +2734,21 @@ DeleteGapOperation GapDeleteOperationForSelection(
     NSView* content = [[NSView alloc] initWithFrame:windowRect];
     self.window.contentView = content;
     constexpr double mediaPanelWidth = 320.0;
-    const double workspaceHeight = windowRect.size.height - 42.0;
+    // F2.1 design system: fixed-width right dock (Inspector/Chat tabs).
+    // Fixed, not user-resized-and-remembered, on purpose -- see
+    // PanelHostView.h.
+    constexpr double rightDockWidth = 300.0;
+    // F2.5 design system: fixed-height bottom dock (Transport panel: play/
+    // pause, scrub bar, timecode, frame step). Sits directly above the
+    // existing status bar, below the Metal-drawn timeline -- see
+    // PanelHostView.h for why this height is fixed rather than
+    // user-resizable.
+    constexpr double bottomDockHeight = 84.0;
+    const double workspaceHeight =
+        windowRect.size.height - 42.0 - bottomDockHeight;
     self.workspaceSplitView = [[CutmachineSplitView alloc]
-        initWithFrame:NSMakeRect(0.0, 42.0, windowRect.size.width,
-                                 workspaceHeight)];
+        initWithFrame:NSMakeRect(0.0, 42.0 + bottomDockHeight,
+                                 windowRect.size.width, workspaceHeight)];
     self.workspaceSplitView.vertical = YES;
     self.workspaceSplitView.dividerStyle = NSSplitViewDividerStyleThin;
     self.workspaceSplitView.delegate = self;
@@ -2675,44 +2760,76 @@ DeleteGapOperation GapDeleteOperationForSelection(
         initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth, workspaceHeight)];
     self.mediaPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.mediaPanel.wantsLayer = YES;
-    self.mediaPanel.layer.backgroundColor =
-        [NSColor colorWithWhite:0.075 alpha:1.0].CGColor;
+    // Same surface token as the new right dock (UiTheme.h kSurfacePanel) --
+    // both are side panels of the same visual kind.
+    self.mediaPanel.layer.backgroundColor = CMSurfacePanelColor().CGColor;
     [self.workspaceSplitView addArrangedSubview:self.mediaPanel];
+
+    // F2.3 -- ROADMAP.md Media panel: Média/Audio/Légendes tabs inside this
+    // one PanelSlot::Media (see MediaPanelModel.h and PanelLayout.h's file
+    // comment on why this slot builds its own tab strip rather than reusing
+    // CMPanelHostView's dock-level chrome). The tab strip claims a fixed
+    // strip off the top; everything that used to be placed directly against
+    // `workspaceHeight` below now lives in `mediaContentHeight`, one of
+    // three sibling containers under the strip.
+    const double mediaContentHeight =
+        workspaceHeight - ui::theme::kTabStripHeight;
+    NSMutableArray<NSString*>* mediaTabTitles = [NSMutableArray array];
+    for (ui::media_panel::Tab tab : ui::media_panel::AllTabs())
+        [mediaTabTitles
+            addObject:[NSString
+                          stringWithUTF8String:ui::media_panel::TabTitle(tab)]];
+    self.mediaTabStrip = [[CMTabStripView alloc]
+        initWithFrame:NSMakeRect(0.0, mediaContentHeight, mediaPanelWidth,
+                                 ui::theme::kTabStripHeight)
+               titles:mediaTabTitles];
+    self.mediaTabStrip.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    self.mediaTabStrip.target = self;
+    self.mediaTabStrip.action = @selector(mediaTabChanged:);
+    [self.mediaPanel addSubview:self.mediaTabStrip];
+
+    self.mediaTabContentMedia =
+        [[NSView alloc] initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth,
+                                                 mediaContentHeight)];
+    self.mediaTabContentMedia.autoresizingMask =
+        NSViewWidthSizable | NSViewHeightSizable;
+    [self.mediaPanel addSubview:self.mediaTabContentMedia];
 
     NSTextField* libraryTitle =
         [NSTextField labelWithString:@"PROJET / CHUTIERS"];
-    libraryTitle.frame =
-        NSMakeRect(14.0, workspaceHeight - 34.0, mediaPanelWidth - 28.0, 18.0);
+    libraryTitle.frame = NSMakeRect(14.0, mediaContentHeight - 34.0,
+                                    mediaPanelWidth - 28.0, 18.0);
     libraryTitle.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     libraryTitle.font = [NSFont systemFontOfSize:11.0
                                           weight:NSFontWeightSemibold];
     libraryTitle.textColor = NSColor.secondaryLabelColor;
-    [self.mediaPanel addSubview:libraryTitle];
+    [self.mediaTabContentMedia addSubview:libraryTitle];
 
     NSButton* addBinButton =
         [NSButton buttonWithTitle:@"+ Chutier"
                            target:self
                            action:@selector(createBinPressed:)];
-    addBinButton.frame = NSMakeRect(12.0, workspaceHeight - 70.0, 142.0, 28.0);
+    addBinButton.frame =
+        NSMakeRect(12.0, mediaContentHeight - 70.0, 142.0, 28.0);
     addBinButton.autoresizingMask = NSViewMinYMargin;
     addBinButton.bezelStyle = NSBezelStyleRounded;
     addBinButton.title = @"Chutier";
     addBinButton.image = SystemSymbol(@"folder.badge.plus", @"Nouveau chutier");
     addBinButton.imagePosition = NSImageLeading;
-    [self.mediaPanel addSubview:addBinButton];
+    [self.mediaTabContentMedia addSubview:addBinButton];
 
     NSButton* deleteBinButton =
         [NSButton buttonWithTitle:@"Supprimer"
                            target:self
                            action:@selector(deleteBinPressed:)];
     deleteBinButton.frame =
-        NSMakeRect(166.0, workspaceHeight - 70.0, 142.0, 28.0);
+        NSMakeRect(166.0, mediaContentHeight - 70.0, 142.0, 28.0);
     deleteBinButton.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
     deleteBinButton.bezelStyle = NSBezelStyleRounded;
     deleteBinButton.image = SystemSymbol(@"trash", @"Supprimer le chutier");
     deleteBinButton.imagePosition = NSImageLeading;
     deleteBinButton.toolTip = @"Supprime le chutier sélectionné s’il est vide";
-    [self.mediaPanel addSubview:deleteBinButton];
+    [self.mediaTabContentMedia addSubview:deleteBinButton];
 
     self.binOutline = [[ContextOutlineView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth - 24.0, 220.0)];
@@ -2730,16 +2847,16 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self.binOutline setDraggingSourceOperationMask:NSDragOperationMove
                                            forLocal:YES];
     NSScrollView* binScroll = [[NSScrollView alloc]
-        initWithFrame:NSMakeRect(12.0, workspaceHeight - 300.0,
+        initWithFrame:NSMakeRect(12.0, mediaContentHeight - 300.0,
                                  mediaPanelWidth - 24.0, 220.0)];
     binScroll.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     binScroll.documentView = self.binOutline;
     binScroll.hasVerticalScroller = YES;
     binScroll.borderType = NSBezelBorder;
-    [self.mediaPanel addSubview:binScroll];
+    [self.mediaTabContentMedia addSubview:binScroll];
 
     self.mediaSearchField = [[NSSearchField alloc]
-        initWithFrame:NSMakeRect(12.0, workspaceHeight - 338.0,
+        initWithFrame:NSMakeRect(12.0, mediaContentHeight - 338.0,
                                  mediaPanelWidth - 104.0, 26.0)];
     self.mediaSearchField.placeholderString = @"Rechercher nom, codec, format…";
     self.mediaSearchField.target = self;
@@ -2747,11 +2864,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaSearchField.continuous = YES;
     self.mediaSearchField.autoresizingMask =
         NSViewMinYMargin | NSViewWidthSizable;
-    [self.mediaPanel addSubview:self.mediaSearchField];
+    [self.mediaTabContentMedia addSubview:self.mediaSearchField];
 
     self.mediaViewToggle = [[NSSegmentedControl alloc]
         initWithFrame:NSMakeRect(mediaPanelWidth - 84.0,
-                                 workspaceHeight - 338.0, 72.0, 26.0)];
+                                 mediaContentHeight - 338.0, 72.0, 26.0)];
     self.mediaViewToggle.segmentCount = 2;
     [self.mediaViewToggle setImage:SystemSymbol(@"list.bullet", @"Vue liste")
                         forSegment:0];
@@ -2763,7 +2880,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaViewToggle.action = @selector(mediaViewChanged:);
     self.mediaViewToggle.autoresizingMask = NSViewMinYMargin;
     self.mediaViewToggle.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
-    [self.mediaPanel addSubview:self.mediaViewToggle];
+    [self.mediaTabContentMedia addSubview:self.mediaViewToggle];
 
     self.mediaTable = [[ContextTableView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth - 24.0, 500.0)];
@@ -2783,14 +2900,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaTable.usesAlternatingRowBackgroundColors = YES;
     self.mediaListScroll = [[NSScrollView alloc]
         initWithFrame:NSMakeRect(12.0, 112.0, mediaPanelWidth - 24.0,
-                                 workspaceHeight - 462.0)];
+                                 mediaContentHeight - 462.0)];
     self.mediaListScroll.autoresizingMask =
         NSViewHeightSizable | NSViewWidthSizable;
     self.mediaListScroll.documentView = self.mediaTable;
     self.mediaListScroll.hasVerticalScroller = YES;
     self.mediaListScroll.hasHorizontalScroller = YES;
     self.mediaListScroll.borderType = NSBezelBorder;
-    [self.mediaPanel addSubview:self.mediaListScroll];
+    [self.mediaTabContentMedia addSubview:self.mediaListScroll];
 
     NSCollectionViewFlowLayout* iconLayout =
         [[NSCollectionViewFlowLayout alloc] init];
@@ -2817,7 +2934,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaIconScroll.hasVerticalScroller = YES;
     self.mediaIconScroll.borderType = NSBezelBorder;
     self.mediaIconScroll.hidden = YES;
-    [self.mediaPanel addSubview:self.mediaIconScroll];
+    [self.mediaTabContentMedia addSubview:self.mediaIconScroll];
 
     self.mediaTable.target = self;
     self.mediaTable.doubleAction = @selector(openSelectedMediaInSourceMonitor:);
@@ -2840,7 +2957,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.assignMediaButton.image =
         SystemSymbol(@"square.and.arrow.down", @"Importer des rushes");
     self.assignMediaButton.imagePosition = NSImageLeading;
-    [self.mediaPanel addSubview:self.assignMediaButton];
+    [self.mediaTabContentMedia addSubview:self.assignMediaButton];
 
     self.sourceMonitorButton =
         [NSButton buttonWithTitle:@"Source"
@@ -2855,7 +2972,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.sourceMonitorButton.imagePosition = NSImageLeading;
     self.sourceMonitorButton.toolTip =
         @"Ouvre le média sélectionné dans le moniteur source";
-    [self.mediaPanel addSubview:self.sourceMonitorButton];
+    [self.mediaTabContentMedia addSubview:self.sourceMonitorButton];
 
     NSMenu* binContext = [[NSMenu alloc] initWithTitle:@"Chutier"];
     [binContext addItem:[self menuItem:@"Nouveau chutier"
@@ -2914,7 +3031,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.binSummaryLabel.font = [NSFont systemFontOfSize:11.0];
     self.binSummaryLabel.textColor = NSColor.secondaryLabelColor;
     self.binSummaryLabel.maximumNumberOfLines = 2;
-    [self.mediaPanel addSubview:self.binSummaryLabel];
+    [self.mediaTabContentMedia addSubview:self.binSummaryLabel];
     self.mediaTaskLabel = [NSTextField labelWithString:@"Tâches média : prêt"];
     self.mediaTaskLabel.frame =
         NSMakeRect(14.0, 13.0, mediaPanelWidth - 152.0, 18.0);
@@ -2923,7 +3040,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaTaskLabel.font = [NSFont systemFontOfSize:10.0];
     self.mediaTaskLabel.textColor = NSColor.tertiaryLabelColor;
     self.mediaTaskLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    [self.mediaPanel addSubview:self.mediaTaskLabel];
+    [self.mediaTabContentMedia addSubview:self.mediaTaskLabel];
     self.mediaTaskProgress = [[NSProgressIndicator alloc]
         initWithFrame:NSMakeRect(mediaPanelWidth - 132.0, 16.0, 88.0, 10.0)];
     self.mediaTaskProgress.autoresizingMask =
@@ -2932,7 +3049,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaTaskProgress.maxValue = 100.0;
     self.mediaTaskProgress.doubleValue = 0.0;
     self.mediaTaskProgress.indeterminate = NO;
-    [self.mediaPanel addSubview:self.mediaTaskProgress];
+    [self.mediaTabContentMedia addSubview:self.mediaTaskProgress];
     self.mediaTaskCancelButton =
         [NSButton buttonWithTitle:@"×"
                            target:self
@@ -2944,9 +3061,23 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaTaskCancelButton.bezelStyle = NSBezelStyleRounded;
     self.mediaTaskCancelButton.toolTip = @"Annuler la tâche média active";
     self.mediaTaskCancelButton.enabled = NO;
-    [self.mediaPanel addSubview:self.mediaTaskCancelButton];
+    [self.mediaTabContentMedia addSubview:self.mediaTaskCancelButton];
 
-    const double editorWidth = windowRect.size.width - mediaPanelWidth - 1.0;
+    [self buildAudioTabContentWithWidth:mediaPanelWidth
+                                 height:mediaContentHeight];
+    [self buildCaptionsTabContentWithWidth:mediaPanelWidth
+                                    height:mediaContentHeight];
+    self.mediaTabContentAudio.hidden = YES;
+    self.mediaTabContentCaptions.hidden = YES;
+    const NSInteger rememberedMediaTab = [NSUserDefaults.standardUserDefaults
+        integerForKey:@"ui.mediaPanel.lastActiveTab"];
+    if (rememberedMediaTab > 0 &&
+        rememberedMediaTab <
+            static_cast<NSInteger>(ui::media_panel::AllTabs().size()))
+        [self.mediaTabStrip selectIndex:rememberedMediaTab];
+
+    const double editorWidth =
+        windowRect.size.width - mediaPanelWidth - rightDockWidth - 2.0;
     self.editorSplitView = [[CutmachineSplitView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, editorWidth, workspaceHeight)];
     self.editorSplitView.vertical = NO;
@@ -3014,9 +3145,110 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self.editorSplitView setPosition:workspaceHeight * 0.56
                      ofDividerAtIndex:0];
     [self.workspaceSplitView addArrangedSubview:self.editorSplitView];
+
+    // F2.1 design system: fixed right dock, tabs = FixedPanelLayout()'s
+    // PanelDock::Right slots (Inspector, Chat), in that fixed order. F2.2
+    // and F2.4 will each call -setContentView:forSlot: once at startup to
+    // replace their placeholder with real content; nothing else about this
+    // dock's shape changes at runtime.
+    self.rightDockPanel = [[CMPanelHostView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)
+                 dock:ui::PanelDock::Right];
+    self.rightDockPanel.autoresizingMask =
+        NSViewWidthSizable | NSViewHeightSizable;
+    [self.workspaceSplitView addArrangedSubview:self.rightDockPanel];
+
+    // F2.2 -- Inspector: clip properties + the eight F1.3 color.* grading
+    // knobs (ColorEffects.h), sliders built on CMControlRowView. Every
+    // slider edit becomes a SetClipEffectsOperation, delivered here via
+    // -inspectorView:didCommitClipEffects: (below) and applied through
+    // self.state->editLog -- the same EditLog::Apply path CLI/MCP already
+    // use for this operation (PHILOSOPHY.md principle 3, "aucune surface
+    // n'est privilégiée"). See InspectorView.h/.mm for the view itself.
+    self.inspectorView = [[CMInspectorView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];
+    self.inspectorView.delegate = self;
+    self.inspectorView.autoresizingMask =
+        NSViewWidthSizable | NSViewHeightSizable;
+    [self.rightDockPanel setContentView:self.inspectorView
+                                forSlot:ui::PanelSlot::Inspector];
+
+    // F2.4 -- ROADMAP.md: chat panel, wired to the exact same in-memory
+    // Document/EditLog `self.state->editLog.Apply(self.state->document, ...)`
+    // already mutates everywhere else in this file, through
+    // McpLiveBackend -> McpToolRegistry::Call -- the identical dispatcher
+    // McpServer.cc's `tools/call` uses for an external MCP client. No
+    // second edit path: see McpLiveBackend.h/ChatSession.h for why. `state`
+    // is allocated once, above, and never reallocated after the window is
+    // built (only its fields are mutated in place by ordinary edits and
+    // project loads), so the reference this backend holds stays valid for
+    // the window's lifetime.
+    __weak AppDelegate* weakSelf = self;
+    self.chatBackend = new McpLiveBackend(
+        self.state->document, self.state->editLog, [weakSelf]() {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) return;
+            // Same sequence every other in-app edit handler runs after a
+            // successful `self.state->editLog.Apply(...)` -- see e.g.
+            // -addTrack: -- so a chat-driven edit is saved and reflected on
+            // screen exactly like a mouse-driven one.
+            const RationalTime playhead = strongSelf.state->requestedPosition;
+            [strongSelf refreshTimelineAfterEditFromPosition:playhead];
+            [strongSelf rebuildMediaList];
+            std::string persistMessage;
+            if (![strongSelf persistEdits:persistMessage]) {
+                std::fprintf(stderr, "Unable to persist chat-driven edit: %s\n",
+                             persistMessage.c_str());
+            }
+        });
+    self.chatPanelView = [[CMChatPanelView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];
+    [self.chatPanelView configureWithBackend:*self.chatBackend];
+    [self.rightDockPanel setContentView:self.chatPanelView
+                                forSlot:ui::PanelSlot::Chat];
+
     [self.workspaceSplitView setHoldingPriority:NSLayoutPriorityDefaultHigh
                               forSubviewAtIndex:0];
+    [self.workspaceSplitView setHoldingPriority:NSLayoutPriorityDefaultHigh
+                              forSubviewAtIndex:2];
     [self.workspaceSplitView setPosition:mediaPanelWidth ofDividerAtIndex:0];
+    [self.workspaceSplitView setPosition:mediaPanelWidth + editorWidth
+                        ofDividerAtIndex:1];
+
+    // F2.5 design system: fixed bottom dock (Transport panel), full window
+    // width, pinned just above the status bar -- see PanelHostView.h for why
+    // this is a fixed slot rather than a user-rearrangeable one.
+    // NSViewWidthSizable only (no height/min-Y flex): stays a fixed height
+    // at a fixed distance from the window's bottom edge as the window
+    // resizes, the same way mediaPanel/rightDockPanel stay pinned to their
+    // edges via workspaceSplitView.
+    self.bottomDockPanel = [[CMPanelHostView alloc]
+        initWithFrame:NSMakeRect(0.0, 42.0, windowRect.size.width,
+                                 bottomDockHeight)
+                 dock:ui::PanelDock::Bottom];
+    self.bottomDockPanel.autoresizingMask = NSViewWidthSizable;
+    [content addSubview:self.bottomDockPanel];
+
+    self.transportView = [[CMTransportView alloc]
+        initWithFrame:NSMakeRect(
+                          0.0, 0.0, windowRect.size.width,
+                          bottomDockHeight - ui::theme::kTabStripHeight)];
+    [self.bottomDockPanel setContentView:self.transportView
+                                 forSlot:ui::PanelSlot::Transport];
+    // Every position change still funnels through -requestTimelinePosition:
+    // (quantized via TimelineView.h's QuantizePlayheadPosition, same as the
+    // main timeline's own scrub/step/edit paths) -- these actions never
+    // touch self.state->requestedPosition directly. See
+    // -stepPlayheadFrames:/-transportScrubChanged:.
+    self.transportView.playPauseButton.target = self;
+    self.transportView.playPauseButton.action = @selector(menuPlayPause:);
+    self.transportView.stepBackButton.target = self;
+    self.transportView.stepBackButton.action = @selector(transportStepBack:);
+    self.transportView.stepForwardButton.target = self;
+    self.transportView.stepForwardButton.action =
+        @selector(transportStepForward:);
+    self.transportView.scrubSlider.target = self;
+    self.transportView.scrubSlider.action = @selector(transportScrubChanged:);
 
     self.infoLabel = [NSTextField labelWithString:@"Aucun clip sélectionné"];
     self.infoLabel.frame =
@@ -3207,11 +3439,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
         icon.image =
             SystemSymbol(toolSymbols[index], toolDescriptions[index], 11.0);
         icon.imageScaling = NSImageScaleProportionallyUpOrDown;
-        icon.contentTintColor = index == 0 ? [NSColor colorWithRed:0.24
-                                                             green:0.82
-                                                              blue:1.0
-                                                             alpha:1.0]
-                                           : NSColor.secondaryLabelColor;
+        icon.contentTintColor =
+            index == 0 ? CMAccentBlueColor() : NSColor.secondaryLabelColor;
         icon.autoresizingMask = NSViewMinYMargin;
         icon.toolTip = toolDescriptions[index];
         [self.metalView addSubview:icon];
@@ -3276,13 +3505,20 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->requestedPosition = position;
     self.timelineTimecodeLabel.stringValue =
         TimelineTimecode(position, [self playheadFrameRate]);
+    // F2.5: single choke point for every playhead move (scrub, playback
+    // tick, arrow keys, edits all funnel through here already) -- the
+    // Transport panel reads the same requestedPosition/duration this label
+    // does, never a second notion of "now".
+    [self.transportView setPosition:position
+                           duration:self.state->duration
+                               rate:[self playheadFrameRate]];
     self.state->requested.clear();
     for (const Ulid& trackId : self.state->videoTrackIds) {
         for (const ResolvedLayer& layer :
              self.state->timeline->ResolveTrackLayers(trackId, position)) {
-            self.state->requested.push_back({true, layer.frame.source_id,
-                                             layer.frame.source_frame,
-                                             layer.opacity});
+            self.state->requested.push_back(
+                {true, layer.frame.source_id, layer.frame.source_frame,
+                 layer.opacity, layer.frame.clip_id});
             const auto worker = self.state->workers.find(layer.frame.source_id);
             if (worker != self.state->workers.end())
                 worker->second->RequestFrame(layer.frame.source_frame);
@@ -3412,6 +3648,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
         [self.binOutline selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
                      byExtendingSelection:NO];
     [self rebuildMediaList];
+    // Bin selection/membership is shared between the Media and Audio tabs --
+    // both filter the same document.library (see MediaPanelModel.h) -- so
+    // keep the Audio tab's list current from this one central place.
+    if (self.audioTable) [self rebuildAudioList];
 }
 
 - (void)binSelectionChanged:(id)sender {
@@ -3690,6 +3930,440 @@ DeleteGapOperation GapDeleteOperationForSelection(
             }];
     }
     return identifiers;
+}
+
+// ---- F2.3 Media panel: Média/Audio/Légendes tab switching -----------------
+// See MediaPanelModel.h -- ui::media_panel::Tab is the pure-C++ source of
+// truth for which tab exists and in what order; this method only toggles
+// AppKit visibility and lazily rebuilds whichever tab's content just became
+// visible (nothing here mutates the Document).
+
+- (void)mediaTabChanged:(CMTabStripView*)sender {
+    const NSInteger index = sender.selectedIndex;
+    const auto& tabs = ui::media_panel::AllTabs();
+    if (index < 0 || index >= static_cast<NSInteger>(tabs.size())) return;
+    const ui::media_panel::Tab tab = tabs[index];
+    self.mediaTabContentMedia.hidden = tab != ui::media_panel::Tab::Media;
+    self.mediaTabContentAudio.hidden = tab != ui::media_panel::Tab::Audio;
+    self.mediaTabContentCaptions.hidden = tab != ui::media_panel::Tab::Captions;
+    [NSUserDefaults.standardUserDefaults setInteger:index
+                                             forKey:@"ui.mediaPanel."
+                                                    @"lastActiveTab"];
+    switch (tab) {
+        case ui::media_panel::Tab::Media:
+            [self rebuildMediaList];
+            break;
+        case ui::media_panel::Tab::Audio:
+            [self rebuildAudioList];
+            break;
+        case ui::media_panel::Tab::Captions:
+            [self rebuildCaptionStylesList];
+            break;
+    }
+}
+
+// ---- F2.3 Media panel: Audio tab -------------------------------------------
+// A restyled, filtered view onto the same document.library the Media tab
+// already browses -- see MediaPanelModel.h's file comment on why
+// "audio-capable" (LibraryMedia::has_audio) stands in for "audio-only
+// source" here. No ingest logic is duplicated: this tab reads the library
+// Ingest.cc already populated and mutates it only through the same
+// SetMediaBinOperation the Media tab already applies via EditLog::Apply.
+
+- (void)buildAudioTabContentWithWidth:(double)width height:(double)height {
+    self.mediaTabContentAudio =
+        [[NSView alloc] initWithFrame:NSMakeRect(0.0, 0.0, width, height)];
+    self.mediaTabContentAudio.autoresizingMask =
+        NSViewWidthSizable | NSViewHeightSizable;
+    [self.mediaPanel addSubview:self.mediaTabContentAudio];
+
+    NSTextField* audioTitle = CMMakeSectionHeader(@"Sources audio");
+    audioTitle.frame = NSMakeRect(14.0, height - 30.0, width - 28.0, 18.0);
+    audioTitle.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [self.mediaTabContentAudio addSubview:audioTitle];
+
+    self.audioSearchField = [[NSSearchField alloc]
+        initWithFrame:NSMakeRect(12.0, height - 66.0, width - 24.0, 26.0)];
+    self.audioSearchField.placeholderString = @"Rechercher nom, codec…";
+    self.audioSearchField.target = self;
+    self.audioSearchField.action = @selector(audioSearchChanged:);
+    self.audioSearchField.continuous = YES;
+    self.audioSearchField.autoresizingMask =
+        NSViewMinYMargin | NSViewWidthSizable;
+    [self.mediaTabContentAudio addSubview:self.audioSearchField];
+
+    self.audioTable = [[ContextTableView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, width - 24.0, 500.0)];
+    for (NSArray<NSString*>* definition in @[
+             @[ @"name", @"Nom", @"140" ], @[ @"format", @"Format", @"90" ],
+             @[ @"duration", @"Durée", @"60" ]
+         ]) {
+        NSTableColumn* column =
+            [[NSTableColumn alloc] initWithIdentifier:definition[0]];
+        column.title = definition[1];
+        column.width = definition[2].doubleValue;
+        [self.audioTable addTableColumn:column];
+    }
+    self.audioTable.dataSource = self;
+    self.audioTable.delegate = self;
+    self.audioTable.allowsMultipleSelection = YES;
+    self.audioTable.usesAlternatingRowBackgroundColors = YES;
+    self.audioTable.target = self;
+    self.audioTable.doubleAction = @selector(openSelectedAudioInSourceMonitor:);
+    self.audioScroll = [[NSScrollView alloc]
+        initWithFrame:NSMakeRect(12.0, 78.0, width - 24.0, height - 174.0)];
+    self.audioScroll.autoresizingMask =
+        NSViewHeightSizable | NSViewWidthSizable;
+    self.audioScroll.documentView = self.audioTable;
+    self.audioScroll.hasVerticalScroller = YES;
+    self.audioScroll.hasHorizontalScroller = YES;
+    self.audioScroll.borderType = NSBezelBorder;
+    [self.mediaTabContentAudio addSubview:self.audioScroll];
+
+    NSButton* openAudioButton =
+        [NSButton buttonWithTitle:@"Source"
+                           target:self
+                           action:@selector(openSelectedAudioInSourceMonitor:)];
+    openAudioButton.frame = NSMakeRect(12.0, 44.0, 140.0, 28.0);
+    openAudioButton.autoresizingMask = NSViewMaxYMargin;
+    openAudioButton.bezelStyle = NSBezelStyleRounded;
+    openAudioButton.image =
+        SystemSymbol(@"rectangle.on.rectangle", @"Moniteur Source");
+    openAudioButton.imagePosition = NSImageLeading;
+    [self.mediaTabContentAudio addSubview:openAudioButton];
+
+    NSButton* assignAudioButton =
+        [NSButton buttonWithTitle:@"Déplacer…"
+                           target:self
+                           action:@selector(assignSelectedAudioToBinPressed:)];
+    assignAudioButton.frame = NSMakeRect(160.0, 44.0, 148.0, 28.0);
+    assignAudioButton.autoresizingMask = NSViewMaxYMargin | NSViewMinXMargin;
+    assignAudioButton.bezelStyle = NSBezelStyleRounded;
+    assignAudioButton.image =
+        SystemSymbol(@"folder", @"Déplacer vers un chutier");
+    assignAudioButton.imagePosition = NSImageLeading;
+    [self.mediaTabContentAudio addSubview:assignAudioButton];
+
+    self.audioSummaryLabel = [NSTextField labelWithString:@""];
+    self.audioSummaryLabel.frame = NSMakeRect(14.0, 12.0, width - 28.0, 24.0);
+    self.audioSummaryLabel.autoresizingMask =
+        NSViewMaxYMargin | NSViewWidthSizable;
+    self.audioSummaryLabel.font = [NSFont systemFontOfSize:11.0];
+    self.audioSummaryLabel.textColor = NSColor.secondaryLabelColor;
+    self.audioSummaryLabel.maximumNumberOfLines = 2;
+    [self.mediaTabContentAudio addSubview:self.audioSummaryLabel];
+}
+
+- (void)audioSearchChanged:(id)sender {
+    (void)sender;
+    [self rebuildAudioList];
+}
+
+- (void)rebuildAudioList {
+    if (!self.state) return;
+    const std::string selected(self.selectedBinId.UTF8String ?: "__all__");
+    const bool anyBin = selected == "__all__";
+    const bool wantRoot = selected == "__root__";
+    const Ulid wantBinId = anyBin || wantRoot ? Ulid{} : selected;
+    const std::string search(self.audioSearchField.stringValue.UTF8String
+                                 ?: "");
+    const auto matches = ui::media_panel::FilterAudioSources(
+        self.state->document.library, anyBin, wantRoot, wantBinId, search);
+    self.visibleAudioIds = [NSMutableArray array];
+    for (const LibraryMedia* media : matches)
+        [self.visibleAudioIds
+            addObject:[NSString stringWithUTF8String:media->id.c_str()]];
+    [self.audioTable reloadData];
+    const NSUInteger count = self.visibleAudioIds.count;
+    self.audioSummaryLabel.stringValue =
+        [NSString stringWithFormat:@"%lu source%@ audio", (unsigned long)count,
+                                   count == 1 ? @"" : @"s"];
+}
+
+- (NSString*)selectedAudioId {
+    return [self selectedAudioIds].firstObject;
+}
+
+- (NSArray<NSString*>*)selectedAudioIds {
+    NSMutableArray<NSString*>* identifiers = [NSMutableArray array];
+    [self.audioTable.selectedRowIndexes
+        enumerateIndexesUsingBlock:^(NSUInteger row, BOOL* stop) {
+          (void)stop;
+          if (row < self.visibleAudioIds.count)
+              [identifiers addObject:self.visibleAudioIds[row]];
+        }];
+    return identifiers;
+}
+
+- (void)openSelectedAudioInSourceMonitor:(id)sender {
+    (void)sender;
+    NSString* identifier = [self selectedAudioId];
+    if (!identifier) return;
+    [self openMediaIdentifierInSourceMonitor:identifier];
+}
+
+- (void)assignSelectedAudioToBinPressed:(id)sender {
+    (void)sender;
+    [self moveMediaIdsToBin:[self selectedAudioIds]];
+}
+
+// ---- F2.3 Media panel: Captions tab ----------------------------------------
+// Lists sequence.caption_styles (F0.2) and lets the user apply one to every
+// clip currently selected on the timeline, or clear the selection's
+// caption. Every mutation goes through the existing
+// AddCaptionStyleOperation/RemoveCaptionStyleOperation/SetClipCaptionOperation
+// via EditLog::Apply -- see MediaPanelModel.h for the pure logic
+// (SummarizeCaptionStyles/JoinClipToCaptionStyle/ClearClipCaption) this
+// method calls into.
+
+- (void)buildCaptionsTabContentWithWidth:(double)width height:(double)height {
+    self.mediaTabContentCaptions =
+        [[NSView alloc] initWithFrame:NSMakeRect(0.0, 0.0, width, height)];
+    self.mediaTabContentCaptions.autoresizingMask =
+        NSViewWidthSizable | NSViewHeightSizable;
+    [self.mediaPanel addSubview:self.mediaTabContentCaptions];
+
+    NSTextField* stylesTitle = CMMakeSectionHeader(@"Styles de légende");
+    stylesTitle.frame = NSMakeRect(14.0, height - 30.0, width - 28.0, 18.0);
+    stylesTitle.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [self.mediaTabContentCaptions addSubview:stylesTitle];
+
+    self.captionStyleTable = [[ContextTableView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, width - 24.0, 220.0)];
+    for (NSArray<NSString*>* definition in
+         @[ @[ @"style", @"Style", @"200" ], @[ @"clips", @"Clips", @"56" ] ]) {
+        NSTableColumn* column =
+            [[NSTableColumn alloc] initWithIdentifier:definition[0]];
+        column.title = definition[1];
+        column.width = definition[2].doubleValue;
+        [self.captionStyleTable addTableColumn:column];
+    }
+    self.captionStyleTable.dataSource = self;
+    self.captionStyleTable.delegate = self;
+    self.captionStyleTable.usesAlternatingRowBackgroundColors = YES;
+    self.captionStyleScroll = [[NSScrollView alloc]
+        initWithFrame:NSMakeRect(12.0, height - 260.0, width - 24.0, 220.0)];
+    self.captionStyleScroll.autoresizingMask =
+        NSViewMinYMargin | NSViewWidthSizable;
+    self.captionStyleScroll.documentView = self.captionStyleTable;
+    self.captionStyleScroll.hasVerticalScroller = YES;
+    self.captionStyleScroll.borderType = NSBezelBorder;
+    [self.mediaTabContentCaptions addSubview:self.captionStyleScroll];
+
+    self.addCaptionStyleButton =
+        [NSButton buttonWithTitle:@"+ Style"
+                           target:self
+                           action:@selector(createCaptionStylePressed:)];
+    self.addCaptionStyleButton.frame =
+        NSMakeRect(12.0, height - 292.0, 140.0, 28.0);
+    self.addCaptionStyleButton.autoresizingMask = NSViewMinYMargin;
+    self.addCaptionStyleButton.bezelStyle = NSBezelStyleRounded;
+    self.addCaptionStyleButton.image =
+        SystemSymbol(@"plus.circle", @"Nouveau style de légende");
+    self.addCaptionStyleButton.imagePosition = NSImageLeading;
+    [self.mediaTabContentCaptions addSubview:self.addCaptionStyleButton];
+
+    self.removeCaptionStyleButton =
+        [NSButton buttonWithTitle:@"− Style"
+                           target:self
+                           action:@selector(deleteCaptionStylePressed:)];
+    self.removeCaptionStyleButton.frame =
+        NSMakeRect(160.0, height - 292.0, 148.0, 28.0);
+    self.removeCaptionStyleButton.autoresizingMask =
+        NSViewMinYMargin | NSViewMinXMargin;
+    self.removeCaptionStyleButton.bezelStyle = NSBezelStyleRounded;
+    self.removeCaptionStyleButton.image =
+        SystemSymbol(@"minus.circle", @"Supprimer le style");
+    self.removeCaptionStyleButton.imagePosition = NSImageLeading;
+    [self.mediaTabContentCaptions addSubview:self.removeCaptionStyleButton];
+
+    NSTextField* selectionTitle = CMMakeSectionHeader(@"Sélection timeline");
+    selectionTitle.frame = NSMakeRect(14.0, height - 320.0, width - 28.0, 18.0);
+    selectionTitle.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [self.mediaTabContentCaptions addSubview:selectionTitle];
+
+    self.captionSelectionLabel = [NSTextField
+        labelWithString:@"Aucun clip sélectionné sur la timeline."];
+    self.captionSelectionLabel.frame =
+        NSMakeRect(14.0, height - 368.0, width - 28.0, 44.0);
+    self.captionSelectionLabel.autoresizingMask =
+        NSViewMinYMargin | NSViewWidthSizable;
+    self.captionSelectionLabel.font = [NSFont systemFontOfSize:11.0];
+    self.captionSelectionLabel.textColor = NSColor.secondaryLabelColor;
+    self.captionSelectionLabel.maximumNumberOfLines = 3;
+    [self.mediaTabContentCaptions addSubview:self.captionSelectionLabel];
+
+    self.applyCaptionStyleButton =
+        [NSButton buttonWithTitle:@"Appliquer le style"
+                           target:self
+                           action:@selector(applyCaptionStylePressed:)];
+    self.applyCaptionStyleButton.frame =
+        NSMakeRect(12.0, height - 404.0, 140.0, 28.0);
+    self.applyCaptionStyleButton.autoresizingMask = NSViewMinYMargin;
+    self.applyCaptionStyleButton.bezelStyle = NSBezelStyleRounded;
+    self.applyCaptionStyleButton.image =
+        SystemSymbol(@"text.bubble", @"Appliquer le style de légende");
+    self.applyCaptionStyleButton.imagePosition = NSImageLeading;
+    [self.mediaTabContentCaptions addSubview:self.applyCaptionStyleButton];
+
+    self.clearCaptionButton =
+        [NSButton buttonWithTitle:@"Retirer"
+                           target:self
+                           action:@selector(clearCaptionPressed:)];
+    self.clearCaptionButton.frame =
+        NSMakeRect(160.0, height - 404.0, 148.0, 28.0);
+    self.clearCaptionButton.autoresizingMask =
+        NSViewMinYMargin | NSViewMinXMargin;
+    self.clearCaptionButton.bezelStyle = NSBezelStyleRounded;
+    self.clearCaptionButton.image =
+        SystemSymbol(@"text.badge.xmark", @"Retirer la légende");
+    self.clearCaptionButton.imagePosition = NSImageLeading;
+    [self.mediaTabContentCaptions addSubview:self.clearCaptionButton];
+}
+
+- (void)rebuildCaptionStylesList {
+    if (!self.state) return;
+    const auto summaries =
+        ui::media_panel::SummarizeCaptionStyles(self.state->document.sequence);
+    self.visibleCaptionStyleIds = [NSMutableArray array];
+    for (const auto& summary : summaries)
+        [self.visibleCaptionStyleIds
+            addObject:[NSString stringWithUTF8String:summary.style_id.c_str()]];
+    [self.captionStyleTable reloadData];
+    [self updateCaptionSelectionLabel];
+}
+
+- (void)updateCaptionSelectionLabel {
+    if (!self.state || !self.state->interaction) {
+        self.captionSelectionLabel.stringValue = @"Aucune timeline chargée.";
+        return;
+    }
+    const std::vector<Ulid>& selected =
+        self.state->interaction->SelectedClipIds();
+    if (selected.empty()) {
+        self.captionSelectionLabel.stringValue =
+            @"Aucun clip sélectionné sur la timeline.";
+        return;
+    }
+    size_t withCaption = 0;
+    for (const Ulid& clipId : selected) {
+        const DocumentClip* clip = self.state->document.FindClip(clipId);
+        if (clip && !clip->caption_group_id.empty()) ++withCaption;
+    }
+    self.captionSelectionLabel.stringValue = [NSString
+        stringWithFormat:@"%lu clip%@ sélectionné%@ · %lu avec légende",
+                         (unsigned long)selected.size(),
+                         selected.size() == 1 ? @"" : @"s",
+                         selected.size() == 1 ? @"" : @"s",
+                         (unsigned long)withCaption];
+}
+
+- (Ulid)selectedCaptionStyleId {
+    const NSInteger row = self.captionStyleTable.selectedRow;
+    if (row < 0 ||
+        row >= static_cast<NSInteger>(self.visibleCaptionStyleIds.count))
+        return {};
+    return Ulid(self.visibleCaptionStyleIds[row].UTF8String ?: "");
+}
+
+- (void)createCaptionStylePressed:(id)sender {
+    (void)sender;
+    if (!self.state) return;
+    EditError error = EditError::None;
+    std::string message;
+    if (!self.state->editLog.Apply(
+            self.state->document,
+            Operation{AddCaptionStyleOperation{CaptionStyle{}, -1}}, error,
+            message)) {
+        self.captionSelectionLabel.stringValue = [NSString
+            stringWithFormat:@"Création refusée : %s", message.c_str()];
+        return;
+    }
+    if (![self persistEdits:message])
+        std::fprintf(stderr, "Unable to persist caption style: %s\n",
+                     message.c_str());
+    [self rebuildCaptionStylesList];
+}
+
+- (void)deleteCaptionStylePressed:(id)sender {
+    (void)sender;
+    if (!self.state) return;
+    const Ulid styleId = [self selectedCaptionStyleId];
+    if (styleId.empty()) return;
+    EditError error = EditError::None;
+    std::string message;
+    if (!self.state->editLog.Apply(
+            self.state->document,
+            Operation{RemoveCaptionStyleOperation{styleId}}, error, message)) {
+        self.captionSelectionLabel.stringValue = [NSString
+            stringWithFormat:@"Suppression refusée : %s", message.c_str()];
+        return;
+    }
+    if (![self persistEdits:message])
+        std::fprintf(stderr, "Unable to persist caption style removal: %s\n",
+                     message.c_str());
+    [self rebuildCaptionStylesList];
+}
+
+- (void)applyCaptionStylePressed:(id)sender {
+    (void)sender;
+    if (!self.state || !self.state->interaction) return;
+    const Ulid styleId = [self selectedCaptionStyleId];
+    if (styleId.empty()) return;
+    const std::vector<Ulid> selected =
+        self.state->interaction->SelectedClipIds();
+    if (selected.empty()) return;
+    EditError error = EditError::None;
+    std::string message;
+    const RationalTime playhead = self.state->requestedPosition;
+    for (const Ulid& clipId : selected) {
+        const DocumentClip* clip = self.state->document.FindClip(clipId);
+        const std::string existingText =
+            (clip && clip->caption_group_id == styleId) ? clip->caption_text
+                                                        : std::string{};
+        if (!self.state->editLog.Apply(
+                self.state->document,
+                Operation{ui::media_panel::JoinClipToCaptionStyle(
+                    clipId, styleId, existingText)},
+                error, message)) {
+            self.captionSelectionLabel.stringValue = [NSString
+                stringWithFormat:@"Application refusée : %s", message.c_str()];
+            return;
+        }
+    }
+    [self refreshTimelineAfterEditFromPosition:playhead];
+    if (![self persistEdits:message])
+        std::fprintf(stderr, "Unable to persist caption assignment: %s\n",
+                     message.c_str());
+    self.state->overlayDirty = true;
+    [self rebuildCaptionStylesList];
+}
+
+- (void)clearCaptionPressed:(id)sender {
+    (void)sender;
+    if (!self.state || !self.state->interaction) return;
+    const std::vector<Ulid> selected =
+        self.state->interaction->SelectedClipIds();
+    if (selected.empty()) return;
+    EditError error = EditError::None;
+    std::string message;
+    const RationalTime playhead = self.state->requestedPosition;
+    for (const Ulid& clipId : selected) {
+        if (!self.state->editLog.Apply(
+                self.state->document,
+                Operation{ui::media_panel::ClearClipCaption(clipId)}, error,
+                message)) {
+            self.captionSelectionLabel.stringValue = [NSString
+                stringWithFormat:@"Retrait refusé : %s", message.c_str()];
+            return;
+        }
+    }
+    [self refreshTimelineAfterEditFromPosition:playhead];
+    if (![self persistEdits:message])
+        std::fprintf(stderr, "Unable to persist caption removal: %s\n",
+                     message.c_str());
+    self.state->overlayDirty = true;
+    [self rebuildCaptionStylesList];
 }
 
 - (NSInteger)collectionView:(NSCollectionView*)collectionView
@@ -4340,12 +5014,57 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView*)tableView {
-    return tableView == self.mediaTable ? self.visibleMediaIds.count : 0;
+    if (tableView == self.mediaTable) return self.visibleMediaIds.count;
+    if (tableView == self.audioTable) return self.visibleAudioIds.count;
+    if (tableView == self.captionStyleTable)
+        return self.visibleCaptionStyleIds.count;
+    return 0;
 }
 
 - (NSView*)tableView:(NSTableView*)tableView
     viewForTableColumn:(NSTableColumn*)tableColumn
                    row:(NSInteger)row {
+    if (tableView == self.audioTable) {
+        if (row < 0 || row >= (NSInteger)self.visibleAudioIds.count) return nil;
+        const LibraryMedia* media = self.state->document.FindLibraryMedia(
+            self.visibleAudioIds[row].UTF8String ?: "");
+        NSTextField* label = [NSTextField labelWithString:@""];
+        label.lineBreakMode = NSLineBreakByTruncatingTail;
+        if (!media) return label;
+        if ([tableColumn.identifier isEqualToString:@"name"])
+            label.stringValue =
+                [NSString stringWithUTF8String:media->filename.c_str()];
+        else if ([tableColumn.identifier isEqualToString:@"format"])
+            label.stringValue =
+                [NSString stringWithFormat:@"%s · %d ch", media->codec.c_str(),
+                                           media->audio_channels];
+        else
+            label.stringValue = TimeString(media->duration);
+        return label;
+    }
+    if (tableView == self.captionStyleTable) {
+        if (row < 0 || row >= (NSInteger)self.visibleCaptionStyleIds.count)
+            return nil;
+        const CaptionStyle* style = self.state->document.FindCaptionStyle(
+            self.visibleCaptionStyleIds[row].UTF8String ?: "");
+        NSTextField* label = [NSTextField labelWithString:@""];
+        label.lineBreakMode = NSLineBreakByTruncatingTail;
+        if (!style) return label;
+        if ([tableColumn.identifier isEqualToString:@"style"]) {
+            label.stringValue = [NSString
+                stringWithUTF8String:ui::media_panel::DescribeCaptionStyle(
+                                         *style)
+                                         .c_str()];
+        } else {
+            const auto summaries = ui::media_panel::SummarizeCaptionStyles(
+                self.state->document.sequence);
+            int32_t count = 0;
+            for (const auto& summary : summaries)
+                if (summary.style_id == style->id) count = summary.clip_count;
+            label.stringValue = [NSString stringWithFormat:@"%d", count];
+        }
+        return label;
+    }
     if (tableView != self.mediaTable || row < 0 ||
         row >= (NSInteger)self.visibleMediaIds.count)
         return nil;
@@ -4721,8 +5440,18 @@ DeleteGapOperation GapDeleteOperationForSelection(
 
 - (void)assignMediaToBinPressed:(id)sender {
     (void)sender;
+    [self moveMediaIdsToBin:[self selectedMediaIds]];
+}
+
+// Shared "choose a destination bin, then apply SetMediaBinOperation to every
+// id" flow. Factored out of -assignMediaToBinPressed so F2.3's Audio tab
+// (ROADMAP.md) -- which lists a different filtered slice of the same
+// document.library, see MediaPanelModel.h -- can offer the identical
+// "Déplacer vers un chutier" gesture without a second alert/menu
+// implementation.
+- (void)moveMediaIdsToBin:(NSArray<NSString*>*)mediaIdentifiers {
     NSMutableArray<NSString*>* mediaIds = [NSMutableArray array];
-    for (NSString* identifier in [self selectedMediaIds])
+    for (NSString* identifier in mediaIdentifiers)
         if (self.state->document.FindLibraryMedia(identifier.UTF8String ?: ""))
             [mediaIds addObject:identifier];
     if (mediaIds.count == 0) return;
@@ -4843,9 +5572,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->tool = tool;
     for (NSInteger index = 0; index < self.timelineToolIcons.count; ++index) {
         self.timelineToolIcons[index].contentTintColor =
-            index == static_cast<NSInteger>(tool)
-                ? [NSColor colorWithRed:0.24 green:0.82 blue:1.0 alpha:1.0]
-                : NSColor.secondaryLabelColor;
+            index == static_cast<NSInteger>(tool) ? CMAccentBlueColor()
+                                                  : NSColor.secondaryLabelColor;
     }
     self.state->interaction->CancelDrag();
     self.state->navigationDragging = false;
@@ -4858,6 +5586,21 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self applyToolCursor];
     [self updateSelectionInfo];
     self.state->overlayDirty = true;
+}
+
+// Moves the playhead by `amount` frames (or samples, in Sample resolution)
+// from its current position. Shared by the Left/Right-arrow keyboard
+// shortcut and the Transport panel's frame-step buttons (F2.5) so both
+// paths compute the same delta and land on the same
+// -requestTimelinePosition: -> QuantizePlayheadPosition machinery every
+// other playhead move already uses.
+- (void)stepPlayheadFrames:(int64_t)amount {
+    const RationalTime delta =
+        self.state->playheadResolution == PlayheadResolution::Sample
+            ? RationalTime{amount, 48000}
+            : RationalTime{amount * [self playheadFrameRate].den,
+                           [self playheadFrameRate].num};
+    [self requestTimelinePosition:self.state->requestedPosition.add(delta)];
 }
 
 - (void)requestTimelinePosition:(RationalTime)position {
@@ -5028,6 +5771,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->playbackDirection = std::clamp(direction, -1, 1);
     self.state->playbackAnchor = self.state->requestedPosition;
     self.state->playbackStarted = std::chrono::steady_clock::now();
+    [self.transportView setPlaying:self.state->playbackDirection != 0];
     if (self.state->audioPlayback) {
         self.state->audioPlayback->Stop();
         if (self.state->playbackDirection != 0) {
@@ -5043,6 +5787,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 
 - (void)updateSelectionInfo {
+    // F2.2 -- this is the one hook already fired after every selection
+    // change and every edit that could touch the selected clip (see this
+    // method's call sites), so it doubles as the Inspector's refresh
+    // trigger. SelectedClipId() is empty for zero or multiple selected
+    // clips, which CMInspectorView already renders as "no selection".
+    [self.inspectorView
+        reloadWithDocument:self.state->document
+            selectedClipId:self.state->interaction->SelectedClipId()];
+    // F2.3 -- keep the Captions tab's "current timeline selection" summary
+    // live even when that tab is not the one on screen; it is cheap (one
+    // label update) and avoids a stale summary the moment the user switches
+    // to it. See MediaPanelModel.h/-updateCaptionSelectionLabel.
+    if (self.captionSelectionLabel) [self updateCaptionSelectionLabel];
     const size_t selectionCount =
         self.state->interaction->SelectedClipIds().size();
     if (selectionCount > 1) {
@@ -5138,6 +5895,33 @@ DeleteGapOperation GapDeleteOperationForSelection(
             roleText, syncText, sourceText, metadataText,
             TimeString(clip->source_in), TimeString(clip->duration),
             TimeString(clip->timeline_in)];
+}
+
+// F2.2 -- CMInspectorViewDelegate. Every grading slider commit arrives
+// here as a ready-to-apply SetClipEffectsOperation; this is the only place
+// that actually calls EditLog::Apply for it, matching every other edit in
+// this file (e.g. -menuAddCrossDissolve: above) -- CMInspectorView itself
+// never touches Document/DocumentClip directly (PHILOSOPHY.md principle
+// 2/3). No refreshTimelineAfterEditFromPosition here: a grade change
+// leaves every clip's position/duration untouched, it only changes what
+// the next render composites (see main.mm's ResolveColorGrade call site),
+// so marking overlayDirty is the only redraw trigger this edit needs.
+- (void)inspectorView:(CMInspectorView*)inspectorView
+    didCommitClipEffects:(SetClipEffectsOperation)operation {
+    (void)inspectorView;
+    EditError error = EditError::None;
+    std::string message;
+    if (!self.state->editLog.Apply(self.state->document,
+                                   Operation{std::move(operation)}, error,
+                                   message)) {
+        std::fprintf(stderr, "Grading edit rejected (%s): %s\n",
+                     EditErrorName(error), message.c_str());
+        return;
+    }
+    self.state->overlayDirty = true;
+    if (![self persistEdits:message])
+        std::fprintf(stderr, "Unable to persist grading edit: %s\n",
+                     message.c_str());
 }
 
 - (void)linkedSelectionPressed:(NSButton*)sender {
@@ -5862,13 +6646,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         const int64_t amount =
             (modifiers & NSEventModifierFlagShift) != 0 ? 10 : 1;
         const int64_t direction = event.keyCode == 123 ? -1 : 1;
-        const RationalTime delta =
-            self.state->playheadResolution == PlayheadResolution::Sample
-                ? RationalTime{direction * amount, 48000}
-                : RationalTime{
-                      direction * amount * [self playheadFrameRate].den,
-                      [self playheadFrameRate].num};
-        [self requestTimelinePosition:self.state->requestedPosition.add(delta)];
+        [self stepPlayheadFrames:direction * amount];
         return YES;
     }
     if (event.keyCode == 53) {  // Escape
@@ -6644,6 +7422,26 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)menuPlayForward:(id)sender {
     (void)sender;
     [self setPlaybackDirection:1];
+}
+
+// F2.5 -- Transport panel actions. Frame-step reuses -stepPlayheadFrames:,
+// the same helper the Left/Right-arrow shortcut calls. Play/pause reuses
+// -menuPlayPause: directly (wired as the transport button's action in
+// -applicationDidFinishLaunching:), so there is exactly one play/pause
+// implementation, not two.
+- (void)transportStepBack:(id)sender {
+    (void)sender;
+    [self stepPlayheadFrames:-1];
+}
+- (void)transportStepForward:(id)sender {
+    (void)sender;
+    [self stepPlayheadFrames:1];
+}
+- (void)transportScrubChanged:(NSSlider*)sender {
+    const ScrubBarRange range{self.state->duration};
+    const RationalTime target =
+        range.FractionToTime(sender.doubleValue, [self playheadInputRate]);
+    [self requestTimelinePosition:target];
 }
 
 - (NSMenu*)timelineMenuForEvent:(NSEvent*)event {
@@ -7804,21 +8602,27 @@ DeleteGapOperation GapDeleteOperationForSelection(
                 0.28f, 0.42f, 0.12f);
         }
         if (rawIn >= self.state->viewport.header_width && rawIn <= width)
-            add(rawIn, top, 2.0, timelineHeight, 0.20f, 0.88f, 0.52f);
+            add(rawIn, top, 2.0, timelineHeight, ui::theme::kAccentGreen.r,
+                ui::theme::kAccentGreen.g, ui::theme::kAccentGreen.b);
         if (rawOut >= self.state->viewport.header_width && rawOut <= width)
-            add(rawOut - 2.0, top, 2.0, timelineHeight, 1.0f, 0.42f, 0.24f);
+            add(rawOut - 2.0, top, 2.0, timelineHeight,
+                ui::theme::kAccentOrange.r, ui::theme::kAccentOrange.g,
+                ui::theme::kAccentOrange.b);
     } else {
         if (self.state->timelineIn) {
             const double x =
                 self.state->viewport.TimeToX(*self.state->timelineIn);
             if (x >= self.state->viewport.header_width && x <= width)
-                add(x, top, 2.0, timelineHeight, 0.20f, 0.88f, 0.52f);
+                add(x, top, 2.0, timelineHeight, ui::theme::kAccentGreen.r,
+                    ui::theme::kAccentGreen.g, ui::theme::kAccentGreen.b);
         }
         if (self.state->timelineOut) {
             const double x =
                 self.state->viewport.TimeToX(*self.state->timelineOut);
             if (x >= self.state->viewport.header_width && x <= width)
-                add(x - 2.0, top, 2.0, timelineHeight, 1.0f, 0.42f, 0.24f);
+                add(x - 2.0, top, 2.0, timelineHeight,
+                    ui::theme::kAccentOrange.r, ui::theme::kAccentOrange.g,
+                    ui::theme::kAccentOrange.b);
         }
     }
     const auto tracks = TimelineTracksInDisplayOrder(self.state->document);
@@ -7839,9 +8643,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
             trackShade + 0.002f, trackShade + 0.004f);
         add(0.0, y, self.state->viewport.header_width,
             self.state->viewport.track_height, 0.090f, 0.093f, 0.097f);
-        add(0.0, y, 3.0, self.state->viewport.track_height,
-            video ? 0.12f : 0.13f, video ? 0.43f : 0.48f,
-            video ? 0.67f : 0.28f);
+        {
+            const ui::theme::Color kindTint = ui::theme::TrackTint(video);
+            add(0.0, y, 3.0, self.state->viewport.track_height, kindTint.r,
+                kindTint.g, kindTint.b);
+        }
         // Resolve-like patch/target cells and compact track controls.
         add(50.0, y + 7.0, 24.0, 20.0, 0.070f, 0.073f, 0.077f);
         add(50.0, y + 7.0, 2.0, 20.0, video ? 0.18f : 0.20f,
@@ -7944,11 +8750,15 @@ DeleteGapOperation GapDeleteOperationForSelection(
             if (right > left && y < top + timelineHeight) {
                 const double height = self.state->viewport.track_height;
                 add(left, y, right - left, height, 0.10f, 0.34f, 0.48f, 0.42f);
-                add(left, y, right - left, 2.0, 0.24f, 0.82f, 1.0f);
-                add(left, y + height - 2.0, right - left, 2.0, 0.24f, 0.82f,
-                    1.0f);
-                add(left, y, 2.0, height, 0.24f, 0.82f, 1.0f);
-                add(right - 2.0, y, 2.0, height, 0.24f, 0.82f, 1.0f);
+                add(left, y, right - left, 2.0, ui::theme::kAccentBlue.r,
+                    ui::theme::kAccentBlue.g, ui::theme::kAccentBlue.b);
+                add(left, y + height - 2.0, right - left, 2.0,
+                    ui::theme::kAccentBlue.r, ui::theme::kAccentBlue.g,
+                    ui::theme::kAccentBlue.b);
+                add(left, y, 2.0, height, ui::theme::kAccentBlue.r,
+                    ui::theme::kAccentBlue.g, ui::theme::kAccentBlue.b);
+                add(right - 2.0, y, 2.0, height, ui::theme::kAccentBlue.r,
+                    ui::theme::kAccentBlue.g, ui::theme::kAccentBlue.b);
                 for (double stripe = left + 8.0; stripe < right; stripe += 12.0)
                     add(stripe, y + 5.0, 1.0, std::max(0.0, height - 10.0),
                         0.20f, 0.58f, 0.72f, 0.55f);
@@ -7979,12 +8789,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
             0.015f, 0.018f, 0.022f, 0.65f);
         if (clip.moving) {
             add(left - 2.0, y - 2.0, right - left + 4.0, clip.height + 4.0,
-                0.86f, 0.16f, 0.12f, 0.82f);
+                ui::theme::kAccentRed.r, ui::theme::kAccentRed.g,
+                ui::theme::kAccentRed.b, 0.82f);
         }
         if (clip.selected) {
             add(left - 2.0, y - 2.0, right - left + 4.0, clip.height + 4.0,
-                clip.valid ? 0.95f : 1.0f, clip.valid ? 0.78f : 0.16f,
-                clip.valid ? 0.18f : 0.12f);
+                clip.valid ? ui::theme::kAccentAmber.r : 1.0f,
+                clip.valid ? ui::theme::kAccentAmber.g : 0.16f,
+                clip.valid ? ui::theme::kAccentAmber.b : 0.12f);
         }
         const auto color = ClipColor(clip.source_id, clip.audio);
         if (!clip.valid)
@@ -8201,7 +9013,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         frames[slot] = self.state->frameCache->GetNearest(
             requested.sourceId, requested.frame, cachedFrame);
         candidates[slot] = {true, requested.sourceId, cachedFrame,
-                            requested.opacity};
+                            requested.opacity, requested.clipId};
         if (!frames[slot] || cachedFrame != requested.frame) {
             missing = true;
         }
@@ -8219,9 +9031,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
         programData.video_zoom = self.state->programMonitorZoom;
         programData.video_rotation_degrees.resize(candidates.size(), 0);
         programData.video_opacities.resize(candidates.size(), 1.0f);
+        // F1.3: read-only render-time consumer of DocumentClip::effects.
+        // Resolving here (rather than in Renderer.mm) keeps the renderer
+        // generic over Document/ClipEffect -- it only ever sees the already
+        // -resolved, already-float ResolvedColorGrade.
+        programData.video_color_grades.resize(candidates.size());
         for (size_t slot = 0; slot < candidates.size(); ++slot) {
             if (!candidates[slot].active) continue;
             programData.video_opacities[slot] = candidates[slot].opacity;
+            if (const DocumentClip* clip =
+                    self.state->document.FindClip(candidates[slot].clipId)) {
+                programData.video_color_grades[slot] =
+                    ResolveColorGrade(clip->effects);
+            }
             const auto media =
                 self.state->mediaMetadata.find(candidates[slot].sourceId);
             if (media != self.state->mediaMetadata.end() &&
@@ -8403,6 +9225,43 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if ((argc == 3 || argc == 5) && std::string(argv[1]) == "--mcp-serve") {
+        int port = 0;
+        if (argc == 5) {
+            if (std::string(argv[3]) != "--port") {
+                std::fprintf(stderr, "Unknown --mcp-serve option: %s\n",
+                             argv[3]);
+                return 2;
+            }
+            port = std::atoi(argv[4]);
+        }
+        // Purely local, loopback-only HTTP + JSON-RPC MCP server
+        // (ROADMAP.md F1.1). McpProjectBackend reuses ApplyOperationCommand/
+        // UndoOperationCommand/RedoOperationCommand/DescribeCommand -- the
+        // exact functions --apply-op/--describe already call -- so every
+        // tool call takes the same load/apply/commit path a human editing
+        // through the app or the CLI does. No AppKit/Metal/media decoding is
+        // initialized for this path.
+        McpProjectBackend backend(argv[2]);
+        McpServer server(backend);
+        std::string startError;
+        if (!server.Start(port, startError)) {
+            std::fprintf(stderr, "mcp-serve failed to start: %s\n",
+                         startError.c_str());
+            return 1;
+        }
+        std::fprintf(stderr,
+                     "MCP server listening on http://127.0.0.1:%d/mcp for "
+                     "'%s' (Ctrl-C to stop)\n",
+                     server.Port(), argv[2]);
+        static std::atomic_bool stopRequested{false};
+        std::signal(SIGINT, [](int) { stopRequested.store(true); });
+        std::signal(SIGTERM, [](int) { stopRequested.store(true); });
+        while (!stopRequested.load() && server.IsRunning())
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        server.Stop();
+        return 0;
+    }
     if ((argc == 4 || argc == 5) && std::string(argv[1]) == "--ingest" &&
         (argc == 4 || std::string(argv[4]) == "--recursive")) {
         std::string output;
@@ -8456,13 +9315,15 @@ int main(int argc, char* argv[]) {
             "'<op.json>'\n"
             "       %s --undo-project-op /path/to/project.cutmachine.json\n"
             "       %s --redo-project-op /path/to/project.cutmachine.json\n"
+            "       %s --mcp-serve /path/to/project.cutmachine.json "
+            "[--port N]\n"
             "       %s --ingest /path/to/project.cutmachine.json "
             "/path/to/media "
             "[--recursive]\n"
             "       %s --export /path/to/project.cutmachine.json output.mp4 "
             "[--software] [--overwrite]\n",
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-            argv[0]);
+            argv[0], argv[0]);
         return 2;
     }
 

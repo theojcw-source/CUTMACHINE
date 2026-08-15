@@ -173,6 +173,14 @@ const DocumentTrack* LockedTrackTouchedBy(const Document& document,
             } else if constexpr (std::is_same_v<T, JoinClipOperation>) {
                 addClipTrack(value.left_clip_id);
                 addClipTrack(value.right_clip_id);
+            } else if constexpr (std::is_same_v<T, SetClipEffectsOperation> ||
+                                 std::is_same_v<T, SetClipCaptionOperation>) {
+                addClipTrack(value.clip_id);
+            } else if constexpr (std::is_same_v<T, RemoveWordsOperation>) {
+                addClipTrack(value.clip_id);
+                for (const Ulid& trackId : value.sync_track_ids)
+                    addTrack(trackId);
+                addExactTracks(value.exact_track_result);
             }
         },
         operation);
@@ -1926,6 +1934,212 @@ bool ApplyUpdateMarker(Document& candidate, UpdateMarkerOperation& operation,
     return true;
 }
 
+bool ApplyAddCaptionStyle(Document& candidate,
+                          AddCaptionStyleOperation& operation,
+                          Operation& inverse, EditError& error,
+                          std::string& message) {
+    if (operation.style.id.empty()) operation.style.id = GenerateUlid();
+    const Ulid& id = operation.style.id;
+    const bool collision =
+        id == candidate.sequence.id || candidate.FindCaptionStyle(id) ||
+        candidate.FindMulticamGroup(id) || candidate.FindMarker(id) ||
+        candidate.FindTransition(id) || candidate.FindBin(id) ||
+        candidate.FindLibraryMedia(id) || candidate.FindSource(id) ||
+        candidate.FindTrack(id) || candidate.FindClip(id);
+    if (!IsValidUlid(id) || collision) {
+        Fail(EditError::DuplicateId,
+             "caption style id is invalid or already exists: '" + id + "'",
+             error, message);
+        return false;
+    }
+    if (operation.insertion_index < -1 ||
+        (operation.insertion_index >= 0 &&
+         static_cast<uint64_t>(operation.insertion_index) >
+             candidate.sequence.caption_styles.size())) {
+        Fail(EditError::InvalidOperation,
+             "caption style insertion_index is outside the style list", error,
+             message);
+        return false;
+    }
+    if (operation.insertion_index < 0)
+        operation.insertion_index =
+            static_cast<int64_t>(candidate.sequence.caption_styles.size());
+    candidate.sequence.caption_styles.insert(
+        candidate.sequence.caption_styles.begin() + operation.insertion_index,
+        operation.style);
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = RemoveCaptionStyleOperation{id};
+    return true;
+}
+
+bool ApplyRemoveCaptionStyle(Document& candidate,
+                             RemoveCaptionStyleOperation& operation,
+                             Operation& inverse, EditError& error,
+                             std::string& message) {
+    auto& styles = candidate.sequence.caption_styles;
+    const auto found = std::find_if(styles.begin(), styles.end(),
+                                    [&](const CaptionStyle& style) {
+                                        return style.id == operation.style_id;
+                                    });
+    if (found == styles.end()) {
+        Fail(EditError::UnknownCaptionStyle,
+             "unknown caption style_id '" + operation.style_id + "'", error,
+             message);
+        return false;
+    }
+    const bool inUse = std::any_of(
+        candidate.sequence.tracks.begin(), candidate.sequence.tracks.end(),
+        [&](const DocumentTrack& track) {
+            return std::any_of(track.clips.begin(), track.clips.end(),
+                               [&](const DocumentClip& clip) {
+                                   return clip.caption_group_id ==
+                                          operation.style_id;
+                               });
+        });
+    if (inUse) {
+        Fail(EditError::InvalidOperation,
+             "caption style_id '" + operation.style_id +
+                 "' is still referenced by a clip",
+             error, message);
+        return false;
+    }
+    const int64_t index =
+        static_cast<int64_t>(std::distance(styles.begin(), found));
+    const CaptionStyle removed = *found;
+    styles.erase(found);
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = AddCaptionStyleOperation{removed, index};
+    return true;
+}
+
+bool ApplySetClipCaption(Document& candidate,
+                         SetClipCaptionOperation& operation, Operation& inverse,
+                         EditError& error, std::string& message) {
+    DocumentClip* clip = candidate.FindClip(operation.clip_id);
+    if (!clip) {
+        Fail(EditError::UnknownClip,
+             "unknown clip_id '" + operation.clip_id + "'", error, message);
+        return false;
+    }
+    const Ulid beforeGroup = clip->caption_group_id;
+    const std::string beforeText = clip->caption_text;
+    clip->caption_group_id = operation.caption_group_id;
+    clip->caption_text = operation.caption_text;
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = SetClipCaptionOperation{clip->id, beforeGroup, beforeText};
+    return true;
+}
+
+// F1.5 ("Multicam"). Registers a new multicam group and its angles. Angle
+// clip existence, video-track membership, no-clip-reused-within-group and
+// active_angle_id membership are all schema-level invariants already
+// enforced by Document::Validate (see MulticamGroup validation), so this
+// only owns the operation's own precondition: a fresh, collision-free group
+// id and a well-formed insertion_index, mirroring
+// ApplyAddTransition/ApplyAddCaptionStyle.
+bool ApplyAddMulticamGroup(Document& candidate,
+                           AddMulticamGroupOperation& operation,
+                           Operation& inverse, EditError& error,
+                           std::string& message) {
+    if (operation.group.id.empty()) operation.group.id = GenerateUlid();
+    const Ulid& id = operation.group.id;
+    const bool collision =
+        id == candidate.sequence.id || candidate.FindMulticamGroup(id) ||
+        candidate.FindCaptionStyle(id) || candidate.FindMarker(id) ||
+        candidate.FindTransition(id) || candidate.FindBin(id) ||
+        candidate.FindLibraryMedia(id) || candidate.FindSource(id) ||
+        candidate.FindTrack(id) || candidate.FindClip(id);
+    if (!IsValidUlid(id) || collision) {
+        Fail(EditError::DuplicateId,
+             "multicam group id is invalid or already exists: '" + id + "'",
+             error, message);
+        return false;
+    }
+    for (MulticamAngle& angle : operation.group.angles) {
+        if (angle.id.empty()) angle.id = GenerateUlid();
+    }
+    if (operation.insertion_index < -1 ||
+        (operation.insertion_index >= 0 &&
+         static_cast<uint64_t>(operation.insertion_index) >
+             candidate.sequence.multicam_groups.size())) {
+        Fail(EditError::InvalidOperation,
+             "multicam group insertion_index is outside the group list", error,
+             message);
+        return false;
+    }
+    if (operation.insertion_index < 0)
+        operation.insertion_index =
+            static_cast<int64_t>(candidate.sequence.multicam_groups.size());
+    candidate.sequence.multicam_groups.insert(
+        candidate.sequence.multicam_groups.begin() + operation.insertion_index,
+        operation.group);
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = RemoveMulticamGroupOperation{id};
+    return true;
+}
+
+// Exact inverse of ApplyAddMulticamGroup. No other schema field references a
+// multicam group by id, so unlike caption styles there is no "still in use"
+// precondition to check here.
+bool ApplyRemoveMulticamGroup(Document& candidate,
+                              RemoveMulticamGroupOperation& operation,
+                              Operation& inverse, EditError& error,
+                              std::string& message) {
+    auto& groups = candidate.sequence.multicam_groups;
+    const auto found = std::find_if(
+        groups.begin(), groups.end(),
+        [&](const auto& group) { return group.id == operation.group_id; });
+    if (found == groups.end()) {
+        Fail(EditError::UnknownMulticamGroup,
+             "unknown multicam group_id '" + operation.group_id + "'", error,
+             message);
+        return false;
+    }
+    const int64_t index =
+        static_cast<int64_t>(std::distance(groups.begin(), found));
+    const MulticamGroup removed = *found;
+    groups.erase(found);
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = AddMulticamGroupOperation{removed, index};
+    return true;
+}
+
+// Changes the active angle of an existing group. The group itself must
+// exist (EditError::UnknownMulticamGroup); a non-empty active_angle_id must
+// name one of that group's own angles (EditError::UnknownMulticamAngle) —
+// Document::Validate would also catch a dangling active_angle_id, but only
+// as a generic ValidationFailed, so this checks it directly for an exact
+// error the way UpdateMarker/SetClipLink check their own references.
+bool ApplySetMulticamActiveAngle(Document& candidate,
+                                 SetMulticamActiveAngleOperation& operation,
+                                 Operation& inverse, EditError& error,
+                                 std::string& message) {
+    MulticamGroup* group = candidate.FindMulticamGroup(operation.group_id);
+    if (!group) {
+        Fail(EditError::UnknownMulticamGroup,
+             "unknown multicam group_id '" + operation.group_id + "'", error,
+             message);
+        return false;
+    }
+    if (!operation.active_angle_id.empty() &&
+        std::none_of(group->angles.begin(), group->angles.end(),
+                     [&](const MulticamAngle& angle) {
+                         return angle.id == operation.active_angle_id;
+                     })) {
+        Fail(EditError::UnknownMulticamAngle,
+             "active_angle_id '" + operation.active_angle_id +
+                 "' is not an angle of multicam group '" + operation.group_id +
+                 "'",
+             error, message);
+        return false;
+    }
+    const Ulid before = group->active_angle_id;
+    group->active_angle_id = operation.active_angle_id;
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = SetMulticamActiveAngleOperation{group->id, before};
+    return true;
+}
+
 bool ApplyAddTransition(Document& candidate, AddTransitionOperation& operation,
                         Operation& inverse, EditError& error,
                         std::string& message) {
@@ -2080,6 +2294,25 @@ bool ApplySetClipLink(Document& candidate, SetClipLinkOperation& operation,
         second->link_group_id, second->sync_anchor_clip_id,
         second->sync_reference_delta};
     return ValidateResult(candidate, error, message);
+}
+
+bool ApplySetClipEffects(Document& candidate,
+                         SetClipEffectsOperation& operation, Operation& inverse,
+                         EditError& error, std::string& message) {
+    DocumentClip* clip = candidate.FindClip(operation.clip_id);
+    if (!clip) {
+        Fail(EditError::UnknownClip,
+             "unknown clip_id '" + operation.clip_id + "'", error, message);
+        return false;
+    }
+    const std::vector<ClipEffect> before = clip->effects;
+    for (ClipEffect& effect : operation.effects) {
+        if (effect.id.empty()) effect.id = GenerateUlid();
+    }
+    clip->effects = operation.effects;
+    if (!ValidateResult(candidate, error, message)) return false;
+    inverse = SetClipEffectsOperation{clip->id, before};
+    return true;
 }
 
 bool ApplySplit(Document& candidate, SplitClipOperation& operation,
@@ -2345,6 +2578,32 @@ void WriteExactPositions(std::ostringstream& output,
     output << ']';
 }
 
+void WriteEffectParamValue(std::ostringstream& output,
+                           const EffectParamValue& value) {
+    output << "{\"num\":" << value.num << ",\"den\":" << value.den << "}";
+}
+
+void WriteClipEffects(std::ostringstream& output,
+                      const std::vector<ClipEffect>& effects) {
+    output << '[';
+    for (size_t index = 0; index < effects.size(); ++index) {
+        if (index) output << ',';
+        const ClipEffect& effect = effects[index];
+        output << "{\"id\":\"" << effect.id << "\",\"type\":";
+        WriteString(output, effect.type);
+        output << ",\"params\":{";
+        size_t paramIndex = 0;
+        for (const auto& param : effect.params) {
+            if (paramIndex++) output << ',';
+            WriteString(output, param.first);
+            output << ':';
+            WriteEffectParamValue(output, param.second);
+        }
+        output << "}}";
+    }
+    output << ']';
+}
+
 void WriteExactTracks(std::ostringstream& output,
                       const std::vector<ExactTrackState>& tracks) {
     output << '[';
@@ -2372,6 +2631,13 @@ void WriteExactTracks(std::ostringstream& output,
                        << clip.sync_anchor_clip_id
                        << "\",\"sync_reference_delta\":";
                 WriteTime(output, clip.sync_reference_delta);
+            }
+            output << ",\"effects\":";
+            WriteClipEffects(output, clip.effects);
+            if (!clip.caption_group_id.empty()) {
+                output << ",\"caption_group_id\":\"" << clip.caption_group_id
+                       << "\",\"caption_text\":";
+                WriteString(output, clip.caption_text);
             }
             output << '}';
         }
@@ -2490,6 +2756,48 @@ std::vector<ExactTimelinePosition> ReadExactPositions(Reader& reader) {
     }
 }
 
+EffectParamValue ReadEffectParamValue(Reader& reader) {
+    reader.Expect("{\"num\":");
+    const int64_t num = reader.Integer();
+    reader.Expect(",\"den\":");
+    const int64_t den = reader.Integer();
+    reader.Expect("}");
+    if (num < std::numeric_limits<int32_t>::min() ||
+        num > std::numeric_limits<int32_t>::max() ||
+        den < std::numeric_limits<int32_t>::min() ||
+        den > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error("EffectParamValue outside int32_t range");
+    }
+    return {static_cast<int32_t>(num), static_cast<int32_t>(den)};
+}
+
+std::vector<ClipEffect> ReadClipEffects(Reader& reader) {
+    std::vector<ClipEffect> effects;
+    reader.Expect("[");
+    if (reader.Consume("]")) return effects;
+    while (true) {
+        ClipEffect effect;
+        reader.Expect("{\"id\":");
+        effect.id = reader.String();
+        reader.Expect(",\"type\":");
+        effect.type = reader.String();
+        reader.Expect(",\"params\":{");
+        if (!reader.Consume("}")) {
+            while (true) {
+                const std::string key = reader.String();
+                reader.Expect(":");
+                effect.params.emplace(key, ReadEffectParamValue(reader));
+                if (reader.Consume("}")) break;
+                reader.Expect(",");
+            }
+        }
+        reader.Expect("}");
+        effects.push_back(std::move(effect));
+        if (reader.Consume("]")) return effects;
+        reader.Expect(",");
+    }
+}
+
 std::vector<ExactTrackState> ReadExactTracks(Reader& reader) {
     std::vector<ExactTrackState> tracks;
     reader.Expect("[");
@@ -2523,6 +2831,13 @@ std::vector<ExactTrackState> ReadExactTracks(Reader& reader) {
                     reader.Expect(",\"sync_reference_delta\":");
                     clip.sync_reference_delta = ReadTime(reader);
                 }
+                reader.Expect(",\"effects\":");
+                clip.effects = ReadClipEffects(reader);
+                if (reader.Consume(",\"caption_group_id\":")) {
+                    clip.caption_group_id = reader.String();
+                    reader.Expect(",\"caption_text\":");
+                    clip.caption_text = reader.String();
+                }
                 reader.Expect("}");
                 state.clips.push_back(std::move(clip));
                 if (reader.Consume("]")) break;
@@ -2534,6 +2849,203 @@ std::vector<ExactTrackState> ReadExactTracks(Reader& reader) {
         if (reader.Consume("]")) return tracks;
         reader.Expect(",");
     }
+}
+
+// Removes the clip's transcript-derived ranges and ripple-closes each cut.
+//
+// Fragment placement rule (the one explicit rounding-adjacent decision this
+// operation makes, documented once here rather than left implicit):
+//   - The clip is cut into the kept fragments that remain outside every
+//     removed range, in source order.
+//   - The first kept fragment keeps the original clip's timeline_in exactly
+//     -- if the very first range starts at the clip's own source_in (a head
+//     removal), this is exactly an ordinary head ripple trim: nothing before
+//     the clip moves.
+//   - Every following kept fragment starts `gap_padding` after the previous
+//     kept fragment's end. Padding therefore only ever appears *between two
+//     fragments of this same clip* (an interior cut); it is never inserted
+//     at the clip's own head or tail edge, where there is no fragment on the
+//     other side to pad against -- a tail removal ripples the same way an
+//     ordinary tail ripple trim does, with no trailing gap.
+//   - Everything after the clip's original end -- on its own track, and on
+//     every track in sync_track_ids -- shifts by exactly
+//     (new total span) - (original total span), so downstream material
+//     closes up around whatever combination of real cuts and kept padding
+//     resulted.
+bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
+                      Operation& inverse, EditError& error,
+                      std::string& message) {
+    std::vector<Ulid> trackIds;
+    const auto addTrack = [&](const Ulid& id) {
+        if (!id.empty() &&
+            std::find(trackIds.begin(), trackIds.end(), id) == trackIds.end())
+            trackIds.push_back(id);
+    };
+    const auto snapshots = [&](const std::vector<Ulid>& ids) {
+        std::vector<ExactTrackState> states;
+        for (const Ulid& id : ids) {
+            const DocumentTrack* track = candidate.FindTrack(id);
+            if (track) states.push_back({id, track->clips});
+        }
+        return states;
+    };
+
+    if (!operation.exact_track_result.empty()) {
+        for (const ExactTrackState& state : operation.exact_track_result)
+            addTrack(state.track_id);
+        const std::vector<ExactTrackState> before = snapshots(trackIds);
+        if (before.size() != operation.exact_track_result.size()) {
+            Fail(EditError::UnknownTrack,
+                 "exact word removal state references an unknown track", error,
+                 message);
+            return false;
+        }
+        for (const ExactTrackState& state : operation.exact_track_result)
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = RemoveWordsOperation{operation.clip_id, operation.ranges,
+                                       operation.gap_padding,
+                                       operation.sync_track_ids, before};
+        return true;
+    }
+
+    if (operation.ranges.empty()) {
+        Fail(EditError::InvalidOperation,
+             "RemoveWords requires at least one range", error, message);
+        return false;
+    }
+    if (operation.gap_padding.rate <= 0 || operation.gap_padding.value < 0) {
+        Fail(EditError::ArithmeticError,
+             "RemoveWords gap_padding must be a non-negative exact duration",
+             error, message);
+        return false;
+    }
+    for (size_t index = 0; index < operation.ranges.size(); ++index) {
+        const WordRemovalRange& range = operation.ranges[index];
+        if (range.source_start.rate <= 0 || range.source_end.rate <= 0 ||
+            range.source_start >= range.source_end) {
+            Fail(EditError::InvalidOperation,
+                 "RemoveWords range must have a positive duration", error,
+                 message);
+            return false;
+        }
+        if (index > 0 &&
+            range.source_start < operation.ranges[index - 1].source_end) {
+            Fail(EditError::InvalidOperation,
+                 "RemoveWords ranges must be sorted and non-overlapping", error,
+                 message);
+            return false;
+        }
+    }
+
+    DocumentTrack* track = candidate.FindTrackForClip(operation.clip_id);
+    if (!track) {
+        Fail(EditError::UnknownClip,
+             "unknown clip_id '" + operation.clip_id + "'", error, message);
+        return false;
+    }
+    const auto found = std::find_if(
+        track->clips.begin(), track->clips.end(),
+        [&](const DocumentClip& clip) { return clip.id == operation.clip_id; });
+    const size_t index =
+        static_cast<size_t>(std::distance(track->clips.begin(), found));
+    const DocumentClip original = *found;
+    const RationalTime clipSourceStart = original.source_in;
+    const RationalTime clipSourceEnd =
+        original.source_in.add(original.duration);
+    for (const WordRemovalRange& range : operation.ranges) {
+        if (range.source_start < clipSourceStart ||
+            range.source_end > clipSourceEnd) {
+            Fail(EditError::SourceOutOfBounds,
+                 "RemoveWords range falls outside the source range of "
+                 "clip_id '" +
+                     operation.clip_id + "'",
+                 error, message);
+            return false;
+        }
+    }
+
+    addTrack(track->id);
+    for (const Ulid& id : operation.sync_track_ids) {
+        if (!candidate.FindTrack(id)) {
+            Fail(EditError::UnknownTrack,
+                 "unknown RemoveWords sync track_id '" + id + "'", error,
+                 message);
+            return false;
+        }
+        addTrack(id);
+    }
+    const std::vector<ExactTrackState> before = snapshots(trackIds);
+
+    struct Fragment {
+        RationalTime source_start;
+        RationalTime source_end;
+    };
+    std::vector<Fragment> fragments;
+    RationalTime cursor = clipSourceStart;
+    for (const WordRemovalRange& range : operation.ranges) {
+        if (range.source_start > cursor)
+            fragments.push_back({cursor, range.source_start});
+        cursor = range.source_end;
+    }
+    if (cursor < clipSourceEnd) fragments.push_back({cursor, clipSourceEnd});
+
+    std::vector<DocumentClip> newClips;
+    RationalTime timelineCursor = original.timeline_in;
+    for (size_t fragmentIndex = 0; fragmentIndex < fragments.size();
+         ++fragmentIndex) {
+        if (fragmentIndex > 0)
+            timelineCursor = timelineCursor.add(operation.gap_padding);
+        DocumentClip fragment = original;
+        fragment.id = fragmentIndex == 0 ? original.id : GenerateUlid();
+        fragment.source_in = fragments[fragmentIndex].source_start;
+        fragment.duration = fragments[fragmentIndex].source_end.sub(
+            fragments[fragmentIndex].source_start);
+        fragment.timeline_in = timelineCursor;
+        timelineCursor = timelineCursor.add(fragment.duration);
+        newClips.push_back(std::move(fragment));
+    }
+    const RationalTime newEnd =
+        fragments.empty() ? original.timeline_in : timelineCursor;
+    const RationalTime originalEnd =
+        original.timeline_in.add(original.duration);
+    const RationalTime shiftDelta = newEnd.sub(originalEnd);
+
+    for (size_t next = index + 1; next < track->clips.size(); ++next)
+        track->clips[next].timeline_in =
+            track->clips[next].timeline_in.add(shiftDelta);
+    track->clips.erase(track->clips.begin() +
+                       static_cast<std::ptrdiff_t>(index));
+    track->clips.insert(
+        track->clips.begin() + static_cast<std::ptrdiff_t>(index),
+        newClips.begin(), newClips.end());
+    for (const Ulid& id : operation.sync_track_ids) {
+        if (id == track->id) continue;
+        DocumentTrack* syncTrack = candidate.FindTrack(id);
+        for (DocumentClip& clip : syncTrack->clips)
+            if (clip.timeline_in >= originalEnd)
+                clip.timeline_in = clip.timeline_in.add(shiftDelta);
+    }
+
+    for (const DocumentClip& fragment : newClips) {
+        const DocumentSource* source = candidate.FindSource(fragment.source_id);
+        if (!source) {
+            Fail(EditError::UnknownSource,
+                 "RemoveWords clip references an unknown source", error,
+                 message);
+            return false;
+        }
+        if (!ValidateSourceRange(*source, fragment.source_in, fragment.duration,
+                                 error, message)) {
+            return false;
+        }
+    }
+    if (!ValidateResult(candidate, error, message)) return false;
+    operation.exact_track_result = snapshots(trackIds);
+    inverse = RemoveWordsOperation{operation.clip_id, operation.ranges,
+                                   operation.gap_padding,
+                                   operation.sync_track_ids, before};
+    return true;
 }
 
 }  // namespace
@@ -2554,6 +3066,12 @@ const char* EditErrorName(EditError error) {
             return "UnknownMarker";
         case EditError::UnknownTransition:
             return "UnknownTransition";
+        case EditError::UnknownCaptionStyle:
+            return "UnknownCaptionStyle";
+        case EditError::UnknownMulticamGroup:
+            return "UnknownMulticamGroup";
+        case EditError::UnknownMulticamAngle:
+            return "UnknownMulticamAngle";
         case EditError::UnknownSequence:
             return "UnknownSequence";
         case EditError::UnknownMedia:
@@ -2736,6 +3254,39 @@ bool ApplyOperation(Document& document, Operation& operation,
         } else if (auto* join = std::get_if<JoinClipOperation>(&normalized)) {
             applied =
                 ApplyJoin(candidate, *join, generatedInverse, error, message);
+        } else if (auto* setEffects =
+                       std::get_if<SetClipEffectsOperation>(&normalized)) {
+            applied = ApplySetClipEffects(candidate, *setEffects,
+                                          generatedInverse, error, message);
+        } else if (auto* addCaptionStyle =
+                       std::get_if<AddCaptionStyleOperation>(&normalized)) {
+            applied = ApplyAddCaptionStyle(candidate, *addCaptionStyle,
+                                           generatedInverse, error, message);
+        } else if (auto* removeCaptionStyle =
+                       std::get_if<RemoveCaptionStyleOperation>(&normalized)) {
+            applied = ApplyRemoveCaptionStyle(candidate, *removeCaptionStyle,
+                                              generatedInverse, error, message);
+        } else if (auto* setCaption =
+                       std::get_if<SetClipCaptionOperation>(&normalized)) {
+            applied = ApplySetClipCaption(candidate, *setCaption,
+                                          generatedInverse, error, message);
+        } else if (auto* addMulticam =
+                       std::get_if<AddMulticamGroupOperation>(&normalized)) {
+            applied = ApplyAddMulticamGroup(candidate, *addMulticam,
+                                            generatedInverse, error, message);
+        } else if (auto* removeMulticam =
+                       std::get_if<RemoveMulticamGroupOperation>(&normalized)) {
+            applied = ApplyRemoveMulticamGroup(
+                candidate, *removeMulticam, generatedInverse, error, message);
+        } else if (auto* setActiveAngle =
+                       std::get_if<SetMulticamActiveAngleOperation>(
+                           &normalized)) {
+            applied = ApplySetMulticamActiveAngle(
+                candidate, *setActiveAngle, generatedInverse, error, message);
+        } else if (auto* removeWords =
+                       std::get_if<RemoveWordsOperation>(&normalized)) {
+            applied = ApplyRemoveWords(candidate, *removeWords,
+                                       generatedInverse, error, message);
         }
         if (!applied) return false;
     } catch (const std::exception& exception) {
@@ -3154,6 +3705,93 @@ std::string SerializeOperation(const Operation& operation) {
         writeState(setClipLink->exact_first_result);
         output << ",\"exact_second\":";
         writeState(setClipLink->exact_second_result);
+        output << '}';
+    } else if (const auto* setEffects =
+                   std::get_if<SetClipEffectsOperation>(&operation)) {
+        output << "{\"type\":\"SetClipEffects\",\"clip_id\":\""
+               << setEffects->clip_id << "\",\"effects\":";
+        WriteClipEffects(output, setEffects->effects);
+        output << '}';
+    } else if (const auto* addCaptionStyle =
+                   std::get_if<AddCaptionStyleOperation>(&operation)) {
+        output << "{\"type\":\"AddCaptionStyle\",\"style\":{\"id\":\""
+               << addCaptionStyle->style.id << "\",\"font_family\":";
+        WriteString(output, addCaptionStyle->style.font_family);
+        output << ",\"font_size\":" << addCaptionStyle->style.font_size
+               << ",\"color\":";
+        WriteString(output, addCaptionStyle->style.color);
+        output << ",\"position\":";
+        WriteString(output, addCaptionStyle->style.position);
+        output << "},\"insertion_index\":" << addCaptionStyle->insertion_index
+               << '}';
+    } else if (const auto* removeCaptionStyle =
+                   std::get_if<RemoveCaptionStyleOperation>(&operation)) {
+        output << "{\"type\":\"RemoveCaptionStyle\",\"style_id\":\""
+               << removeCaptionStyle->style_id << "\"}";
+    } else if (const auto* setCaption =
+                   std::get_if<SetClipCaptionOperation>(&operation)) {
+        output << "{\"type\":\"SetClipCaption\",\"clip_id\":\""
+               << setCaption->clip_id << "\",\"caption_group_id\":\""
+               << setCaption->caption_group_id << "\",\"caption_text\":";
+        WriteString(output, setCaption->caption_text);
+        output << '}';
+    } else if (const auto* addMulticam =
+                   std::get_if<AddMulticamGroupOperation>(&operation)) {
+        const MulticamGroup& value = addMulticam->group;
+        output << "{\"type\":\"AddMulticamGroup\",\"group\":{\"id\":";
+        WriteString(output, value.id);
+        output << ",\"name\":";
+        WriteString(output, value.name);
+        output << ",\"angles\":[";
+        for (size_t index = 0; index < value.angles.size(); ++index) {
+            if (index) output << ',';
+            const MulticamAngle& angle = value.angles[index];
+            output << "{\"id\":";
+            WriteString(output, angle.id);
+            output << ",\"name\":";
+            WriteString(output, angle.name);
+            output << ",\"clip_id\":";
+            WriteString(output, angle.clip_id);
+            output << '}';
+        }
+        output << "],\"active_angle_id\":";
+        WriteString(output, value.active_angle_id);
+        output << "},\"insertion_index\":" << addMulticam->insertion_index
+               << '}';
+    } else if (const auto* removeMulticam =
+                   std::get_if<RemoveMulticamGroupOperation>(&operation)) {
+        output << "{\"type\":\"RemoveMulticamGroup\",\"group_id\":";
+        WriteString(output, removeMulticam->group_id);
+        output << '}';
+    } else if (const auto* setActiveAngle =
+                   std::get_if<SetMulticamActiveAngleOperation>(&operation)) {
+        output << "{\"type\":\"SetMulticamActiveAngle\",\"group_id\":";
+        WriteString(output, setActiveAngle->group_id);
+        output << ",\"active_angle_id\":";
+        WriteString(output, setActiveAngle->active_angle_id);
+        output << '}';
+    } else if (const auto* removeWords =
+                   std::get_if<RemoveWordsOperation>(&operation)) {
+        output << "{\"type\":\"RemoveWords\",\"clip_id\":\""
+               << removeWords->clip_id << "\",\"ranges\":[";
+        for (size_t index = 0; index < removeWords->ranges.size(); ++index) {
+            if (index) output << ',';
+            output << "{\"source_start\":";
+            WriteTime(output, removeWords->ranges[index].source_start);
+            output << ",\"source_end\":";
+            WriteTime(output, removeWords->ranges[index].source_end);
+            output << '}';
+        }
+        output << "],\"gap_padding\":";
+        WriteTime(output, removeWords->gap_padding);
+        output << ",\"sync_track_ids\":[";
+        for (size_t index = 0; index < removeWords->sync_track_ids.size();
+             ++index) {
+            if (index) output << ',';
+            WriteString(output, removeWords->sync_track_ids[index]);
+        }
+        output << "],\"exact_tracks\":";
+        WriteExactTracks(output, removeWords->exact_track_result);
         output << '}';
     } else {
         const auto& join = std::get<JoinClipOperation>(operation);
@@ -3815,6 +4453,125 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             reader.Expect(",\"timeline_in\":");
             value.joined_times.timeline_in = ReadTime(reader);
             reader.Expect("}}");
+            operation = std::move(value);
+        } else if (type == "SetClipEffects") {
+            SetClipEffectsOperation value;
+            reader.Expect(",\"clip_id\":");
+            value.clip_id = reader.String();
+            reader.Expect(",\"effects\":");
+            value.effects = ReadClipEffects(reader);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "AddCaptionStyle") {
+            AddCaptionStyleOperation value;
+            reader.Expect(",\"style\":{\"id\":");
+            value.style.id = reader.String();
+            reader.Expect(",\"font_family\":");
+            value.style.font_family = reader.String();
+            reader.Expect(",\"font_size\":");
+            const int64_t fontSize = reader.Integer();
+            if (fontSize < std::numeric_limits<int32_t>::min() ||
+                fontSize > std::numeric_limits<int32_t>::max()) {
+                throw std::runtime_error("font_size outside int32_t range");
+            }
+            value.style.font_size = static_cast<int32_t>(fontSize);
+            reader.Expect(",\"color\":");
+            value.style.color = reader.String();
+            reader.Expect(",\"position\":");
+            value.style.position = reader.String();
+            reader.Expect("},\"insertion_index\":");
+            value.insertion_index = reader.Integer();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "RemoveCaptionStyle") {
+            RemoveCaptionStyleOperation value;
+            reader.Expect(",\"style_id\":");
+            value.style_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "SetClipCaption") {
+            SetClipCaptionOperation value;
+            reader.Expect(",\"clip_id\":");
+            value.clip_id = reader.String();
+            reader.Expect(",\"caption_group_id\":");
+            value.caption_group_id = reader.String();
+            reader.Expect(",\"caption_text\":");
+            value.caption_text = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "AddMulticamGroup") {
+            AddMulticamGroupOperation value;
+            reader.Expect(",\"group\":{\"id\":");
+            value.group.id = reader.String();
+            reader.Expect(",\"name\":");
+            value.group.name = reader.String();
+            reader.Expect(",\"angles\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    MulticamAngle angle;
+                    reader.Expect("{\"id\":");
+                    angle.id = reader.String();
+                    reader.Expect(",\"name\":");
+                    angle.name = reader.String();
+                    reader.Expect(",\"clip_id\":");
+                    angle.clip_id = reader.String();
+                    reader.Expect("}");
+                    value.group.angles.push_back(std::move(angle));
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"active_angle_id\":");
+            value.group.active_angle_id = reader.String();
+            reader.Expect("},\"insertion_index\":");
+            value.insertion_index = reader.Integer();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "RemoveMulticamGroup") {
+            RemoveMulticamGroupOperation value;
+            reader.Expect(",\"group_id\":");
+            value.group_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "SetMulticamActiveAngle") {
+            SetMulticamActiveAngleOperation value;
+            reader.Expect(",\"group_id\":");
+            value.group_id = reader.String();
+            reader.Expect(",\"active_angle_id\":");
+            value.active_angle_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "RemoveWords") {
+            RemoveWordsOperation value;
+            reader.Expect(",\"clip_id\":");
+            value.clip_id = reader.String();
+            reader.Expect(",\"ranges\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    WordRemovalRange range;
+                    reader.Expect("{\"source_start\":");
+                    range.source_start = ReadTime(reader);
+                    reader.Expect(",\"source_end\":");
+                    range.source_end = ReadTime(reader);
+                    reader.Expect("}");
+                    value.ranges.push_back(range);
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"gap_padding\":");
+            value.gap_padding = ReadTime(reader);
+            reader.Expect(",\"sync_track_ids\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    value.sync_track_ids.push_back(reader.String());
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
+            reader.Expect("}");
             operation = std::move(value);
         } else {
             throw std::runtime_error("unknown operation type '" + type + "'");
