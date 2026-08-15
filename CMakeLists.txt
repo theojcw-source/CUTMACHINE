@@ -94,6 +94,11 @@ set(CUTMACHINE_APP_SOURCES
     src/UiPreferences.mm
     src/UiComponents.mm
     src/PanelHostView.mm
+    # F2.5 -- playback transport (ROADMAP.md). TransportBar.h and Timecode.h
+    # are plain C++ (see tests/transport_bar_tests.cc,
+    # tests/timecode_tests.cc); TransportView.mm is AppKit-only chrome built
+    # on top of them.
+    src/TransportView.mm
 )
 
 add_executable(cutmachine ${CUTMACHINE_APP_SOURCES})
@@ -294,6 +299,21 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME cutmachine_panel_layout_tests
              COMMAND cutmachine_panel_layout_tests)
+
+    # F2.5 -- playback transport (ROADMAP.md). TransportBar.h and Timecode.h
+    # are plain C++, no AppKit dependency, so -- like UiTheme.h/PanelLayout.h
+    # above -- these build and run on a plain Linux host.
+    add_executable(cutmachine_transport_bar_tests
+                   tests/transport_bar_tests.cc)
+    target_include_directories(cutmachine_transport_bar_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME cutmachine_transport_bar_tests
+             COMMAND cutmachine_transport_bar_tests)
+
+    add_executable(cutmachine_timecode_tests tests/timecode_tests.cc)
+    target_include_directories(cutmachine_timecode_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME cutmachine_timecode_tests COMMAND cutmachine_timecode_tests)
 
     add_executable(cutmachine_beat_detection_tests
                    tests/beat_detection_tests.cc)
