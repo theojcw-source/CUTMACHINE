@@ -631,3 +631,60 @@ int RedoProjectOperationCommand(const std::string& projectPath,
                                 std::string& output) {
     return MutateProjectLogCommand(projectPath, std::nullopt, true, output);
 }
+
+namespace {
+
+// Shared tail of UndoOperationCommand/RedoOperationCommand: identical to the
+// load/mutate/commit shape of ApplyOperationCommand above, but drives the
+// active timeline's EditLog::Undo/Redo instead of EditLog::Apply. Kept
+// separate from ApplyOperationCommand rather than folded into it so neither
+// entry point grows a branch the other doesn't need.
+int MutateTimelineLogCommand(const std::string& documentPath, bool redo,
+                             std::string& output) {
+    std::string message;
+    EditError error = EditError::None;
+    Project project;
+    if (!LoadStoredProject(documentPath, project, message)) {
+        output = ErrorJson(EditError::ParseError, message);
+        return 1;
+    }
+    Document document = project.MakeActiveDocument();
+
+    EditLog log;
+    if (!LoadOptionalTimelineLog(documentPath, project.active_timeline_id, log,
+                                 error, message)) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+
+    const bool changed = redo ? log.Redo(document, error, message)
+                              : log.Undo(document, error, message);
+    if (!changed) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+
+    const std::string updatedDocument = document.SaveToString();
+    std::map<std::string, EditLog> logs;
+    logs[project.active_timeline_id] = log;
+    ProjectEditLog projectLog;
+    if (!project.CommitActiveDocument(document, message) ||
+        !CommitStoredProjectAndLogs(documentPath, project, logs, projectLog,
+                                    message)) {
+        output = ErrorJson(EditError::IoError, message);
+        return 1;
+    }
+    output = "{\"ok\":true,\"doc_hash\":\"" + CanonicalHash(updatedDocument) +
+             "\"}\n";
+    return 0;
+}
+
+}  // namespace
+
+int UndoOperationCommand(const std::string& documentPath, std::string& output) {
+    return MutateTimelineLogCommand(documentPath, false, output);
+}
+
+int RedoOperationCommand(const std::string& documentPath, std::string& output) {
+    return MutateTimelineLogCommand(documentPath, true, output);
+}

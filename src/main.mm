@@ -7,17 +7,21 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -29,6 +33,8 @@ extern "C" {
 #include "Export.h"
 #include "FrameCache.h"
 #include "Ingest.h"
+#include "McpProjectBackend.h"
+#include "McpServer.h"
 #include "MediaTaskManager.h"
 #include "PerformanceMetrics.h"
 #include "Project.h"
@@ -8403,6 +8409,43 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if ((argc == 3 || argc == 5) && std::string(argv[1]) == "--mcp-serve") {
+        int port = 0;
+        if (argc == 5) {
+            if (std::string(argv[3]) != "--port") {
+                std::fprintf(stderr, "Unknown --mcp-serve option: %s\n",
+                             argv[3]);
+                return 2;
+            }
+            port = std::atoi(argv[4]);
+        }
+        // Purely local, loopback-only HTTP + JSON-RPC MCP server
+        // (ROADMAP.md F1.1). McpProjectBackend reuses ApplyOperationCommand/
+        // UndoOperationCommand/RedoOperationCommand/DescribeCommand -- the
+        // exact functions --apply-op/--describe already call -- so every
+        // tool call takes the same load/apply/commit path a human editing
+        // through the app or the CLI does. No AppKit/Metal/media decoding is
+        // initialized for this path.
+        McpProjectBackend backend(argv[2]);
+        McpServer server(backend);
+        std::string startError;
+        if (!server.Start(port, startError)) {
+            std::fprintf(stderr, "mcp-serve failed to start: %s\n",
+                         startError.c_str());
+            return 1;
+        }
+        std::fprintf(stderr,
+                     "MCP server listening on http://127.0.0.1:%d/mcp for "
+                     "'%s' (Ctrl-C to stop)\n",
+                     server.Port(), argv[2]);
+        static std::atomic_bool stopRequested{false};
+        std::signal(SIGINT, [](int) { stopRequested.store(true); });
+        std::signal(SIGTERM, [](int) { stopRequested.store(true); });
+        while (!stopRequested.load() && server.IsRunning())
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        server.Stop();
+        return 0;
+    }
     if ((argc == 4 || argc == 5) && std::string(argv[1]) == "--ingest" &&
         (argc == 4 || std::string(argv[4]) == "--recursive")) {
         std::string output;
@@ -8456,13 +8499,15 @@ int main(int argc, char* argv[]) {
             "'<op.json>'\n"
             "       %s --undo-project-op /path/to/project.cutmachine.json\n"
             "       %s --redo-project-op /path/to/project.cutmachine.json\n"
+            "       %s --mcp-serve /path/to/project.cutmachine.json "
+            "[--port N]\n"
             "       %s --ingest /path/to/project.cutmachine.json "
             "/path/to/media "
             "[--recursive]\n"
             "       %s --export /path/to/project.cutmachine.json output.mp4 "
             "[--software] [--overwrite]\n",
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-            argv[0]);
+            argv[0], argv[0]);
         return 2;
     }
 
