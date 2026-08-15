@@ -20,6 +20,7 @@ enum class EditError {
     UnknownTransition,
     UnknownCaptionStyle,
     UnknownMulticamGroup,
+    UnknownMulticamAngle,
     UnknownSequence,
     UnknownMedia,
     InvalidDuration,
@@ -369,15 +370,17 @@ struct SetClipCaptionOperation {
     std::string caption_text;
 };
 
-// Schema and serialization for F0.3 are complete and tested; ApplyOperation
-// currently rejects both multicam operations below with
-// EditError::InvalidOperation. ROADMAP.md ticket F1.5 ("Multicam") owns
-// wiring their real apply logic, so a second agent does not collide with
-// this one over the same code path.
+// F1.5 ("Multicam"): register a new multicam group and its angles.
 struct AddMulticamGroupOperation {
     MulticamGroup group;
     // -1 appends on first application, mirroring AddMarker/AddTransition.
     int64_t insertion_index = -1;
+};
+
+// Exact inverse of AddMulticamGroupOperation, following the Add/Remove
+// convention used by markers, transitions and caption styles.
+struct RemoveMulticamGroupOperation {
+    Ulid group_id;
 };
 
 struct SetMulticamActiveAngleOperation {
@@ -400,7 +403,7 @@ using Operation = std::variant<
     UpdateTransitionOperation, SetClipLinkOperation, SetClipEffectsOperation,
     AddCaptionStyleOperation, RemoveCaptionStyleOperation,
     SetClipCaptionOperation, AddMulticamGroupOperation,
-    SetMulticamActiveAngleOperation>;
+    RemoveMulticamGroupOperation, SetMulticamActiveAngleOperation>;
 
 struct ExactProjectState {
     std::string canonical_json;
