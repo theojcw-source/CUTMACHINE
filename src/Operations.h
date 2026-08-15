@@ -388,6 +388,40 @@ struct SetMulticamActiveAngleOperation {
     Ulid active_angle_id;
 };
 
+// One exact, already-resolved span to cut from a clip's own source range.
+// [source_start, source_end) in the clip's own time domain (the same domain
+// as DocumentClip::source_in/duration). Never built from a raw frame number
+// a caller invented: see Transcription.h's ResolveWordRemoval, which is the
+// only intended producer -- it turns transcript word indices (what an agent
+// or UI can name) into these exact ranges (what the engine can cut),
+// mirroring PHILOSOPHY.md principle 7.
+struct WordRemovalRange {
+    RationalTime source_start;
+    RationalTime source_end;
+};
+
+// Removes one or more word-derived spans from a single clip's own source
+// range and ripple-closes each cut, splitting the clip into the fragments
+// that remain. See ApplyRemoveWords in Operations.cc for the exact fragment
+// placement and padding rule (documented once, at the implementation).
+struct RemoveWordsOperation {
+    Ulid clip_id;
+    // Sorted, non-overlapping, each fully inside the clip's own
+    // [source_in, source_in+duration) span. ApplyOperation validates this
+    // itself rather than trusting the resolver that built it.
+    std::vector<WordRemovalRange> ranges;
+    // Extra timeline space left unfilled between two fragments of this same
+    // clip that used to be separated only by a removed range. Zero means the
+    // fragments butt together exactly. Never applied at the clip's own head
+    // or tail edge (see ApplyRemoveWords) -- there is no fragment on the
+    // other side of those cuts to pad against.
+    RationalTime gap_padding{0, 1};
+    // Other tracks ripple-shifted by this clip's same total delta, beyond
+    // its own track. Mirrors RippleTrimOperation::sync_track_ids.
+    std::vector<Ulid> sync_track_ids;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 using Operation = std::variant<
     InsertClipOperation, RemoveClipOperation, ClearClipOperation,
     PasteClipsOperation, TrimClipOperation, MoveClipOperation,
@@ -403,7 +437,8 @@ using Operation = std::variant<
     UpdateTransitionOperation, SetClipLinkOperation, SetClipEffectsOperation,
     AddCaptionStyleOperation, RemoveCaptionStyleOperation,
     SetClipCaptionOperation, AddMulticamGroupOperation,
-    RemoveMulticamGroupOperation, SetMulticamActiveAngleOperation>;
+    RemoveMulticamGroupOperation, SetMulticamActiveAngleOperation,
+    RemoveWordsOperation>;
 
 struct ExactProjectState {
     std::string canonical_json;

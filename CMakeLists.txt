@@ -14,6 +14,31 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libswresample
 )
 
+# F1.4 -- local transcription. Fetched, not vendored, following this
+# project's general preference for build-time dependencies over committed
+# third-party source. whisper.cpp is MIT licensed (compatible with this
+# project's Apache-2.0) and runs entirely on-device: pulling it in does not
+# touch PHILOSOPHY.md's "pas de service central" guard-rail, since inference
+# still happens against a local model file the caller supplies, never a
+# network call. Examples/tests/server and the GPU backends this project's
+# target platform (macOS/Apple Silicon) does not use are disabled; GGML_METAL
+# is left at its own default, which auto-enables on Apple platforms and
+# stays off elsewhere.
+include(FetchContent)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    whispercpp
+    GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
+    GIT_TAG        v1.7.4
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(whispercpp)
+
 set(SHADER_RUNTIME_PATH "${CMAKE_CURRENT_BINARY_DIR}/shader.metal")
 configure_file(src/shader.metal "${SHADER_RUNTIME_PATH}" COPYONLY)
 
@@ -38,11 +63,12 @@ add_library(cutmachine_model
     src/Thumbnail.cc
     src/Timeline.cc
     src/TimelineView.cc
+    src/Transcription.cc
     src/Ulid.cc
     src/Waveform.cc
 )
 target_include_directories(cutmachine_model PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(cutmachine_model PUBLIC PkgConfig::FFMPEG)
+target_link_libraries(cutmachine_model PUBLIC PkgConfig::FFMPEG whisper)
 
 set(CUTMACHINE_APP_SOURCES
     src/main.mm
@@ -207,6 +233,13 @@ if(BUILD_TESTING)
     target_compile_definitions(cutmachine_waveform_tests PRIVATE
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
     add_test(NAME cutmachine_waveform_tests COMMAND cutmachine_waveform_tests)
+
+    add_executable(cutmachine_transcription_tests tests/transcription_tests.cc)
+    target_link_libraries(cutmachine_transcription_tests PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_transcription_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_transcription_tests
+             COMMAND cutmachine_transcription_tests)
 
     add_executable(cutmachine_thumbnail_tests tests/thumbnail_tests.cc)
     target_link_libraries(cutmachine_thumbnail_tests PRIVATE cutmachine_model)
