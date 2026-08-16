@@ -5822,11 +5822,16 @@ DeleteGapOperation GapDeleteOperationForSelection(
     // F2.2 -- this is the one hook already fired after every selection
     // change and every edit that could touch the selected clip (see this
     // method's call sites), so it doubles as the Inspector's refresh
-    // trigger. SelectedClipId() is empty for zero or multiple selected
-    // clips, which CMInspectorView already renders as "no selection".
+    // trigger.
+    //
+    // PrimarySelectedClipId(), not SelectedClipId(): the latter is empty
+    // whenever more than one clip is selected, and clicking a clip that is
+    // A/V-linked -- which every clip imported from a video with sound is --
+    // selects its partner too. Keying the Inspector off it left the panel
+    // blank for exactly the footage people actually edit.
     [self.inspectorView
         reloadWithDocument:self.state->document
-            selectedClipId:self.state->interaction->SelectedClipId()];
+            selectedClipId:self.state->interaction->PrimarySelectedClipId()];
     // F2.3 -- keep the Captions tab's "current timeline selection" summary
     // live even when that tab is not the one on screen; it is cheap (one
     // label update) and avoids a stale summary the moment the user switches

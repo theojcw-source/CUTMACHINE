@@ -382,12 +382,14 @@ void TimelineInteraction::PointerDown(double x, double y, double width,
             requested_playhead_ = viewport_.XToTime(x, timeRate);
         }
         selected_clip_id_.clear();
+        primary_clip_id_.clear();
         selected_clip_ids_.clear();
         return;
     }
     if (trim_mode_ == TimelineTrimMode::Slip) hit->edge = TimelineHitEdge::None;
     selected_gap_.reset();
     selected_clip_id_ = hit->clip_id;
+    primary_clip_id_ = hit->clip_id;
     selected_clip_ids_ = {hit->clip_id};
     if (linked_selection_enabled_)
         selected_clip_ids_ =
@@ -917,12 +919,17 @@ const Ulid& TimelineInteraction::SelectedClipId() const {
     return selected_clip_id_;
 }
 
+const Ulid& TimelineInteraction::PrimarySelectedClipId() const {
+    return primary_clip_id_;
+}
+
 const std::vector<Ulid>& TimelineInteraction::SelectedClipIds() const {
     return selected_clip_ids_;
 }
 
 void TimelineInteraction::SelectClip(const Ulid& clipId) {
     selected_clip_id_ = document_.FindClip(clipId) ? clipId : Ulid{};
+    primary_clip_id_ = selected_clip_id_;
     selected_clip_ids_.clear();
     if (!selected_clip_id_.empty())
         selected_clip_ids_.push_back(selected_clip_id_);
@@ -939,6 +946,12 @@ void TimelineInteraction::SelectClips(const std::vector<Ulid>& clipIds) {
     }
     selected_clip_id_ =
         selected_clip_ids_.size() == 1 ? selected_clip_ids_.front() : Ulid{};
+    // The anchor is the caller's first surviving id. Callers that expand a
+    // click through ExpandLinkedClipSelection pass the clicked clip first
+    // and that function preserves input order, so this is the clip the user
+    // actually pointed at rather than whichever linked clip sorts first.
+    primary_clip_id_ =
+        selected_clip_ids_.empty() ? Ulid{} : selected_clip_ids_.front();
     selected_gap_.reset();
 }
 

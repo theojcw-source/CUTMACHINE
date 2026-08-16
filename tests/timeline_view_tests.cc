@@ -379,6 +379,17 @@ int main() {
         Check(interaction.SelectedClipIds().size() == 2 &&
                   interaction.SelectedClipId().empty(),
               "multi-selection has no accidental single edit target");
+        // ...but it still has an anchor. Selecting an A/V-linked clip always
+        // brings in its partner, so a panel that describes one clip at a
+        // time cannot key off SelectedClipId() or it stays blank for every
+        // clip imported from a video with sound -- which is what left the
+        // Inspector empty in practice.
+        Check(interaction.PrimarySelectedClipId() == selected.front(),
+              "multi-selection still anchors on the caller's first clip");
+        interaction.SelectClips({});
+        Check(interaction.PrimarySelectedClipId().empty(),
+              "clearing the selection clears its anchor");
+        interaction.SelectClips(selected);
         const auto rectangles =
             VisibleTimelineClips(document, viewport, 700.0,
                                  interaction.SelectedClipIds(), std::nullopt);
