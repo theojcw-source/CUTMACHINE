@@ -427,6 +427,10 @@ struct AppState {
     std::optional<RationalTime> timelineOut;
     PlayheadResolution playheadResolution = PlayheadResolution::Frame;
     bool overlayDirty = true;
+    // Whether the timeline has been scaled to a real, laid-out viewport
+    // width yet. False until then, so the first resize that brings a usable
+    // width does the fit the launch path could not.
+    bool viewportFitted = false;
     TimelineTool tool = TimelineTool::Select;
     bool spaceHand = false;
     bool navigationDragging = false;
@@ -2321,6 +2325,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 
 - (BOOL)loadDocumentAndSources {
+    if ([self loadDocumentAndSourcesHoldingLock]) return YES;
+    // A load that fails must not keep the project locked. Several callers
+    // react to NO with -[NSApp terminate:], which tears the process down
+    // without unwinding C++ destructors, so ProjectSessionLock's own
+    // destructor never runs and the .lock directory outlives the process.
+    // Acquire() does reclaim a lock whose owning pid is gone, so this only
+    // ever leaked litter rather than wedging the next open -- but the litter
+    // is confusing next to a project that failed to open for another reason.
+    if (self.state) self.state->projectLock.reset();
+    return NO;
+}
+
+- (BOOL)loadDocumentAndSourcesHoldingLock {
     const std::string documentPath(self.documentPath.UTF8String ?: "");
     std::string error;
     self.lastProjectLoadError = nil;
@@ -2754,7 +2771,13 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.workspaceSplitView.delegate = self;
     self.workspaceSplitView.autoresizingMask =
         NSViewWidthSizable | NSViewHeightSizable;
-    self.workspaceSplitView.autosaveName = @"CUTMACHINE.WorkspaceSplit";
+    // ".3pane" because this split view gained a third pane (the right dock)
+    // in F2.1. Autosaved geometry is positional, so frames written by a
+    // two-pane build restore onto the wrong panes -- and since -adjustSubviews
+    // redistributes in proportion to current sizes, a restored zero width
+    // stays zero forever, which bricks the window rather than looking odd.
+    // A new name retires that geometry instead of trying to repair it.
+    self.workspaceSplitView.autosaveName = @"CUTMACHINE.WorkspaceSplit.3pane";
     [content addSubview:self.workspaceSplitView];
     self.mediaPanel = [[NSView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth, workspaceHeight)];
@@ -3136,12 +3159,21 @@ DeleteGapOperation GapDeleteOperationForSelection(
                             forSubviewAtIndex:0];
     [self.monitorSplitView setHoldingPriority:NSLayoutPriorityDefaultLow
                             forSubviewAtIndex:1];
+    // -adjustSubviews before every -setPosition:ofDividerAtIndex: below, and
+    // never the other way round. Freshly added arranged subviews all still
+    // sit at x/y 0 -- the split view has not placed them relative to each
+    // other yet -- and setting a divider position against overlapping frames
+    // makes AppKit resolve the conflict by collapsing panes to zero width.
+    // -adjustSubviews lays them out first, so each -setPosition: is then a
+    // small nudge from a valid arrangement rather than a guess from garbage.
+    [self.monitorSplitView adjustSubviews];
     [self.monitorSplitView setPosition:editorWidth * 0.5 ofDividerAtIndex:0];
     [self.editorSplitView addArrangedSubview:self.monitorSplitView];
     [self.editorSplitView setHoldingPriority:NSLayoutPriorityDefaultLow
                            forSubviewAtIndex:0];
     [self.editorSplitView setHoldingPriority:NSLayoutPriorityDefaultLow
                            forSubviewAtIndex:1];
+    [self.editorSplitView adjustSubviews];
     [self.editorSplitView setPosition:workspaceHeight * 0.56
                      ofDividerAtIndex:0];
     [self.workspaceSplitView addArrangedSubview:self.editorSplitView];
@@ -3211,6 +3243,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
                               forSubviewAtIndex:0];
     [self.workspaceSplitView setHoldingPriority:NSLayoutPriorityDefaultHigh
                               forSubviewAtIndex:2];
+    [self.workspaceSplitView adjustSubviews];
     [self.workspaceSplitView setPosition:mediaPanelWidth ofDividerAtIndex:0];
     [self.workspaceSplitView setPosition:mediaPanelWidth + editorWidth
                         ofDividerAtIndex:1];
@@ -3447,8 +3480,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         [self.timelineToolIcons addObject:icon];
     }
     [self refreshTimelineChrome];
-    self.state->viewport.FitDuration(self.state->duration,
-                                     self.metalView.bounds.size.width);
+    [self fitTimelineToViewportWidth];
 
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
@@ -5790,11 +5822,16 @@ DeleteGapOperation GapDeleteOperationForSelection(
     // F2.2 -- this is the one hook already fired after every selection
     // change and every edit that could touch the selected clip (see this
     // method's call sites), so it doubles as the Inspector's refresh
-    // trigger. SelectedClipId() is empty for zero or multiple selected
-    // clips, which CMInspectorView already renders as "no selection".
+    // trigger.
+    //
+    // PrimarySelectedClipId(), not SelectedClipId(): the latter is empty
+    // whenever more than one clip is selected, and clicking a clip that is
+    // A/V-linked -- which every clip imported from a video with sound is --
+    // selects its partner too. Keying the Inspector off it left the panel
+    // blank for exactly the footage people actually edit.
     [self.inspectorView
         reloadWithDocument:self.state->document
-            selectedClipId:self.state->interaction->SelectedClipId()];
+            selectedClipId:self.state->interaction->PrimarySelectedClipId()];
     // F2.3 -- keep the Captions tab's "current timeline selection" summary
     // live even when that tab is not the one on screen; it is cheap (one
     // label update) and avoids a stale summary the moment the user switches
@@ -7322,9 +7359,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 - (void)menuFitTimeline:(id)sender {
     (void)sender;
-    self.state->viewport.FitDuration(self.state->duration,
-                                     self.metalView.bounds.size.width);
-    self.state->overlayDirty = true;
+    [self fitTimelineToViewportWidth];
 }
 - (void)menuAddVideoTrack:(id)sender {
     (void)sender;
@@ -9115,10 +9150,29 @@ DeleteGapOperation GapDeleteOperationForSelection(
     }
 }
 
+// FitDuration rejects a width at or below the track-header gutter, which is
+// the right contract for it: below that there is no timeline left to scale
+// into, so any answer it returned would be a lie. A view that AppKit has not
+// laid out yet reports exactly such a width, though, and that is an ordinary
+// transient state rather than a caller error -- so ask here instead of
+// letting an uncaught C++ exception out of a Cocoa callback and abort the
+// process. -timelineMetalViewDidResize: re-fits as soon as there is a real
+// width, so nothing is lost by skipping.
+- (void)fitTimelineToViewportWidth {
+    if (!self.state) return;
+    const double width = self.metalView.bounds.size.width;
+    if (!std::isfinite(width) || width <= self.state->viewport.header_width)
+        return;
+    self.state->viewport.FitDuration(self.state->duration, width);
+    self.state->viewportFitted = true;
+    self.state->overlayDirty = true;
+}
+
 - (void)timelineMetalViewDidResize:(TimelineMetalView*)view {
     if (!self.state) return;
     if (view == self.metalView && self.state->renderer) {
         self.state->renderer->Resize(view.bounds);
+        if (!self.state->viewportFitted) [self fitTimelineToViewportWidth];
         [self refreshTimelineChrome];
     } else if (view == self.sourceMonitorView && self.state->sourceRenderer) {
         self.state->sourceRenderer->Resize(view.bounds);
@@ -9128,12 +9182,33 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->overlayDirty = true;
 }
 
+// The workspace is three panes -- media | editor | right dock -- so it has
+// two dividers, and they cannot share one constraint. Divider 1 sits roughly
+// a dock's width from the right edge, which is far past where divider 0 is
+// allowed to go; answering divider 0's range for both is what collapsed the
+// editor and the dock to zero width on launch, and a zero-width timeline is
+// what made FitDuration throw. Every bound below is an absolute x in the
+// split view, which is the coordinate space AppKit asks about.
+static constexpr CGFloat kMediaPaneMinWidth = 220.0;
+static constexpr CGFloat kEditorPaneMinWidth = 360.0;
+static constexpr CGFloat kRightDockMinWidth = 260.0;
+
+// AppKit exposes setPosition:ofDividerAtIndex: but no matching getter, so
+// read divider 0 off the pane in front of it: in a vertical split view that
+// pane's right edge is the divider.
+static CGFloat FirstDividerPosition(NSSplitView* splitView) {
+    NSArray<NSView*>* panes = splitView.arrangedSubviews;
+    return panes.count > 0 ? NSMaxX(panes.firstObject.frame) : 0.0;
+}
+
 - (CGFloat)splitView:(NSSplitView*)splitView
     constrainMinCoordinate:(CGFloat)proposedMinimumPosition
                ofSubviewAt:(NSInteger)dividerIndex {
-    (void)proposedMinimumPosition;
-    (void)dividerIndex;
-    if (splitView == self.workspaceSplitView) return 220.0;
+    const CGFloat divider = splitView.dividerThickness;
+    if (splitView == self.workspaceSplitView) {
+        if (dividerIndex == 0) return kMediaPaneMinWidth;
+        return FirstDividerPosition(splitView) + divider + kEditorPaneMinWidth;
+    }
     if (splitView == self.editorSplitView) return 180.0;
     if (splitView == self.monitorSplitView)
         return self.state && !self.state->sourceMonitorVisible ? 0.0 : 320.0;
@@ -9143,10 +9218,17 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (CGFloat)splitView:(NSSplitView*)splitView
     constrainMaxCoordinate:(CGFloat)proposedMaximumPosition
                ofSubviewAt:(NSInteger)dividerIndex {
-    (void)proposedMaximumPosition;
-    (void)dividerIndex;
-    if (splitView == self.workspaceSplitView)
-        return std::max<CGFloat>(220.0, splitView.bounds.size.width - 647.0);
+    const CGFloat divider = splitView.dividerThickness;
+    if (splitView == self.workspaceSplitView) {
+        const CGFloat width = splitView.bounds.size.width;
+        if (dividerIndex == 0)
+            return std::max<CGFloat>(kMediaPaneMinWidth,
+                                     width - kRightDockMinWidth -
+                                         kEditorPaneMinWidth - divider * 2.0);
+        return std::max<CGFloat>(
+            FirstDividerPosition(splitView) + divider + kEditorPaneMinWidth,
+            width - kRightDockMinWidth - divider);
+    }
     if (splitView == self.editorSplitView)
         return std::max<CGFloat>(180.0, splitView.bounds.size.height - 200.0);
     if (splitView == self.monitorSplitView)

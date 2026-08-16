@@ -147,6 +147,30 @@ int main() {
               integrity.missing_media.empty() &&
               integrity.modified_media.empty(),
           "fresh collection passes full integrity verification: " + error);
+
+    // A path with no manifest.json beside it has two very different causes,
+    // and the message has to say which: a single-file project from before
+    // the package format (the file is there, the package is not) versus a
+    // path that simply is not there. Reporting "collection manifest is
+    // missing" for both describes our bookkeeping instead of the mistake.
+    const fs::path legacyProject = root / "example-timeline.json";
+    Write(legacyProject, "{\"version\":3,\"sequence\":{}}\n");
+    CollectionIntegrityReport legacyReport;
+    std::string legacyError;
+    Check(!VerifyPortableProject(legacyProject.string(), legacyReport,
+                                 legacyError) &&
+              legacyError.find("cutmachine-project") != std::string::npos,
+          "a single-file project is refused by naming the package "
+          "requirement, not the missing manifest: " +
+              legacyError);
+    CollectionIntegrityReport absentReport;
+    std::string absentError;
+    Check(!VerifyPortableProject((root / "nope.cutmachine.json").string(),
+                                 absentReport, absentError) &&
+              absentError.find("no project file at") != std::string::npos,
+          "a path that does not exist says so rather than blaming the "
+          "manifest: " +
+              absentError);
     for (const DocumentSequence& timeline : collected.timelines) {
         EditLog log;
         EditError editError = EditError::None;

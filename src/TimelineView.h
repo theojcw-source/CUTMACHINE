@@ -118,7 +118,16 @@ public:
     bool PointerUp(EditError& error, std::string& message);
     void CancelDrag();
 
+    // Empty unless *exactly one* clip is selected. Callers that must act on
+    // an unambiguous single target rely on that.
     const Ulid& SelectedClipId() const;
+    // The clip the selection is anchored on -- the one actually clicked --
+    // even when selecting it pulled in others. Non-empty whenever anything
+    // is selected. Surfaces that describe or edit one clip at a time (the
+    // Inspector) want this, not SelectedClipId(): linking a video clip to
+    // its audio is the norm for imported footage, so requiring a selection
+    // of exactly one would leave them permanently blank.
+    const Ulid& PrimarySelectedClipId() const;
     const std::vector<Ulid>& SelectedClipIds() const;
     void SelectClip(const Ulid& clipId);
     void SelectClips(const std::vector<Ulid>& clipIds);
@@ -149,6 +158,7 @@ private:
     EditLog& edit_log_;
     TimelineViewport& viewport_;
     Ulid selected_clip_id_;
+    Ulid primary_clip_id_;
     std::vector<Ulid> selected_clip_ids_;
     std::optional<TimelineGapSelection> selected_gap_;
     std::optional<RationalTime> requested_playhead_;
