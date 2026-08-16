@@ -2354,14 +2354,47 @@ bool ApplySplit(Document& candidate, SplitClipOperation& operation,
         operation.timeline_position.sub(original.timeline_in);
     DocumentClip left = original;
     left.duration = leftDuration;
-    DocumentClip right{operation.right_clip_id, original.source_id,
-                       original.source_in.add(leftDuration),
-                       original.duration.sub(leftDuration),
-                       operation.timeline_position};
-    right.include_audio = original.include_audio;
-    right.link_group_id = original.link_group_id;
-    right.sync_anchor_clip_id = original.sync_anchor_clip_id;
-    right.sync_reference_delta = original.sync_reference_delta;
+    // Copy the original and override only what a cut actually changes --
+    // identity and *where* the piece sits. Everything else a clip carries
+    // describes the material, not its placement, so it belongs to both
+    // halves. This used to build the right half from an explicit field
+    // list, which silently dropped every field the list had not been taught
+    // about: ClipEffect stacks and captions were added to DocumentClip
+    // without touching this, so splitting a graded clip lost the grade on
+    // every piece but the first, with no error anywhere.
+    //
+    // Captions are copied wholesale rather than re-sliced: duplicating the
+    // run's text on both halves is wrong for a cut that lands mid-caption,
+    // but re-slicing needs word timings this operation does not have, and
+    // silently discarding the text is worse than duplicating it.
+    if (operation.right_effect_ids.empty() && !original.effects.empty()) {
+        for (size_t effect = 0; effect < original.effects.size(); ++effect)
+            operation.right_effect_ids.push_back(GenerateUlid());
+    }
+    if (operation.right_effect_ids.size() != original.effects.size()) {
+        Fail(EditError::InvalidOperation,
+             "split requires one right effect ID per effect on the clip", error,
+             message);
+        return false;
+    }
+    for (const Ulid& effectId : operation.right_effect_ids) {
+        if (!IsValidUlid(effectId) || candidate.FindClip(effectId) ||
+            candidate.FindSource(effectId) || candidate.FindTrack(effectId)) {
+            Fail(EditError::DuplicateId,
+                 "split right effect ID is invalid or already exists: '" +
+                     effectId + "'",
+                 error, message);
+            return false;
+        }
+    }
+
+    DocumentClip right = original;
+    right.id = operation.right_clip_id;
+    right.source_in = original.source_in.add(leftDuration);
+    right.duration = original.duration.sub(leftDuration);
+    right.timeline_in = operation.timeline_position;
+    for (size_t effect = 0; effect < right.effects.size(); ++effect)
+        right.effects[effect].id = operation.right_effect_ids[effect];
     track->clips[index] = std::move(left);
     track->clips.insert(
         track->clips.begin() + static_cast<std::ptrdiff_t>(index + 1),
@@ -3496,7 +3529,14 @@ std::string SerializeOperation(const Operation& operation) {
         output << "{\"type\":\"SplitClip\",\"clip_id\":\"" << split->clip_id
                << "\",\"timeline_position\":";
         WriteTime(output, split->timeline_position);
-        output << ",\"right_clip_id\":\"" << split->right_clip_id << "\"}";
+        output << ",\"right_clip_id\":\"" << split->right_clip_id
+               << "\",\"right_effect_ids\":[";
+        for (size_t index = 0; index < split->right_effect_ids.size();
+             ++index) {
+            if (index) output << ',';
+            WriteString(output, split->right_effect_ids[index]);
+        }
+        output << "]}";
     } else if (const auto* split =
                    std::get_if<SplitLinkedClipsOperation>(&operation)) {
         output << "{\"type\":\"SplitLinkedClips\",\"link_group_id\":";
@@ -4103,6 +4143,21 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             value.timeline_position = ReadTime(reader);
             reader.Expect(",\"right_clip_id\":");
             value.right_clip_id = reader.String();
+            // Optional: logs written before a split learned to carry the
+            // clip's grade have no such field. Leaving it absent means the
+            // same thing as an empty list -- no effect IDs assigned yet --
+            // which ApplySplit fills in on the next application. Requiring
+            // it here would make every project with a cut in its history
+            // unreplayable, undo and redo included.
+            if (reader.Consume(",\"right_effect_ids\":[")) {
+                if (!reader.Consume("]")) {
+                    while (true) {
+                        value.right_effect_ids.push_back(reader.String());
+                        if (reader.Consume("]")) break;
+                        reader.Expect(",");
+                    }
+                }
+            }
             reader.Expect("}");
             operation = std::move(value);
         } else if (type == "SplitLinkedClips") {

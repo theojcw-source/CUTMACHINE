@@ -1227,6 +1227,83 @@ int main() {
                        "slip rejects a locked track");
     });
 
+    Test("splitting a clip carries its grade and caption onto both halves", [] {
+        Document document = EditDocument();
+        const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+
+        Check(Apply(log, document,
+                    SetClipEffectsOperation{
+                        clipId,
+                        {{{}, "color.exposure", {{"amount", {35, 100}}}}}},
+                    "grade the clip"),
+              "grading the clip to be split succeeds");
+        const DocumentClip* before = document.FindClip(clipId);
+        const RationalTime cut = before->timeline_in.add(
+            {before->duration.value / 2, before->duration.rate});
+        const std::string graded = document.SaveToString();
+
+        SplitClipOperation split{clipId, cut};
+        Check(Apply(log, document, split, "split the graded clip"),
+              "splitting a graded clip succeeds");
+        const Ulid rightId =
+            std::get<SplitClipOperation>(log.AppliedEntries().back().op)
+                .right_clip_id;
+        const DocumentClip* left = document.FindClip(clipId);
+        const DocumentClip* right = document.FindClip(rightId);
+        // The regression this pins: the right half used to be built
+        // from an explicit field list, so anything added to
+        // DocumentClip later -- effects, captions -- was dropped on
+        // every piece after the first cut, silently.
+        Check(right && right->effects.size() == 1 &&
+                  left->effects.size() == 1 &&
+                  right->effects[0].type == "color.exposure" &&
+                  right->effects[0].params.at("amount").num == 35 &&
+                  right->effects[0].params.at("amount").den == 100,
+              "the right half of a split keeps the grade");
+        // Same grade, its own effect IDs: a ClipEffect id is unique
+        // document-wide, so cloning the stack verbatim would produce a
+        // document that fails validation.
+        Check(right && right->effects[0].id != left->effects[0].id,
+              "the copied grade gets its own effect IDs");
+        Check(right && right->include_audio == left->include_audio &&
+                  right->link_group_id == left->link_group_id &&
+                  right->sync_anchor_clip_id == left->sync_anchor_clip_id,
+              "the right half of a split keeps its link and sync identity");
+        const std::string afterSplit = document.SaveToString();
+        const std::string splitJson =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation reparsed = RemoveClipOperation{};
+        Check(DeserializeOperation(splitJson, reparsed, error, message) &&
+                  SerializeOperation(reparsed) == splitJson,
+              "SplitClip JSON round-trips canonically with its effect IDs");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == graded,
+              "undoing the split restores the graded clip byte-exactly");
+        // The reason right_effect_ids is stored rather than generated
+        // per application: without it, redo would mint fresh ULIDs and
+        // land on different bytes every time.
+        Check(log.Redo(document, error, message) &&
+                  document.SaveToString() == afterSplit,
+              "redoing the split reproduces the same effect IDs");
+
+        // A log written before splits carried the grade has no
+        // right_effect_ids at all. Every project with a cut in its
+        // history contains these, so refusing them would make undo and
+        // redo fail on real projects rather than on a fixture.
+        Operation legacy = RemoveClipOperation{};
+        const std::string legacyJson =
+            "{\"type\":\"SplitClip\",\"clip_id\":\"" + clipId +
+            "\",\"timeline_position\":{\"value\":" + std::to_string(cut.value) +
+            ",\"rate\":" + std::to_string(cut.rate) +
+            "},\"right_clip_id\":\"01K20000000000000000000098\"}";
+        Check(DeserializeOperation(legacyJson, legacy, error, message) &&
+                  std::get<SplitClipOperation>(legacy).right_effect_ids.empty(),
+              "a SplitClip logged without right_effect_ids still parses");
+    });
+
     Test(
         "clip color effects are addressable, serializable and byte-exactly "
         "reversible",

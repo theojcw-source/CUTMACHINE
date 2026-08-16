@@ -321,6 +321,13 @@ struct SplitClipOperation {
 
     // Generated on first application and retained for redo identity.
     Ulid right_clip_id;
+    // One per entry in the split clip's effect stack, in the same order.
+    // Both halves of a cut keep the grade, but a ClipEffect's id lives in
+    // the document's one ID space, so the right half needs its own -- and
+    // they have to be the same on redo as on first application, exactly
+    // like right_clip_id. Empty until the first application, or when the
+    // clip carries no effects.
+    std::vector<Ulid> right_effect_ids;
 };
 
 // A linked cut splits every A/V member at the same timeline position and gives
