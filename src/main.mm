@@ -2321,6 +2321,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 
 - (BOOL)loadDocumentAndSources {
+    if ([self loadDocumentAndSourcesHoldingLock]) return YES;
+    // A load that fails must not keep the project locked. Several callers
+    // react to NO with -[NSApp terminate:], which tears the process down
+    // without unwinding C++ destructors, so ProjectSessionLock's own
+    // destructor never runs and the .lock directory outlives the process.
+    // Acquire() does reclaim a lock whose owning pid is gone, so this only
+    // ever leaked litter rather than wedging the next open -- but the litter
+    // is confusing next to a project that failed to open for another reason.
+    if (self.state) self.state->projectLock.reset();
+    return NO;
+}
+
+- (BOOL)loadDocumentAndSourcesHoldingLock {
     const std::string documentPath(self.documentPath.UTF8String ?: "");
     std::string error;
     self.lastProjectLoadError = nil;

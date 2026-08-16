@@ -474,7 +474,20 @@ bool VerifyPortableProject(const std::string& projectPath,
     const fs::path manifestPath = project.parent_path() / "manifest.json";
     std::ifstream input(manifestPath, std::ios::binary);
     if (!input) {
-        error = "collection manifest is missing";
+        // "manifest is missing" describes our own bookkeeping, not what the
+        // caller did wrong. The two ways to get here are worth telling
+        // apart, because they need opposite things from the user.
+        std::error_code projectError;
+        if (!fs::exists(project, projectError) || projectError) {
+            error = "no project file at " + project.string();
+        } else {
+            error = project.filename().string() + " is not inside a " +
+                    ".cutmachine-project package (no manifest.json beside "
+                    "it). Single-file projects predate the package format "
+                    "and cannot be opened directly; create a new project "
+                    "and re-ingest, or point at the project.cutmachine.json "
+                    "inside an existing package";
+        }
         return false;
     }
     std::ostringstream contents;

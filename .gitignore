@@ -38,6 +38,13 @@ DartConfiguration.tcl
 *.log
 .cutmachine/
 
+# Generated repo snapshot for AI review (scripts/export_for_ai.py). It is a
+# verbatim copy of every tracked file, so committing it doubles every diff
+# and it starts contradicting the real files the moment anything changes --
+# which is exactly how it ended up advertising a project layout that no
+# longer exists. Regenerate on demand instead.
+repo_export.md
+
 # Python tooling (harnesses, scripts)
 __pycache__/
 *.pyc
