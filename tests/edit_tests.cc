@@ -1227,6 +1227,101 @@ int main() {
                        "slip rejects a locked track");
     });
 
+    Test("an interval subdivides a clip in one exact, reversible gesture", [] {
+        Document document = EditDocument();
+        const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+        const DocumentClip* clip = document.FindClip(clipId);
+        const RationalTime start = clip->timeline_in;
+        const RationalTime end = start.add(clip->duration);
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const std::string before = document.SaveToString();
+
+        // Stated as a duration, not as a frame count the caller worked out.
+        // That is the whole point of the resolver.
+        SplitClipAtPositionsOperation op;
+        Check(ResolveIntervalSplits(document, clipId, {2, 25}, op, message),
+              "resolving an interval succeeds: " + message);
+        Check(!op.positions.empty(), "the resolver produced cut positions");
+        bool ascending = true;
+        for (size_t index = 0; index < op.positions.size(); ++index) {
+            if (op.positions[index] <= start || end <= op.positions[index])
+                ascending = false;
+            if (index && op.positions[index] <= op.positions[index - 1])
+                ascending = false;
+        }
+        Check(ascending,
+              "resolved positions are strictly increasing and inside the clip");
+
+        // An interval whose rate differs from the clip's: 1/5s against a
+        // 25fps clip. Nobody converted anything by hand, and what comes out
+        // is exactly one interval past the clip's start -- this is the
+        // off-by-one-per-cut that principle 7 exists to prevent. Checked
+        // before the document is subdivided, while clipId still names the
+        // whole clip.
+        SplitClipAtPositionsOperation crossRate;
+        Check(ResolveIntervalSplits(document, clipId, {1, 5}, crossRate,
+                                    message) &&
+                  crossRate.positions.size() == 1 &&
+                  crossRate.positions[0].compare(start.add({1, 5})) == 0,
+              "an interval stated in another timebase resolves exactly");
+
+        const size_t clipsBefore = document.sequence.tracks[0].clips.size();
+        Check(Apply(log, document, op, "subdivide at one-second interval"),
+              "the interval split applies");
+        Check(document.sequence.tracks[0].clips.size() ==
+                  clipsBefore + op.positions.size(),
+              "each resolved position produced exactly one more clip");
+        const std::string after = document.SaveToString();
+
+        const std::string json =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(json, parsed, error, message) &&
+                  SerializeOperation(parsed) == json,
+              "SplitClipAtPositions JSON round-trips canonically");
+
+        // The reason this is one operation and not N: one undo puts the
+        // whole subdivision back.
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "one undo reverses every cut of the gesture, byte-exactly");
+        Check(log.Redo(document, error, message) &&
+                  document.SaveToString() == after,
+              "redo reproduces the subdivision byte-exactly");
+
+        // Rejections are checked against a pristine document: `document` has
+        // been subdivided by now, so its clipId names a much shorter first
+        // piece and would fail these for the wrong reason.
+        Document fresh = EditDocument();
+        std::string resolveError;
+        SplitClipAtPositionsOperation rejected;
+        Check(!ResolveIntervalSplits(fresh, clipId, {0, 1}, rejected,
+                                     resolveError),
+              "a zero interval is refused rather than looping forever");
+        Check(!ResolveIntervalSplits(fresh, clipId, {9999, 1}, rejected,
+                                     resolveError),
+              "an interval longer than the clip is refused, not a silent "
+              "no-op");
+        Check(!ResolveIntervalSplits(fresh, "01K20000000000000000000099",
+                                     {1, 1}, rejected, resolveError),
+              "an unknown clip is refused");
+
+        ExpectRejected(fresh, SplitClipAtPositionsOperation{clipId, {}, {}},
+                       EditError::InvalidOperation,
+                       "an interval split with no positions");
+        ExpectRejected(
+            fresh,
+            SplitClipAtPositionsOperation{
+                clipId, {start.add({4, 25}), start.add({2, 25})}, {}},
+            EditError::InvalidOperation,
+            "positions that are not strictly increasing");
+        ExpectRejected(fresh, SplitClipAtPositionsOperation{clipId, {end}, {}},
+                       EditError::InvalidTimelineIn,
+                       "a position on the clip's own edge");
+    });
+
     Test("splitting a clip carries its grade and caption onto both halves", [] {
         Document document = EditDocument();
         const Ulid clipId = document.sequence.tracks[0].clips[0].id;

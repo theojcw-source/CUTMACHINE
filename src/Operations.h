@@ -343,6 +343,33 @@ struct SplitLinkedClipsOperation {
     std::vector<ExactTrackState> exact_track_result;
 };
 
+// Subdivides one clip -- and every clip A/V-linked to it -- at several exact
+// timeline positions, as one atomic gesture with one undo step.
+//
+// `positions` is never a spacing a caller converted into frames itself. See
+// ResolveIntervalSplits below, the only intended producer: it is where "every
+// three seconds" becomes exact positions in the sequence's timebase. Same
+// division of labour as RemoveWordsOperation/ResolveWordRemoval, for the same
+// reason -- PHILOSOPHY.md principle 7, the caller states the intent and the
+// code computes the frames. A model asked to convert 3s at 24000/1001 will
+// eventually be off by a frame, silently, once per cut.
+//
+// Why one operation instead of N SplitClip calls: an agent gets one round
+// trip rather than one per cut (ChatSession caps a turn at a handful of tool
+// round trips, so repetitive work used to die half-finished), and the editor
+// gets one Cmd+Z for "cut every three seconds" -- which is one intention, not
+// eighteen.
+struct SplitClipAtPositionsOperation {
+    Ulid clip_id;
+    // Strictly increasing, each strictly inside the clip's own timeline span.
+    // ApplyOperation re-validates this rather than trusting its producer.
+    std::vector<RationalTime> positions;
+    // Whole-track snapshots, as SplitLinkedClipsOperation uses: they make
+    // redo byte-exact without the operation having to carry a generated ID
+    // for every piece and every effect on it.
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 // JoinClip is the exact inverse stored by the event log for SplitClip. Keeping
 // it explicit makes persisted undo/redo deterministic across timebases.
 struct JoinClipOperation {
@@ -445,7 +472,24 @@ using Operation = std::variant<
     AddCaptionStyleOperation, RemoveCaptionStyleOperation,
     SetClipCaptionOperation, AddMulticamGroupOperation,
     RemoveMulticamGroupOperation, SetMulticamActiveAngleOperation,
-    RemoveWordsOperation>;
+    RemoveWordsOperation, SplitClipAtPositionsOperation>;
+
+// Turns a repeat spacing into the exact positions to cut `clipId` at:
+// interval, 2*interval, ... for as long as they stay strictly inside the
+// clip's own timeline span. This is the deterministic computation
+// PHILOSOPHY.md principle 7 asks for -- the caller names *how often*
+// (semantic, agent- or UI-sized), this resolves *which frames* (exact,
+// code-guaranteed) -- and it is the only intended producer of
+// SplitClipAtPositionsOperation::positions.
+//
+// `interval` is a duration, not a frame count: {3, 1} is three seconds
+// whatever the sequence runs at. Refuses a non-positive interval, an unknown
+// clip, and an interval so long that it would not cut the clip at all, rather
+// than silently applying nothing.
+bool ResolveIntervalSplits(const Document& document, const Ulid& clipId,
+                           const RationalTime& interval,
+                           SplitClipAtPositionsOperation& operation,
+                           std::string& error);
 
 struct ExactProjectState {
     std::string canonical_json;

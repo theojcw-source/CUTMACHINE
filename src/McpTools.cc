@@ -510,6 +510,36 @@ bool DispatchSplitClip(McpBackend& backend, const IdResolver& resolver,
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
+bool DispatchSplitAtInterval(McpBackend& backend, const IdResolver& resolver,
+                             const Value& args, std::string& resultJson,
+                             std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"clip_id", "interval"};
+    if (!CheckKnownKeys(args, kAllowed, "split_at_interval", message))
+        return Fail(errorName, message, message);
+    Ulid clipId;
+    RationalTime interval;
+    if (!ReadId(args, "clip_id", "split_at_interval", resolver, true, clipId,
+                message) ||
+        !ReadTime(args, "interval", "split_at_interval", true, interval,
+                  message))
+        return Fail(errorName, message, message);
+
+    // Its own snapshot: dispatch functions receive only the ID resolver, and
+    // giving all 38 of them a Document parameter to serve the one tool that
+    // resolves against clip geometry is the wrong trade. Nothing mutates
+    // between McpToolRegistry::Call's snapshot and this one.
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+
+    SplitClipAtPositionsOperation op;
+    if (!ResolveIntervalSplits(document, clipId, interval, op, message))
+        return Fail(errorName, message, message);
+    return backend.ApplyOperation(op, resultJson, errorName, message);
+}
+
 bool DispatchDeleteGap(McpBackend& backend, const IdResolver& resolver,
                        const Value& args, std::string& resultJson,
                        std::string& errorName, std::string& message) {
@@ -1325,6 +1355,21 @@ McpToolRegistry::McpToolRegistry() {
             .Field("timeline_position", kTimeSchemaText, true)
             .Build("split_clip arguments"),
         DispatchSplitClip);
+
+    add("split_at_interval",
+        "Cut one clip repeatedly at a regular spacing -- every N seconds -- "
+        "in a single call. Give the spacing as a duration (interval "
+        "{value:3,rate:1} is every three seconds); the engine converts it "
+        "into exact frame positions in the sequence's own timebase, so never "
+        "compute frame numbers yourself. Cuts the clip's A/V-linked partners "
+        "at the same positions, and undoes in one step. Prefer this over "
+        "repeated split_clip calls: it is one round trip instead of one per "
+        "cut.",
+        SchemaBuilder()
+            .Field("clip_id", IdSchema("Clip to subdivide."), true)
+            .Field("interval", kTimeSchemaText, true)
+            .Build("split_at_interval arguments"),
+        DispatchSplitAtInterval);
 
     add("delete_gap",
         "Remove a gap of exact duration starting at an exact position on a "
