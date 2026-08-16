@@ -176,6 +176,10 @@ const DocumentTrack* LockedTrackTouchedBy(const Document& document,
             } else if constexpr (std::is_same_v<T, SetClipEffectsOperation> ||
                                  std::is_same_v<T, SetClipCaptionOperation>) {
                 addClipTrack(value.clip_id);
+            } else if constexpr (std::is_same_v<
+                                     T, SplitClipAtPositionsOperation>) {
+                addClipTrack(value.clip_id);
+                addExactTracks(value.exact_track_result);
             } else if constexpr (std::is_same_v<T, RemoveWordsOperation>) {
                 addClipTrack(value.clip_id);
                 for (const Ulid& trackId : value.sync_track_ids)
@@ -2546,6 +2550,174 @@ bool ApplySplitLinked(Document& candidate, SplitLinkedClipsOperation& operation,
     return true;
 }
 
+// Every track the gesture can touch: the clip's own, plus each A/V-linked
+// member's. Snapshotting all of them is what makes one undo restore the whole
+// subdivision, however many pieces it produced.
+std::vector<Ulid> SplitAffectedTrackIds(const Document& document,
+                                        const DocumentClip& clip) {
+    std::vector<Ulid> trackIds;
+    const auto addTrackOf = [&](const Ulid& clipId) {
+        const DocumentTrack* track = document.FindTrackForClip(clipId);
+        if (track && std::find(trackIds.begin(), trackIds.end(), track->id) ==
+                         trackIds.end())
+            trackIds.push_back(track->id);
+    };
+    addTrackOf(clip.id);
+    if (!clip.link_group_id.empty()) {
+        for (const DocumentTrack& track : document.sequence.tracks)
+            for (const DocumentClip& member : track.clips)
+                if (member.link_group_id == clip.link_group_id)
+                    addTrackOf(member.id);
+    }
+    return trackIds;
+}
+
+// The single-position cut for `clip`: linked when the clip belongs to a group
+// whose members actually straddle `position`, plain otherwise. Deliberately a
+// local twin of TimelineView.cc's TimelineCutOperationForClip rather than a
+// call into it -- Operations.cc is the layer below the timeline view and does
+// not depend on it. Both read the same link_group_id off the document, so
+// they agree by construction; only the caller's linked-selection preference,
+// which is a view concern, is missing here.
+Operation TimelineCutOperation(const Document& document,
+                               const DocumentClip& clip,
+                               const RationalTime& position) {
+    if (!clip.link_group_id.empty()) {
+        std::vector<Ulid> members;
+        for (const DocumentTrack& track : document.sequence.tracks) {
+            for (const DocumentClip& member : track.clips) {
+                if (member.link_group_id != clip.link_group_id) continue;
+                if (position <= member.timeline_in ||
+                    position >= member.timeline_in.add(member.duration))
+                    continue;
+                members.push_back(member.id);
+            }
+        }
+        if (members.size() > 1)
+            return SplitLinkedClipsOperation{
+                clip.link_group_id, members, position, {}, {}, {}, {}};
+    }
+    return SplitClipOperation{clip.id, position, {}, {}};
+}
+
+bool ApplySplitAtPositions(Document& candidate,
+                           SplitClipAtPositionsOperation& operation,
+                           Operation& inverse, EditError& error,
+                           std::string& message) {
+    const auto snapshots = [&](const std::vector<Ulid>& trackIds) {
+        std::vector<ExactTrackState> result;
+        for (const Ulid& trackId : trackIds) {
+            const DocumentTrack* track = candidate.FindTrack(trackId);
+            if (track) result.push_back({track->id, track->clips});
+        }
+        return result;
+    };
+    if (!operation.exact_track_result.empty()) {
+        std::vector<ExactTrackState> before;
+        for (const ExactTrackState& state : operation.exact_track_result) {
+            DocumentTrack* track = candidate.FindTrack(state.track_id);
+            if (!track) {
+                Fail(EditError::UnknownTrack,
+                     "exact interval split references an unknown track", error,
+                     message);
+                return false;
+            }
+            before.push_back({track->id, track->clips});
+        }
+        for (const ExactTrackState& state : operation.exact_track_result)
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = SplitClipAtPositionsOperation{
+            operation.clip_id, operation.positions, std::move(before)};
+        return true;
+    }
+
+    const DocumentClip* original = candidate.FindClip(operation.clip_id);
+    if (!original) {
+        Fail(EditError::UnknownClip,
+             "unknown clip_id '" + operation.clip_id + "'", error, message);
+        return false;
+    }
+    if (operation.positions.empty()) {
+        Fail(EditError::InvalidOperation,
+             "split requires at least one position", error, message);
+        return false;
+    }
+    const RationalTime clipStart = original->timeline_in;
+    const RationalTime clipEnd = clipStart.add(original->duration);
+    for (size_t index = 0; index < operation.positions.size(); ++index) {
+        const RationalTime& position = operation.positions[index];
+        if (position.rate <= 0) {
+            Fail(EditError::ArithmeticError, "time rate must be positive",
+                 error, message);
+            return false;
+        }
+        if (position <= clipStart || position >= clipEnd) {
+            Fail(EditError::InvalidTimelineIn,
+                 "split position must be strictly inside the clip", error,
+                 message);
+            return false;
+        }
+        if (index > 0 && position <= operation.positions[index - 1]) {
+            Fail(EditError::InvalidOperation,
+                 "split positions must be strictly increasing", error, message);
+            return false;
+        }
+    }
+
+    const std::vector<Ulid> trackIds =
+        SplitAffectedTrackIds(candidate, *original);
+    const std::vector<ExactTrackState> before = snapshots(trackIds);
+
+    // Each position is applied through the ordinary single-cut path, so a
+    // subdivision is exactly N normal cuts -- same link-group bookkeeping,
+    // same effect-stack cloning -- and never a second implementation of
+    // "split" that could drift from it. Positions ascend, so each one lands
+    // in the right-hand piece produced by the previous.
+    for (const RationalTime& position : operation.positions) {
+        const DocumentClip* piece = nullptr;
+        for (const Ulid& trackId : trackIds) {
+            const DocumentTrack* track = candidate.FindTrack(trackId);
+            if (!track) continue;
+            for (const DocumentClip& candidateClip : track->clips) {
+                if (candidateClip.timeline_in < position &&
+                    position <
+                        candidateClip.timeline_in.add(candidateClip.duration) &&
+                    !(candidateClip.timeline_in.add(candidateClip.duration) <=
+                      clipStart) &&
+                    !(clipEnd <= candidateClip.timeline_in)) {
+                    piece = &candidateClip;
+                    break;
+                }
+            }
+            if (piece) break;
+        }
+        if (!piece) {
+            Fail(EditError::InvalidTimelineIn,
+                 "split position must be strictly inside the clip", error,
+                 message);
+            return false;
+        }
+        Operation cut = TimelineCutOperation(candidate, *piece, position);
+        Operation ignored = RemoveClipOperation{};
+        bool cutApplied = false;
+        if (auto* linked = std::get_if<SplitLinkedClipsOperation>(&cut)) {
+            cutApplied =
+                ApplySplitLinked(candidate, *linked, ignored, error, message);
+        } else {
+            auto& single = std::get<SplitClipOperation>(cut);
+            cutApplied = ApplySplit(candidate, single, ignored, error, message);
+        }
+        if (!cutApplied) return false;
+    }
+
+    if (!ValidateResult(candidate, error, message)) return false;
+    operation.exact_track_result = snapshots(trackIds);
+    inverse = SplitClipAtPositionsOperation{operation.clip_id,
+                                            operation.positions, before};
+    return true;
+}
+
 bool ApplyJoin(Document& candidate, JoinClipOperation& operation,
                Operation& inverse, EditError& error, std::string& message) {
     DocumentTrack* track = candidate.FindTrackForClip(operation.left_clip_id);
@@ -3083,6 +3255,40 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
 
 }  // namespace
 
+bool ResolveIntervalSplits(const Document& document, const Ulid& clipId,
+                           const RationalTime& interval,
+                           SplitClipAtPositionsOperation& operation,
+                           std::string& error) {
+    operation = SplitClipAtPositionsOperation{};
+    if (interval.rate <= 0 || interval.value <= 0) {
+        error = "interval must be a positive duration";
+        return false;
+    }
+    const DocumentClip* clip = document.FindClip(clipId);
+    if (!clip) {
+        error = "no clip matches id '" + clipId + "'";
+        return false;
+    }
+    const RationalTime start = clip->timeline_in;
+    const RationalTime end = start.add(clip->duration);
+    // Accumulate by repeated exact addition rather than multiplying a
+    // converted frame count: RationalTime::add is the only thing in this
+    // codebase allowed to reconcile two timebases, and going through it once
+    // per step keeps every position exact even when the interval's rate and
+    // the clip's disagree.
+    RationalTime position = start.add(interval);
+    while (position < end) {
+        operation.positions.push_back(position);
+        position = position.add(interval);
+    }
+    if (operation.positions.empty()) {
+        error = "interval is longer than the clip; nothing to cut";
+        return false;
+    }
+    operation.clip_id = clipId;
+    return true;
+}
+
 const char* EditErrorName(EditError error) {
     switch (error) {
         case EditError::None:
@@ -3211,6 +3417,11 @@ bool ApplyOperation(Document& document, Operation& operation,
                        std::get_if<SplitLinkedClipsOperation>(&normalized)) {
             applied = ApplySplitLinked(candidate, *linkedSplit,
                                        generatedInverse, error, message);
+        } else if (auto* intervalSplit =
+                       std::get_if<SplitClipAtPositionsOperation>(
+                           &normalized)) {
+            applied = ApplySplitAtPositions(candidate, *intervalSplit,
+                                            generatedInverse, error, message);
         } else if (auto* gap = std::get_if<DeleteGapOperation>(&normalized)) {
             applied = ApplyDeleteGap(candidate, *gap, generatedInverse, error,
                                      message);
@@ -3809,6 +4020,19 @@ std::string SerializeOperation(const Operation& operation) {
         WriteString(output, setActiveAngle->group_id);
         output << ",\"active_angle_id\":";
         WriteString(output, setActiveAngle->active_angle_id);
+        output << '}';
+    } else if (const auto* intervalSplit =
+                   std::get_if<SplitClipAtPositionsOperation>(&operation)) {
+        output << "{\"type\":\"SplitClipAtPositions\",\"clip_id\":";
+        WriteString(output, intervalSplit->clip_id);
+        output << ",\"positions\":[";
+        for (size_t index = 0; index < intervalSplit->positions.size();
+             ++index) {
+            if (index) output << ',';
+            WriteTime(output, intervalSplit->positions[index]);
+        }
+        output << "],\"exact_tracks\":";
+        WriteExactTracks(output, intervalSplit->exact_track_result);
         output << '}';
     } else if (const auto* removeWords =
                    std::get_if<RemoveWordsOperation>(&operation)) {
@@ -4594,6 +4818,22 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             value.group_id = reader.String();
             reader.Expect(",\"active_angle_id\":");
             value.active_angle_id = reader.String();
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "SplitClipAtPositions") {
+            SplitClipAtPositionsOperation value;
+            reader.Expect(",\"clip_id\":");
+            value.clip_id = reader.String();
+            reader.Expect(",\"positions\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    value.positions.push_back(ReadTime(reader));
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
             reader.Expect("}");
             operation = std::move(value);
         } else if (type == "RemoveWords") {
