@@ -35,6 +35,4 @@ NSColor* CMTextSecondaryColor(void) {
     return CMThemeColor(ui::theme::kTextSecondary);
 }
 
-NSColor* CMAccentBlueColor(void) {
-    return CMThemeColor(ui::theme::kAccentBlue);
-}
+NSColor* CMAccentColor(void) { return CMThemeColor(ui::theme::kAccent); }

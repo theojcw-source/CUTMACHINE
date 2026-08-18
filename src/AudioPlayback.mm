@@ -17,6 +17,7 @@ extern "C" {
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -204,7 +205,17 @@ AudioPlayback::~AudioPlayback() {
 bool AudioPlayback::Open(const Document& document,
                          const std::string& baseDirectory, std::string& error) {
     impl_->sources.clear();
+    // AudioPlayback owns the decoded PCM for the active timeline, not a cache
+    // for the whole media library. Decoding unused rushes here made launch
+    // time and memory scale with every imported file.
+    std::set<Ulid> audibleSourceIds;
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        if (track.kind != "audio") continue;
+        for (const DocumentClip& clip : track.clips)
+            audibleSourceIds.insert(clip.source_id);
+    }
     for (const DocumentSource& source : document.sources) {
+        if (audibleSourceIds.count(source.id) == 0) continue;
         std::filesystem::path path(source.path);
         if (path.is_relative())
             path = std::filesystem::path(baseDirectory) / path;
@@ -309,9 +320,15 @@ bool AudioPlayback::Open(const Document& document,
 
 void AudioPlayback::RebuildTimeline(const Document& document) {
     auto plan = std::make_shared<MixPlan>();
+    const bool hasSolo = std::any_of(
+        document.sequence.tracks.begin(), document.sequence.tracks.end(),
+        [](const DocumentTrack& track) {
+            return track.kind == "audio" && track.solo;
+        });
     for (const DocumentTrack& track : document.sequence.tracks) {
+        if (track.kind != "audio" || track.muted || (hasSolo && !track.solo))
+            continue;
         for (const DocumentClip& clip : track.clips) {
-            if (track.kind != "audio") continue;
             const auto source = impl_->sources.find(clip.source_id);
             if (source == impl_->sources.end()) continue;
             MixClip mixed;
@@ -336,7 +353,7 @@ bool AudioPlayback::PlayFrom(RationalTime position, int direction,
     impl_->cursor.store(position.to_frames(kMixRate));
     impl_->scrubRemaining.store(0);
     impl_->lastScrubSample.store(std::numeric_limits<int64_t>::min());
-    impl_->direction.store(direction < 0 ? -1 : 1);
+    impl_->direction.store(std::clamp(direction, -4, 4));
     NSError* startError = nil;
     if (!impl_->engine.isRunning &&
         ![impl_->engine startAndReturnError:&startError]) {
@@ -398,3 +415,5 @@ size_t AudioPlayback::PlannedClipCount() const {
 uint64_t AudioPlayback::ScrubTriggerCount() const {
     return impl_->scrubTriggerCount.load();
 }
+
+int AudioPlayback::ShuttleSpeed() const { return impl_->direction.load(); }

@@ -4,10 +4,10 @@
 // been exercised at runtime yet -- see VISUAL_QA_CHECKLIST.md for what still
 // needs walking through (same caveat as PanelHostView.h/UiComponents.h).
 //
-// The playback transport for ROADMAP.md F2.5: play/pause, frame step,
-// scrub bar, current/total timecode. Installed into PanelLayout.h's
-// PanelSlot::Transport via CMPanelHostView (see PanelHostView.h), the same
-// way F2.2's Inspector and F2.4's Chat install into their own docks.
+// Legacy playback transport for ROADMAP.md F2.5: play/pause, frame step,
+// scrub bar, current/total timecode. The ATELIER redesign removed its dock
+// slot and no longer builds this AppKit view; the pure exact-time boundary in
+// TransportBar.h remains independently tested.
 //
 // Like every other view in UiComponents.h, this is dumb chrome: it owns no
 // playhead state of its own and mutates nothing in AppState/Document. Every

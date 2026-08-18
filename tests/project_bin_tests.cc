@@ -105,6 +105,44 @@ int main() {
           "redo timeline placement: " + error);
     Check(project.SaveToString() == afterPlacement,
           "bin mutation redo is deterministic");
+
+    const std::string beforeRushRename = project.SaveToString();
+    Check(projectLog.Apply(project,
+                           ProjectOperation{RenameProjectItemOperation{
+                               clip10, "Hero interview.mov"}},
+                           editError, error),
+          "rush display rename: " + error);
+    Check(project.rushes.front().filename == "Clip 10.mov" &&
+              project.FindBinMetadata(clip10) &&
+              project.FindBinMetadata(clip10)->display_name ==
+                  "Hero interview.mov",
+          "rush rename leaves the source filename untouched");
+    ProjectOperation decodedRename;
+    Check(DeserializeProjectOperation(
+              SerializeProjectOperation(projectLog.AppliedEntries().back().op),
+              decodedRename, editError, error) &&
+              std::holds_alternative<RenameProjectItemOperation>(decodedRename),
+          "rush rename operation round-trips canonically: " + error);
+    Check(projectLog.Undo(project, editError, error) &&
+              project.SaveToString() == beforeRushRename,
+          "rush rename undo restores exact project bytes");
+    Check(projectLog.Redo(project, editError, error),
+          "rush rename redo succeeds: " + error);
+
+    const std::string beforeTimelineRename = project.SaveToString();
+    Check(projectLog.Apply(project,
+                           ProjectOperation{RenameProjectItemOperation{
+                               trailer, "Trailer selects"}},
+                           editError, error),
+          "timeline rename: " + error);
+    Check(project.FindTimeline(trailer) &&
+              project.FindTimeline(trailer)->name == "Trailer selects",
+          "timeline rename updates its project identity");
+    Check(projectLog.Undo(project, editError, error) &&
+              project.SaveToString() == beforeTimelineRename,
+          "timeline rename undo restores exact project bytes");
+    Check(projectLog.Redo(project, editError, error),
+          "timeline rename redo succeeds: " + error);
     ProjectEditLog decodedLog;
     Check(ProjectEditLog::Deserialize(projectLog.Serialize(), decodedLog,
                                       editError, error) &&
@@ -114,8 +152,9 @@ int main() {
 
     ProjectBinModel model(project);
     const ProjectBinItem* used = model.Find(clip10);
-    Check(used && used->total_usage == 1 && used->active_timeline_usage == 1,
-          "usage is derived from timelines");
+    Check(used && used->name == "Hero interview.mov" &&
+              used->total_usage == 1 && used->active_timeline_usage == 1,
+          "display rename and usage are derived without changing the file");
 
     ProjectBinFilter filter;
     filter.search = "hero";

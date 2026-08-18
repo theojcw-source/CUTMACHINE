@@ -30,6 +30,22 @@ int64_t RoundedInt64(long double value) {
     return static_cast<int64_t>(std::round(value));
 }
 
+void ClampViewportStartToZero(TimelineViewport& viewport) {
+    if (viewport.view_start < RationalTime{0, 1})
+        viewport.view_start = {0, viewport.view_start.rate};
+}
+
+double DominantScrollDelta(double deltaX, double deltaY) {
+    if (!std::isfinite(deltaX) || !std::isfinite(deltaY)) return 0.0;
+    return std::abs(deltaX) > 0.01 ? deltaX : deltaY;
+}
+
+long double Seconds(const RationalTime& time) {
+    if (time.rate <= 0)
+        throw std::invalid_argument("time rate must be positive");
+    return static_cast<long double>(time.value) / time.rate;
+}
+
 int64_t RoundNonNegativeRatio(__int128 numerator, __int128 denominator) {
     if (numerator < 0 || denominator <= 0)
         throw std::invalid_argument("invalid playhead quantization ratio");
@@ -129,6 +145,7 @@ RationalTime TimelineViewport::XToTime(double x, int32_t rate) const {
 
 void TimelineViewport::ScrollByPixels(double delta_x, int32_t rate) {
     view_start = XToTime(header_width + delta_x, rate);
+    ClampViewportStartToZero(*this);
 }
 
 void TimelineViewport::ZoomAroundX(double x, double factor, int32_t rate) {
@@ -138,6 +155,7 @@ void TimelineViewport::ZoomAroundX(double x, double factor, int32_t rate) {
     pixels_per_second = std::clamp(pixels_per_second * factor, 4.0, 4000.0);
     const RationalTime displaced = XToTime(x, rate);
     view_start = view_start.add(anchor.sub(displaced));
+    ClampViewportStartToZero(*this);
 }
 
 void TimelineViewport::FitDuration(RationalTime duration, double width) {
@@ -155,6 +173,108 @@ void TimelineViewport::FitDuration(RationalTime duration, double width) {
     const long double available = std::max(1.0, width - header_width - 24.0);
     pixels_per_second =
         std::clamp(static_cast<double>(available / seconds), 4.0, 4000.0);
+}
+
+TimelineScrollIntent ResolveTimelineScrollIntent(double deltaX, double deltaY,
+                                                 bool preciseDeltas,
+                                                 bool shiftPressed) {
+    const double delta = DominantScrollDelta(deltaX, deltaY);
+    if (preciseDeltas || shiftPressed) {
+        // Precise deltas already use logical points. A discrete wheel reports
+        // line-sized units, so give Shift+wheel a useful navigation step.
+        return {TimelineScrollAction::Pan,
+                preciseDeltas ? delta : delta * 32.0};
+    }
+    return {TimelineScrollAction::Zoom, delta};
+}
+
+TimelineZoomBarPart TimelineZoomBarGeometry::HitTest(double x) const {
+    if (!std::isfinite(x) || rail_width <= 0.0 || thumb_width <= 0.0 ||
+        x < thumb_x || x > thumb_x + thumb_width)
+        return TimelineZoomBarPart::None;
+    const double hitWidth =
+        std::min(thumb_width * 0.5, std::max(8.0, handle_width * 2.0));
+    if (x <= thumb_x + hitWidth) return TimelineZoomBarPart::LeftHandle;
+    if (x >= thumb_x + thumb_width - hitWidth)
+        return TimelineZoomBarPart::RightHandle;
+    return TimelineZoomBarPart::Body;
+}
+
+TimelineZoomBarGeometry CalculateTimelineZoomBarGeometry(
+    const TimelineViewport& viewport, RationalTime duration, double width) {
+    CheckViewport(viewport);
+    TimelineZoomBarGeometry geometry;
+    geometry.rail_x = viewport.header_width;
+    geometry.rail_width = std::max(0.0, width - viewport.header_width);
+    geometry.thumb_x = geometry.rail_x;
+    geometry.thumb_width = geometry.rail_width;
+    if (geometry.rail_width <= 0.0) return geometry;
+
+    const long double durationSeconds = std::max(0.0L, Seconds(duration));
+    const long double visibleSeconds =
+        geometry.rail_width / viewport.pixels_per_second;
+    const long double rulerSeconds = std::max(durationSeconds, visibleSeconds);
+    if (rulerSeconds <= 0.0L) return geometry;
+
+    const double rawWidth = geometry.rail_width *
+                            static_cast<double>(visibleSeconds / rulerSeconds);
+    geometry.thumb_width = std::clamp(
+        rawWidth, std::min(24.0, geometry.rail_width), geometry.rail_width);
+    const long double maximumStart =
+        std::max(0.0L, rulerSeconds - visibleSeconds);
+    if (maximumStart <= 0.0L) return geometry;
+    const long double start =
+        std::clamp(Seconds(viewport.view_start), 0.0L, maximumStart);
+    geometry.thumb_x += (geometry.rail_width - geometry.thumb_width) *
+                        static_cast<double>(start / maximumStart);
+    return geometry;
+}
+
+void UpdateTimelineZoomBarDrag(TimelineViewport& viewport,
+                               const TimelineZoomBarDrag& drag, double pointerX,
+                               RationalTime duration, double width,
+                               int32_t rate) {
+    if (!std::isfinite(pointerX) || rate <= 0 ||
+        drag.part == TimelineZoomBarPart::None)
+        return;
+    viewport = drag.initial_viewport;
+    const double delta = pointerX - drag.pointer_x;
+    const TimelineZoomBarGeometry& geometry = drag.initial_geometry;
+    if (geometry.rail_width <= 0.0) return;
+
+    if (drag.part == TimelineZoomBarPart::Body) {
+        const double travel = geometry.rail_width - geometry.thumb_width;
+        const long double visibleSeconds =
+            geometry.rail_width / viewport.pixels_per_second;
+        const long double maximumStart =
+            std::max(0.0L, Seconds(duration) - visibleSeconds);
+        if (travel <= 0.0 || maximumStart <= 0.0L) return;
+        const long double initialStart = Seconds(viewport.view_start);
+        const long double requested =
+            std::clamp(initialStart + static_cast<long double>(delta / travel) *
+                                          maximumStart,
+                       0.0L, maximumStart);
+        viewport.view_start = {RoundedInt64(requested * rate), rate};
+        return;
+    }
+
+    const double minimumWidth = std::min(24.0, geometry.rail_width);
+    double requestedWidth = geometry.thumb_width;
+    double anchorX = viewport.header_width;
+    if (drag.part == TimelineZoomBarPart::LeftHandle) {
+        requestedWidth -= delta;
+        anchorX = width;
+    } else {
+        requestedWidth += delta;
+    }
+    requestedWidth =
+        std::clamp(requestedWidth, minimumWidth, geometry.rail_width);
+    if (requestedWidth >= geometry.rail_width - 0.5) {
+        viewport.FitDuration(duration, width);
+        return;
+    }
+    if (geometry.thumb_width <= 0.0) return;
+    viewport.ZoomAroundX(anchorX, geometry.thumb_width / requestedWidth, rate);
 }
 
 std::vector<double> TimelineViewport::TickXs(double width) const {
@@ -361,6 +481,52 @@ std::optional<RationalTime> ClipSyncDrift(const Document& document,
     }
 }
 
+std::vector<RationalTime> TimelineEditPoints(const Document& document) {
+    std::vector<RationalTime> points;
+    points.push_back({0, document.sequence.frame_rate.num});
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        for (const DocumentClip& clip : track.clips) {
+            points.push_back(clip.timeline_in);
+            points.push_back(clip.timeline_in.add(clip.duration));
+        }
+    }
+    std::sort(points.begin(), points.end());
+    points.erase(std::unique(points.begin(), points.end()), points.end());
+    return points;
+}
+
+std::optional<RationalTime> AdjacentTimelineEdit(const Document& document,
+                                                 const RationalTime& position,
+                                                 bool forward) {
+    const std::vector<RationalTime> points = TimelineEditPoints(document);
+    if (forward) {
+        const auto next =
+            std::upper_bound(points.begin(), points.end(), position);
+        return next == points.end() ? std::nullopt
+                                    : std::optional<RationalTime>(*next);
+    }
+    const auto previous =
+        std::lower_bound(points.begin(), points.end(), position);
+    if (previous == points.begin()) return std::nullopt;
+    return *std::prev(previous);
+}
+
+std::optional<RationalTime> SnapTimelineTimeToEdit(
+    const Document& document, const TimelineViewport& viewport,
+    const RationalTime& candidate) {
+    std::optional<RationalTime> best;
+    double bestDistance = kTimelineSnapDistance + 1.0;
+    for (const RationalTime& point : TimelineEditPoints(document)) {
+        const double distance =
+            std::abs(viewport.TimeToX(point) - viewport.TimeToX(candidate));
+        if (distance <= kTimelineSnapDistance && distance < bestDistance) {
+            best = point;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
 TimelineInteraction::TimelineInteraction(Document& document, EditLog& editLog,
                                          TimelineViewport& viewport)
     : document_(document), edit_log_(editLog), viewport_(viewport) {}
@@ -391,11 +557,23 @@ void TimelineInteraction::PointerDown(double x, double y, double width,
     selected_clip_id_ = hit->clip_id;
     primary_clip_id_ = hit->clip_id;
     selected_clip_ids_ = {hit->clip_id};
-    if (linked_selection_enabled_)
-        selected_clip_ids_ =
-            ExpandLinkedClipSelection(document_, selected_clip_ids_);
     const DocumentTrack* selectedTrack = document_.FindTrack(hit->track_id);
     if (selectedTrack && selectedTrack->locked) return;
+    if (linked_selection_enabled_) {
+        std::vector<Ulid> linked =
+            ExpandLinkedClipSelection(document_, selected_clip_ids_);
+        const bool lockedPartner =
+            hit->edge == TimelineHitEdge::None &&
+            std::any_of(linked.begin(), linked.end(), [&](const Ulid& id) {
+                const DocumentTrack* track = document_.FindTrackForClip(id);
+                return id != hit->clip_id && track && track->locked;
+            });
+        // A locked linked partner is a hard boundary, not a reason to make an
+        // otherwise editable anchor immovable. For this body-move gesture,
+        // temporarily detach the anchor from linked editing; the persistent
+        // link group itself is unchanged.
+        if (!lockedPartner) selected_clip_ids_ = std::move(linked);
+    }
     const DocumentClip* clip = document_.FindClip(hit->clip_id);
     drag_rate_ = clip ? clip->duration.rate : timeRate;
     drag_x_ = x;
@@ -490,7 +668,7 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
                 document_.FindTrack(preview.target_track_id);
             RationalTime unsnapped = preview.timeline_in;
             std::optional<RationalTime> snappedBoundary;
-            if (snapping_enabled_ && targetTrack) {
+            if ((snapping_enabled_ || playhead_snap_target_) && targetTrack) {
                 const auto startSnap =
                     FindSnapTime(unsnapped, *targetTrack, clip->id, true);
                 const RationalTime end = unsnapped.add(clip->duration);
@@ -616,7 +794,7 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
                                : clip->timeline_in.add(clip->duration);
     RationalTime candidateBoundary = originalBoundary.add(delta);
     std::optional<RationalTime> snappedBoundary;
-    if (snapping_enabled_ && track) {
+    if ((snapping_enabled_ || playhead_snap_target_) && track) {
         snappedBoundary = FindSnapTime(candidateBoundary, *track, clip->id);
         if (snappedBoundary) delta = snappedBoundary->sub(originalBoundary);
     }
@@ -817,6 +995,7 @@ std::optional<RationalTime> TimelineInteraction::FindSnapTime(
         }
     };
     consider({0, candidate.rate});
+    if (playhead_snap_target_) consider(*playhead_snap_target_);
     if (includeSyncTarget && !linked_selection_enabled_) {
         const DocumentClip* clip = document_.FindClip(excludedClipId);
         const DocumentClip* anchor =
@@ -992,6 +1171,11 @@ void TimelineInteraction::SetSnappingEnabled(bool enabled) {
 
 bool TimelineInteraction::SnappingEnabled() const { return snapping_enabled_; }
 
+void TimelineInteraction::SetPlayheadSnapTarget(
+    std::optional<RationalTime> target) {
+    playhead_snap_target_ = std::move(target);
+}
+
 const std::optional<RationalTime>& TimelineInteraction::SnapGuideTime() const {
     return snap_guide_time_;
 }
@@ -1102,8 +1286,9 @@ std::vector<TimelineClipRect> VisibleTimelineClips(
                 result.push_back(std::move(rect));
         }
     }
-    // Ghosts are deliberately last, matching NLE stacking conventions and
-    // keeping an overwrite destination readable above affected clips.
+    // Moving candidates are deliberately last, matching NLE stacking
+    // conventions and keeping the opaque overwrite result above affected
+    // clips.
     for (TimelineClipRect& rect : movingRects)
         result.push_back(std::move(rect));
     return result;
@@ -1203,6 +1388,28 @@ std::optional<DeleteGapOperation> TimelineRangeDeleteOperation(
     for (size_t index = 1; index < results.size(); ++index)
         operation.linked_track_ids.push_back(results[index].track_id);
     return operation;
+}
+
+std::optional<DeleteGapOperation> BuildTimelineRippleDeleteSelection(
+    const Document& document, const std::vector<Ulid>& clipIds) {
+    std::optional<RationalTime> rangeIn;
+    std::optional<RationalTime> rangeOut;
+    std::vector<Ulid> trackIds;
+    for (const Ulid& id : clipIds) {
+        const DocumentClip* clip = document.FindClip(id);
+        const DocumentTrack* track = document.FindTrackForClip(id);
+        if (!clip || !track) continue;
+        const RationalTime end = clip->timeline_in.add(clip->duration);
+        if (!rangeIn || clip->timeline_in < *rangeIn)
+            rangeIn = clip->timeline_in;
+        if (!rangeOut || end > *rangeOut) rangeOut = end;
+        if (std::find(trackIds.begin(), trackIds.end(), track->id) ==
+            trackIds.end())
+            trackIds.push_back(track->id);
+    }
+    if (!rangeIn || !rangeOut) return std::nullopt;
+    return TimelineRangeDeleteOperation(document, *rangeIn, *rangeOut, true,
+                                        trackIds);
 }
 
 std::optional<DeleteGapOperation> TimelineSourceEditOperation(

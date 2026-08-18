@@ -25,6 +25,16 @@
 #include <limits>
 #include <stdexcept>
 
+// Repeated J/L presses ramp shuttle playback through 1x, 2x and 4x. Pressing
+// the opposite direction starts that direction at 1x; K remains zero.
+inline int NextShuttleSpeed(int current, int direction) {
+    if (direction == 0) return 0;
+    const int sign = direction < 0 ? -1 : 1;
+    if ((current < 0 ? -1 : current > 0 ? 1 : 0) != sign) return sign;
+    const int magnitude = std::abs(current);
+    return sign * (magnitude < 2 ? 2 : 4);
+}
+
 struct ScrubBarRange {
     // The sequence's total duration. A scrub fraction of 0.0 is time zero;
     // 1.0 is `duration`.

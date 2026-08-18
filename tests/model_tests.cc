@@ -2,6 +2,7 @@
 #include "Document.h"
 #include "Timeline.h"
 #include "Ulid.h"
+#include "VideoScopes.h"
 
 #include <cmath>
 #include <cstdio>
@@ -121,6 +122,34 @@ int main() {
         Near(hlg.red, hlg.green, 2e-5,
              "neutral conversion remains neutral in Rec.2020");
         Near(hlg.green, hlg.blue, 2e-5, "neutral conversion has no blue cast");
+        const ColorManagementSettings preview =
+            ColorManagementForSdrPreview(sony);
+        Check(preview.enabled && preview.input_gamut == sony.input_gamut &&
+                  preview.input_transfer == sony.input_transfer &&
+                  preview.working_gamut == sony.working_gamut,
+              "SDR preview preserves the input and working transforms");
+        Check(preview.output_gamut == "rec709" &&
+                  preview.output_transfer == "rec709" &&
+                  sony.output_gamut == "rec2020" &&
+                  sony.output_transfer == "hlg",
+              "SDR preview overrides only its copy of the output transform");
+        ColorManagementSettings sdr = sony;
+        sdr.output_gamut = "rec709";
+        sdr.output_transfer = "rec709";
+        const RgbColor compressed =
+            MapLinearOutputToDisplay(sdr, {4.0, 1.0, -0.5});
+        Check(compressed.red < 1.0 && compressed.red > compressed.green &&
+                  compressed.green > compressed.blue && compressed.blue >= 0.0,
+              "display rendering compresses highlights and gamut without "
+              "independent channel clipping");
+        const RgbColor lower = MapLinearOutputToDisplay(sdr, {2.0, 0.8, -0.2});
+        Check(compressed.red > lower.red,
+              "display shoulder remains continuous instead of flattening "
+              "all highlights at code maximum");
+        const RgbColor hlgReference =
+            MapLinearOutputToDisplay(sony, {0.9, 0.9, 0.9});
+        Near(hlgReference.red, 0.9, 1e-12,
+             "HLG reference white remains unchanged before encoding");
         const YuvCodeParameters full = BuildYuvCodeParameters(10, true);
         const YuvCodeParameters legal = BuildYuvCodeParameters(10, false);
         Near(full.y_offset, 0.0, 1e-7, "full range starts at code zero");
@@ -134,6 +163,21 @@ int main() {
              "BT.709 uses normalized chroma coefficients once");
         Near(bt2020.red_from_cr, 1.4746, 1e-6,
              "BT.2020 NCL uses its own normalized matrix");
+    });
+
+    Test("video scope monitoring policy", [] {
+        Check(VideoScopeModeFromPreference(-1) == VideoScopeMode::Off &&
+                  VideoScopeModeFromPreference(4) == VideoScopeMode::Off,
+              "invalid stored scope values fall back to off");
+        Check(VideoScopeModeFromPreference(2) == VideoScopeMode::ParadeRgb,
+              "stored RGB parade preference round trips");
+        Check(VideoScopeHistogramBinCount(VideoScopeMode::Waveform) ==
+                      256u * 128u &&
+                  VideoScopeHistogramBinCount(VideoScopeMode::ParadeRgb) ==
+                      3u * 128u * 128u &&
+                  VideoScopeHistogramBinCount(VideoScopeMode::Vectorscope) ==
+                      256u * 256u,
+              "each scope owns the expected histogram layout");
     });
 
     Test("RationalTime arithmetic across rates", [] {

@@ -132,6 +132,28 @@ int main() {
               "locked track remains byte-for-byte timed as before");
     });
 
+    Test("selected clip ripple delete removes and closes in one operation", [] {
+        Document document = Fixture();
+        const std::string before = document.SaveToString();
+        const Ulid selected = document.sequence.tracks[0].clips[0].id;
+        const Ulid following = document.sequence.tracks[0].clips[1].id;
+        const auto operation =
+            BuildTimelineRippleDeleteSelection(document, {selected});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(operation &&
+                  log.Apply(document, Operation{*operation}, error, message),
+              "selected clip produces an applicable exact ripple edit");
+        Check(!document.FindClip(selected) &&
+                  document.FindClip(following)->timeline_in ==
+                      RationalTime{20, 10},
+              "selected duration is removed and the next clip closes it");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "selected ripple delete undoes byte-exactly");
+    });
+
     Test("range edits obey targeting and independent sync lock", [] {
         Document document = Fixture();
         DocumentTrack follower = document.sequence.tracks[0];
@@ -667,6 +689,58 @@ int main() {
               "one undo restores the pre-move document byte-exactly");
     });
 
+    Test("locked linked partner detaches only the current move gesture", [] {
+        Document document = Fixture();
+        document.sequence.tracks.push_back(
+            {"01KT0000000000000000000005", "audio", 1, {}});
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const Ulid videoId = document.sequence.tracks[0].clips[0].id;
+        Check(log.Apply(
+                  document,
+                  Operation{DetachAudioOperation{videoId,
+                                                 document.sequence.tracks[1].id,
+                                                 "01KT0000000000000000000006",
+                                                 {}}},
+                  error, message),
+              "locked-partner fixture detaches audio: " + message);
+        const Ulid audioId = document.sequence.tracks[1].clips[0].id;
+        document.sequence.tracks[0].locked = true;
+        const std::string beforeMove = document.SaveToString();
+        TimelineViewport viewport = Viewport();
+        TimelineInteraction interaction(document, log, viewport);
+        const double audioY =
+            kTimelineRulerHeight + viewport.track_height + 20.0;
+        interaction.PointerDown(200.0, audioY, 700.0, 10);
+        interaction.PointerDrag(250.0, audioY, 700.0);
+        const auto pending = interaction.PendingOperation();
+        Check(interaction.SelectedClipIds() == std::vector<Ulid>{audioId} &&
+                  interaction.MovePreview() &&
+                  interaction.MovePreview()->linked_moves.empty() &&
+                  interaction.MovePreview()->valid && pending &&
+                  std::holds_alternative<MoveClipOperation>(*pending),
+              "dragging unlocked audio skips its locked video partner");
+        Check(interaction.PointerUp(error, message),
+              "independent audio gesture applies: " + message);
+        Check(document.FindClip(videoId)->timeline_in == RationalTime{10, 10} &&
+                  document.FindClip(audioId)->timeline_in ==
+                      RationalTime{15, 10} &&
+                  !document.FindClip(audioId)->link_group_id.empty(),
+              "gesture moves only audio without destroying the persistent "
+              "link");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == beforeMove,
+              "independent locked-partner move undoes byte-exactly");
+
+        TimelineInteraction lockedAnchor(document, log, viewport);
+        const double videoY = kTimelineRulerHeight + 20.0;
+        lockedAnchor.PointerDown(200.0, videoY, 700.0, 10);
+        lockedAnchor.PointerDrag(250.0, videoY, 700.0);
+        Check(!lockedAnchor.HasActiveDrag() && !lockedAnchor.PendingOperation(),
+              "a clip on the locked track itself remains immovable");
+    });
+
     Test("linked cross-track move maps V1/A1 to V2/A2", [] {
         Document document = Fixture();
         document.sequence.tracks.push_back(
@@ -922,6 +996,67 @@ int main() {
              Check(viewport.TimeToX({200, 10}) <= 1000.0,
                    "fit keeps the timeline end visible");
          });
+
+    Test("timeline navigation never exposes negative time", [] {
+        TimelineViewport viewport = Viewport();
+        viewport.ScrollByPixels(-1000.0, 1000);
+        Check(viewport.view_start == RationalTime{0, 1000},
+              "trackpad pan clamps the visible start to zero");
+        viewport.ZoomAroundX(425.0, 0.5, 1000);
+        Check(viewport.view_start == RationalTime{0, 1000},
+              "zooming out near the origin cannot reveal negative time");
+    });
+
+    Test("mouse wheel and trackpad resolve to distinct navigation intents", [] {
+        const TimelineScrollIntent wheel =
+            ResolveTimelineScrollIntent(0.0, 1.0, false, false);
+        Check(wheel.action == TimelineScrollAction::Zoom && wheel.delta == 1.0,
+              "a discrete wheel zooms without a modifier");
+        const TimelineScrollIntent shifted =
+            ResolveTimelineScrollIntent(0.0, -1.0, false, true);
+        Check(shifted.action == TimelineScrollAction::Pan &&
+                  shifted.delta == -32.0,
+              "Shift plus wheel pans by a useful logical-point step");
+        const TimelineScrollIntent trackpad =
+            ResolveTimelineScrollIntent(7.5, 0.0, true, false);
+        Check(trackpad.action == TimelineScrollAction::Pan &&
+                  trackpad.delta == 7.5,
+              "precise two-finger deltas pan without changing scale");
+    });
+
+    Test("zoom scroll bar geometry and drags follow the viewport", [] {
+        TimelineViewport viewport = Viewport();
+        viewport.view_start = {50, 10};
+        const RationalTime duration{200, 10};
+        const double width = 1050.0;
+        const TimelineZoomBarGeometry geometry =
+            CalculateTimelineZoomBarGeometry(viewport, duration, width);
+        Check(std::abs(geometry.thumb_x - 300.0) < 0.001 &&
+                  std::abs(geometry.thumb_width - 500.0) < 0.001,
+              "thumb position and width represent the visible time range");
+        Check(geometry.HitTest(302.0) == TimelineZoomBarPart::LeftHandle &&
+                  geometry.HitTest(550.0) == TimelineZoomBarPart::Body &&
+                  geometry.HitTest(798.0) == TimelineZoomBarPart::RightHandle,
+              "the rendered thumb exposes two handles and a draggable body");
+
+        TimelineZoomBarDrag body{TimelineZoomBarPart::Body, 550.0, viewport,
+                                 geometry};
+        UpdateTimelineZoomBarDrag(viewport, body, 650.0, duration, width, 10);
+        Check(viewport.view_start == RationalTime{70, 10} &&
+                  std::abs(viewport.pixels_per_second - 100.0) < 0.001,
+              "dragging the thumb pans without changing zoom");
+
+        TimelineViewport zoomed = body.initial_viewport;
+        TimelineZoomBarDrag right{TimelineZoomBarPart::RightHandle, 800.0,
+                                  zoomed, geometry};
+        UpdateTimelineZoomBarDrag(zoomed, right, 900.0, duration, width, 10);
+        Check(zoomed.pixels_per_second < 100.0,
+              "dragging the right handle outward zooms out");
+        UpdateTimelineZoomBarDrag(zoomed, right, 2000.0, duration, width, 10);
+        Check(zoomed.view_start == RationalTime{0, 10} &&
+                  zoomed.TimeToX(duration) <= width,
+              "expanding the thumb fully fits the timeline");
+    });
 
     Test("simulated trim emits the canonical operation and undo restores hash",
          [] {
@@ -1259,6 +1394,12 @@ int main() {
                                              {}},
                         error, message),
               "linked cut fixture detaches audio: " + message);
+        Check(log.Apply(document,
+                        SetClipEffectsOperation{
+                            videoId,
+                            {{{}, "color.exposure", {{"amount", {35, 100}}}}}},
+                        error, message),
+              "linked cut fixture grades video: " + message);
         const Ulid audioId = document.sequence.tracks[1].clips[0].id;
         const std::string beforeCut = document.SaveToString();
         Operation cut = TimelineCutOperationForClip(
@@ -1273,6 +1414,15 @@ int main() {
               "linked cut creates one stable right ID per A/V member");
         const Ulid rightVideoId = applied.right_clip_ids[0];
         const Ulid rightAudioId = applied.right_clip_ids[1];
+        const DocumentClip* leftVideo = document.FindClip(videoId);
+        const DocumentClip* rightVideo = document.FindClip(rightVideoId);
+        Check(leftVideo && rightVideo && leftVideo->effects.size() == 1 &&
+                  rightVideo->effects.size() == 1 &&
+                  rightVideo->effects[0].type == "color.exposure" &&
+                  rightVideo->effects[0].params.at("amount").num == 35 &&
+                  rightVideo->effects[0].params.at("amount").den == 100 &&
+                  rightVideo->effects[0].id != leftVideo->effects[0].id,
+              "linked cut preserves grading with an independent effect ID");
         const std::vector<Ulid> leftSelection =
             ExpandLinkedClipSelection(document, {videoId});
         const std::vector<Ulid> rightSelection =
@@ -1371,6 +1521,36 @@ int main() {
         Check(document.sequence.tracks[0].clips[0].duration ==
                   RationalTime{30, 10},
               "document receives the snapped duration");
+    });
+
+    Test("playhead edit navigation and temporary snapping are exact", [] {
+        Document document = Fixture();
+        TimelineViewport viewport = Viewport();
+        viewport.pixels_per_second = 50.0;
+        const std::vector<RationalTime> points = TimelineEditPoints(document);
+        Check(points == std::vector<RationalTime>(
+                            {{0, 10}, {10, 10}, {30, 10}, {40, 10}, {50, 10}}),
+              "edit points are sorted and deduplicated across boundaries");
+        Check(AdjacentTimelineEdit(document, {35, 10}, false) ==
+                      RationalTime{30, 10} &&
+                  AdjacentTimelineEdit(document, {35, 10}, true) ==
+                      RationalTime{40, 10},
+              "up/down navigation chooses the strict previous/next cut");
+        Check(SnapTimelineTimeToEdit(document, viewport, {393, 100}) ==
+                  RationalTime{40, 10},
+              "command scrub snaps the playhead inside the pixel threshold");
+
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        interaction.SetSnappingEnabled(false);
+        interaction.SetPlayheadSnapTarget(RationalTime{35, 10});
+        const double trackY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(200.0, trackY, 700.0, 10);
+        interaction.PointerDrag(223.0, trackY, 700.0);
+        Check(interaction.TrimPreview() && interaction.SnapGuideTime() &&
+                  *interaction.SnapGuideTime() == RationalTime{35, 10},
+              "holding Command snaps an edit to the playhead even when global "
+              "magnetism is off");
     });
 
     Test("tail trim cannot pass the source media end", [] {

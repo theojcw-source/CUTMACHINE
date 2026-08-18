@@ -16,6 +16,17 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+Le test natif `cutmachine_ui_smoke_tests` ouvre l’éditeur sur un projet
+jetable et vérifie les vrais contrôles AppKit/Metal : affichage/masquage du
+moniteur Source, glissières de l’Inspecteur, montage Insérer/Écraser et dépôt
+d’un média dans la timeline. Il couvre aussi le clic de playhead, le déplacement
+d’un clip et la navette J/K/L à vitesses 1×, 2× et 4×. Il s’exécute dans une session macOS graphique,
+sans autorisation Accessibilité :
+
+```sh
+ctest --test-dir build -R cutmachine_ui_smoke_tests --output-on-failure
+```
+
 ## Lancement
 
 La compilation produit une application macOS dans `build/CUTMACHINE.app`.
@@ -32,6 +43,21 @@ sans argument :
 ```sh
 ./build/cutmachine
 ```
+
+### Boucle de développement
+
+Le script de développement fournit une boucle proche de `npm run dev` pour
+l’application native : chaque modification des sources déclenche une
+compilation incrémentale, ferme proprement l’ancienne instance, puis ouvre le
+nouveau bundle. Il n’a besoin ni de Homebrew ni de `fswatch`.
+
+```sh
+./scripts/dev.sh
+```
+
+Il ne s’agit pas d’un hot reload dans le processus : AppKit et les shaders
+Metal sont reconstruits, puis l’application redémarre. Le projet récent peut
+ensuite être rouvert depuis l’écran d’accueil.
 
 Une page d’accueil permet de créer un projet, d’ouvrir un fichier existant ou
 de reprendre l’un des huit projets récents. La création demande le nom et
@@ -151,8 +177,11 @@ deux côtés deviennent deux nouvelles paires A/V indépendantes. La sélection 
 scrubber en continu dans les trous et la règle. `Espace` lance ou arrête la lecture ;
 maintenu pendant un drag, il devient temporairement l'outil Main. `J`, `K` et
 `L` contrôlent la lecture arrière, l'arrêt et la lecture avant. `F` cadre toute
-la timeline, `+`/`-` zooment, Home/End rejoignent les extrémités et les flèches
-gauche/droite avancent d'une frame (`Shift` : dix frames).
+la timeline, `+`/`-` zooment, Home/End rejoignent les extrémités, les flèches
+gauche/droite avancent d'une frame (`Shift` : dix frames), et haut/bas vont au
+raccord précédent/suivant. Maintenir `Cmd` pendant le scrub aimante la playhead
+au raccord le plus proche ; pendant un move ou un trim, `Cmd` ajoute aussi la
+playhead aux cibles de magnétisme.
 La ligne `+` sous les en-têtes est divisée en deux : bleu pour ajouter une
 piste vidéo, vert pour ajouter une piste audio. `Cmd+Shift+T` ajoute une piste
 vidéo et `Cmd+Option+Shift+T` une piste audio. La création est atomique et
@@ -184,10 +213,10 @@ immédiatement. Le plein écran est affecté à `P` par défaut et reste
 réassignable dans cette même fenêtre.
 
 Le cadenas dans chaque en-tête verrouille la piste via une opération persistée
-et annulable. Une piste verrouillée reste rendue et lisible, mais toute mutation
-qui la cible est refusée atomiquement. Le séparateur vertical du chutier ajuste
-sa largeur ; la frontière entre moniteur et timeline se glisse verticalement
-pour adapter l’espace de montage.
+et annulable. Une piste verrouillée reste rendue et lisible sous des hachures,
+mais toute mutation qui la cible est refusée atomiquement. Le séparateur
+vertical du chutier ajuste sa largeur ; la frontière entre moniteur et timeline
+se glisse verticalement pour adapter l’espace de montage.
 
 ## Audio
 
@@ -197,7 +226,9 @@ mixte en temps réel uniquement les clips placés sur des pistes audio. Un clip
 vidéo est toujours muet : aucun fallback de lecture ou d'export ne récupère
 son audio. Le callback audio lit un plan immuable construit depuis la
 timeline et ne touche jamais directement au document éditable. `Espace` et
-`J/K/L` pilotent simultanément image et son ; un seek, un trim, un move, une
+`J/K/L` pilotent simultanément image et son, y compris la navette accélérée
+avant/arrière à 2× et 4× (échantillonnage accéléré, sans correction de pitch) ;
+un seek, un trim, un move, une
 fermeture de trou ou un undo reconstruit le plan de mixage au raccord exact.
 Les échantillons additionnés sont limités dans `[-1, 1]` pour éviter un
 dépassement numérique lors du mixage multipiste.
@@ -464,10 +495,11 @@ peuvent aussi suivre automatiquement les métadonnées FFmpeg de chaque frame.
 Chaque frame YUV planaire 8 à 16 bits est d'abord normalisée selon sa profondeur
 et sa plage, puis l'IDT l'amène en ACES AP1. Le point de grading est encodé en
 ACEScct ; la composition des pistes se fait ensuite en AP1 linéaire dans
-une texture flottante 16 bits. Une seconde passe produit le signal HLG dans une
-cible XR 10 bits. La couche Core Animation est annoncée en BT.2100 HLG avec ses
-métadonnées EDR. Le blanc de l'interface est limité au blanc HDR de référence
-(signal HLG 0,75), afin que la timeline reste à un niveau SDR confortable.
+une texture flottante 16 bits. L'export conserve la transformation de sortie du
+projet, notamment Rec.2020/HLG. Les moniteurs de montage en dérivent une vue
+locale Rec.709/SDR afin que macOS ne présente pas le master HLG comme une couche
+EDR au milieu de l'interface. Cette préférence d'affichage ne modifie ni le
+document ni le rendu exporté.
 
 `--apply-op`
 réutilise le format canonique de `SerializeOperation`, remplace le document de

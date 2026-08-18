@@ -20,6 +20,9 @@ Media Pool de Resolve, adaptées au modèle journalisé de CUTMACHINE.
   `SetProjectBinMetadataOperation`. Le classement d’une timeline émet
   `SetProjectTimelineBinOperation`. Ces mutations partagées passent par le
   `ProjectEditLog`, sont sérialisables et s’annulent sans perte d’identité.
+- Le nom sous une icône ou dans la colonne Nom est éditable. Une timeline ou
+  un rush émet `RenameProjectItemOperation`; le nom d’affichage du rush reste
+  distinct du nom de fichier utilisé pour le relink.
 - `Cmd+Z`/`Cmd+Shift+Z` annulent et rejouent toutes ces mutations.
 - Le clic droit sur un chutier permet de créer un enfant, le renommer ou le
   supprimer. `RenameBinOperation` rend le renommage sérialisable et annulable.

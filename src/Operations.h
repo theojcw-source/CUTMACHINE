@@ -109,6 +109,13 @@ struct ClearClipOperation {
     std::vector<ExactTrackState> exact_track_result;
 };
 
+// One non-ripple delete gesture over an arbitrary selection is one atomic
+// event. Unlike ClearLinkedClips, members need not share an A/V link group.
+struct ClearClipsOperation {
+    std::vector<Ulid> clip_ids;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 struct MoveClipOperation {
     Ulid clip_id;
     Ulid track_id;
@@ -211,6 +218,9 @@ struct AddTrackOperation {
     std::vector<DocumentClip> clips;
     bool locked = false;
     bool sync_lock = true;
+    bool visible = true;
+    bool muted = false;
+    bool solo = false;
 };
 
 struct UpdateSequenceOperation {
@@ -233,6 +243,13 @@ struct SetTrackLockOperation {
 struct SetTrackSyncLockOperation {
     Ulid track_id;
     bool sync_lock = true;
+};
+
+struct SetTrackOutputOperation {
+    Ulid track_id;
+    bool visible = true;
+    bool muted = false;
+    bool solo = false;
 };
 
 struct AddBinOperation {
@@ -458,21 +475,22 @@ struct RemoveWordsOperation {
 
 using Operation = std::variant<
     InsertClipOperation, RemoveClipOperation, ClearClipOperation,
-    PasteClipsOperation, TrimClipOperation, MoveClipOperation,
-    DeleteGapOperation, DetachAudioOperation, MoveLinkedClipsOperation,
-    TrimLinkedClipsOperation, RippleTrimOperation, RollEditOperation,
-    SlipEditOperation, RemoveLinkedClipsOperation, ClearLinkedClipsOperation,
-    AddTrackOperation, RemoveTrackOperation, SetTrackLockOperation,
-    SetTrackSyncLockOperation, UpdateSequenceOperation, SplitClipOperation,
-    SplitLinkedClipsOperation, JoinClipOperation, AddBinOperation,
-    RemoveBinOperation, RenameBinOperation, MoveBinOperation,
-    SetMediaBinOperation, AddMarkerOperation, RemoveMarkerOperation,
-    UpdateMarkerOperation, AddTransitionOperation, RemoveTransitionOperation,
-    UpdateTransitionOperation, SetClipLinkOperation, SetClipEffectsOperation,
-    AddCaptionStyleOperation, RemoveCaptionStyleOperation,
-    SetClipCaptionOperation, AddMulticamGroupOperation,
-    RemoveMulticamGroupOperation, SetMulticamActiveAngleOperation,
-    RemoveWordsOperation, SplitClipAtPositionsOperation>;
+    ClearClipsOperation, PasteClipsOperation, TrimClipOperation,
+    MoveClipOperation, DeleteGapOperation, DetachAudioOperation,
+    MoveLinkedClipsOperation, TrimLinkedClipsOperation, RippleTrimOperation,
+    RollEditOperation, SlipEditOperation, RemoveLinkedClipsOperation,
+    ClearLinkedClipsOperation, AddTrackOperation, RemoveTrackOperation,
+    SetTrackLockOperation, SetTrackSyncLockOperation, SetTrackOutputOperation,
+    UpdateSequenceOperation, SplitClipOperation, SplitLinkedClipsOperation,
+    JoinClipOperation, AddBinOperation, RemoveBinOperation, RenameBinOperation,
+    MoveBinOperation, SetMediaBinOperation, AddMarkerOperation,
+    RemoveMarkerOperation, UpdateMarkerOperation, AddTransitionOperation,
+    RemoveTransitionOperation, UpdateTransitionOperation, SetClipLinkOperation,
+    SetClipEffectsOperation, AddCaptionStyleOperation,
+    RemoveCaptionStyleOperation, SetClipCaptionOperation,
+    AddMulticamGroupOperation, RemoveMulticamGroupOperation,
+    SetMulticamActiveAngleOperation, RemoveWordsOperation,
+    SplitClipAtPositionsOperation>;
 
 // Turns a repeat spacing into the exact positions to cut `clipId` at:
 // interval, 2*interval, ... for as long as they stay strictly inside the
@@ -523,6 +541,12 @@ struct SetProjectTimelineBinOperation {
     std::optional<ExactProjectState> exact_project_result;
 };
 
+struct RenameProjectItemOperation {
+    Ulid item_id;
+    std::string name;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
 struct ProjectRelinkItem {
     Ulid media_id;
     LibraryMedia replacement;
@@ -537,7 +561,7 @@ struct RelinkProjectMediaOperation {
 using ProjectOperation =
     std::variant<AddProjectTimelineOperation, RemoveProjectTimelineOperation,
                  SetProjectBinMetadataOperation, SetProjectTimelineBinOperation,
-                 RelinkProjectMediaOperation>;
+                 RenameProjectItemOperation, RelinkProjectMediaOperation>;
 
 // On success, operation is enriched with generated IDs and exact redo state.
 // Both document and operation remain unchanged on failure.

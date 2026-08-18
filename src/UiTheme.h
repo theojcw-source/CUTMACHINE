@@ -5,13 +5,9 @@
 // here is a named constant or a pure function of one, so it is directly
 // unit-testable (see tests/ui_theme_tests.cc) without a macOS toolchain.
 //
-// The color values are not invented: they are read out of the one place
-// this project already committed to a visual language, the Metal-drawn
-// timeline built in -[AppDelegate timelineRenderData] (src/main.mm). That
-// function still owns the timeline's one-off glyph geometry, but its
-// *palette* -- surfaces, borders, text, accents -- now comes from here, so
-// the timeline and every AppKit panel built on top of UiComponents.h read
-// the same numbers instead of two palettes that quietly drift apart.
+// The named values are the C++ delivery from the 2026-08 ATELIER design
+// pass. Keeping them here makes the AppKit chrome and Metal display lists
+// projections of one palette instead of independent approximations.
 //
 // Cocoa-facing code converts these into NSColor/NSFont through
 // UiThemeAppKit.h rather than re-deriving literals.
@@ -25,41 +21,53 @@ struct Color {
     float a = 1.0f;
 };
 
-// ---- Surfaces (dark, low-key desaturated grays, darkest to lightest) ----
-inline constexpr Color kSurfaceBase{0.055f, 0.055f, 0.058f, 1.0f};
-inline constexpr Color kSurfacePanel{0.075f, 0.075f, 0.078f, 1.0f};
-inline constexpr Color kSurfaceRaised{0.095f, 0.098f, 0.102f, 1.0f};
-inline constexpr Color kSurfaceRowEven{0.070f, 0.072f, 0.076f, 1.0f};
-inline constexpr Color kSurfaceRowOdd{0.078f, 0.080f, 0.084f, 1.0f};
-inline constexpr Color kSurfaceControl{0.130f, 0.135f, 0.140f, 1.0f};
-inline constexpr Color kSurfaceControlActive{0.160f, 0.340f, 0.460f, 1.0f};
+// ---- Surfaces (dark, cool industrial grays, darkest to lightest) ----
+inline constexpr Color kSurfaceBase{0.047f, 0.051f, 0.055f, 1.0f};
+inline constexpr Color kSurfacePanel{0.082f, 0.094f, 0.106f, 1.0f};
+inline constexpr Color kSurfaceRaised{0.114f, 0.125f, 0.137f, 1.0f};
+inline constexpr Color kSurfaceControl{0.149f, 0.161f, 0.176f, 1.0f};
+inline constexpr Color kSurfaceControlHi{0.243f, 0.263f, 0.282f, 1.0f};
+inline constexpr Color kSurfaceSunken{0.031f, 0.035f, 0.035f, 1.0f};
+inline constexpr Color kSurfaceLane{0.039f, 0.043f, 0.047f, 1.0f};
 
-// ---- Borders ----
-inline constexpr Color kBorderSubtle{0.130f, 0.132f, 0.135f, 1.0f};
-inline constexpr Color kBorderStrong{0.260f, 0.260f, 0.280f, 1.0f};
+// Alternating rows remain named because NSTableView consumes them directly.
+// Their two-percent separation is deliberately quieter than a border.
+inline constexpr Color kSurfaceRowEven = kSurfacePanel;
+inline constexpr Color kSurfaceRowOdd{0.086f, 0.098f, 0.110f, 1.0f};
+inline constexpr Color kSurfaceControlActive = kSurfaceControlHi;
+
+// ---- Separation and relief ----
+inline constexpr Color kSeparator{0.000f, 0.000f, 0.000f, 1.0f};
+inline constexpr Color kBorderSubtle{0.133f, 0.149f, 0.165f, 1.0f};
+inline constexpr Color kBorderStrong{0.200f, 0.216f, 0.231f, 1.0f};
+inline constexpr Color kEdgeLight{0.290f, 0.310f, 0.329f, 1.0f};
+inline constexpr Color kLaneGrid{0.078f, 0.094f, 0.106f, 1.0f};
 
 // ---- Text ----
-inline constexpr Color kTextPrimary{0.900f, 0.900f, 0.920f, 1.0f};
-inline constexpr Color kTextSecondary{0.600f, 0.610f, 0.630f, 1.0f};
-inline constexpr Color kTextTertiary{0.420f, 0.430f, 0.450f, 1.0f};
+inline constexpr Color kTextPrimary{0.910f, 0.894f, 0.863f, 1.0f};
+inline constexpr Color kTextSecondary{0.557f, 0.580f, 0.561f, 1.0f};
+inline constexpr Color kTextTertiary{0.486f, 0.514f, 0.533f, 1.0f};
+inline constexpr Color kTextOnAccent{0.047f, 0.051f, 0.055f, 1.0f};
+inline constexpr Color kTextClip{0.957f, 0.945f, 0.918f, 1.0f};
 
-// ---- Accents ----
-// Same numbers as the timeline's in/out markers, snap guide and selection
-// highlight, so a panel's "selected" or "recording" state reads as the same
-// color the timeline already uses for the same meaning.
-inline constexpr Color kAccentBlue{0.240f, 0.820f, 1.000f,
-                                   1.0f};  // focus / snap / active tab
-inline constexpr Color kAccentGreen{0.200f, 0.880f, 0.520f,
-                                    1.0f};  // in-point / positive
-inline constexpr Color kAccentOrange{1.000f, 0.420f, 0.240f,
-                                     1.0f};  // out-point
-inline constexpr Color kAccentAmber{0.950f, 0.780f, 0.180f,
-                                    1.0f};  // valid selection
-inline constexpr Color kAccentRed{0.860f, 0.160f, 0.120f,
-                                  1.0f};  // moving / error
+// ---- One interaction accent ----
+inline constexpr Color kAccent{1.000f, 0.353f, 0.122f, 1.0f};
+inline constexpr Color kAccentHi{1.000f, 0.580f, 0.400f, 1.0f};
+inline constexpr Color kAccentLo{0.902f, 0.290f, 0.071f, 1.0f};
 
-inline constexpr Color kVideoTrackTint{0.120f, 0.430f, 0.670f, 1.0f};
-inline constexpr Color kAudioTrackTint{0.130f, 0.480f, 0.280f, 1.0f};
+// ---- Semantic colors (information, never generic interaction chrome) ----
+inline constexpr Color kMarkIn{0.545f, 0.831f, 0.314f, 1.0f};
+inline constexpr Color kMarkOut = kTextPrimary;
+inline constexpr Color kRenderCached{0.180f, 0.431f, 0.322f, 1.0f};
+inline constexpr Color kRenderStale{0.541f, 0.353f, 0.133f, 1.0f};
+inline constexpr Color kError{0.769f, 0.212f, 0.165f, 1.0f};
+
+// ---- Track families ----
+inline constexpr Color kTrackVideo{0.200f, 0.220f, 0.239f, 1.0f};
+inline constexpr Color kTrackVideoAlt{0.180f, 0.198f, 0.216f, 1.0f};
+inline constexpr Color kTrackAudio{0.235f, 0.373f, 0.271f, 1.0f};
+inline constexpr Color kTrackAudioAlt{0.200f, 0.310f, 0.259f, 1.0f};
+inline constexpr Color kTrackMusic{0.243f, 0.251f, 0.220f, 1.0f};
 
 // ---- Spacing scale (points) ----
 inline constexpr double kSpaceXxs = 2.0;
@@ -76,12 +84,21 @@ inline constexpr double kFontSizeSmall = 11.0;
 inline constexpr double kFontSizeBody = 12.0;
 inline constexpr double kFontSizeSection = 13.0;
 inline constexpr double kFontSizeTitle = 15.0;
+inline constexpr double kFontSizeMonitorTimecode = 32.0;
 
 // ---- Fixed component metrics ----
 inline constexpr double kPanelHeaderHeight = 28.0;
 inline constexpr double kControlRowHeight = 24.0;
 inline constexpr double kTabStripHeight = 26.0;
 inline constexpr double kCornerRadius = 4.0;
+inline constexpr double kTimelineToolbarHeight = 26.0;
+inline constexpr double kTimelineRulerHeight = 28.0;
+inline constexpr double kTimelineRenderBandHeight = 5.0;
+inline constexpr double kTimelineTrackHeight = 44.0;
+inline constexpr double kTimelineTrackHeaderWidth = 96.0;
+inline constexpr double kTimelineZoomBarHeight = 14.0;
+inline constexpr double kTimelinePlayheadWidth = 1.0;
+inline constexpr double kTimelineClipNameMinWidth = 40.0;
 
 // Returns `color` with its alpha replaced by `alpha`; RGB unchanged.
 constexpr Color WithAlpha(Color color, float alpha) {
@@ -92,7 +109,7 @@ constexpr Color WithAlpha(Color color, float alpha) {
 // the ternary that used to be repeated at every one of its call sites in
 // -[AppDelegate timelineRenderData].
 constexpr Color TrackTint(bool isVideoTrack) {
-    return isVideoTrack ? kVideoTrackTint : kAudioTrackTint;
+    return isVideoTrack ? kTrackVideo : kTrackAudio;
 }
 
 // Linear interpolation between two colors, componentwise. `t` is not

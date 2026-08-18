@@ -507,10 +507,13 @@ bool VerifyPortableProject(const std::string& projectPath,
     for (const LibraryMedia& media : loaded.rushes) {
         uint64_t expectedBytes = 0;
         std::string expectedSha;
-        if (!ExtractManifestValue(json, media.id, expectedBytes, expectedSha)) {
-            report.modified_media.push_back(media.filename);
+        // A regular project package deliberately leaves externally referenced
+        // rushes out of the collection manifest. Only media copied by
+        // CollectPortableProject has a fingerprint to verify; treating every
+        // external rush as tampered makes all non-collected projects report a
+        // false integrity failure on their second launch.
+        if (!ExtractManifestValue(json, media.id, expectedBytes, expectedSha))
             continue;
-        }
         const fs::path path = project.parent_path() / media.path;
         std::error_code sizeError;
         const uint64_t actualBytes = fs::file_size(path, sizeError);

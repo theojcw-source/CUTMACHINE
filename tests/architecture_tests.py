@@ -195,6 +195,7 @@ def main() -> int:
     gui_non_model_tokens = {
         "ApplyOperation",
         "GapDeleteOperation",
+        "NSCollectionViewDropOperation",
         "NSDragOperation",
         "ProjectOperation",
         "RedoProjectOperation",

@@ -36,8 +36,22 @@ double DecodeHlg(double signal);
 // Reference White at signal 0.75.
 double HlgSceneReflectionScale();
 
+// Display rendering stage applied after AP1 has been converted into the
+// output primaries. It provides a luminance shoulder and hue-preserving gamut
+// compression before the transfer function is encoded. This is deliberately
+// not named an ACES Output Transform: CUTMACHINE does not yet ship the full
+// ACES 2.0 JMh transform or an OCIO processor.
+RgbColor MapLinearOutputToDisplay(const ColorManagementSettings& settings,
+                                  RgbColor linearOutput);
+
 // CPU reference for the Metal shader's scene-linear color path. Offline
 // export uses this to build a high-precision 3D LUT, while tests use it as the
 // parity oracle for known S-Log3/HLG values.
 RgbColor TransformColorForOutput(const ColorManagementSettings& settings,
                                  RgbColor signal);
+
+// The project output remains authoritative for export. On-screen editing
+// monitors use a display-referred Rec.709 view so an HDR delivery transform
+// cannot be interpreted as EDR by the desktop compositor a second time.
+ColorManagementSettings ColorManagementForSdrPreview(
+    const ColorManagementSettings& settings);

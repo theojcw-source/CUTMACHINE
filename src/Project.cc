@@ -122,6 +122,10 @@ bool Project::Validate(std::string& error) const {
             error = "project bin rating must be between 0 and 5";
             return false;
         }
+        if (entry.second.display_name.size() > 128) {
+            error = "project bin display name exceeds 128 bytes";
+            return false;
+        }
         if (entry.second.insert_order >
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
             error = "project bin insertion order is outside int64_t range";

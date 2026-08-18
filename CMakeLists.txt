@@ -58,6 +58,44 @@ endif()
 set(SHADER_RUNTIME_PATH "${CMAKE_CURRENT_BINARY_DIR}/shader.metal")
 configure_file(src/shader.metal "${SHADER_RUNTIME_PATH}" COPYONLY)
 
+# UI-2026-08 -- Lucide stays a build-time input. `sips` is part of macOS and
+# rasterizes each SVG to a high-resolution RGBA mask; Renderer.mm packs these
+# PNG alphas beside the CoreText glyphs in one R8 atlas. No SVG parser ships in
+# the application and the generated files remain build artifacts.
+find_program(SIPS_EXECUTABLE NAMES sips REQUIRED)
+set(CUTMACHINE_ICON_NAMES
+    chevrons-right-left
+    eye
+    hand
+    headphones
+    link
+    lock
+    magnet
+    mouse-pointer-2
+    scissors
+    search
+    unfold-horizontal
+    volume-x
+)
+set(CUTMACHINE_ICON_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/ui-icons")
+set(CUTMACHINE_ICON_PNGS)
+foreach(_icon IN LISTS CUTMACHINE_ICON_NAMES)
+    set(_source "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/${_icon}.svg")
+    set(_output "${CUTMACHINE_ICON_OUTPUT_DIR}/${_icon}.png")
+    add_custom_command(
+        OUTPUT "${_output}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${CUTMACHINE_ICON_OUTPUT_DIR}"
+        COMMAND "${SIPS_EXECUTABLE}" -s format png -z 48 48 "${_source}"
+                --out "${_output}"
+        DEPENDS "${_source}"
+        COMMENT "Rasterizing Lucide icon ${_icon} @2x"
+        VERBATIM
+    )
+    list(APPEND CUTMACHINE_ICON_PNGS "${_output}")
+endforeach()
+add_custom_target(cutmachine_ui_icons DEPENDS ${CUTMACHINE_ICON_PNGS})
+
 add_library(cutmachine_model
     src/BeatDetection.cc
     src/ChatLlmClient.cc
@@ -90,6 +128,7 @@ add_library(cutmachine_model
     src/TimelineView.cc
     src/Transcription.cc
     src/Ulid.cc
+    src/VideoScopes.cc
     src/Waveform.cc
 )
 target_include_directories(cutmachine_model PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -103,6 +142,7 @@ set(CUTMACHINE_APP_SOURCES
     src/PerformanceMetrics.cc
     src/MediaSource.mm
     src/Renderer.mm
+    src/MetalUiAtlas.mm
     # F2.1 -- design system (ROADMAP.md). UiTheme.h/PanelLayout.h are plain
     # C++ (see tests/ui_theme_tests.cc, tests/panel_layout_tests.cc) and
     # need no .cc of their own; everything below is AppKit/Foundation-only.
@@ -110,11 +150,6 @@ set(CUTMACHINE_APP_SOURCES
     src/UiPreferences.mm
     src/UiComponents.mm
     src/PanelHostView.mm
-    # F2.5 -- playback transport (ROADMAP.md). TransportBar.h and Timecode.h
-    # are plain C++ (see tests/transport_bar_tests.cc,
-    # tests/timecode_tests.cc); TransportView.mm is AppKit-only chrome built
-    # on top of them.
-    src/TransportView.mm
     # F2.2 -- Inspector (ROADMAP.md). InspectorGradeControls.h is plain
     # C++ (see tests/inspector_grade_controls_tests.cc) and needs no .cc of
     # its own; InspectorView.mm is AppKit-only, same as the rest of this
@@ -128,6 +163,7 @@ set(CUTMACHINE_APP_SOURCES
 )
 
 add_executable(cutmachine ${CUTMACHINE_APP_SOURCES})
+add_dependencies(cutmachine cutmachine_ui_icons)
 target_include_directories(cutmachine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(cutmachine PRIVATE cutmachine_model)
 target_compile_options(cutmachine PRIVATE
@@ -135,6 +171,7 @@ target_compile_options(cutmachine PRIVATE
 )
 target_compile_definitions(cutmachine PRIVATE
     CUTMACHINE_SHADER_PATH="${SHADER_RUNTIME_PATH}"
+    CUTMACHINE_ICON_DIR="${CUTMACHINE_ICON_OUTPUT_DIR}"
 )
 target_link_libraries(cutmachine PRIVATE
     PkgConfig::FFMPEG
@@ -151,10 +188,19 @@ target_link_libraries(cutmachine PRIVATE
 add_executable(cutmachine_app MACOSX_BUNDLE
     ${CUTMACHINE_APP_SOURCES}
     src/shader.metal
+    ${CUTMACHINE_ICON_PNGS}
+    assets/icons/LICENSE
 )
 set_source_files_properties(src/shader.metal PROPERTIES
     MACOSX_PACKAGE_LOCATION Resources
 )
+set_source_files_properties(${CUTMACHINE_ICON_PNGS} PROPERTIES
+    MACOSX_PACKAGE_LOCATION Resources/icons
+)
+set_source_files_properties(assets/icons/LICENSE PROPERTIES
+    MACOSX_PACKAGE_LOCATION Resources/icons
+)
+add_dependencies(cutmachine_app cutmachine_ui_icons)
 set_target_properties(cutmachine_app PROPERTIES
     OUTPUT_NAME CUTMACHINE
     MACOSX_BUNDLE_BUNDLE_NAME CUTMACHINE
@@ -170,6 +216,7 @@ target_compile_options(cutmachine_app PRIVATE
 )
 target_compile_definitions(cutmachine_app PRIVATE
     CUTMACHINE_SHADER_PATH="${SHADER_RUNTIME_PATH}"
+    CUTMACHINE_ICON_DIR="${CUTMACHINE_ICON_OUTPUT_DIR}"
 )
 target_link_libraries(cutmachine_app PRIVATE
     PkgConfig::FFMPEG
@@ -411,6 +458,35 @@ if(BUILD_TESTING)
     )
     add_test(NAME cutmachine_audio_playback_tests
              COMMAND cutmachine_audio_playback_tests)
+
+    # Native AppKit/Metal smoke test. It launches the real AppDelegate against
+    # a disposable project and exercises target/action wiring in-process, so
+    # it needs a macOS WindowServer but no Accessibility permission.
+    add_executable(cutmachine_ui_smoke_tests ${CUTMACHINE_APP_SOURCES})
+    add_dependencies(cutmachine_ui_smoke_tests cutmachine_ui_icons)
+    target_include_directories(cutmachine_ui_smoke_tests
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(cutmachine_ui_smoke_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+    )
+    target_compile_definitions(cutmachine_ui_smoke_tests PRIVATE
+        CUTMACHINE_UI_SMOKE_TEST=1
+        CUTMACHINE_SHADER_PATH="${SHADER_RUNTIME_PATH}"
+        CUTMACHINE_ICON_DIR="${CUTMACHINE_ICON_OUTPUT_DIR}"
+    )
+    target_link_libraries(cutmachine_ui_smoke_tests PRIVATE
+        cutmachine_model
+        PkgConfig::FFMPEG
+        "-framework AppKit"
+        "-framework AVFAudio"
+        "-framework Foundation"
+        "-framework Metal"
+        "-framework QuartzCore"
+        "-framework UniformTypeIdentifiers"
+    )
+    add_test(NAME cutmachine_ui_smoke_tests
+             COMMAND cutmachine_ui_smoke_tests --ui-smoke)
+    set_tests_properties(cutmachine_ui_smoke_tests PROPERTIES TIMEOUT 30)
 
     add_test(
         NAME cutmachine_sidecar_tests

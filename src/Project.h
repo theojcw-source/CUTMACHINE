@@ -16,6 +16,9 @@ struct ProjectBinMetadata {
     uint32_t rating = 0;
     std::vector<std::string> tags;
     uint64_t insert_order = 0;
+    // F2.1 -- A user-facing rush name must not rewrite the source filename,
+    // which remains authoritative for relink and portable media paths.
+    std::string display_name;
 };
 
 // User-facing aggregate. Document remains the focused edit snapshot consumed

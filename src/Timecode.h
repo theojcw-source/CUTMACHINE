@@ -1,9 +1,9 @@
 #pragma once
 
 // F2.5 -- ROADMAP.md. Factored out of main.mm's TimelineTimecode() so the
-// existing timeline-overlay timecode label and the new Transport panel
-// (TransportView.h) format HH:MM:SS:FF from the exact same rule instead of
-// two copies quietly drifting apart. Plain C++, no AppKit -- this is a pure
+// existing timeline-overlay timecode label and integrated transport toolbar
+// format HH:MM:SS:FF from the exact same rule instead of two copies quietly
+// drifting apart. Plain C++, no AppKit -- this is a pure
 // function of a RationalTime and a MediaRate, so it builds and is tested on
 // a plain Linux host the same way UiTheme.h/PanelLayout.h are (see
 // tests/timecode_tests.cc).

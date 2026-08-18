@@ -253,6 +253,10 @@ std::string Describe(const Document& document) {
         const DocumentTrack& track = *tracks[trackOrdinal];
         output << "{\"id\":\"" << EscapeJson(track.id) << "\",\"kind\":\""
                << EscapeJson(track.kind) << "\",\"index\":" << track.index
+               << ",\"locked\":" << (track.locked ? "true" : "false")
+               << ",\"visible\":" << (track.visible ? "true" : "false")
+               << ",\"muted\":" << (track.muted ? "true" : "false")
+               << ",\"solo\":" << (track.solo ? "true" : "false")
                << ",\"items\":[";
         RationalTime cursor{0, 1};
         bool firstItem = true;

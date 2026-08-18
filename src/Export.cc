@@ -316,9 +316,17 @@ bool Exporter::BuildPlan(const Document& document,
                      [](const DocumentTrack* left, const DocumentTrack* right) {
                          return left->index < right->index;
                      });
+    const bool hasAudioSolo = std::any_of(
+        tracks.begin(), tracks.end(), [](const DocumentTrack* track) {
+            return track->kind == "audio" && track->solo;
+        });
 
     std::vector<InputClip> inputs;
     for (const DocumentTrack* track : tracks) {
+        if ((track->kind == "video" && !track->visible) ||
+            (track->kind == "audio" &&
+             (track->muted || (hasAudioSolo && !track->solo))))
+            continue;
         for (const DocumentClip& clip : track->clips) {
             const DocumentSource* source = document.FindSource(clip.source_id);
             if (!source) {

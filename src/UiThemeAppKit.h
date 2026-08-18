@@ -36,4 +36,4 @@ NSColor* CMSurfaceControlColor(void);
 NSColor* CMBorderSubtleColor(void);
 NSColor* CMTextPrimaryColor(void);
 NSColor* CMTextSecondaryColor(void);
-NSColor* CMAccentBlueColor(void);
+NSColor* CMAccentColor(void);

@@ -13,7 +13,7 @@ struct TimelineViewport {
     RationalTime view_start{0, 1};
     double pixels_per_second = 100.0;
     double track_height = 44.0;
-    double header_width = 72.0;
+    double header_width = 96.0;
 
     double TimeToX(RationalTime time) const;
     RationalTime XToTime(double x, int32_t rate) const;
@@ -24,7 +24,57 @@ struct TimelineViewport {
     std::vector<double> TickXs(double width) const;
 };
 
-constexpr double kTimelineRulerHeight = 28.0;
+// UI-2026-08 -- Keep device-specific NSEvent details out of the viewport.
+// AppKit only reports whether deltas are precise and which modifiers are
+// active; this portable policy decides whether the same gesture pans or
+// zooms, so mouse and trackpad regressions are covered by unit tests.
+enum class TimelineScrollAction { Pan, Zoom };
+
+struct TimelineScrollIntent {
+    TimelineScrollAction action = TimelineScrollAction::Pan;
+    double delta = 0.0;
+};
+
+TimelineScrollIntent ResolveTimelineScrollIntent(double deltaX, double deltaY,
+                                                 bool preciseDeltas,
+                                                 bool shiftPressed);
+
+enum class TimelineZoomBarPart { None, LeftHandle, Body, RightHandle };
+
+struct TimelineZoomBarGeometry {
+    double rail_x = 0.0;
+    double rail_width = 0.0;
+    double thumb_x = 0.0;
+    double thumb_width = 0.0;
+    double handle_width = 4.0;
+
+    TimelineZoomBarPart HitTest(double x) const;
+};
+
+TimelineZoomBarGeometry CalculateTimelineZoomBarGeometry(
+    const TimelineViewport& viewport, RationalTime duration, double width);
+
+struct TimelineZoomBarDrag {
+    TimelineZoomBarPart part = TimelineZoomBarPart::None;
+    double pointer_x = 0.0;
+    TimelineViewport initial_viewport;
+    TimelineZoomBarGeometry initial_geometry;
+};
+
+void UpdateTimelineZoomBarDrag(TimelineViewport& viewport,
+                               const TimelineZoomBarDrag& drag, double pointerX,
+                               RationalTime duration, double width,
+                               int32_t rate);
+
+constexpr double kTimelineToolbarHeight = 26.0;
+constexpr double kTimelineScaleHeight = 28.0;
+constexpr double kTimelineRenderBandHeight = 5.0;
+// Compatibility name used by the interaction engine for "everything above
+// the first track". It now includes the integrated toolbar and render band;
+// the actual ruler remains kTimelineScaleHeight.
+constexpr double kTimelineRulerHeight =
+    kTimelineToolbarHeight + kTimelineScaleHeight + kTimelineRenderBandHeight;
+constexpr double kTimelineZoomBarHeight = 14.0;
 constexpr double kTimelineEdgeHitWidth = 6.0;
 constexpr double kTimelineSnapDistance = 8.0;
 
@@ -80,6 +130,16 @@ std::vector<Ulid> LassoHitTestTimeline(const Document& document,
                                        double endX, double endY, double width);
 std::vector<Ulid> ExpandLinkedClipSelection(const Document& document,
                                             const std::vector<Ulid>& clipIds);
+
+// Exact edit points shared by keyboard navigation and temporary playhead
+// snapping. Results are sorted and deduplicated across every track.
+std::vector<RationalTime> TimelineEditPoints(const Document& document);
+std::optional<RationalTime> AdjacentTimelineEdit(const Document& document,
+                                                 const RationalTime& position,
+                                                 bool forward);
+std::optional<RationalTime> SnapTimelineTimeToEdit(
+    const Document& document, const TimelineViewport& viewport,
+    const RationalTime& candidate);
 
 // Builds the canonical blade operation. With linked selection enabled, every
 // member of the same A/V group containing the cut is split atomically.
@@ -140,6 +200,7 @@ public:
     bool HasActiveDrag() const;
     void SetSnappingEnabled(bool enabled);
     bool SnappingEnabled() const;
+    void SetPlayheadSnapTarget(std::optional<RationalTime> target);
     const std::optional<RationalTime>& SnapGuideTime() const;
     void SetLinkedSelectionEnabled(bool enabled);
     void SetTrimMode(TimelineTrimMode mode);
@@ -170,6 +231,7 @@ private:
     int32_t drag_rate_ = 1;
     double drag_x_ = 0.0;
     bool snapping_enabled_ = true;
+    std::optional<RationalTime> playhead_snap_target_;
     bool linked_selection_enabled_ = true;
     TimelineTrimMode trim_mode_ = TimelineTrimMode::Normal;
     std::optional<RationalTime> snap_guide_time_;
@@ -195,6 +257,12 @@ std::optional<DeleteGapOperation> TimelineRangeDeleteOperation(
     const Document& document, const RationalTime& rangeIn,
     const RationalTime& rangeOut, bool ripple,
     const std::vector<Ulid>& targetedTrackIds);
+
+// Builds the exact range edit used by UI ripple-delete for a clip selection.
+// Linked selections may span tracks; downstream sync-locked tracks follow the
+// same range through TimelineRangeDeleteOperation.
+std::optional<DeleteGapOperation> BuildTimelineRippleDeleteSelection(
+    const Document& document, const std::vector<Ulid>& clipIds);
 
 // Builds one atomic source-to-record edit. Insert opens time on the target and
 // every unlocked sync-locked follower; overwrite replaces only the target

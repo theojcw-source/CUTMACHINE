@@ -538,6 +538,9 @@ bool Project::LoadFromString(const std::string& json, Project& output,
                     throw std::runtime_error(
                         context + ".insert_order cannot be negative");
                 entry.insert_order = static_cast<uint64_t>(order);
+                if (const JsonValue* displayName = Optional(
+                        item, "display_name", JsonValue::Type::String, context))
+                    entry.display_name = displayName->string;
                 const JsonValue& tags =
                     Require(item, "tags", JsonValue::Type::Array, context);
                 for (size_t tagIndex = 0; tagIndex < tags.array.size();
@@ -632,7 +635,9 @@ std::string Project::SaveToString() const {
             if (tagIndex) output << ',';
             output << "\"" << Escape(item.second.tags[tagIndex]) << "\"";
         }
-        output << "],\"insert_order\":" << item.second.insert_order << '}';
+        output << "],\"insert_order\":" << item.second.insert_order
+               << ",\"display_name\":\"" << Escape(item.second.display_name)
+               << "\"}";
     }
     if (!bin_metadata.empty()) output << '\n';
     output << "  ],\n  \"timeline_bin_ids\":[";
@@ -1021,6 +1026,15 @@ bool Document::LoadFromString(const std::string& json, Document& output,
             if (const JsonValue* syncLock = Optional(
                     item, "sync_lock", JsonValue::Type::Boolean, context))
                 track.sync_lock = syncLock->boolean;
+            if (const JsonValue* visible = Optional(
+                    item, "visible", JsonValue::Type::Boolean, context))
+                track.visible = visible->boolean;
+            if (const JsonValue* muted =
+                    Optional(item, "muted", JsonValue::Type::Boolean, context))
+                track.muted = muted->boolean;
+            if (const JsonValue* solo =
+                    Optional(item, "solo", JsonValue::Type::Boolean, context))
+                track.solo = solo->boolean;
             const JsonValue& clips =
                 Require(item, "clips", JsonValue::Type::Array, context);
             for (size_t clipIndex = 0; clipIndex < clips.array.size();
@@ -1190,6 +1204,9 @@ std::string Document::SaveToString() const {
                << "\",\"index\":" << track.index
                << ",\"locked\":" << (track.locked ? "true" : "false")
                << ",\"sync_lock\":" << (track.sync_lock ? "true" : "false")
+               << ",\"visible\":" << (track.visible ? "true" : "false")
+               << ",\"muted\":" << (track.muted ? "true" : "false")
+               << ",\"solo\":" << (track.solo ? "true" : "false")
                << ",\"clips\":[";
         for (size_t clipIndex = 0; clipIndex < track.clips.size();
              ++clipIndex) {

@@ -186,6 +186,11 @@ struct DocumentTrack {
     // Ripple edits initiated on another track affect this track when enabled.
     // This is independent from the hard edit lock above.
     bool sync_lock = true;
+    // Output state is canonical because it changes playback and export, not
+    // merely local UI chrome. Video uses visible; audio uses muted/solo.
+    bool visible = true;
+    bool muted = false;
+    bool solo = false;
 };
 
 // A sequence is the addressable owner of one timeline. Project media and bins

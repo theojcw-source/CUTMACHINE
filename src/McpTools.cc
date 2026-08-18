@@ -460,6 +460,23 @@ bool DispatchClearClip(McpBackend& backend, const IdResolver& resolver,
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
+bool DispatchClearClips(McpBackend& backend, const IdResolver& resolver,
+                        const Value& args, std::string& resultJson,
+                        std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"clip_ids"};
+    if (!CheckKnownKeys(args, kAllowed, "clear_clips", message))
+        return Fail(errorName, message, message);
+    ClearClipsOperation op;
+    if (!ReadIdArray(args, "clip_ids", "clear_clips", resolver, op.clip_ids,
+                     message))
+        return Fail(errorName, message, message);
+    if (op.clip_ids.empty()) {
+        message = "'clear_clips.clip_ids' must contain at least one clip";
+        return Fail(errorName, message, message);
+    }
+    return backend.ApplyOperation(op, resultJson, errorName, message);
+}
+
 bool DispatchTrimClip(McpBackend& backend, const IdResolver& resolver,
                       const Value& args, std::string& resultJson,
                       std::string& errorName, std::string& message) {
@@ -857,8 +874,8 @@ bool DispatchPasteClips(McpBackend& backend, const IdResolver& resolver,
 bool DispatchAddTrack(McpBackend& backend, const IdResolver&, const Value& args,
                       std::string& resultJson, std::string& errorName,
                       std::string& message) {
-    static const std::vector<std::string> kAllowed = {"kind", "index", "locked",
-                                                      "sync_lock"};
+    static const std::vector<std::string> kAllowed = {
+        "kind", "index", "locked", "sync_lock", "visible", "muted", "solo"};
     if (!CheckKnownKeys(args, kAllowed, "add_track", message))
         return Fail(errorName, message, message);
     AddTrackOperation op;
@@ -866,7 +883,11 @@ bool DispatchAddTrack(McpBackend& backend, const IdResolver&, const Value& args,
     if (!ReadString(args, "kind", "add_track", true, "", op.kind, message) ||
         !ReadInt64(args, "index", "add_track", true, -1, index, message) ||
         !ReadBool(args, "locked", "add_track", false, op.locked, message) ||
-        !ReadBool(args, "sync_lock", "add_track", true, op.sync_lock, message))
+        !ReadBool(args, "sync_lock", "add_track", true, op.sync_lock,
+                  message) ||
+        !ReadBool(args, "visible", "add_track", true, op.visible, message) ||
+        !ReadBool(args, "muted", "add_track", false, op.muted, message) ||
+        !ReadBool(args, "solo", "add_track", false, op.solo, message))
         return Fail(errorName, message, message);
     if (index < std::numeric_limits<int32_t>::min() ||
         index > std::numeric_limits<int32_t>::max())
@@ -913,6 +934,25 @@ bool DispatchSetTrackSyncLock(McpBackend& backend, const IdResolver& resolver,
                 op.track_id, message) ||
         !ReadBool(args, "sync_lock", "set_track_sync_lock", true, op.sync_lock,
                   message))
+        return Fail(errorName, message, message);
+    return backend.ApplyOperation(op, resultJson, errorName, message);
+}
+
+bool DispatchSetTrackOutput(McpBackend& backend, const IdResolver& resolver,
+                            const Value& args, std::string& resultJson,
+                            std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"track_id", "visible",
+                                                      "muted", "solo"};
+    if (!CheckKnownKeys(args, kAllowed, "set_track_output", message))
+        return Fail(errorName, message, message);
+    SetTrackOutputOperation op;
+    if (!ReadId(args, "track_id", "set_track_output", resolver, true,
+                op.track_id, message) ||
+        !ReadBool(args, "visible", "set_track_output", true, op.visible,
+                  message) ||
+        !ReadBool(args, "muted", "set_track_output", false, op.muted,
+                  message) ||
+        !ReadBool(args, "solo", "set_track_output", false, op.solo, message))
         return Fail(errorName, message, message);
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
@@ -1326,6 +1366,14 @@ McpToolRegistry::McpToolRegistry() {
             .Build("clear_clip arguments"),
         DispatchClearClip);
 
+    add("clear_clips",
+        "Remove an arbitrary selection of clips atomically in place, leaving "
+        "gaps instead of rippling later clips.",
+        SchemaBuilder()
+            .Field("clip_ids", IdArraySchema("Clips to clear."), true)
+            .Build("clear_clips arguments"),
+        DispatchClearClips);
+
     add("trim_clip",
         "Trim one edge of a clip by an exact delta, changing only that "
         "clip's own extent.",
@@ -1568,6 +1616,9 @@ McpToolRegistry::McpToolRegistry() {
                    BoolSchema("Whether ripple edits on other tracks affect "
                               "this one (default true)."),
                    false)
+            .Field("visible", BoolSchema("Initial video visibility."), false)
+            .Field("muted", BoolSchema("Initial audio mute state."), false)
+            .Field("solo", BoolSchema("Initial audio solo state."), false)
             .Build("add_track arguments"),
         DispatchAddTrack);
 
@@ -1594,6 +1645,16 @@ McpToolRegistry::McpToolRegistry() {
             .Field("sync_lock", BoolSchema("Desired sync-lock state."), false)
             .Build("set_track_sync_lock arguments"),
         DispatchSetTrackSyncLock);
+
+    add("set_track_output",
+        "Set video visibility or audio mute/solo output state.",
+        SchemaBuilder()
+            .Field("track_id", IdSchema("Track to change."), true)
+            .Field("visible", BoolSchema("Video track visibility."), true)
+            .Field("muted", BoolSchema("Audio track mute state."), true)
+            .Field("solo", BoolSchema("Audio track solo state."), true)
+            .Build("set_track_output arguments"),
+        DispatchSetTrackOutput);
 
     add("update_sequence",
         "Rename the sequence and/or change its frame size and rate.",
