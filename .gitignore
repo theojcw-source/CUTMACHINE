@@ -65,3 +65,8 @@ venv/
 *.MOV
 *.mxf
 *.MXF
+
+# Delivery/design bundles dropped in the working tree. They are inputs to a
+# design pass, not sources: the repo keeps the SVGs under assets/ and the
+# brief in docs/UI_STACK.md instead.
+*.zip
