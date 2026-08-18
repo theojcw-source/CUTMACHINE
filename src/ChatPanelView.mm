@@ -194,7 +194,7 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
         _textField.font = CMFont(ui::theme::kFontSizeBody, NSFontWeightRegular);
         _textField.textColor = (style == CMChatRowStyleError ||
                                 style == CMChatRowStyleToolResultError)
-                                   ? CMThemeColor(ui::theme::kAccentRed)
+                                   ? CMThemeColor(ui::theme::kError)
                                    : CMTextPrimaryColor();
         _textField.backgroundColor = NSColor.clearColor;
         [self addSubview:_textField];
@@ -205,16 +205,16 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
 - (NSColor*)accentColor {
     switch (_style) {
         case CMChatRowStyleUser:
-            return CMAccentBlueColor();
+            return CMThemeColor(ui::theme::kAccent);
         case CMChatRowStyleAssistant:
             return CMTextSecondaryColor();
         case CMChatRowStyleToolCall:
-            return CMThemeColor(ui::theme::kAccentAmber);
+            return CMThemeColor(ui::theme::kAccentHi);
         case CMChatRowStyleToolResultOk:
-            return CMThemeColor(ui::theme::kAccentGreen);
+            return CMThemeColor(ui::theme::kRenderCached);
         case CMChatRowStyleToolResultError:
         case CMChatRowStyleError:
-            return CMThemeColor(ui::theme::kAccentRed);
+            return CMThemeColor(ui::theme::kError);
     }
     return CMTextSecondaryColor();
 }
@@ -292,7 +292,7 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
         _statusLabel = [NSTextField wrappingLabelWithString:@""];
         _statusLabel.font =
             CMFont(ui::theme::kFontSizeCaption, NSFontWeightRegular);
-        _statusLabel.textColor = CMThemeColor(ui::theme::kAccentRed);
+        _statusLabel.textColor = CMThemeColor(ui::theme::kError);
         _statusLabel.backgroundColor = NSColor.clearColor;
         _statusLabel.hidden = YES;
         [self addSubview:_statusLabel];

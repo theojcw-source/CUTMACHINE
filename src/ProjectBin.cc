@@ -108,6 +108,8 @@ ProjectBinModel::ProjectBinModel(const Project& project) {
         item.total_usage = totalUsage[rush.id];
         if (const ProjectBinMetadata* metadata =
                 project.FindBinMetadata(rush.id)) {
+            if (!metadata->display_name.empty())
+                item.name = metadata->display_name;
             item.description = metadata->description;
             item.tags = metadata->tags;
             item.rating = metadata->rating;

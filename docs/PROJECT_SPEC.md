@@ -47,6 +47,8 @@ journal, `ProjectEditLog`, indépendant du `EditLog` de montage :
 - `SetProjectBinMetadataOperation` modifie description, note, tags et ordre
   d’un rush ou d’une timeline ;
 - `SetProjectTimelineBinOperation` classe une timeline dans un chutier ;
+- `RenameProjectItemOperation` renomme une timeline ou le nom d’affichage
+  d’un rush sans modifier le nom de son fichier source ;
 - `RelinkProjectMediaOperation` reconnecte atomiquement un ou plusieurs rushes
   partagés par toutes les timelines et invalide leurs proxies.
 

@@ -217,6 +217,7 @@ int main() {
               toolsField->AsArray().size() > 30,
           "tools/list exposes the full catalog (>30 tools)");
     bool sawInsertClip = false;
+    bool sawClearClips = false;
     bool sawTrimClip = false;
     bool sawUndo = false;
     if (toolsField) {
@@ -224,6 +225,7 @@ int main() {
             const mcp_json::Value* name = tool.Find("name");
             if (!name) continue;
             if (name->AsString() == "insert_clip") sawInsertClip = true;
+            if (name->AsString() == "clear_clips") sawClearClips = true;
             if (name->AsString() == "trim_clip") sawTrimClip = true;
             if (name->AsString() == "undo") sawUndo = true;
             // Multicam operations are stubbed pending F1.5; must not be
@@ -234,6 +236,7 @@ int main() {
         }
     }
     Check(sawInsertClip, "tools/list includes insert_clip");
+    Check(sawClearClips, "tools/list includes clear_clips");
     Check(sawTrimClip, "tools/list includes trim_clip");
     Check(sawUndo, "tools/list includes undo");
 
@@ -270,6 +273,26 @@ int main() {
     Check(backend.CurrentDocument().SaveToString() == expected.SaveToString(),
           "tools/call trim_clip changes the document exactly as a direct "
           "EditLog::Apply/--apply-op call would");
+
+    // ---- tools/call: arbitrary atomic multi-clear ----
+    const std::string clearRequest =
+        R"({"jsonrpc":"2.0","id":8,"method":"tools/call",)"
+        R"("params":{"name":"clear_clips","arguments":{"clip_ids":[)"
+        R"("01K30000000000000000000003",)"
+        R"("01K30000000000000000000004"]}}})";
+    const std::string clearResponse =
+        HttpPostJson(server.Port(), "/mcp", clearRequest);
+    Check(clearResponse.find("\"isError\":false") != std::string::npos,
+          "tools/call clear_clips is not an error");
+    Check(expectedLog.Apply(expected,
+                            ClearClipsOperation{{"01K30000000000000000000003",
+                                                 "01K30000000000000000000004"},
+                                                {}},
+                            expectedError, expectedMessage),
+          "reference direct EditLog::Apply(clear_clips) succeeds: " +
+              expectedMessage);
+    Check(backend.CurrentDocument().SaveToString() == expected.SaveToString(),
+          "tools/call clear_clips matches a direct atomic operation");
 
     // ---- tools/call: insert_clip ----
     // insert_clip's clip_id is engine-generated (ApplyInsert's own

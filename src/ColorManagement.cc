@@ -182,6 +182,63 @@ RgbColor Ap1ToOutput(RgbColor ap1, const std::string& gamut) {
 
 }  // namespace
 
+RgbColor MapLinearOutputToDisplay(const ColorManagementSettings& settings,
+                                  RgbColor linearOutput) {
+    const bool hlg = settings.output_transfer == "hlg";
+    const double maximum = hlg ? 1.0 / HlgSceneReflectionScale() : 1.0;
+    const double knee = hlg ? 0.9 : 0.72;
+    const RgbColor weights = settings.output_gamut == "rec2020"
+                                 ? RgbColor{0.2627, 0.6780, 0.0593}
+                                 : RgbColor{0.2126, 0.7152, 0.0722};
+    const double luminance = linearOutput.red * weights.red +
+                             linearOutput.green * weights.green +
+                             linearOutput.blue * weights.blue;
+    if (luminance > knee) {
+        const double shoulder =
+            maximum -
+            (maximum - knee) * std::exp(-(luminance - knee) / (maximum - knee));
+        const double scale = shoulder / luminance;
+        linearOutput.red *= scale;
+        linearOutput.green *= scale;
+        linearOutput.blue *= scale;
+    }
+
+    // Compress chroma around luminance instead of clipping channels
+    // independently. The ratio describes how far a colour is from neutral as
+    // a fraction of the available RGB cube in that direction. A smooth knee
+    // begins before the boundary so saturated highlights retain hue detail.
+    const double mappedLuminance = linearOutput.red * weights.red +
+                                   linearOutput.green * weights.green +
+                                   linearOutput.blue * weights.blue;
+    const double positiveRoom = std::max(maximum - mappedLuminance, 1e-9);
+    const double negativeRoom = std::max(mappedLuminance, 1e-9);
+    const auto excursion = [&](double channel) {
+        const double chroma = channel - mappedLuminance;
+        return chroma >= 0.0 ? chroma / positiveRoom : -chroma / negativeRoom;
+    };
+    const double ratio =
+        std::max({excursion(linearOutput.red), excursion(linearOutput.green),
+                  excursion(linearOutput.blue)});
+    constexpr double kChromaKnee = 0.75;
+    constexpr double kChromaLimit = 0.98;
+    if (ratio > kChromaKnee) {
+        const double compressed =
+            kChromaKnee + (kChromaLimit - kChromaKnee) *
+                              (1.0 - std::exp(-(ratio - kChromaKnee) /
+                                              (kChromaLimit - kChromaKnee)));
+        const double scale = compressed / ratio;
+        linearOutput.red =
+            mappedLuminance + (linearOutput.red - mappedLuminance) * scale;
+        linearOutput.green =
+            mappedLuminance + (linearOutput.green - mappedLuminance) * scale;
+        linearOutput.blue =
+            mappedLuminance + (linearOutput.blue - mappedLuminance) * scale;
+    }
+    return {std::clamp(linearOutput.red, 0.0, maximum),
+            std::clamp(linearOutput.green, 0.0, maximum),
+            std::clamp(linearOutput.blue, 0.0, maximum)};
+}
+
 RgbColor TransformColorForOutput(const ColorManagementSettings& settings,
                                  RgbColor signal) {
     if (!settings.enabled)
@@ -192,6 +249,7 @@ RgbColor TransformColorForOutput(const ColorManagementSettings& settings,
         Ap1ToOutput(SourceToAp1(DecodeTransfer(signal, settings.input_transfer),
                                 settings.input_gamut),
                     settings.output_gamut);
+    output = MapLinearOutputToDisplay(settings, output);
     if (settings.output_transfer == "hlg") {
         const double scale = HlgSceneReflectionScale();
         return {
@@ -203,4 +261,12 @@ RgbColor TransformColorForOutput(const ColorManagementSettings& settings,
     }
     return {EncodeRec709(output.red), EncodeRec709(output.green),
             EncodeRec709(output.blue)};
+}
+
+ColorManagementSettings ColorManagementForSdrPreview(
+    const ColorManagementSettings& settings) {
+    ColorManagementSettings preview = settings;
+    preview.output_gamut = "rec709";
+    preview.output_transfer = "rec709";
+    return preview;
 }

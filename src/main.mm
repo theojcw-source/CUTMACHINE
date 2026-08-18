@@ -1,4 +1,5 @@
 #import <AppKit/AppKit.h>
+#import <QuartzCore/CAMetalLayer.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 extern "C" {
@@ -34,6 +35,7 @@ extern "C" {
 #include "Export.h"
 #include "FrameCache.h"
 #include "Ingest.h"
+#include "InspectorGradeControls.h"
 #include "McpLiveBackend.h"
 #include "McpProjectBackend.h"
 #include "McpServer.h"
@@ -66,9 +68,6 @@ extern "C" {
 #import "PanelHostView.h"
 #import "UiComponents.h"
 #import "UiThemeAppKit.h"
-// F2.5 -- ROADMAP.md playback transport: installs into PanelSlot::Transport
-// the same way the F2.1 imports above install into the other docks.
-#import "TransportView.h"
 
 namespace {
 
@@ -77,6 +76,103 @@ constexpr double kAddTrackRowHeight = 22.0;
 NSPasteboardType const kCutmachineMediaPasteboardType =
     @"com.cutmachine.library-media";
 NSPasteboardType const kCutmachineBinPasteboardType = @"com.cutmachine.bin";
+NSPasteboardType const kCutmachineTimelinePasteboardType =
+    @"com.cutmachine.timeline";
+// A media drag can copy into the timeline or move into a bin. AppKit
+// intersects this source mask with the destination's requested operation;
+// advertising Copy alone makes every bin drop resolve to None.
+constexpr NSDragOperation kMediaLocalDragOperations =
+    NSDragOperationCopy | NSDragOperationMove;
+NSString* const kAutomaticProxyGenerationDefaultsKey =
+    @"CUTMACHINEAutomaticProxyGeneration";
+NSString* const kProgramVideoScopeDefaultsKey = @"CUTMACHINEProgramVideoScope";
+
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+bool gUiSmokeTesting = false;
+int gUiSmokeFailures = 0;
+bool gUiSmokeIconMouseDown = false;
+bool gUiSmokeIconDragSession = false;
+int gUiSmokeDecodeReloads = 0;
+std::filesystem::path gUiSmokeRoot;
+std::string gUiSmokeProjectPath;
+
+void UiSmokeCheck(bool condition, const char* label) {
+    if (condition) {
+        std::fprintf(stdout, "PASS: %s\n", label);
+    } else {
+        ++gUiSmokeFailures;
+        std::fprintf(stderr, "FAIL: %s\n", label);
+    }
+    std::fflush(condition ? stdout : stderr);
+}
+
+bool PrepareUiSmokeProject(std::string& error) {
+    gUiSmokeRoot = std::filesystem::temp_directory_path() /
+                   (GenerateUlid() + "-cutmachine-ui-smoke");
+    std::filesystem::create_directories(gUiSmokeRoot);
+    const std::filesystem::path mediaPath = gUiSmokeRoot / "fixture.mov";
+    if (FILE* media = std::fopen(mediaPath.c_str(), "wb")) {
+        const char bytes[] = "CUTMACHINE UI smoke fixture";
+        std::fwrite(bytes, 1, sizeof(bytes), media);
+        std::fclose(media);
+    } else {
+        error = "unable to create UI smoke media fixture";
+        return false;
+    }
+
+    Document document;
+    const Ulid parentBinId = GenerateUlid();
+    const Ulid mediaBinId = GenerateUlid();
+    LibraryMedia media;
+    media.id = GenerateUlid();
+    media.path = mediaPath.string();
+    media.filename = "00-fixture.mov";
+    media.rate = {25, 1};
+    media.duration = {100, 25};
+    media.metadata_complete = false;
+    media.bin_id = mediaBinId;
+    document.library = {media};
+    document.bins = {{parentBinId, "Rush", ""},
+                     {mediaBinId, "1_RUSHES", parentBinId}};
+    document.sources = {
+        {media.id, media.path, media.rate, media.duration},
+    };
+    // Multiple visual rows are deliberate: a one-row fixture cannot catch a
+    // flipped NSCollectionView coordinate lookup selecting a lower tile.
+    for (int index = 1; index < 7; ++index) {
+        LibraryMedia extra = media;
+        extra.id = GenerateUlid();
+        extra.filename = "0" + std::to_string(index) + "-fixture.mov";
+        document.library.push_back(extra);
+        document.sources.push_back(
+            {extra.id, extra.path, extra.rate, extra.duration});
+    }
+    DocumentClip clip;
+    clip.source_id = media.id;
+    clip.source_in = {0, 25};
+    clip.duration = {50, 25};
+    clip.timeline_in = {0, 25};
+    clip.include_audio = false;
+    DocumentTrack track;
+    track.kind = "video";
+    track.index = 0;
+    track.clips = {clip};
+    DocumentClip audioClip = clip;
+    audioClip.id = GenerateUlid();
+    audioClip.include_audio = true;
+    DocumentTrack audioTrack;
+    audioTrack.kind = "audio";
+    audioTrack.index = 1;
+    audioTrack.clips = {audioClip};
+    document.sequence.name = "UI Smoke";
+    document.sequence.tracks = {track, audioTrack};
+    Project project = Project::FromDocument(std::move(document), "UI Smoke");
+    const std::filesystem::path package =
+        gUiSmokeRoot / "UI Smoke.cutmachine-project";
+    return CreatePortableProject(package.string(), project, gUiSmokeProjectPath,
+                                 error);
+}
+#endif
 
 enum class TimelineTool { Select, Hand, Zoom, Cut, Slip };
 enum class HistoryDomain { Timeline, Project };
@@ -410,6 +506,7 @@ struct AppState {
     std::map<Ulid, PendingBatchRelink> pendingBatchRelinks;
     std::map<Ulid, AudioWaveform> waveforms;
     bool proxiesEnabled = true;
+    bool automaticProxiesEnabled = false;
     std::map<Ulid, std::unique_ptr<DecodeWorker>> workers;
     // Sources remain part of the edit even when their files are unavailable.
     // Keeping this separate from the document makes reconnecting media a
@@ -434,6 +531,7 @@ struct AppState {
     TimelineTool tool = TimelineTool::Select;
     bool spaceHand = false;
     bool navigationDragging = false;
+    std::optional<TimelineZoomBarDrag> zoomBarDrag;
     bool scrubDragging = false;
     bool editDragging = false;
     bool duplicateDragging = false;
@@ -454,6 +552,9 @@ struct AppState {
     std::chrono::steady_clock::time_point playbackStarted;
     std::optional<double> cutPreviewX;
     std::optional<double> cutPreviewY;
+    int hoveredTimelineTool = -1;
+    Ulid hoveredTrackId;
+    int hoveredTrackControl = -1;
     bool sourceMonitor = false;
     Ulid sourceMonitorId;
     RationalTime sourceMonitorPosition{0, 1};
@@ -462,6 +563,7 @@ struct AppState {
     bool sourceMonitorActive = false;
     double sourceMonitorZoom = 0.0;
     double programMonitorZoom = 0.0;
+    VideoScopeMode programVideoScope = VideoScopeMode::Off;
     bool sourceMonitorVisible = true;
     double sourceMonitorPanelWidth = 0.0;
     Ulid contextClipId;
@@ -478,12 +580,34 @@ std::array<float, 3> ClipColor(const Ulid& sourceId, bool audio) {
         hash ^= byte;
         hash *= UINT64_C(1099511628211);
     }
-    const float variation = static_cast<float>(hash & 0xff) / 2550.0f;
-    if (audio)
-        return {0.08f + variation * 0.18f, 0.30f + variation * 0.72f,
-                0.20f + variation * 0.32f};
-    return {0.10f + variation * 0.24f, 0.27f + variation * 0.48f,
-            0.42f + variation * 0.58f};
+    const float variation = static_cast<float>(hash & 0xff) / 255.0f;
+    const ui::theme::Color base =
+        audio ? ui::theme::kTrackAudio : ui::theme::kTrackVideo;
+    const float lift = (variation - 0.5f) * 0.06f;
+    return {std::clamp(base.r + lift, 0.0f, 1.0f),
+            std::clamp(base.g + lift, 0.0f, 1.0f),
+            std::clamp(base.b + lift, 0.0f, 1.0f)};
+}
+
+std::string RushDisplayName(const Project& project, const LibraryMedia& media) {
+    if (const ProjectBinMetadata* metadata = project.FindBinMetadata(media.id);
+        metadata && !metadata->display_name.empty())
+        return metadata->display_name;
+    return media.filename;
+}
+
+std::string TimelineClipName(const Document& document, const Project& project,
+                             const Ulid& sourceId) {
+    std::string name;
+    if (const LibraryMedia* media = document.FindLibraryMedia(sourceId))
+        name = RushDisplayName(project, *media);
+    if (name.empty()) {
+        if (const DocumentSource* source = document.FindSource(sourceId))
+            name = std::filesystem::path(source->path).filename().string();
+    }
+    const size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) name.resize(dot);
+    return name;
 }
 
 NSImage* SystemSymbol(NSString* name, NSString* description,
@@ -504,7 +628,7 @@ NSString* TimeString(const RationalTime& time) {
 }
 
 // Delegates to Timecode.h's plain-C++ FormatTimecode so this label and the
-// new Transport panel (TransportView.mm) format HH:MM:SS:FF identically
+// timeline toolbar format HH:MM:SS:FF identically
 // instead of maintaining two copies of the same rule.
 NSString* TimelineTimecode(const RationalTime& time, MediaRate rate) {
     return [NSString stringWithUTF8String:FormatTimecode(time, rate).c_str()];
@@ -559,6 +683,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)timelineMouseUp:(NSEvent*)event;
 - (void)timelineMouseMoved:(NSEvent*)event;
 - (void)timelineScroll:(NSEvent*)event;
+- (void)timelineMagnify:(NSEvent*)event;
 - (BOOL)timelineKeyDown:(NSEvent*)event;
 - (void)timelineKeyUp:(NSEvent*)event;
 - (BOOL)timelineDropMedia:(NSString*)mediaId atViewPoint:(NSPoint)point;
@@ -578,9 +703,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
     return 7.0;
 }
 - (void)drawDividerInRect:(NSRect)rect {
-    [[NSColor colorWithWhite:0.055 alpha:1.0] setFill];
+    [CMThemeColor(ui::theme::kSurfaceBase) setFill];
     NSRectFill(rect);
-    [[NSColor colorWithWhite:0.24 alpha:1.0] setFill];
+    [CMThemeColor(ui::theme::kBorderStrong) setFill];
     if (self.isVertical) {
         const CGFloat x = NSMidX(rect) - 0.5;
         NSRectFill(NSMakeRect(x, NSMidY(rect) - 18.0, 1.0, 36.0));
@@ -596,7 +721,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, weak) id<TimelineMetalViewResizeTarget> resizeTarget;
 @end
 
-@implementation TimelineMetalView
+@implementation TimelineMetalView {
+    NSTrackingArea* _trackingArea;
+}
 - (instancetype)initWithFrame:(NSRect)frame {
     if ((self = [super initWithFrame:frame]))
         [self registerForDraggedTypes:@[ kCutmachineMediaPasteboardType ]];
@@ -610,14 +737,36 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [super setFrameSize:newSize];
     if (changed) [self.resizeTarget timelineMetalViewDidResize:self];
 }
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (_trackingArea) [self removeTrackingArea:_trackingArea];
+    _trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+             options:NSTrackingInVisibleRect | NSTrackingMouseEnteredAndExited |
+                     NSTrackingMouseMoved | NSTrackingActiveInActiveApp
+               owner:self
+            userInfo:nil];
+    [self addTrackingArea:_trackingArea];
+}
 - (NSView*)hitTest:(NSPoint)point {
     // Monitor controls remain interactive while passive labels stay visual
     // overlays and editing gestures remain owned by the Metal surface.
     NSView* child = [super hitTest:point];
-    if ([child isKindOfClass:NSPopUpButton.class] ||
-        [child isKindOfClass:NSButton.class])
-        return child;
-    return NSPointInRect(point, self.bounds) ? self : nil;
+    // Modern AppKit controls can return a private content subview from
+    // -hitTest:. Walk back to the public control instead of handing the click
+    // to the Metal view, which otherwise swallows Insert/Overwrite actions.
+    for (NSView* candidate = child; candidate && candidate != self;
+         candidate = candidate.superview) {
+        if ([candidate isKindOfClass:NSPopUpButton.class] ||
+            [candidate isKindOfClass:NSButton.class])
+            return candidate;
+    }
+    // `point` is expressed in the superview's coordinates. Comparing it to
+    // `bounds` only happened to work for monitor views placed at (0, 0); the
+    // timeline has a non-zero frame origin, so every click and drag was
+    // rejected. Let NSView's hit test decide whether the point is inside and
+    // redirect passive overlay labels back to the Metal interaction surface.
+    return child ? self : nil;
 }
 - (void)mouseDown:(NSEvent*)event {
     [self.window makeFirstResponder:self];
@@ -632,8 +781,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)mouseMoved:(NSEvent*)event {
     [self.eventTarget timelineMouseMoved:event];
 }
+- (void)mouseExited:(NSEvent*)event {
+    [self.eventTarget timelineMouseMoved:event];
+}
 - (void)scrollWheel:(NSEvent*)event {
     [self.eventTarget timelineScroll:event];
+}
+- (void)magnifyWithEvent:(NSEvent*)event {
+    [self.eventTarget timelineMagnify:event];
 }
 - (void)keyDown:(NSEvent*)event {
     if (![self.eventTarget timelineKeyDown:event]) [super keyDown:event];
@@ -657,6 +812,18 @@ DeleteGapOperation GapDeleteOperationForSelection(
     const NSPoint point = [self convertPoint:sender.draggingLocation
                                     fromView:nil];
     return [self.eventTarget timelineDropMedia:mediaId atViewPoint:point];
+}
+@end
+
+@interface VideoFullscreenWindow : NSWindow
+@end
+
+@implementation VideoFullscreenWindow
+- (BOOL)canBecomeKeyWindow {
+    return YES;
+}
+- (BOOL)canBecomeMainWindow {
+    return YES;
 }
 @end
 
@@ -694,18 +861,315 @@ DeleteGapOperation GapDeleteOperationForSelection(
             byExtendingSelection:NO];
     return [super menuForEvent:event];
 }
+- (void)mouseDown:(NSEvent*)event {
+    NSView* content = self.window.contentView;
+    NSView* hit = [content hitTest:[content convertPoint:event.locationInWindow
+                                                fromView:nil]];
+    for (NSView* candidate = hit; candidate && candidate != self;
+         candidate = candidate.superview) {
+        if (![candidate isKindOfClass:NSTextField.class]) continue;
+        NSTextField* field = (NSTextField*)candidate;
+        if (![field.identifier hasPrefix:@"browser:"] || !field.editable) break;
+        const NSInteger row = [self rowForView:field];
+        if (row >= 0)
+            [self selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
+                byExtendingSelection:NO];
+        [field selectText:field];
+        return;
+    }
+    [super mouseDown:event];
+}
 @end
 
-@interface ContextCollectionView : NSCollectionView
+@interface CMIndustrialTableRowView : NSTableRowView
+@end
+
+@implementation CMIndustrialTableRowView {
+    NSTrackingArea* _trackingArea;
+    BOOL _hovered;
+    CALayer* _hoverEdge;
+}
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    if ((self = [super initWithFrame:frameRect])) {
+        self.wantsLayer = YES;
+        _hoverEdge = [CALayer layer];
+        _hoverEdge.backgroundColor = CMThemeColor(ui::theme::kAccent).CGColor;
+        [self.layer addSublayer:_hoverEdge];
+    }
+    return self;
+}
+
+- (BOOL)wantsUpdateLayer {
+    return YES;
+}
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (_trackingArea) [self removeTrackingArea:_trackingArea];
+    _trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+             options:NSTrackingInVisibleRect | NSTrackingMouseEnteredAndExited |
+                     NSTrackingActiveInActiveApp
+               owner:self
+            userInfo:nil];
+    [self addTrackingArea:_trackingArea];
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+    (void)event;
+    _hovered = YES;
+    self.needsDisplay = YES;
+}
+
+- (void)mouseExited:(NSEvent*)event {
+    (void)event;
+    _hovered = NO;
+    self.needsDisplay = YES;
+}
+
+- (void)setSelected:(BOOL)selected {
+    [super setSelected:selected];
+    self.needsDisplay = YES;
+}
+
+- (void)drawSelectionInRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+}
+
+- (void)updateLayer {
+    const ui::theme::Color background =
+        self.selected ? ui::theme::kSurfaceControl
+        : _hovered    ? ui::theme::Mix(ui::theme::kSurfacePanel,
+                                       ui::theme::kTextPrimary, 0.05f)
+                      : ui::theme::kSurfacePanel;
+    self.layer.backgroundColor = CMThemeColor(background).CGColor;
+    _hoverEdge.frame = CGRectMake(0.0, 0.0, 2.0, self.bounds.size.height);
+    _hoverEdge.hidden = !_hovered || self.selected;
+}
+
+@end
+
+@interface ContextCollectionView : NSCollectionView <NSDraggingSource>
+@property(nonatomic, weak) id doubleClickTarget;
+@property(nonatomic) SEL doubleClickAction;
+@property(nonatomic, strong) NSIndexPath* forwardedMouseDownPath;
 @end
 @implementation ContextCollectionView
+- (NSIndexPath*)iconIndexPathAtPoint:(NSPoint)point {
+    // The flow layout and its flipped document view can disagree about the Y
+    // axis. Resolve from actual visible item views: these are the rectangles
+    // AppKit displayed and the user can physically click.
+    for (NSCollectionViewItem* item in self.visibleItems) {
+        NSIndexPath* path = [self indexPathForItem:item];
+        if (!path) continue;
+        const NSRect frame = [item.view convertRect:item.view.bounds
+                                             toView:self];
+        if (NSPointInRect(point, frame)) return path;
+    }
+    return nil;
+}
+- (BOOL)point:(NSPoint)point isInLabelAtIndexPath:(NSIndexPath*)indexPath {
+    NSCollectionViewItem* item = [self itemAtIndexPath:indexPath];
+    if (!item.textField) return NO;
+    const NSRect labelRect = [item.textField convertRect:item.textField.bounds
+                                                  toView:self];
+    return NSPointInRect(point, labelRect);
+}
 - (NSMenu*)menuForEvent:(NSEvent*)event {
     NSIndexPath* indexPath =
-        [self indexPathForItemAtPoint:[self convertPoint:event.locationInWindow
-                                                fromView:nil]];
+        [self iconIndexPathAtPoint:[self convertPoint:event.locationInWindow
+                                             fromView:nil]];
     if (indexPath && ![self.selectionIndexPaths containsObject:indexPath])
         self.selectionIndexPaths = [NSSet setWithObject:indexPath];
     return [super menuForEvent:event];
+}
+- (void)mouseDown:(NSEvent*)event {
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+    if (gUiSmokeTesting) gUiSmokeIconMouseDown = true;
+#endif
+    const NSPoint point = [self convertPoint:event.locationInWindow
+                                    fromView:nil];
+    // Always prefer current on-screen geometry. forwardedMouseDownPath is
+    // only a fallback because NSCollectionView can reuse an item's view
+    // across reloadData, leaving a previously forwarded path stale.
+    NSIndexPath* path =
+        [self iconIndexPathAtPoint:point] ?: self.forwardedMouseDownPath;
+    self.forwardedMouseDownPath = nil;
+    if (!path) {
+        self.selectionIndexPaths = [NSSet set];
+        return;
+    }
+    const BOOL renameClick =
+        event.clickCount == 1 && [self point:point isInLabelAtIndexPath:path];
+    NSSet<NSIndexPath*>* previous = self.selectionIndexPaths;
+    NSSet<NSIndexPath*>* selection = [NSSet setWithObject:path];
+    if ((event.modifierFlags & NSEventModifierFlagCommand) != 0 &&
+        self.allowsMultipleSelection) {
+        NSMutableSet<NSIndexPath*>* toggled = [previous mutableCopy];
+        if ([toggled containsObject:path])
+            [toggled removeObject:path];
+        else
+            [toggled addObject:path];
+        selection = toggled;
+    }
+    self.selectionIndexPaths = selection;
+    NSSet<NSIndexPath*>* added = [selection
+        objectsPassingTest:^BOOL(NSIndexPath* candidate, BOOL* stop) {
+          (void)stop;
+          return ![previous containsObject:candidate];
+        }];
+    if (!renameClick && added.count > 0 &&
+        [self.delegate respondsToSelector:@selector(collectionView:
+                                              didSelectItemsAtIndexPaths:)])
+        [self.delegate collectionView:self didSelectItemsAtIndexPaths:added];
+
+    const NSEventMask trackingMask =
+        NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp;
+    while (true) {
+        NSEvent* next = [self.window nextEventMatchingMask:trackingMask];
+        if (!next || next.type == NSEventTypeLeftMouseUp) {
+            if (renameClick) {
+                NSCollectionViewItem* item = [self itemAtIndexPath:path];
+                if (item.textField.editable) [item.textField selectText:self];
+            } else if (event.clickCount == 2 && self.doubleClickAction) {
+                [NSApp sendAction:self.doubleClickAction
+                               to:self.doubleClickTarget
+                             from:self];
+            }
+            return;
+        }
+        const NSPoint current = [self convertPoint:next.locationInWindow
+                                          fromView:nil];
+        if (std::hypot(current.x - point.x, current.y - point.y) < 4.0)
+            continue;
+        if ([self.delegate
+                respondsToSelector:@selector(collectionView:
+                                       canDragItemsAtIndexPaths:withEvent:)] &&
+            ![self.delegate collectionView:self
+                  canDragItemsAtIndexPaths:selection
+                                 withEvent:event])
+            continue;
+        if (![self.delegate
+                respondsToSelector:@selector(collectionView:
+                                       pasteboardWriterForItemAtIndexPath:)])
+            continue;
+        id<NSPasteboardWriting> writer = [self.delegate collectionView:self
+                                    pasteboardWriterForItemAtIndexPath:path];
+        if (!writer) continue;
+        NSCollectionViewItem* collectionItem = [self itemAtIndexPath:path];
+        if (!collectionItem) continue;
+        NSDraggingItem* draggingItem =
+            [[NSDraggingItem alloc] initWithPasteboardWriter:writer];
+        NSPoint imageOffset = NSZeroPoint;
+        NSImage* image = [self draggingImageForItemsAtIndexPaths:selection
+                                                       withEvent:event
+                                                          offset:&imageOffset];
+        [draggingItem setDraggingFrame:collectionItem.view.frame
+                              contents:image];
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+        if (gUiSmokeTesting) gUiSmokeIconDragSession = true;
+#endif
+        [self beginDraggingSessionWithItems:@[ draggingItem ]
+                                      event:next
+                                     source:self];
+        return;
+    }
+}
+
+- (NSDragOperation)draggingSession:(NSDraggingSession*)session
+    sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+    (void)session;
+    return context == NSDraggingContextWithinApplication
+               ? kMediaLocalDragOperations
+               : NSDragOperationCopy;
+}
+@end
+
+@interface BrowserRenameTextField : NSTextField
+@end
+
+@implementation BrowserRenameTextField
+- (ContextCollectionView*)owningCollectionView {
+    NSView* ancestor = self.superview;
+    while (ancestor && ![ancestor isKindOfClass:ContextCollectionView.class])
+        ancestor = ancestor.superview;
+    return (ContextCollectionView*)ancestor;
+}
+
+- (NSTableView*)owningTableView {
+    NSView* ancestor = self.superview;
+    while (ancestor && ![ancestor isKindOfClass:NSTableView.class])
+        ancestor = ancestor.superview;
+    return (NSTableView*)ancestor;
+}
+
+- (void)selectBrowserObjectForEvent:(NSEvent*)event {
+    if (ContextCollectionView* collection = [self owningCollectionView]) {
+        NSIndexPath* path = [collection
+            iconIndexPathAtPoint:[collection convertPoint:event.locationInWindow
+                                                 fromView:nil]];
+        if (path) collection.selectionIndexPaths = [NSSet setWithObject:path];
+        return;
+    }
+    if (NSTableView* table = [self owningTableView]) {
+        const NSInteger row = [table rowForView:self];
+        if (row >= 0)
+            [table selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
+                byExtendingSelection:NO];
+    }
+}
+
+- (void)mouseDown:(NSEvent*)event {
+    [self selectBrowserObjectForEvent:event];
+    // A name is an explicit editing affordance. Enter the field editor on the
+    // first click instead of waiting for NSTableView's delayed second click.
+    if (event.type == NSEventTypeLeftMouseDown && event.clickCount == 1 &&
+        self.editable) {
+        [self selectText:self];
+        return;
+    }
+    [super mouseDown:event];
+}
+
+- (NSMenu*)menuForEvent:(NSEvent*)event {
+    [self selectBrowserObjectForEvent:event];
+    if (ContextCollectionView* collection = [self owningCollectionView])
+        return collection.menu;
+    if (NSTableView* table = [self owningTableView]) return table.menu;
+    return [super menuForEvent:event];
+}
+@end
+
+@interface MediaIconView : NSView
+@property(nonatomic, strong) NSIndexPath* indexPath;
+@end
+
+@implementation MediaIconView
+- (NSView*)hitTest:(NSPoint)point {
+    if (!NSPointInRect(point, self.bounds)) return nil;
+    // One owner for the whole tile avoids a race between NSTextField's field
+    // editor and NSCollectionView's selection/drag tracking. The collection
+    // resolves the label rectangle after mouse-up and starts editing there.
+    return self;
+}
+- (void)mouseDown:(NSEvent*)event {
+    NSView* ancestor = self.superview;
+    while (ancestor && ![ancestor isKindOfClass:ContextCollectionView.class])
+        ancestor = ancestor.superview;
+    if (ancestor) {
+        ((ContextCollectionView*)ancestor).forwardedMouseDownPath =
+            self.indexPath;
+        [(ContextCollectionView*)ancestor mouseDown:event];
+    } else
+        [super mouseDown:event];
+}
+- (NSMenu*)menuForEvent:(NSEvent*)event {
+    NSView* ancestor = self.superview;
+    while (ancestor && ![ancestor isKindOfClass:ContextCollectionView.class])
+        ancestor = ancestor.superview;
+    return ancestor ? [(ContextCollectionView*)ancestor menuForEvent:event]
+                    : [super menuForEvent:event];
 }
 @end
 
@@ -714,16 +1178,17 @@ DeleteGapOperation GapDeleteOperationForSelection(
 
 @implementation MediaIconItem
 - (void)loadView {
-    self.view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 132, 112)];
+    self.view =
+        [[MediaIconView alloc] initWithFrame:NSMakeRect(0, 0, 132, 112)];
     NSImageView* image =
         [[NSImageView alloc] initWithFrame:NSMakeRect(14, 27, 104, 76)];
     image.imageScaling = NSImageScaleProportionallyUpOrDown;
     image.wantsLayer = YES;
     image.layer.backgroundColor =
-        [NSColor colorWithWhite:0.13 alpha:1.0].CGColor;
-    image.layer.cornerRadius = 5.0;
-    NSTextField* label =
-        [[NSTextField alloc] initWithFrame:NSMakeRect(4, 4, 124, 19)];
+        CMThemeColor(ui::theme::kSurfaceControl).CGColor;
+    image.layer.cornerRadius = 0.0;
+    NSTextField* label = [[BrowserRenameTextField alloc]
+        initWithFrame:NSMakeRect(4, 4, 124, 19)];
     label.editable = NO;
     label.selectable = NO;
     label.bezeled = NO;
@@ -767,6 +1232,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, strong) TimelineMetalView* programMonitorView;
 @property(nonatomic, strong) NSView* sourceMonitorPanel;
 @property(nonatomic, strong) NSView* programMonitorPanel;
+@property(nonatomic, strong) VideoFullscreenWindow* videoFullscreenWindow;
+@property(nonatomic, assign) BOOL videoFullscreenActive;
 @property(nonatomic, strong) NSView* mediaPanel;
 @property(nonatomic, strong) NSSplitView* workspaceSplitView;
 @property(nonatomic, strong) NSSplitView* editorSplitView;
@@ -775,11 +1242,6 @@ DeleteGapOperation GapDeleteOperationForSelection(
 // Chat (F2.4) tabs. See PanelHostView.h -- the set of tabs and their order
 // are fixed at construction time, never user-rearrangeable.
 @property(nonatomic, strong) CMPanelHostView* rightDockPanel;
-// F2.5 design system: fixed bottom dock hosting the Transport panel (play/
-// pause, scrub bar, timecode, frame step). One slot, same fixed-tab host as
-// rightDockPanel -- see PanelHostView.h.
-@property(nonatomic, strong) CMPanelHostView* bottomDockPanel;
-@property(nonatomic, strong) CMTransportView* transportView;
 // F2.2 -- Inspector content installed into rightDockPanel's Inspector slot
 // (see -applicationDidFinishLaunching below).
 @property(nonatomic, strong) CMInspectorView* inspectorView;
@@ -806,6 +1268,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, strong) NSSearchField* mediaSearchField;
 @property(nonatomic, strong) NSMutableArray<NSString*>* visibleMediaIds;
 @property(nonatomic, copy) NSString* selectedBinId;
+@property(nonatomic, assign) BOOL updatingBinControls;
 @property(nonatomic, strong) NSCollectionView* mediaCollection;
 @property(nonatomic, strong)
     NSMutableDictionary<NSString*, NSImage*>* mediaThumbnails;
@@ -813,12 +1276,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, strong) NSScrollView* mediaIconScroll;
 @property(nonatomic, strong) NSSegmentedControl* mediaViewToggle;
 @property(nonatomic, strong) NSButton* sourceMonitorButton;
-// F2.3 -- ROADMAP.md Media panel: Media/Audio/Captions sub-tabs living
-// inside the single PanelSlot::Media the Left dock already reserves (see
-// PanelLayout.h and MediaPanelModel.h). `mediaTabStrip` switches which of
-// the three content containers below is visible; nothing here is project
-// state, only which already-existing tab is on screen (see UiPreferences.h
-// for the same rule applied to the dock-level tabs).
+// Legacy F2.3 builders remain below while their engine operations are being
+// migrated, but the ATELIER interface installs only mediaTabContentMedia.
+// Audio and caption controls are deliberately absent from the static dock.
 @property(nonatomic, strong) CMTabStripView* mediaTabStrip;
 @property(nonatomic, strong) NSView* mediaTabContentMedia;
 @property(nonatomic, strong) NSView* mediaTabContentAudio;
@@ -844,11 +1304,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, strong) NSTextField* programMonitorTitleLabel;
 @property(nonatomic, strong) NSPopUpButton* sourceMonitorZoomPopup;
 @property(nonatomic, strong) NSPopUpButton* programMonitorZoomPopup;
+@property(nonatomic, strong) NSPopUpButton* programVideoScopePopup;
 @property(nonatomic, strong) NSButton* sourceMonitorToggleButton;
 @property(nonatomic, strong) NSTextField* timelineTimecodeLabel;
 @property(nonatomic, strong) NSMutableArray<NSTextField*>* trackHeaderLabels;
 @property(nonatomic, strong) NSMutableArray<NSImageView*>* timelineToolIcons;
-@property(nonatomic, strong) NSButton* linkedSelectionButton;
 @property(nonatomic, strong)
     NSMutableDictionary<NSString*, NSString*>* shortcutBindings;
 @property(nonatomic, strong)
@@ -861,6 +1321,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, strong) NSButton* keyboardControlModifier;
 @property(nonatomic, strong) NSButton* keyboardShiftModifier;
 @property(nonatomic, strong) NSTimer* displayTimer;
+// Timeline shortcuts remain global editing gestures while an Inspector
+// control owns first responder. AppKit otherwise sends plain keys such as C
+// only to the slider, making a graded clip appear impossible to cut.
+@property(nonatomic, strong) id timelineShortcutMonitor;
 @property(nonatomic, copy) NSString* documentPath;
 @property(nonatomic, copy) NSString* lastProjectLoadError;
 @property(nonatomic, assign) AppState* state;
@@ -870,6 +1334,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (BOOL)openStartupProject;
 - (NSString*)resolvedProjectPath:(NSString*)selection;
 - (void)collectPortableProject:(id)sender;
+- (NSString*)selectedBrowserObjectId;
 - (NSArray<NSString*>*)selectedMediaIds;
 - (void)beginEditingBin:(NSString*)binId;
 - (void)refreshTimelineChrome;
@@ -893,6 +1358,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
                        message:(std::string&)message;
 - (BOOL)activateTimelineIdentifier:(NSString*)identifier;
 - (void)createTimelinePressed:(id)sender;
+- (void)createTimelineFromSelectedMedia:(id)sender;
+- (void)saveProjectPressed:(id)sender;
+- (void)openIconBin:(NSClickGestureRecognizer*)recognizer;
+- (void)openIconItem:(id)sender;
 - (void)requestSourcePosition:(RationalTime)position;
 - (BOOL)performSourceEditInsert:(BOOL)insert;
 - (void)updateSourceZoneLabel;
@@ -906,12 +1375,187 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)processCompletedBatchRelinks;
 - (void)reloadDecodeWorkers;
 - (void)refreshAfterProjectMutation;
+- (void)refreshAfterProjectRename;
 - (void)enqueueProxyForMediaIdentifier:(NSString*)identifier;
 - (void)loadOrEnqueueWaveformForMediaIdentifier:(NSString*)identifier;
 - (void)enqueueWaveformForMediaIdentifier:(NSString*)identifier;
 - (void)loadOrEnqueueThumbnailForMediaIdentifier:(NSString*)identifier;
 - (void)enqueueThumbnailForMediaIdentifier:(NSString*)identifier;
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+- (void)runUiSmokeTests;
+#endif
 @end
+
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+static NSButton* FindButtonWithTitle(NSView* root, NSString* title) {
+    if ([root isKindOfClass:NSButton.class] &&
+        [((NSButton*)root).title isEqualToString:title])
+        return (NSButton*)root;
+    for (NSView* child in root.subviews) {
+        if (NSButton* match = FindButtonWithTitle(child, title)) return match;
+    }
+    return nil;
+}
+
+static void CollectSliders(NSView* root, NSMutableArray<NSSlider*>* result) {
+    if ([root isKindOfClass:NSSlider.class]) [result addObject:(NSSlider*)root];
+    for (NSView* child in root.subviews) CollectSliders(child, result);
+}
+
+static void ClickControlThroughWindow(NSControl* control) {
+    NSWindow* window = control.window;
+    const NSPoint local =
+        NSMakePoint(NSMidX(control.bounds), NSMidY(control.bounds));
+    const NSPoint windowPoint = [control convertPoint:local toView:nil];
+    const NSTimeInterval timestamp = NSProcessInfo.processInfo.systemUptime;
+    NSEvent* down = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                       location:windowPoint
+                                  modifierFlags:0
+                                      timestamp:timestamp
+                                   windowNumber:window.windowNumber
+                                        context:nil
+                                    eventNumber:0
+                                     clickCount:1
+                                       pressure:1.0];
+    NSEvent* up = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
+                                     location:windowPoint
+                                modifierFlags:0
+                                    timestamp:timestamp + 0.01
+                                 windowNumber:window.windowNumber
+                                      context:nil
+                                  eventNumber:0
+                                   clickCount:1
+                                     pressure:0.0];
+    // NSButton's mouseDown enters a tracking loop. Queue mouse-up first so
+    // that loop consumes it exactly as it would for a physical click.
+    [NSApp postEvent:up atStart:NO];
+    [window sendEvent:down];
+}
+
+static void SendWindowClick(NSView* view, NSPoint point) {
+    NSWindow* window = view.window;
+    if (!window) return;
+    const NSPoint windowPoint = [view convertPoint:point toView:nil];
+    const NSTimeInterval timestamp = NSProcessInfo.processInfo.systemUptime;
+    NSEvent* down = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                       location:windowPoint
+                                  modifierFlags:0
+                                      timestamp:timestamp
+                                   windowNumber:window.windowNumber
+                                        context:nil
+                                    eventNumber:0
+                                     clickCount:1
+                                       pressure:1.0];
+    NSEvent* up = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
+                                     location:windowPoint
+                                modifierFlags:0
+                                    timestamp:timestamp + 0.01
+                                 windowNumber:window.windowNumber
+                                      context:nil
+                                  eventNumber:0
+                                   clickCount:1
+                                     pressure:0.0];
+    [NSApp postEvent:up atStart:NO];
+    [window sendEvent:down];
+}
+
+static void SendTimelineMouseGesture(NSView* view, NSPoint start, NSPoint end) {
+    NSWindow* window = view.window;
+    const NSPoint windowStart = [view convertPoint:start toView:nil];
+    const NSPoint windowEnd = [view convertPoint:end toView:nil];
+    const NSTimeInterval timestamp = NSProcessInfo.processInfo.systemUptime;
+    const auto event = [&](NSEventType type, NSPoint location,
+                           NSTimeInterval offset) {
+        return [NSEvent
+            mouseEventWithType:type
+                      location:location
+                 modifierFlags:0
+                     timestamp:timestamp + offset
+                  windowNumber:window.windowNumber
+                       context:nil
+                   eventNumber:0
+                    clickCount:1
+                      pressure:type == NSEventTypeLeftMouseUp ? 0.0 : 1.0];
+    };
+    TimelineMetalView* timeline = (TimelineMetalView*)view;
+    [timeline mouseDown:event(NSEventTypeLeftMouseDown, windowStart, 0.0)];
+    if (!NSEqualPoints(start, end))
+        [timeline
+            mouseDragged:event(NSEventTypeLeftMouseDragged, windowEnd, 0.01)];
+    [timeline mouseUp:event(NSEventTypeLeftMouseUp, windowEnd, 0.02)];
+}
+
+static void SendWindowDragGesture(NSView* sourceView, NSPoint sourcePoint,
+                                  NSView* destinationView,
+                                  NSPoint destinationPoint) {
+    NSWindow* window = sourceView.window;
+    if (!window || destinationView.window != window) return;
+    const NSPoint windowStart = [sourceView convertPoint:sourcePoint
+                                                  toView:nil];
+    const NSPoint windowEnd = [destinationView convertPoint:destinationPoint
+                                                     toView:nil];
+    const NSTimeInterval timestamp = NSProcessInfo.processInfo.systemUptime;
+    const auto event = [&](NSEventType type, NSPoint location,
+                           NSTimeInterval offset) {
+        return [NSEvent
+            mouseEventWithType:type
+                      location:location
+                 modifierFlags:0
+                     timestamp:timestamp + offset
+                  windowNumber:window.windowNumber
+                       context:nil
+                   eventNumber:0
+                    clickCount:1
+                      pressure:type == NSEventTypeLeftMouseUp ? 0.0 : 1.0];
+    };
+    const NSPoint windowThreshold =
+        NSMakePoint(windowStart.x + 12.0, windowStart.y);
+    NSEvent* threshold =
+        event(NSEventTypeLeftMouseDragged, windowThreshold, 0.03);
+    NSEvent* dragged = event(NSEventTypeLeftMouseDragged, windowEnd, 0.07);
+    NSEvent* up = event(NSEventTypeLeftMouseUp, windowEnd, 0.10);
+    [NSApp postEvent:threshold atStart:NO];
+    [NSApp postEvent:dragged atStart:NO];
+    [NSApp postEvent:up atStart:NO];
+    [window sendEvent:event(NSEventTypeLeftMouseDown, windowStart, 0.0)];
+}
+
+static void SendKeyThroughWindow(NSView* view, NSString* characters,
+                                 unsigned short keyCode) {
+    NSWindow* window = view.window;
+    [window makeFirstResponder:view];
+    NSEvent* event =
+        [NSEvent keyEventWithType:NSEventTypeKeyDown
+                               location:NSZeroPoint
+                          modifierFlags:0
+                              timestamp:NSProcessInfo.processInfo.systemUptime
+                           windowNumber:window.windowNumber
+                                context:nil
+                             characters:characters
+            charactersIgnoringModifiers:characters
+                              isARepeat:NO
+                                keyCode:keyCode];
+    [window sendEvent:event];
+}
+
+static void SendKeyThroughApplication(NSView* view, NSString* characters,
+                                      unsigned short keyCode) {
+    NSWindow* window = view.window;
+    [window makeFirstResponder:view];
+    NSEvent* event =
+        [NSEvent keyEventWithType:NSEventTypeKeyDown
+                               location:NSZeroPoint
+                          modifierFlags:0
+                              timestamp:NSProcessInfo.processInfo.systemUptime
+                           windowNumber:window.windowNumber
+                                context:nil
+                             characters:characters
+            charactersIgnoringModifiers:characters
+                              isARepeat:NO
+                                keyCode:keyCode];
+    [NSApp sendEvent:event];
+}
+#endif
 
 @implementation AppDelegate
 
@@ -993,7 +1637,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         },
         @{
             @"id" : @"view.fullscreen",
-            @"title" : @"Affichage · Plein écran",
+            @"title" : @"Affichage · Vidéo plein écran",
             @"default" : @"P"
         },
         @{
@@ -1329,6 +1973,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
                           action:@selector(collectPortableProject:)
                              key:@""]];
     [file addItem:NSMenuItem.separatorItem];
+    [file addItem:[self menuItem:@"Enregistrer le projet"
+                          action:@selector(saveProjectPressed:)
+                             key:@"s"]];
+    [file addItem:NSMenuItem.separatorItem];
     [file addItem:[self menuItem:@"Exporter la vidéo finale…"
                           action:@selector(exportFinalVideo:)
                              key:@"e"]];
@@ -1455,6 +2103,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [timeline addItem:[self menuItem:@"Utiliser les proxies"
                               action:@selector(menuToggleProxies:)
                                  key:@""]];
+    [timeline addItem:[self menuItem:@"Générer automatiquement les proxies"
+                              action:@selector(menuToggleAutomaticProxies:)
+                                 key:@""]];
     [timeline addItem:[self shortcutMenuItem:@"Cadrer toute la timeline"
                                       action:@selector(menuFitTimeline:)
                                      command:@"timeline.fit"]];
@@ -1497,7 +2148,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                                       action:nil
                                                keyEquivalent:@""];
     NSMenu* view = [[NSMenu alloc] initWithTitle:@"Affichage"];
-    [view addItem:[self shortcutMenuItem:@"Activer/désactiver le plein écran"
+    [view addItem:[self shortcutMenuItem:@"Vidéo plein écran"
                                   action:@selector(toggleFullscreen:)
                                  command:@"view.fullscreen"]];
     viewRoot.submenu = view;
@@ -1508,7 +2159,66 @@ DeleteGapOperation GapDeleteOperationForSelection(
 
 - (void)toggleFullscreen:(id)sender {
     (void)sender;
-    [self.window toggleFullScreen:nil];
+    if (self.videoFullscreenActive) {
+        self.videoFullscreenActive = NO;
+        [self.programMonitorView removeFromSuperview];
+        [self.videoFullscreenWindow orderOut:nil];
+        self.programMonitorView.frame = self.programMonitorPanel.bounds;
+        [self.programMonitorPanel addSubview:self.programMonitorView];
+        self.programMonitorTitleLabel.hidden = NO;
+        self.programMonitorZoomPopup.hidden = NO;
+        self.sourceMonitorToggleButton.hidden = NO;
+        [self.window makeKeyAndOrderFront:nil];
+        [self.window makeFirstResponder:self.programMonitorView];
+    } else {
+        NSScreen* screen = self.window.screen ?: NSScreen.mainScreen;
+        if (!screen) return;
+        [self.programMonitorView removeFromSuperview];
+        if (!self.videoFullscreenWindow) {
+            self.videoFullscreenWindow = [[VideoFullscreenWindow alloc]
+                initWithContentRect:screen.frame
+                          styleMask:NSWindowStyleMaskBorderless
+                            backing:NSBackingStoreBuffered
+                              defer:NO
+                             screen:screen];
+            self.videoFullscreenWindow.backgroundColor = NSColor.blackColor;
+            self.videoFullscreenWindow.opaque = YES;
+            self.videoFullscreenWindow.level = NSMainMenuWindowLevel + 1;
+            self.videoFullscreenWindow.animationBehavior =
+                NSWindowAnimationBehaviorNone;
+            self.videoFullscreenWindow.releasedWhenClosed = NO;
+            self.videoFullscreenWindow.collectionBehavior =
+                NSWindowCollectionBehaviorFullScreenAuxiliary |
+                NSWindowCollectionBehaviorStationary;
+        } else {
+            [self.videoFullscreenWindow setFrame:screen.frame display:NO];
+        }
+        self.videoFullscreenActive = YES;
+        self.programMonitorView.frame =
+            self.videoFullscreenWindow.contentView.bounds;
+        [self.videoFullscreenWindow.contentView
+            addSubview:self.programMonitorView];
+        self.programMonitorTitleLabel.hidden = YES;
+        self.programMonitorZoomPopup.hidden = YES;
+        self.sourceMonitorToggleButton.hidden = YES;
+        self.state->sourceMonitorActive = false;
+        [self.videoFullscreenWindow makeKeyAndOrderFront:nil];
+        [self.videoFullscreenWindow makeFirstResponder:self.programMonitorView];
+    }
+    self.state->overlayDirty = true;
+}
+
+- (void)saveProjectPressed:(id)sender {
+    (void)sender;
+    std::string message;
+    if ([self persistEdits:message]) {
+        self.infoLabel.stringValue = @"Projet enregistré";
+    } else {
+        self.infoLabel.stringValue =
+            [NSString stringWithFormat:@"Échec de l’enregistrement : %s",
+                                       message.c_str()];
+        NSBeep();
+    }
 }
 
 - (BOOL)commitColorSettings:(const ColorManagementSettings&)settings {
@@ -2060,7 +2770,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     NSView* content = [[NSView alloc] initWithFrame:frame];
     content.wantsLayer = YES;
     content.layer.backgroundColor =
-        [NSColor colorWithWhite:0.075 alpha:1.0].CGColor;
+        CMThemeColor(ui::theme::kSurfacePanel).CGColor;
     self.startupWindow.contentView = content;
 
     NSImageView* icon =
@@ -2319,6 +3029,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
     if ((self = [super init])) {
         _documentPath = [documentPath copy];
         _state = new AppState();
+        _state->automaticProxiesEnabled = [NSUserDefaults.standardUserDefaults
+            boolForKey:kAutomaticProxyGenerationDefaultsKey];
+        _state->programVideoScope = VideoScopeModeFromPreference(
+            static_cast<int32_t>([NSUserDefaults.standardUserDefaults
+                integerForKey:kProgramVideoScopeDefaultsKey]));
         _mediaThumbnails = [NSMutableDictionary dictionary];
     }
     return self;
@@ -2468,8 +3183,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->targetedTrackIds;
     self.state->viewport.view_start = {0, 1};
     self.state->viewport.pixels_per_second = 100.0;
-    self.state->viewport.track_height = 34.0;
-    self.state->viewport.header_width = 176.0;
+    self.state->viewport.track_height = ui::theme::kTimelineTrackHeight;
+    self.state->viewport.header_width = ui::theme::kTimelineTrackHeaderWidth;
     self.state->interaction = std::make_unique<TimelineInteraction>(
         self.state->document, self.state->editLog, self.state->viewport);
     self.state->timeline = std::make_unique<Timeline>(self.state->document);
@@ -2727,6 +3442,12 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.documentPath = nil;
         delete self.state;
         self.state = new AppState();
+        self.state->automaticProxiesEnabled =
+            [NSUserDefaults.standardUserDefaults
+                boolForKey:kAutomaticProxyGenerationDefaultsKey];
+        self.state->programVideoScope = VideoScopeModeFromPreference(
+            static_cast<int32_t>([NSUserDefaults.standardUserDefaults
+                integerForKey:kProgramVideoScopeDefaultsKey]));
         self.mediaThumbnails = [NSMutableDictionary dictionary];
     }
     [self recordRecentProject:self.documentPath];
@@ -2749,23 +3470,21 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.window.contentMinSize = NSMakeSize(900.0, 560.0);
 
     NSView* content = [[NSView alloc] initWithFrame:windowRect];
+    content.wantsLayer = YES;
+    content.layer.backgroundColor =
+        CMThemeColor(ui::theme::kSurfaceBase).CGColor;
     self.window.contentView = content;
     constexpr double mediaPanelWidth = 320.0;
     // F2.1 design system: fixed-width right dock (Inspector/Chat tabs).
     // Fixed, not user-resized-and-remembered, on purpose -- see
     // PanelHostView.h.
     constexpr double rightDockWidth = 300.0;
-    // F2.5 design system: fixed-height bottom dock (Transport panel: play/
-    // pause, scrub bar, timecode, frame step). Sits directly above the
-    // existing status bar, below the Metal-drawn timeline -- see
-    // PanelHostView.h for why this height is fixed rather than
-    // user-resizable.
-    constexpr double bottomDockHeight = 84.0;
-    const double workspaceHeight =
-        windowRect.size.height - 42.0 - bottomDockHeight;
+    // UI-2026-08 -- transport and zoom now belong to the timeline display
+    // list. The only fixed bottom strip is the 42 pt status surface.
+    const double workspaceHeight = windowRect.size.height - 42.0;
     self.workspaceSplitView = [[CutmachineSplitView alloc]
-        initWithFrame:NSMakeRect(0.0, 42.0 + bottomDockHeight,
-                                 windowRect.size.width, workspaceHeight)];
+        initWithFrame:NSMakeRect(0.0, 42.0, windowRect.size.width,
+                                 workspaceHeight)];
     self.workspaceSplitView.vertical = YES;
     self.workspaceSplitView.dividerStyle = NSSplitViewDividerStyleThin;
     self.workspaceSplitView.delegate = self;
@@ -2788,28 +3507,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaPanel.layer.backgroundColor = CMSurfacePanelColor().CGColor;
     [self.workspaceSplitView addArrangedSubview:self.mediaPanel];
 
-    // F2.3 -- ROADMAP.md Media panel: Média/Audio/Légendes tabs inside this
-    // one PanelSlot::Media (see MediaPanelModel.h and PanelLayout.h's file
-    // comment on why this slot builds its own tab strip rather than reusing
-    // CMPanelHostView's dock-level chrome). The tab strip claims a fixed
-    // strip off the top; everything that used to be placed directly against
-    // `workspaceHeight` below now lives in `mediaContentHeight`, one of
-    // three sibling containers under the strip.
-    const double mediaContentHeight =
-        workspaceHeight - ui::theme::kTabStripHeight;
-    NSMutableArray<NSString*>* mediaTabTitles = [NSMutableArray array];
-    for (ui::media_panel::Tab tab : ui::media_panel::AllTabs())
-        [mediaTabTitles
-            addObject:[NSString
-                          stringWithUTF8String:ui::media_panel::TabTitle(tab)]];
-    self.mediaTabStrip = [[CMTabStripView alloc]
-        initWithFrame:NSMakeRect(0.0, mediaContentHeight, mediaPanelWidth,
-                                 ui::theme::kTabStripHeight)
-               titles:mediaTabTitles];
-    self.mediaTabStrip.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    self.mediaTabStrip.target = self;
-    self.mediaTabStrip.action = @selector(mediaTabChanged:);
-    [self.mediaPanel addSubview:self.mediaTabStrip];
+    // UI-2026-08 -- the left dock is a static media browser. Audio and
+    // caption editing remain engine/command capabilities; they no longer
+    // masquerade as alternate contents of this physical dock.
+    const double mediaContentHeight = workspaceHeight;
+    constexpr double binSidebarX = 8.0;
+    constexpr double binSidebarWidth = 112.0;
+    constexpr double mediaBrowserX = 128.0;
+    constexpr double mediaBrowserWidth = mediaPanelWidth - mediaBrowserX - 8.0;
 
     self.mediaTabContentMedia =
         [[NSView alloc] initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth,
@@ -2828,34 +3533,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
     libraryTitle.textColor = NSColor.secondaryLabelColor;
     [self.mediaTabContentMedia addSubview:libraryTitle];
 
-    NSButton* addBinButton =
-        [NSButton buttonWithTitle:@"+ Chutier"
-                           target:self
-                           action:@selector(createBinPressed:)];
-    addBinButton.frame =
-        NSMakeRect(12.0, mediaContentHeight - 70.0, 142.0, 28.0);
-    addBinButton.autoresizingMask = NSViewMinYMargin;
-    addBinButton.bezelStyle = NSBezelStyleRounded;
-    addBinButton.title = @"Chutier";
-    addBinButton.image = SystemSymbol(@"folder.badge.plus", @"Nouveau chutier");
-    addBinButton.imagePosition = NSImageLeading;
-    [self.mediaTabContentMedia addSubview:addBinButton];
-
-    NSButton* deleteBinButton =
-        [NSButton buttonWithTitle:@"Supprimer"
-                           target:self
-                           action:@selector(deleteBinPressed:)];
-    deleteBinButton.frame =
-        NSMakeRect(166.0, mediaContentHeight - 70.0, 142.0, 28.0);
-    deleteBinButton.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
-    deleteBinButton.bezelStyle = NSBezelStyleRounded;
-    deleteBinButton.image = SystemSymbol(@"trash", @"Supprimer le chutier");
-    deleteBinButton.imagePosition = NSImageLeading;
-    deleteBinButton.toolTip = @"Supprime le chutier sélectionné s’il est vide";
-    [self.mediaTabContentMedia addSubview:deleteBinButton];
-
     self.binOutline = [[ContextOutlineView alloc]
-        initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth - 24.0, 220.0)];
+        initWithFrame:NSMakeRect(0.0, 0.0, binSidebarWidth,
+                                 mediaContentHeight - 154.0)];
     NSTableColumn* binColumn =
         [[NSTableColumn alloc] initWithIdentifier:@"bin"];
     [self.binOutline addTableColumn:binColumn];
@@ -2863,24 +3543,30 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.binOutline.headerView = nil;
     self.binOutline.dataSource = self;
     self.binOutline.delegate = self;
+    self.binOutline.rowHeight = 26.0;
+    self.binOutline.indentationPerLevel = 12.0;
+    self.binOutline.backgroundColor = CMSurfacePanelColor();
+    binColumn.width = binSidebarWidth;
     [self.binOutline registerForDraggedTypes:@[
         kCutmachineMediaPasteboardType, kCutmachineBinPasteboardType,
-        NSPasteboardTypeFileURL
+        kCutmachineTimelinePasteboardType, NSPasteboardTypeFileURL
     ]];
     [self.binOutline setDraggingSourceOperationMask:NSDragOperationMove
                                            forLocal:YES];
     NSScrollView* binScroll = [[NSScrollView alloc]
-        initWithFrame:NSMakeRect(12.0, mediaContentHeight - 300.0,
-                                 mediaPanelWidth - 24.0, 220.0)];
-    binScroll.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+        initWithFrame:NSMakeRect(binSidebarX, 112.0, binSidebarWidth,
+                                 mediaContentHeight - 154.0)];
+    binScroll.autoresizingMask = NSViewHeightSizable | NSViewMaxXMargin;
     binScroll.documentView = self.binOutline;
     binScroll.hasVerticalScroller = YES;
-    binScroll.borderType = NSBezelBorder;
+    binScroll.borderType = NSNoBorder;
+    binScroll.drawsBackground = YES;
+    binScroll.backgroundColor = CMSurfacePanelColor();
     [self.mediaTabContentMedia addSubview:binScroll];
 
     self.mediaSearchField = [[NSSearchField alloc]
-        initWithFrame:NSMakeRect(12.0, mediaContentHeight - 338.0,
-                                 mediaPanelWidth - 104.0, 26.0)];
+        initWithFrame:NSMakeRect(mediaBrowserX, mediaContentHeight - 70.0,
+                                 mediaBrowserWidth - 80.0, 26.0)];
     self.mediaSearchField.placeholderString = @"Rechercher nom, codec, format…";
     self.mediaSearchField.target = self;
     self.mediaSearchField.action = @selector(mediaSearchChanged:);
@@ -2890,15 +3576,15 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self.mediaTabContentMedia addSubview:self.mediaSearchField];
 
     self.mediaViewToggle = [[NSSegmentedControl alloc]
-        initWithFrame:NSMakeRect(mediaPanelWidth - 84.0,
-                                 mediaContentHeight - 338.0, 72.0, 26.0)];
+        initWithFrame:NSMakeRect(mediaPanelWidth - 80.0,
+                                 mediaContentHeight - 70.0, 72.0, 26.0)];
     self.mediaViewToggle.segmentCount = 2;
     [self.mediaViewToggle setImage:SystemSymbol(@"list.bullet", @"Vue liste")
                         forSegment:0];
     [self.mediaViewToggle
           setImage:SystemSymbol(@"square.grid.2x2", @"Vue grille")
         forSegment:1];
-    self.mediaViewToggle.selectedSegment = 0;
+    self.mediaViewToggle.selectedSegment = 1;
     self.mediaViewToggle.target = self;
     self.mediaViewToggle.action = @selector(mediaViewChanged:);
     self.mediaViewToggle.autoresizingMask = NSViewMinYMargin;
@@ -2920,10 +3606,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaTable.dataSource = self;
     self.mediaTable.delegate = self;
     self.mediaTable.allowsMultipleSelection = YES;
-    self.mediaTable.usesAlternatingRowBackgroundColors = YES;
+    self.mediaTable.rowHeight = 44.0;
+    self.mediaTable.usesAlternatingRowBackgroundColors = NO;
     self.mediaListScroll = [[NSScrollView alloc]
-        initWithFrame:NSMakeRect(12.0, 112.0, mediaPanelWidth - 24.0,
-                                 mediaContentHeight - 462.0)];
+        initWithFrame:NSMakeRect(mediaBrowserX, 112.0, mediaBrowserWidth,
+                                 mediaContentHeight - 190.0)];
     self.mediaListScroll.autoresizingMask =
         NSViewHeightSizable | NSViewWidthSizable;
     self.mediaListScroll.documentView = self.mediaTable;
@@ -2939,14 +3626,21 @@ DeleteGapOperation GapDeleteOperationForSelection(
     iconLayout.minimumLineSpacing = 8.0;
     iconLayout.sectionInset = NSEdgeInsetsMake(8, 8, 8, 8);
     self.mediaCollection = [[ContextCollectionView alloc]
-        initWithFrame:NSMakeRect(0.0, 0.0, mediaPanelWidth - 24.0, 500.0)];
+        initWithFrame:NSMakeRect(0.0, 0.0, mediaBrowserWidth, 500.0)];
     self.mediaCollection.collectionViewLayout = iconLayout;
     self.mediaCollection.dataSource = self;
     self.mediaCollection.delegate = self;
     self.mediaCollection.selectable = YES;
     self.mediaCollection.allowsMultipleSelection = YES;
+    [self.mediaCollection
+        setDraggingSourceOperationMask:kMediaLocalDragOperations
+                              forLocal:YES];
     [self.mediaCollection setDraggingSourceOperationMask:NSDragOperationCopy
-                                                forLocal:YES];
+                                                forLocal:NO];
+    [self.mediaCollection registerForDraggedTypes:@[
+        kCutmachineMediaPasteboardType, kCutmachineBinPasteboardType,
+        kCutmachineTimelinePasteboardType, NSPasteboardTypeFileURL
+    ]];
     [self.mediaCollection registerClass:MediaIconItem.class
                   forItemWithIdentifier:@"media-icon"];
     self.mediaIconScroll =
@@ -2956,40 +3650,33 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaIconScroll.documentView = self.mediaCollection;
     self.mediaIconScroll.hasVerticalScroller = YES;
     self.mediaIconScroll.borderType = NSBezelBorder;
-    self.mediaIconScroll.hidden = YES;
+    self.mediaListScroll.hidden = YES;
+    self.mediaIconScroll.hidden = NO;
     [self.mediaTabContentMedia addSubview:self.mediaIconScroll];
 
     self.mediaTable.target = self;
     self.mediaTable.doubleAction = @selector(openSelectedMediaInSourceMonitor:);
-    NSClickGestureRecognizer* iconDoubleClick =
-        [[NSClickGestureRecognizer alloc]
-            initWithTarget:self
-                    action:@selector(openSelectedMediaInSourceMonitor:)];
-    iconDoubleClick.numberOfClicksRequired = 2;
-    [self.mediaCollection addGestureRecognizer:iconDoubleClick];
-    [self.mediaTable setDraggingSourceOperationMask:NSDragOperationCopy
+    ContextCollectionView* iconCollection =
+        (ContextCollectionView*)self.mediaCollection;
+    iconCollection.doubleClickTarget = self;
+    iconCollection.doubleClickAction = @selector(openIconItem:);
+    [self.mediaTable setDraggingSourceOperationMask:kMediaLocalDragOperations
                                            forLocal:YES];
 
-    self.assignMediaButton =
-        [NSButton buttonWithTitle:@"Importer des rushes…"
-                           target:self
-                           action:@selector(importMediaPressed:)];
+    self.assignMediaButton = CMMakeStyledButton(@"IMPORTER DES RUSHES…", self,
+                                                @selector(importMediaPressed:));
     self.assignMediaButton.frame = NSMakeRect(12.0, 76.0, 184.0, 28.0);
     self.assignMediaButton.autoresizingMask = NSViewMaxYMargin;
-    self.assignMediaButton.bezelStyle = NSBezelStyleRounded;
     self.assignMediaButton.image =
         SystemSymbol(@"square.and.arrow.down", @"Importer des rushes");
     self.assignMediaButton.imagePosition = NSImageLeading;
     [self.mediaTabContentMedia addSubview:self.assignMediaButton];
 
-    self.sourceMonitorButton =
-        [NSButton buttonWithTitle:@"Source"
-                           target:self
-                           action:@selector(openSelectedMediaInSourceMonitor:)];
+    self.sourceMonitorButton = CMMakeStyledButton(
+        @"SOURCE", self, @selector(openSelectedMediaInSourceMonitor:));
     self.sourceMonitorButton.frame = NSMakeRect(202.0, 76.0, 106.0, 28.0);
     self.sourceMonitorButton.autoresizingMask = NSViewMaxYMargin;
     self.sourceMonitorButton.autoresizingMask = NSViewMinXMargin;
-    self.sourceMonitorButton.bezelStyle = NSBezelStyleRounded;
     self.sourceMonitorButton.image =
         SystemSymbol(@"rectangle.on.rectangle", @"Moniteur Source");
     self.sourceMonitorButton.imagePosition = NSImageLeading;
@@ -3022,6 +3709,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [mediaContext addItem:[self menuItem:@"Déplacer dans le chutier sélectionné"
                                   action:@selector(assignMediaToBinPressed:)
                                      key:@""]];
+    [mediaContext
+        addItem:[self menuItem:@"Nouvelle timeline avec la sélection"
+                        action:@selector(createTimelineFromSelectedMedia:)
+                           key:@""]];
     [mediaContext addItem:NSMenuItem.separatorItem];
     [mediaContext addItem:[self menuItem:@"Révéler dans le Finder"
                                   action:@selector(revealSelectedMediaInFinder:)
@@ -3074,65 +3765,60 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.mediaTaskProgress.indeterminate = NO;
     [self.mediaTabContentMedia addSubview:self.mediaTaskProgress];
     self.mediaTaskCancelButton =
-        [NSButton buttonWithTitle:@"×"
-                           target:self
-                           action:@selector(cancelDisplayedMediaTask:)];
+        CMMakeStyledButton(@"×", self, @selector(cancelDisplayedMediaTask:));
     self.mediaTaskCancelButton.frame =
         NSMakeRect(mediaPanelWidth - 40.0, 7.0, 28.0, 26.0);
     self.mediaTaskCancelButton.autoresizingMask =
         NSViewMaxYMargin | NSViewMinXMargin;
-    self.mediaTaskCancelButton.bezelStyle = NSBezelStyleRounded;
     self.mediaTaskCancelButton.toolTip = @"Annuler la tâche média active";
     self.mediaTaskCancelButton.enabled = NO;
     [self.mediaTabContentMedia addSubview:self.mediaTaskCancelButton];
-
-    [self buildAudioTabContentWithWidth:mediaPanelWidth
-                                 height:mediaContentHeight];
-    [self buildCaptionsTabContentWithWidth:mediaPanelWidth
-                                    height:mediaContentHeight];
-    self.mediaTabContentAudio.hidden = YES;
-    self.mediaTabContentCaptions.hidden = YES;
-    const NSInteger rememberedMediaTab = [NSUserDefaults.standardUserDefaults
-        integerForKey:@"ui.mediaPanel.lastActiveTab"];
-    if (rememberedMediaTab > 0 &&
-        rememberedMediaTab <
-            static_cast<NSInteger>(ui::media_panel::AllTabs().size()))
-        [self.mediaTabStrip selectIndex:rememberedMediaTab];
 
     const double editorWidth =
         windowRect.size.width - mediaPanelWidth - rightDockWidth - 2.0;
     self.editorSplitView = [[CutmachineSplitView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, editorWidth, workspaceHeight)];
     self.editorSplitView.vertical = NO;
+    self.editorSplitView.arrangesAllSubviews = NO;
     self.editorSplitView.dividerStyle = NSSplitViewDividerStyleThin;
     self.editorSplitView.delegate = self;
-    self.editorSplitView.autosaveName = @"CUTMACHINE.EditorSplit";
+    // v5 retires every earlier key: v4 and before were written while the panes
+    // were inserted in the reverse of their visual order and their frames
+    // rewritten afterwards, so the saved coordinates describe a composition
+    // this build no longer produces.
+    self.editorSplitView.autosaveName =
+        @"CUTMACHINE.EditorSplit.MonitorsTop.v5";
     self.editorSplitView.autoresizingMask =
         NSViewWidthSizable | NSViewHeightSizable;
 
+    // NSSplitView is flipped: arranged subview 0 is the *top* pane of a
+    // horizontal split and -setPosition: measures from the top edge. The
+    // monitors therefore go in first and the timeline second -- the order
+    // they appear on screen -- and AppKit needs no help holding them there.
+    const double editorDivider = self.editorSplitView.dividerThickness;
+    const double monitorPaneHeight = workspaceHeight * 0.44;
+    const double timelinePaneTop = monitorPaneHeight + editorDivider;
     self.metalView = [[TimelineMetalView alloc]
-        initWithFrame:NSMakeRect(0.0, 0.0, editorWidth,
-                                 workspaceHeight * 0.56)];
+        initWithFrame:NSMakeRect(0.0, timelinePaneTop, editorWidth,
+                                 workspaceHeight - timelinePaneTop)];
     self.metalView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.metalView.eventTarget = self;
     self.metalView.resizeTarget = self;
-    [self.editorSplitView addArrangedSubview:self.metalView];
-
     self.monitorSplitView = [[CutmachineSplitView alloc]
-        initWithFrame:NSMakeRect(0.0, workspaceHeight * 0.56, editorWidth,
-                                 workspaceHeight * 0.44)];
+        initWithFrame:NSMakeRect(0.0, 0.0, editorWidth, monitorPaneHeight)];
     self.monitorSplitView.vertical = YES;
     self.monitorSplitView.dividerStyle = NSSplitViewDividerStyleThin;
     self.monitorSplitView.delegate = self;
-    self.monitorSplitView.autosaveName = @"CUTMACHINE.MonitorSplit";
+    // The two viewers are one comparison surface: while Source is visible,
+    // both panes always receive exactly half of the available width.
     self.monitorSplitView.autoresizingMask =
         NSViewWidthSizable | NSViewHeightSizable;
     self.sourceMonitorPanel =
         [[NSView alloc] initWithFrame:NSMakeRect(0.0, 0.0, editorWidth * 0.5,
-                                                 workspaceHeight * 0.44)];
+                                                 monitorPaneHeight)];
     self.programMonitorPanel = [[NSView alloc]
         initWithFrame:NSMakeRect(editorWidth * 0.5, 0.0, editorWidth * 0.5,
-                                 workspaceHeight * 0.44)];
+                                 monitorPaneHeight)];
     for (NSView* panel in
          @[ self.sourceMonitorPanel, self.programMonitorPanel ]) {
         panel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -3168,14 +3854,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
     // small nudge from a valid arrangement rather than a guess from garbage.
     [self.monitorSplitView adjustSubviews];
     [self.monitorSplitView setPosition:editorWidth * 0.5 ofDividerAtIndex:0];
-    [self.editorSplitView addArrangedSubview:self.monitorSplitView];
+    // Monitors above, timeline below -- see the flipped-coordinates note next
+    // to editorSplitView's autosaveName. Divider 0 is then the boundary the
+    // -constrain{Min,Max}Coordinate: pair below already describes: at least
+    // 180 pt of monitors above it, at least 200 pt of timeline under it.
+    [self.editorSplitView insertArrangedSubview:self.monitorSplitView
+                                        atIndex:0];
+    [self.editorSplitView insertArrangedSubview:self.metalView atIndex:1];
     [self.editorSplitView setHoldingPriority:NSLayoutPriorityDefaultLow
                            forSubviewAtIndex:0];
     [self.editorSplitView setHoldingPriority:NSLayoutPriorityDefaultLow
                            forSubviewAtIndex:1];
     [self.editorSplitView adjustSubviews];
-    [self.editorSplitView setPosition:workspaceHeight * 0.56
-                     ofDividerAtIndex:0];
+    [self.editorSplitView setPosition:monitorPaneHeight ofDividerAtIndex:0];
     [self.workspaceSplitView addArrangedSubview:self.editorSplitView];
 
     // F2.1 design system: fixed right dock, tabs = FixedPanelLayout()'s
@@ -3248,70 +3939,18 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self.workspaceSplitView setPosition:mediaPanelWidth + editorWidth
                         ofDividerAtIndex:1];
 
-    // F2.5 design system: fixed bottom dock (Transport panel), full window
-    // width, pinned just above the status bar -- see PanelHostView.h for why
-    // this is a fixed slot rather than a user-rearrangeable one.
-    // NSViewWidthSizable only (no height/min-Y flex): stays a fixed height
-    // at a fixed distance from the window's bottom edge as the window
-    // resizes, the same way mediaPanel/rightDockPanel stay pinned to their
-    // edges via workspaceSplitView.
-    self.bottomDockPanel = [[CMPanelHostView alloc]
-        initWithFrame:NSMakeRect(0.0, 42.0, windowRect.size.width,
-                                 bottomDockHeight)
-                 dock:ui::PanelDock::Bottom];
-    self.bottomDockPanel.autoresizingMask = NSViewWidthSizable;
-    [content addSubview:self.bottomDockPanel];
-
-    self.transportView = [[CMTransportView alloc]
-        initWithFrame:NSMakeRect(
-                          0.0, 0.0, windowRect.size.width,
-                          bottomDockHeight - ui::theme::kTabStripHeight)];
-    [self.bottomDockPanel setContentView:self.transportView
-                                 forSlot:ui::PanelSlot::Transport];
-    // Every position change still funnels through -requestTimelinePosition:
-    // (quantized via TimelineView.h's QuantizePlayheadPosition, same as the
-    // main timeline's own scrub/step/edit paths) -- these actions never
-    // touch self.state->requestedPosition directly. See
-    // -stepPlayheadFrames:/-transportScrubChanged:.
-    self.transportView.playPauseButton.target = self;
-    self.transportView.playPauseButton.action = @selector(menuPlayPause:);
-    self.transportView.stepBackButton.target = self;
-    self.transportView.stepBackButton.action = @selector(transportStepBack:);
-    self.transportView.stepForwardButton.target = self;
-    self.transportView.stepForwardButton.action =
-        @selector(transportStepForward:);
-    self.transportView.scrubSlider.target = self;
-    self.transportView.scrubSlider.action = @selector(transportScrubChanged:);
-
     self.infoLabel = [NSTextField labelWithString:@"Aucun clip sélectionné"];
     self.infoLabel.frame =
-        NSMakeRect(20.0, 12.0, windowRect.size.width - 225.0, 18.0);
+        NSMakeRect(20.0, 12.0, windowRect.size.width - 40.0, 18.0);
     self.infoLabel.autoresizingMask = NSViewWidthSizable;
     self.infoLabel.font =
-        [NSFont monospacedDigitSystemFontOfSize:12.0
+        [NSFont monospacedDigitSystemFontOfSize:11.0
                                          weight:NSFontWeightRegular];
-    self.infoLabel.textColor = NSColor.secondaryLabelColor;
+    self.infoLabel.textColor = CMThemeColor(ui::theme::kTextSecondary);
     self.infoLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [content addSubview:self.infoLabel];
 
-    self.linkedSelectionButton =
-        [NSButton buttonWithTitle:@"Sélection liée : ON"
-                           target:self
-                           action:@selector(linkedSelectionPressed:)];
-    self.linkedSelectionButton.frame =
-        NSMakeRect(windowRect.size.width - 180.0, 7.0, 160.0, 28.0);
-    self.linkedSelectionButton.autoresizingMask = NSViewMinXMargin;
-    self.linkedSelectionButton.bezelStyle = NSBezelStyleRounded;
-    self.linkedSelectionButton.controlSize = NSControlSizeSmall;
-    self.linkedSelectionButton.image =
-        SystemSymbol(@"link", @"Sélection liée", 12.0);
-    self.linkedSelectionButton.imagePosition = NSImageLeading;
-    [self.linkedSelectionButton setButtonType:NSButtonTypePushOnPushOff];
-    self.linkedSelectionButton.state = NSControlStateValueOn;
-    self.linkedSelectionButton.toolTip =
-        @"Sélectionner ensemble l’image et son audio associé";
-    [content addSubview:self.linkedSelectionButton];
-    [self refreshBinControlsSelecting:@"__all__"];
+    [self refreshBinControlsSelecting:@"__root__"];
 
     self.state->renderer = std::make_unique<Renderer>();
     if (!self.state->renderer->Initialize(self.metalView)) {
@@ -3359,33 +3998,36 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                                        .name.c_str()]];
     for (NSTextField* label in
          @[ self.sourceMonitorTitleLabel, self.programMonitorTitleLabel ]) {
-        label.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightSemibold];
-        label.textColor = [NSColor colorWithWhite:0.82 alpha:1.0];
-        label.frame = NSMakeRect(10.0, 8.0, 360.0, 18.0);
-        label.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+        TimelineMetalView* monitor = label == self.programMonitorTitleLabel
+                                         ? self.programMonitorView
+                                         : self.sourceMonitorView;
+        label.font = CMFont(ui::theme::kFontSizeSmall, NSFontWeightBold);
+        label.drawsBackground = NO;
+        label.frame = NSMakeRect(
+            8.0,
+            monitor.bounds.size.height - ui::theme::kPanelHeaderHeight - 4.0,
+            monitor.bounds.size.width - 16.0, ui::theme::kPanelHeaderHeight);
+        label.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     }
+    self.sourceMonitorTitleLabel.textColor =
+        CMThemeColor(ui::theme::kTextPrimary);
+    self.programMonitorTitleLabel.textColor = NSColor.whiteColor;
     [self.sourceMonitorView addSubview:self.sourceMonitorTitleLabel];
     [self.programMonitorView addSubview:self.programMonitorTitleLabel];
     self.sourceMonitorZoneLabel =
         [NSTextField labelWithString:@"IN —    OUT —"];
     self.sourceMonitorZoneLabel.font =
         [NSFont monospacedDigitSystemFontOfSize:10.0 weight:NSFontWeightMedium];
-    self.sourceMonitorZoneLabel.textColor = [NSColor colorWithRed:0.35
-                                                            green:0.90
-                                                             blue:0.62
-                                                            alpha:1.0];
+    self.sourceMonitorZoneLabel.textColor =
+        CMThemeColor(ui::theme::kTextSecondary);
     self.sourceMonitorZoneLabel.frame = NSMakeRect(10.0, 29.0, 300.0, 16.0);
     self.sourceMonitorZoneLabel.autoresizingMask =
         NSViewWidthSizable | NSViewMaxYMargin;
     [self.sourceMonitorView addSubview:self.sourceMonitorZoneLabel];
     NSButton* sourceInsertButton =
-        [NSButton buttonWithTitle:@"Insérer"
-                           target:self
-                           action:@selector(menuInsertSource:)];
+        CMMakeStyledButton(@"INSÉRER", self, @selector(menuInsertSource:));
     NSButton* sourceOverwriteButton =
-        [NSButton buttonWithTitle:@"Écraser"
-                           target:self
-                           action:@selector(menuOverwriteSource:)];
+        CMMakeStyledButton(@"ÉCRASER", self, @selector(menuOverwriteSource:));
     sourceInsertButton.frame = NSMakeRect(10.0, 49.0, 78.0, 24.0);
     sourceOverwriteButton.frame = NSMakeRect(92.0, 49.0, 82.0, 24.0);
     sourceInsertButton.image =
@@ -3393,8 +4035,6 @@ DeleteGapOperation GapDeleteOperationForSelection(
     sourceOverwriteButton.image =
         SystemSymbol(@"square.on.square", @"Écraser depuis Source", 10.0);
     for (NSButton* button in @[ sourceInsertButton, sourceOverwriteButton ]) {
-        button.bezelStyle = NSBezelStyleRounded;
-        button.controlSize = NSControlSizeSmall;
         button.font = [NSFont systemFontOfSize:10.0];
         button.imagePosition = NSImageLeading;
         button.autoresizingMask = NSViewMaxYMargin;
@@ -3428,16 +4068,35 @@ DeleteGapOperation GapDeleteOperationForSelection(
     }
     [self.sourceMonitorView addSubview:self.sourceMonitorZoomPopup];
     [self.programMonitorView addSubview:self.programMonitorZoomPopup];
+    self.programVideoScopePopup =
+        [[NSPopUpButton alloc] initWithFrame:NSMakeRect(8.0, 4.0, 132.0, 24.0)
+                                   pullsDown:NO];
+    [self.programVideoScopePopup addItemsWithTitles:@[
+        @"Aucun scope", @"Waveform", @"Parade RGB", @"Vectorscope"
+    ]];
+    for (NSInteger index = 0; index < self.programVideoScopePopup.numberOfItems;
+         ++index)
+        [self.programVideoScopePopup itemAtIndex:index].tag = index;
+    [self.programVideoScopePopup
+        selectItemWithTag:static_cast<NSInteger>(
+                              self.state->programVideoScope)];
+    self.programVideoScopePopup.target = self;
+    self.programVideoScopePopup.action = @selector(programVideoScopeChanged:);
+    self.programVideoScopePopup.controlSize = NSControlSizeSmall;
+    self.programVideoScopePopup.font =
+        [NSFont monospacedDigitSystemFontOfSize:10.0 weight:NSFontWeightMedium];
+    self.programVideoScopePopup.autoresizingMask =
+        NSViewMaxXMargin | NSViewMaxYMargin;
+    self.programVideoScopePopup.toolTip =
+        @"Afficher un scope de la sortie Record après grading";
+    [self.programMonitorView addSubview:self.programVideoScopePopup];
     self.sourceMonitorToggleButton =
-        [NSButton buttonWithTitle:@"Source : ON"
-                           target:self
-                           action:@selector(toggleSourceMonitor:)];
+        CMMakeStyledButton(@"SOURCE ON", self, @selector(toggleSourceMonitor:));
+    self.sourceMonitorToggleButton.state = NSControlStateValueOn;
     self.sourceMonitorToggleButton.frame = NSMakeRect(
         self.programMonitorView.bounds.size.width - 198.0, 4.0, 98.0, 24.0);
     self.sourceMonitorToggleButton.autoresizingMask =
         NSViewMinXMargin | NSViewMaxYMargin;
-    self.sourceMonitorToggleButton.bezelStyle = NSBezelStyleRounded;
-    self.sourceMonitorToggleButton.controlSize = NSControlSizeSmall;
     self.sourceMonitorToggleButton.font =
         [NSFont systemFontOfSize:10.0 weight:NSFontWeightMedium];
     self.sourceMonitorToggleButton.image = SystemSymbol(
@@ -3458,29 +4117,52 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.timelineTimecodeLabel.alignment = NSTextAlignmentLeft;
     [self.metalView addSubview:self.timelineTimecodeLabel];
     self.timelineToolIcons = [NSMutableArray array];
-    NSArray<NSString*>* toolSymbols = @[
-        @"cursorarrow", @"hand.raised", @"magnifyingglass", @"scissors",
-        @"arrow.left.and.right.square"
-    ];
-    NSArray<NSString*>* toolDescriptions =
-        @[ @"Sélection", @"Main", @"Zoom", @"Lame", @"Slip (Y)" ];
-    for (NSInteger index = 0; index < toolSymbols.count; ++index) {
-        NSImageView* icon = [[NSImageView alloc]
-            initWithFrame:NSMakeRect(110.0 + index * 17.0,
-                                     self.metalView.bounds.size.height - 23.0,
-                                     13.0, 13.0)];
-        icon.image =
-            SystemSymbol(toolSymbols[index], toolDescriptions[index], 11.0);
-        icon.imageScaling = NSImageScaleProportionallyUpOrDown;
-        icon.contentTintColor =
-            index == 0 ? CMAccentBlueColor() : NSColor.secondaryLabelColor;
-        icon.autoresizingMask = NSViewMinYMargin;
-        icon.toolTip = toolDescriptions[index];
-        [self.metalView addSubview:icon];
-        [self.timelineToolIcons addObject:icon];
-    }
     [self refreshTimelineChrome];
     [self fitTimelineToViewportWidth];
+
+    __weak AppDelegate* weakShortcutTarget = self;
+    self.timelineShortcutMonitor = [NSEvent
+        addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                     handler:^NSEvent*(NSEvent* event) {
+                                       AppDelegate* target = weakShortcutTarget;
+                                       if (!target ||
+                                           event.window != target.window)
+                                           return event;
+                                       NSResponder* responder =
+                                           target.window.firstResponder;
+                                       if (![responder
+                                               isKindOfClass:NSView.class])
+                                           return event;
+                                       NSView* focusedView = (NSView*)responder;
+                                       if (![focusedView
+                                               isDescendantOf:
+                                                   target.inspectorView] ||
+                                           [focusedView
+                                               isKindOfClass:NSTextView.class])
+                                           return event;
+                                       // Preserve native Inspector control
+                                       // navigation and adjustment. The
+                                       // remaining keys use the same
+                                       // configurable timeline dispatcher as
+                                       // the Metal view, so this does not
+                                       // create a second shortcut policy.
+                                       switch (event.keyCode) {
+                                           case 48:   // Tab
+                                           case 53:   // Escape
+                                           case 115:  // Home
+                                           case 119:  // End
+                                           case 123:  // Left
+                                           case 124:  // Right
+                                           case 125:  // Down
+                                           case 126:  // Up
+                                               return event;
+                                           default:
+                                               break;
+                                       }
+                                       return [target timelineKeyDown:event]
+                                                  ? nil
+                                                  : event;
+                                     }];
 
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
@@ -3512,6 +4194,12 @@ DeleteGapOperation GapDeleteOperationForSelection(
     // Metal presenting correctly letterboxed frames throughout the gesture.
     [NSRunLoop.mainRunLoop addTimer:self.displayTimer
                             forMode:NSRunLoopCommonModes];
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+    if (gUiSmokeTesting)
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [self runUiSmokeTests];
+        });
+#endif
 }
 
 - (void)application:(NSApplication*)application
@@ -3537,13 +4225,6 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->requestedPosition = position;
     self.timelineTimecodeLabel.stringValue =
         TimelineTimecode(position, [self playheadFrameRate]);
-    // F2.5: single choke point for every playhead move (scrub, playback
-    // tick, arrow keys, edits all funnel through here already) -- the
-    // Transport panel reads the same requestedPosition/duration this label
-    // does, never a second notion of "now".
-    [self.transportView setPosition:position
-                           duration:self.state->duration
-                               rate:[self playheadFrameRate]];
     self.state->requested.clear();
     for (const Ulid& trackId : self.state->videoTrackIds) {
         for (const ResolvedLayer& layer :
@@ -3623,62 +4304,28 @@ DeleteGapOperation GapDeleteOperationForSelection(
         [label removeFromSuperview];
     [self.trackHeaderLabels removeAllObjects];
 
-    const double timelineHeight = [self timelineHeight];
     if (self.offlineMediaLabel)
         self.offlineMediaLabel.frame =
             NSMakeRect(0.0, 0.0, self.programMonitorView.bounds.size.width,
                        self.programMonitorView.bounds.size.height);
-    self.timelineTimecodeLabel.frame = NSMakeRect(
-        10.0, timelineHeight - kTimelineRulerHeight + 4.0,
-        self.state->viewport.header_width - 20.0, kTimelineRulerHeight - 7.0);
-    self.timelineTimecodeLabel.stringValue = TimelineTimecode(
-        self.state->requestedPosition, [self playheadFrameRate]);
-
-    const auto tracks = TimelineTracksInDisplayOrder(self.state->document);
-    uint32_t videoNumber = static_cast<uint32_t>(std::count_if(
-        tracks.begin(), tracks.end(),
-        [](const DocumentTrack* track) { return track->kind == "video"; }));
-    uint32_t audioNumber = 0;
-    for (size_t index = 0; index < tracks.size(); ++index) {
-        const bool video = tracks[index]->kind == "video";
-        const uint32_t number = video ? videoNumber-- : ++audioNumber;
-        NSString* title =
-            [NSString stringWithFormat:@"%c%u", video ? 'V' : 'A', number];
-        NSTextField* label = [NSTextField labelWithString:title];
-        label.font = [NSFont monospacedDigitSystemFontOfSize:11.0
-                                                      weight:NSFontWeightBold];
-        label.alignment = NSTextAlignmentCenter;
-        label.textColor =
-            video ? [NSColor colorWithRed:0.47 green:0.76 blue:0.95 alpha:1.0]
-                  : [NSColor colorWithRed:0.47 green:0.82 blue:0.61 alpha:1.0];
-        label.drawsBackground = YES;
-        label.backgroundColor = [NSColor colorWithWhite:0.075 alpha:0.96];
-        label.wantsLayer = YES;
-        label.layer.cornerRadius = 2.0;
-        label.layer.borderWidth = 1.0;
-        label.layer.borderColor =
-            (video ? [NSColor colorWithRed:0.18 green:0.44 blue:0.61 alpha:1.0]
-                   : [NSColor colorWithRed:0.18 green:0.48 blue:0.31 alpha:1.0])
-                .CGColor;
-        const double y = timelineHeight - kTimelineRulerHeight -
-                         (index + 1) * self.state->viewport.track_height + 7.0;
-        if (y + 20.0 < 0.0) continue;
-        label.frame = NSMakeRect(9.0, y, 34.0, 20.0);
-        [self.metalView addSubview:label];
-        [self.trackHeaderLabels addObject:label];
-    }
+    // Labels now live in the ordered Metal atlas display list. Keeping the
+    // former AppKit overlays hidden avoids two coordinate systems drifting
+    // apart when the timeline is resized.
+    self.timelineTimecodeLabel.hidden = YES;
 }
 
 - (void)refreshBinControlsSelecting:(NSString*)selectedBinId {
     if (!self.binOutline || !self.mediaTable) return;
     NSString* requested = selectedBinId ?: self.selectedBinId ?: @"__all__";
     self.selectedBinId = requested;
+    self.updatingBinControls = YES;
     [self.binOutline reloadData];
     [self.binOutline expandItem:nil expandChildren:YES];
     const NSInteger row = [self.binOutline rowForItem:requested];
     if (row >= 0)
         [self.binOutline selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
                      byExtendingSelection:NO];
+    self.updatingBinControls = NO;
     [self rebuildMediaList];
     // Bin selection/membership is shared between the Media and Audio tabs --
     // both filter the same document.library (see MediaPanelModel.h) -- so
@@ -3688,8 +4335,12 @@ DeleteGapOperation GapDeleteOperationForSelection(
 
 - (void)binSelectionChanged:(id)sender {
     (void)sender;
+    if (self.updatingBinControls) return;
     const NSInteger row = self.binOutline.selectedRow;
-    if (row >= 0) self.selectedBinId = [self.binOutline itemAtRow:row];
+    if (row < 0) return;
+    NSString* selected = [self.binOutline itemAtRow:row];
+    if ([selected isEqualToString:self.selectedBinId]) return;
+    self.selectedBinId = selected;
     [self rebuildMediaList];
 }
 
@@ -3711,9 +4362,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (NSInteger)outlineView:(NSOutlineView*)outlineView
     numberOfChildrenOfItem:(id)item {
     (void)outlineView;
-    if (!item) return 2 + [self childBinIds:@""].count;
+    if (!item) return 2;
     NSString* identifier = item;
-    if ([identifier hasPrefix:@"__"]) return 0;
+    if ([identifier isEqualToString:@"__all__"]) return 0;
+    if ([identifier isEqualToString:@"__root__"])
+        return [self childBinIds:@""].count;
     return [self childBinIds:identifier].count;
 }
 
@@ -3723,17 +4376,20 @@ DeleteGapOperation GapDeleteOperationForSelection(
     (void)outlineView;
     if (!item) {
         if (index == 0) return @"__all__";
-        if (index == 1) return @"__root__";
-        return [self childBinIds:@""][index - 2];
+        return @"__root__";
     }
+    if ([item isEqualToString:@"__root__"])
+        return [self childBinIds:@""][index];
     return [self childBinIds:item][index];
 }
 
 - (BOOL)outlineView:(NSOutlineView*)outlineView isItemExpandable:(id)item {
     (void)outlineView;
     NSString* identifier = item;
-    return ![identifier hasPrefix:@"__"] &&
-           [self childBinIds:identifier].count > 0;
+    if ([identifier isEqualToString:@"__all__"]) return NO;
+    if ([identifier isEqualToString:@"__root__"])
+        return [self childBinIds:@""].count > 0;
+    return [self childBinIds:identifier].count > 0;
 }
 
 - (id<NSPasteboardWriting>)outlineView:(NSOutlineView*)outlineView
@@ -3784,6 +4440,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                                        : NSDragOperationNone;
     if ([pasteboard stringForType:kCutmachineMediaPasteboardType])
         return NSDragOperationMove;
+    if ([pasteboard stringForType:kCutmachineTimelinePasteboardType])
+        return NSDragOperationMove;
     if ([pasteboard availableTypeFromArray:@[ NSPasteboardTypeFileURL ]])
         return NSDragOperationCopy;
     (void)index;
@@ -3805,8 +4463,41 @@ DeleteGapOperation GapDeleteOperationForSelection(
     if (urls.count > 0) return [self importMediaURLs:urls intoBin:target];
 
     NSString* media = [pasteboard stringForType:kCutmachineMediaPasteboardType];
+    NSString* timeline =
+        [pasteboard stringForType:kCutmachineTimelinePasteboardType];
     NSString* movingBin =
         [pasteboard stringForType:kCutmachineBinPasteboardType];
+    if (timeline) {
+        Project candidate = self.state->project;
+        ProjectEditLog projectLog = self.state->projectEditLog;
+        EditError error = EditError::None;
+        std::string message;
+        if (!projectLog.Apply(
+                candidate,
+                ProjectOperation{SetProjectTimelineBinOperation{
+                    timeline.UTF8String ?: "", target.UTF8String ?: ""}},
+                error, message)) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Déplacement refusé (%s) : %s",
+                                 EditErrorName(error), message.c_str()];
+            return NO;
+        }
+        if (![self commitProjectCandidate:candidate
+                                  editLog:self.state->editLog
+                               projectLog:projectLog
+                                  message:message]) {
+            self.binSummaryLabel.stringValue =
+                [NSString stringWithFormat:@"Enregistrement impossible : %s",
+                                           message.c_str()];
+            return NO;
+        }
+        self.state->project = std::move(candidate);
+        self.state->projectEditLog = std::move(projectLog);
+        self.state->lastHistoryDomain = HistoryDomain::Project;
+        NSString* selected = target.length == 0 ? @"__root__" : target;
+        [self refreshBinControlsSelecting:selected];
+        return YES;
+    }
     Operation operation;
     if (media)
         operation = SetMediaBinOperation{media.UTF8String ?: "",
@@ -3841,19 +4532,34 @@ DeleteGapOperation GapDeleteOperationForSelection(
     viewForTableColumn:(NSTableColumn*)tableColumn
                   item:(id)item {
     (void)outlineView;
-    (void)tableColumn;
+    NSTableCellView* cell = [[NSTableCellView alloc]
+        initWithFrame:NSMakeRect(0.0, 0.0, tableColumn.width, 26.0)];
+    NSImageView* icon =
+        [[NSImageView alloc] initWithFrame:NSMakeRect(2.0, 6.0, 14.0, 14.0)];
+    icon.imageScaling = NSImageScaleProportionallyUpOrDown;
     NSTextField* label = [NSTextField labelWithString:@""];
+    label.frame = NSMakeRect(
+        21.0, 4.0, std::max<CGFloat>(20.0, tableColumn.width - 23.0), 18.0);
+    label.autoresizingMask = NSViewWidthSizable;
+    label.font = CMFont(ui::theme::kFontSizeSmall, NSFontWeightMedium);
+    label.textColor = CMTextSecondaryColor();
     NSString* identifier = item;
-    if ([identifier isEqualToString:@"__all__"])
-        label.stringValue = @"▣ Tous les objets";
-    else if ([identifier isEqualToString:@"__root__"])
-        label.stringValue = @"⌂ Sans chutier";
-    else {
+    if ([identifier isEqualToString:@"__all__"]) {
+        label.stringValue = @"Tous";
+        icon.image = SystemSymbol(@"square.grid.2x2", @"Tous les objets", 12.0);
+        icon.contentTintColor = CMThemeColor(ui::theme::kTextTertiary);
+    } else if ([identifier isEqualToString:@"__root__"]) {
+        label.stringValue = @"Projet";
+        icon.image = SystemSymbol(@"folder", @"Racine du projet", 12.0);
+        icon.contentTintColor = CMAccentColor();
+    } else {
         const DocumentBin* bin =
             self.state->document.FindBin(identifier.UTF8String ?: "");
         label.stringValue =
             bin ? [NSString stringWithUTF8String:bin->name.c_str()]
                 : @"Chutier manquant";
+        icon.image = SystemSymbol(@"folder", @"Chutier", 12.0);
+        icon.contentTintColor = CMAccentColor();
         if (bin) {
             label.editable = YES;
             label.selectable = YES;
@@ -3862,7 +4568,11 @@ DeleteGapOperation GapDeleteOperationForSelection(
         }
     }
     label.lineBreakMode = NSLineBreakByTruncatingTail;
-    return label;
+    cell.imageView = icon;
+    cell.textField = label;
+    [cell addSubview:icon];
+    [cell addSubview:label];
+    return cell;
 }
 
 - (void)outlineViewSelectionDidChange:(NSNotification*)notification {
@@ -3874,6 +4584,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.visibleMediaIds = [NSMutableArray array];
     NSString* query = self.mediaSearchField.stringValue.lowercaseString ?: @"";
     const std::string selected(self.selectedBinId.UTF8String ?: "__all__");
+    if (selected != "__all__") {
+        const Ulid parent = selected == "__root__" ? Ulid{} : selected;
+        const auto childBins = ui::media_panel::DirectChildBins(
+            self.state->document.bins, parent, query.UTF8String ?: "");
+        for (const DocumentBin* bin : childBins)
+            [self.visibleMediaIds
+                addObject:[NSString stringWithUTF8String:bin->id.c_str()]];
+    }
     for (const DocumentSequence& sequence : self.state->project.timelines) {
         const auto placement =
             self.state->project.timeline_bin_ids.find(sequence.id);
@@ -3900,21 +4618,26 @@ DeleteGapOperation GapDeleteOperationForSelection(
             ((selected == "__root__" && !media.bin_id.empty()) ||
              (selected != "__root__" && media.bin_id != selected)))
             continue;
+        const std::string displayName =
+            RushDisplayName(self.state->project, media);
         NSString* searchable = [NSString
-            stringWithFormat:@"%s %s %s %s %dx%d", media.filename.c_str(),
-                             media.path.c_str(), media.codec.c_str(),
-                             media.orientation.c_str(), media.width,
-                             media.height];
+            stringWithFormat:@"%s %s %s %s %s %dx%d", displayName.c_str(),
+                             media.filename.c_str(), media.path.c_str(),
+                             media.codec.c_str(), media.orientation.c_str(),
+                             media.width, media.height];
         if (query.length > 0 &&
             [searchable.lowercaseString rangeOfString:query].location ==
                 NSNotFound)
             continue;
         mediaItems.push_back(&media);
     }
-    std::stable_sort(mediaItems.begin(), mediaItems.end(),
-                     [](const LibraryMedia* left, const LibraryMedia* right) {
-                         return left->filename < right->filename;
-                     });
+    const Project* project = &self.state->project;
+    std::stable_sort(
+        mediaItems.begin(), mediaItems.end(),
+        [project](const LibraryMedia* left, const LibraryMedia* right) {
+            return RushDisplayName(*project, *left) <
+                   RushDisplayName(*project, *right);
+        });
     for (const LibraryMedia* media : mediaItems)
         [self.visibleMediaIds
             addObject:[NSString stringWithUTF8String:media->id.c_str()]];
@@ -3939,6 +4662,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
     return [self selectedMediaIds].firstObject;
 }
 
+- (NSString*)selectedBrowserObjectId {
+    if (self.mediaViewToggle.selectedSegment == 1) {
+        NSIndexPath* path = self.mediaCollection.selectionIndexPaths.anyObject;
+        return path && path.item < self.visibleMediaIds.count
+                   ? self.visibleMediaIds[path.item]
+                   : nil;
+    }
+    const NSInteger row = self.mediaTable.selectedRow;
+    return row >= 0 && row < (NSInteger)self.visibleMediaIds.count
+               ? self.visibleMediaIds[row]
+               : nil;
+}
+
 - (NSArray<NSString*>*)selectedMediaIds {
     NSMutableArray<NSString*>* identifiers = [NSMutableArray array];
     if (self.mediaViewToggle.selectedSegment == 1) {
@@ -3950,15 +4686,20 @@ DeleteGapOperation GapDeleteOperationForSelection(
                   if (left.item > right.item) return NSOrderedDescending;
                   return NSOrderedSame;
                 }];
-        for (NSIndexPath* path in paths)
-            if (path.item < self.visibleMediaIds.count)
-                [identifiers addObject:self.visibleMediaIds[path.item]];
+        for (NSIndexPath* path in paths) {
+            if (path.item >= self.visibleMediaIds.count) continue;
+            NSString* identifier = self.visibleMediaIds[path.item];
+            if (!self.state->document.FindBin(identifier.UTF8String ?: ""))
+                [identifiers addObject:identifier];
+        }
     } else {
         [self.mediaTable.selectedRowIndexes
             enumerateIndexesUsingBlock:^(NSUInteger row, BOOL* stop) {
               (void)stop;
-              if (row < self.visibleMediaIds.count)
-                  [identifiers addObject:self.visibleMediaIds[row]];
+              if (row >= self.visibleMediaIds.count) return;
+              NSString* identifier = self.visibleMediaIds[row];
+              if (!self.state->document.FindBin(identifier.UTF8String ?: ""))
+                  [identifiers addObject:identifier];
             }];
     }
     return identifiers;
@@ -4411,20 +5152,34 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                                     forIndexPath:indexPath];
     if (indexPath.item >= self.visibleMediaIds.count) return item;
     NSString* identifier = self.visibleMediaIds[indexPath.item];
+    item.representedObject = identifier;
+    ((MediaIconView*)item.view).indexPath = indexPath;
+    item.textField.editable = YES;
+    item.textField.selectable = YES;
+    item.textField.delegate = self;
+    item.textField.identifier =
+        [@"browser:" stringByAppendingString:identifier];
+    const DocumentBin* bin =
+        self.state->document.FindBin(identifier.UTF8String ?: "");
+    if (bin) {
+        item.textField.stringValue =
+            [NSString stringWithUTF8String:bin->name.c_str()];
+        item.imageView.image = SystemSymbol(@"folder.fill", @"Chutier", 38.0);
+        item.imageView.contentTintColor = CMThemeColor(ui::theme::kAccent);
+        item.imageView.layer.backgroundColor = NSColor.clearColor.CGColor;
+        item.view.toolTip = @"Double-cliquer pour ouvrir ce chutier";
+        return item;
+    }
     const DocumentSequence* timeline =
         self.state->project.FindTimeline(identifier.UTF8String ?: "");
     if (timeline) {
         const DocumentSequence& sequence = *timeline;
-        item.textField.stringValue = [NSString
-            stringWithFormat:@"%@%s",
-                             sequence.id == self.state->activeTimelineId ? @"● "
-                                                                         : @"",
-                             sequence.name.c_str()];
-        NSImage* symbol =
-            [NSImage imageWithSystemSymbolName:@"timeline.selection"
-                      accessibilityDescription:@"Séquence"];
-        symbol.size = NSMakeSize(44.0, 44.0);
-        item.imageView.image = symbol;
+        item.textField.stringValue =
+            [NSString stringWithUTF8String:sequence.name.c_str()];
+        item.imageView.image =
+            SystemSymbol(@"rectangle.stack.fill", @"Séquence", 34.0);
+        item.imageView.contentTintColor = CMAccentColor();
+        item.imageView.layer.backgroundColor = NSColor.clearColor.CGColor;
         item.view.toolTip = [NSString
             stringWithFormat:@"Séquence · %dx%d · %d/%d fps · %lu pistes",
                              sequence.width, sequence.height,
@@ -4436,11 +5191,12 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->document.FindLibraryMedia(identifier.UTF8String ?: "");
     if (!media) return item;
     item.textField.stringValue = [NSString
-        stringWithFormat:@"%@%s", media->proxy_path.empty() ? @"" : @"P · ",
-                         media->filename.c_str()];
+        stringWithUTF8String:RushDisplayName(self.state->project, *media)
+                                 .c_str()];
     const bool offline = self.state->offlineSourceIds.count(media->id) != 0;
     NSImage* thumbnail = offline ? nil : self.mediaThumbnails[identifier];
     if (thumbnail) {
+        item.imageView.contentTintColor = nil;
         item.imageView.image = thumbnail;
     } else {
         NSImage* symbol = [NSImage
@@ -4450,7 +5206,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                                : @"Média vidéo")];
         symbol.size = NSMakeSize(44.0, 44.0);
         item.imageView.image = symbol;
+        item.imageView.contentTintColor =
+            offline ? CMThemeColor(ui::theme::kError) : CMTextSecondaryColor();
     }
+    item.imageView.layer.backgroundColor = CMSurfaceRaisedColor().CGColor;
     item.view.toolTip =
         offline ? [NSString stringWithFormat:@"%s · MÉDIA OFFLINE",
                                              media->filename.c_str()]
@@ -4469,13 +5228,112 @@ DeleteGapOperation GapDeleteOperationForSelection(
        pasteboardWriterForItemAtIndexPath:(NSIndexPath*)indexPath {
     (void)collectionView;
     if (indexPath.item >= self.visibleMediaIds.count) return nil;
-    if (self.state->project.FindTimeline(
+    if (self.state->document.FindBin(
             self.visibleMediaIds[indexPath.item].UTF8String ?: ""))
         return nil;
     NSPasteboardItem* item = [[NSPasteboardItem alloc] init];
-    [item setString:self.visibleMediaIds[indexPath.item]
-            forType:kCutmachineMediaPasteboardType];
+    NSString* identifier = self.visibleMediaIds[indexPath.item];
+    const NSPasteboardType type =
+        self.state->project.FindTimeline(identifier.UTF8String ?: "")
+            ? kCutmachineTimelinePasteboardType
+            : kCutmachineMediaPasteboardType;
+    [item setString:identifier forType:type];
     return item;
+}
+
+- (BOOL)collectionView:(NSCollectionView*)collectionView
+    canDragItemsAtIndexPaths:(NSSet<NSIndexPath*>*)indexPaths
+                   withEvent:(NSEvent*)event {
+    (void)collectionView;
+    (void)event;
+    for (NSIndexPath* path in indexPaths) {
+        if (path.item >= self.visibleMediaIds.count) continue;
+        const std::string identifier(self.visibleMediaIds[path.item].UTF8String
+                                         ?: "");
+        if (self.state->document.FindLibraryMedia(identifier) ||
+            self.state->project.FindTimeline(identifier))
+            return YES;
+    }
+    return NO;
+}
+
+- (NSString*)iconGridDropTargetAtIndexPath:(NSIndexPath*)indexPath
+                             dropOperation:
+                                 (NSCollectionViewDropOperation)dropOperation {
+    if (dropOperation == NSCollectionViewDropOn && indexPath &&
+        indexPath.item < self.visibleMediaIds.count) {
+        NSString* identifier = self.visibleMediaIds[indexPath.item];
+        if (self.state->document.FindBin(identifier.UTF8String ?: ""))
+            return identifier;
+    }
+    if (self.state->document.FindBin(self.selectedBinId.UTF8String ?: ""))
+        return self.selectedBinId;
+    return @"";
+}
+
+- (NSDragOperation)collectionView:(NSCollectionView*)collectionView
+                     validateDrop:(id<NSDraggingInfo>)draggingInfo
+                proposedIndexPath:(NSIndexPath**)proposedDropIndexPath
+                    dropOperation:
+                        (NSCollectionViewDropOperation*)proposedDropOperation {
+    if (collectionView != self.mediaCollection || !proposedDropIndexPath ||
+        !*proposedDropIndexPath)
+        return NSDragOperationNone;
+    NSString* target =
+        [self iconGridDropTargetAtIndexPath:*proposedDropIndexPath
+                              dropOperation:*proposedDropOperation];
+
+    NSPasteboard* pasteboard = draggingInfo.draggingPasteboard;
+    NSString* movingMedia =
+        [pasteboard stringForType:kCutmachineMediaPasteboardType];
+    if (movingMedia) {
+        const LibraryMedia* media =
+            self.state->document.FindLibraryMedia(movingMedia.UTF8String ?: "");
+        if (!media || media->bin_id == (target.UTF8String ?: ""))
+            return NSDragOperationNone;
+        return NSDragOperationMove;
+    }
+    NSString* movingTimeline =
+        [pasteboard stringForType:kCutmachineTimelinePasteboardType];
+    if (movingTimeline) {
+        const Ulid timelineId(movingTimeline.UTF8String ?: "");
+        if (!self.state->project.FindTimeline(timelineId))
+            return NSDragOperationNone;
+        const auto placement =
+            self.state->project.timeline_bin_ids.find(timelineId);
+        const Ulid current =
+            placement == self.state->project.timeline_bin_ids.end()
+                ? Ulid{}
+                : placement->second;
+        return current == (target.UTF8String ?: "") ? NSDragOperationNone
+                                                    : NSDragOperationMove;
+    }
+    NSString* movingBin =
+        [pasteboard stringForType:kCutmachineBinPasteboardType];
+    if (movingBin) {
+        if (![self bin:movingBin canMoveInto:target])
+            return NSDragOperationNone;
+        return NSDragOperationMove;
+    }
+    if ([pasteboard availableTypeFromArray:@[ NSPasteboardTypeFileURL ]])
+        return NSDragOperationCopy;
+    return NSDragOperationNone;
+}
+
+- (BOOL)collectionView:(NSCollectionView*)collectionView
+            acceptDrop:(id<NSDraggingInfo>)draggingInfo
+             indexPath:(NSIndexPath*)indexPath
+         dropOperation:(NSCollectionViewDropOperation)dropOperation {
+    if (collectionView != self.mediaCollection) return NO;
+    NSString* target = [self iconGridDropTargetAtIndexPath:indexPath
+                                             dropOperation:dropOperation];
+    // Reuse the sidebar's operation-backed drop path: media classification,
+    // bin nesting, Finder ingest, persistence, and refresh stay identical for
+    // both representations of the same project architecture.
+    return [self outlineView:self.binOutline
+                  acceptDrop:draggingInfo
+                        item:target.length > 0 ? target : @"__root__"
+                  childIndex:NSOutlineViewDropOnItemIndex];
 }
 
 - (BOOL)tableView:(NSTableView*)tableView
@@ -4484,16 +5342,62 @@ DeleteGapOperation GapDeleteOperationForSelection(
     if (tableView != self.mediaTable || rowIndexes.count != 1) return NO;
     const NSUInteger row = rowIndexes.firstIndex;
     if (row >= self.visibleMediaIds.count) return NO;
-    if (self.state->project.FindTimeline(self.visibleMediaIds[row].UTF8String
-                                             ?: ""))
+    if (self.state->document.FindBin(self.visibleMediaIds[row].UTF8String
+                                         ?: ""))
         return NO;
-    [pasteboard declareTypes:@[ kCutmachineMediaPasteboardType ] owner:nil];
-    return [pasteboard setString:self.visibleMediaIds[row]
-                         forType:kCutmachineMediaPasteboardType];
+    NSString* identifier = self.visibleMediaIds[row];
+    const NSPasteboardType type =
+        self.state->project.FindTimeline(identifier.UTF8String ?: "")
+            ? kCutmachineTimelinePasteboardType
+            : kCutmachineMediaPasteboardType;
+    [pasteboard declareTypes:@[ type ] owner:nil];
+    return [pasteboard setString:identifier forType:type];
+}
+
+- (void)openIconBin:(NSClickGestureRecognizer*)recognizer {
+    if (recognizer.state != NSGestureRecognizerStateEnded) return;
+    const NSPoint point = [recognizer locationInView:self.mediaCollection];
+    NSIndexPath* path = [self.mediaCollection indexPathForItemAtPoint:point];
+    if (!path || path.item >= self.visibleMediaIds.count) return;
+    NSString* identifier = self.visibleMediaIds[path.item];
+    if (!self.state->document.FindBin(identifier.UTF8String ?: "")) return;
+    self.mediaCollection.selectionIndexPaths = [NSSet setWithObject:path];
+    self.selectedBinId = identifier;
+    const NSInteger row = [self.binOutline rowForItem:identifier];
+    if (row >= 0) {
+        self.updatingBinControls = YES;
+        [self.binOutline selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
+                     byExtendingSelection:NO];
+        self.updatingBinControls = NO;
+    }
+    [self rebuildMediaList];
+}
+
+- (void)openIconItem:(id)sender {
+    NSIndexPath* path = nil;
+    if ([sender isKindOfClass:NSGestureRecognizer.class]) {
+        NSGestureRecognizer* recognizer = sender;
+        if (recognizer.state != NSGestureRecognizerStateEnded) return;
+        const NSPoint point = [recognizer locationInView:self.mediaCollection];
+        path = [self.mediaCollection indexPathForItemAtPoint:point];
+    } else {
+        path = self.mediaCollection.selectionIndexPaths.anyObject;
+    }
+    if (!path || path.item >= self.visibleMediaIds.count) return;
+    NSString* identifier = self.visibleMediaIds[path.item];
+    if (self.state->document.FindBin(identifier.UTF8String ?: "")) return;
+    self.mediaCollection.selectionIndexPaths = [NSSet setWithObject:path];
+    [self openSelectedMediaInSourceMonitor:sender];
 }
 
 - (void)openSelectedMediaInSourceMonitor:(id)sender {
     (void)sender;
+    NSString* browserObject = [self selectedBrowserObjectId];
+    if (browserObject &&
+        self.state->document.FindBin(browserObject.UTF8String ?: "")) {
+        [self refreshBinControlsSelecting:browserObject];
+        return;
+    }
     NSString* identifier = [self selectedMediaId];
     if (!identifier) {
         const DocumentClip* clip = self.state->document.FindClip(
@@ -4645,6 +5549,132 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                        stringWithUTF8String:createdId.c_str()]];
 }
 
+- (void)createTimelineFromSelectedMedia:(id)sender {
+    (void)sender;
+    std::vector<Ulid> mediaIds;
+    for (NSString* identifier in [self selectedMediaIds]) {
+        const Ulid mediaId(identifier.UTF8String ?: "");
+        if (self.state->document.FindLibraryMedia(mediaId))
+            mediaIds.push_back(mediaId);
+    }
+    if (mediaIds.empty()) {
+        self.binSummaryLabel.stringValue =
+            @"Sélectionnez au moins un rush pour créer une timeline.";
+        NSBeep();
+        return;
+    }
+
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = @"Nouvelle timeline avec la sélection";
+    alert.informativeText =
+        [NSString stringWithFormat:@"Les %lu rushes seront placés bout à bout.",
+                                   (unsigned long)mediaIds.size()];
+    [alert addButtonWithTitle:@"Créer"];
+    [alert addButtonWithTitle:@"Annuler"];
+    NSTextField* nameField =
+        [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 320, 24)];
+    nameField.stringValue = [NSString
+        stringWithFormat:@"Timeline %lu",
+                         (unsigned long)self.state->project.timelines.size() +
+                             1];
+    alert.accessoryView = nameField;
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    NSString* trimmed = [nameField.stringValue
+        stringByTrimmingCharactersInSet:NSCharacterSet
+                                            .whitespaceAndNewlineCharacterSet];
+    if (trimmed.length == 0) return;
+
+    const DocumentSequence& current = self.state->document.sequence;
+    Project finalProject = self.state->project;
+    AddProjectTimelineOperation enriched{trimmed.UTF8String ?: "New Timeline",
+                                         current.width, current.height,
+                                         current.frame_rate};
+    enriched.timeline_id = GenerateUlid();
+    enriched.video_track_id = GenerateUlid();
+    enriched.audio_track_id = GenerateUlid();
+    DocumentSequence createdTimeline;
+    createdTimeline.id = enriched.timeline_id;
+    createdTimeline.name = enriched.name;
+    createdTimeline.width = enriched.width;
+    createdTimeline.height = enriched.height;
+    createdTimeline.frame_rate = enriched.frame_rate;
+    createdTimeline.tracks = {{enriched.video_track_id, "video", 0, {}},
+                              {enriched.audio_track_id, "audio", 1, {}}};
+    finalProject.timelines.push_back(std::move(createdTimeline));
+    EditError editError = EditError::None;
+    std::string message;
+    DocumentSequence* timeline =
+        finalProject.FindTimeline(enriched.timeline_id);
+    if (!timeline) return;
+    DocumentTrack* videoTrack = nullptr;
+    DocumentTrack* audioTrack = nullptr;
+    for (DocumentTrack& track : timeline->tracks) {
+        if (track.id == enriched.video_track_id) videoTrack = &track;
+        if (track.id == enriched.audio_track_id) audioTrack = &track;
+    }
+    if (!videoTrack || !audioTrack) return;
+
+    RationalTime position{0, 1};
+    for (const Ulid& mediaId : mediaIds) {
+        const auto foundMedia = std::find_if(
+            finalProject.rushes.begin(), finalProject.rushes.end(),
+            [&](const LibraryMedia& value) { return value.id == mediaId; });
+        const LibraryMedia* media =
+            foundMedia == finalProject.rushes.end() ? nullptr : &*foundMedia;
+        const DocumentSource* source = self.state->document.FindSource(mediaId);
+        if (!media || !source) continue;
+        const Ulid linkGroup = media->has_audio ? GenerateUlid() : Ulid{};
+        DocumentClip video;
+        video.source_id = mediaId;
+        video.source_in = {0, source->duration.rate};
+        video.duration = source->duration;
+        video.timeline_in = position;
+        video.include_audio = false;
+        video.link_group_id = linkGroup;
+        video.sync_anchor_clip_id = video.id;
+        videoTrack->clips.push_back(video);
+        if (media->has_audio) {
+            DocumentClip audio;
+            audio.source_id = mediaId;
+            audio.source_in = video.source_in;
+            audio.duration = video.duration;
+            audio.timeline_in = video.timeline_in;
+            audio.include_audio = true;
+            audio.link_group_id = linkGroup;
+            audio.sync_anchor_clip_id = video.id;
+            audioTrack->clips.push_back(std::move(audio));
+        }
+        position = position.add(source->duration);
+    }
+    if (!finalProject.Validate(message)) {
+        self.binSummaryLabel.stringValue = [NSString
+            stringWithFormat:@"Timeline invalide : %s", message.c_str()];
+        return;
+    }
+
+    enriched.exact_project_result =
+        ExactProjectState{finalProject.SaveToString()};
+    Project candidate = self.state->project;
+    ProjectEditLog projectLog = self.state->projectEditLog;
+    if (!projectLog.Apply(candidate, ProjectOperation{std::move(enriched)},
+                          editError, message) ||
+        ![self commitProjectCandidate:candidate
+                              editLog:self.state->editLog
+                           projectLog:projectLog
+                              message:message]) {
+        self.binSummaryLabel.stringValue = [NSString
+            stringWithFormat:@"Création impossible : %s", message.c_str()];
+        return;
+    }
+    self.state->project = std::move(candidate);
+    self.state->projectEditLog = std::move(projectLog);
+    self.state->lastHistoryDomain = HistoryDomain::Project;
+    [self rebuildMediaList];
+    [self activateTimelineIdentifier:[NSString
+                                         stringWithUTF8String:timeline->id
+                                                                  .c_str()]];
+}
+
 - (BOOL)validateMenuItem:(NSMenuItem*)item {
     const SEL action = item.action;
     if (action == @selector(exportFinalVideo:))
@@ -4686,6 +5716,13 @@ DeleteGapOperation GapDeleteOperationForSelection(
         if (!self.state) return NO;
         item.state = self.state->proxiesEnabled ? NSControlStateValueOn
                                                 : NSControlStateValueOff;
+        return YES;
+    }
+    if (action == @selector(menuToggleAutomaticProxies:)) {
+        if (!self.state) return NO;
+        item.state = self.state->automaticProxiesEnabled
+                         ? NSControlStateValueOn
+                         : NSControlStateValueOff;
         return YES;
     }
     if (action == @selector(renameBinPressed:) || action == @selector
@@ -4788,29 +5825,42 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->overlayDirty = true;
 }
 
+- (void)programVideoScopeChanged:(NSPopUpButton*)sender {
+    self.state->programVideoScope = VideoScopeModeFromPreference(
+        static_cast<int32_t>(sender.selectedItem.tag));
+    [NSUserDefaults.standardUserDefaults
+        setInteger:static_cast<NSInteger>(self.state->programVideoScope)
+            forKey:kProgramVideoScopeDefaultsKey];
+    self.state->overlayDirty = true;
+}
+
 - (void)toggleSourceMonitor:(NSButton*)sender {
-    if (self.state->sourceMonitorVisible) {
+    // Removing the pane from the split is deterministic. Merely hiding an
+    // arranged subview leaves NSSplitView free to restore its autosaved
+    // divider on the next layout pass, which made SOURCE OFF appear inert.
+    const bool makeVisible = !self.state->sourceMonitorVisible;
+    if (!makeVisible) {
         self.state->sourceMonitorPanelWidth =
             self.sourceMonitorPanel.frame.size.width;
         self.state->sourceMonitorVisible = false;
         self.state->sourceMonitorActive = false;
-        self.sourceMonitorPanel.hidden = YES;
-        sender.title = @"Source : OFF";
+        [self.monitorSplitView removeArrangedSubview:self.sourceMonitorPanel];
+        [self.sourceMonitorPanel removeFromSuperview];
+        sender.state = NSControlStateValueOff;
+        sender.title = @"SOURCE OFF";
         sender.image =
             SystemSymbol(@"rectangle", @"Moniteur Record seul", 11.0);
     } else {
         self.state->sourceMonitorVisible = true;
-        self.sourceMonitorPanel.hidden = NO;
+        [self.monitorSplitView insertArrangedSubview:self.sourceMonitorPanel
+                                             atIndex:0];
+        [self.monitorSplitView adjustSubviews];
         const double available = self.monitorSplitView.bounds.size.width -
                                  self.monitorSplitView.dividerThickness;
-        const double restored = self.state->sourceMonitorPanelWidth > 0.0
-                                    ? self.state->sourceMonitorPanelWidth
-                                    : available * 0.5;
-        [self.monitorSplitView
-                 setPosition:std::clamp(restored, 320.0,
-                                        std::max(320.0, available - 320.0))
-            ofDividerAtIndex:0];
-        sender.title = @"Source : ON";
+        [self.monitorSplitView setPosition:available * 0.5 ofDividerAtIndex:0];
+        self.state->sourceMonitorActive = self.state->sourceMonitor;
+        sender.state = NSControlStateValueOn;
+        sender.title = @"SOURCE ON";
         sender.image = SystemSymbol(@"rectangle.split.2x1",
                                     @"Afficher le moniteur Source", 11.0);
     }
@@ -5053,6 +6103,13 @@ DeleteGapOperation GapDeleteOperationForSelection(
     return 0;
 }
 
+- (NSTableRowView*)tableView:(NSTableView*)tableView
+               rowViewForRow:(NSInteger)row {
+    (void)tableView;
+    (void)row;
+    return [[CMIndustrialTableRowView alloc] initWithFrame:NSZeroRect];
+}
+
 - (NSView*)tableView:(NSTableView*)tableView
     viewForTableColumn:(NSTableColumn*)tableColumn
                    row:(NSInteger)row {
@@ -5103,8 +6160,76 @@ DeleteGapOperation GapDeleteOperationForSelection(
     NSString* identifier = self.visibleMediaIds[row];
     const LibraryMedia* media =
         self.state->document.FindLibraryMedia(identifier.UTF8String ?: "");
+    const DocumentBin* bin =
+        self.state->document.FindBin(identifier.UTF8String ?: "");
+    if ([tableColumn.identifier isEqualToString:@"name"]) {
+        NSTableCellView* cell = [[NSTableCellView alloc]
+            initWithFrame:NSMakeRect(0, 0, tableColumn.width, 44.0)];
+        NSImageView* image =
+            [[NSImageView alloc] initWithFrame:NSMakeRect(4, 3, 60, 38)];
+        image.imageScaling = NSImageScaleProportionallyUpOrDown;
+        image.wantsLayer = YES;
+        image.layer.cornerRadius = 0.0;
+        image.layer.masksToBounds = YES;
+        NSTextField* title = [[BrowserRenameTextField alloc]
+            initWithFrame:NSMakeRect(72, 12,
+                                     std::max(40.0, tableColumn.width - 76),
+                                     20)];
+        title.bezeled = NO;
+        title.drawsBackground = NO;
+        title.autoresizingMask = NSViewWidthSizable;
+        title.lineBreakMode = NSLineBreakByTruncatingTail;
+        title.editable = YES;
+        title.selectable = YES;
+        title.delegate = self;
+        title.identifier = [@"browser:" stringByAppendingString:identifier];
+        cell.imageView = image;
+        cell.textField = title;
+        [cell addSubview:image];
+        [cell addSubview:title];
+        if (bin) {
+            title.stringValue =
+                [NSString stringWithUTF8String:bin->name.c_str()];
+            image.image = SystemSymbol(@"folder.fill", @"Chutier", 24.0);
+            image.contentTintColor = CMThemeColor(ui::theme::kAccent);
+        } else if (media) {
+            title.stringValue =
+                [NSString stringWithUTF8String:RushDisplayName(
+                                                   self.state->project, *media)
+                                                   .c_str()];
+            const bool offline =
+                self.state->offlineSourceIds.count(media->id) != 0;
+            image.image = offline ? nil : self.mediaThumbnails[identifier];
+            if (image.image) {
+                image.contentTintColor = nil;
+            } else {
+                image.image = SystemSymbol(
+                    offline ? @"exclamationmark.triangle" : @"film",
+                    offline ? @"Média offline" : @"Média vidéo");
+                image.contentTintColor = offline
+                                             ? CMThemeColor(ui::theme::kError)
+                                             : CMTextSecondaryColor();
+            }
+        } else if (const DocumentSequence* sequence =
+                       self.state->project.FindTimeline(identifier.UTF8String
+                                                            ?: "")) {
+            title.stringValue =
+                [NSString stringWithUTF8String:sequence->name.c_str()];
+            image.image =
+                SystemSymbol(@"rectangle.stack.fill", @"Séquence", 22.0);
+            image.contentTintColor = CMAccentColor();
+        }
+        return cell;
+    }
     NSTextField* label = [NSTextField labelWithString:@""];
     label.lineBreakMode = NSLineBreakByTruncatingTail;
+    if (bin) {
+        if ([tableColumn.identifier isEqualToString:@"format"])
+            label.stringValue = @"Chutier";
+        else
+            label.stringValue = @"—";
+        return label;
+    }
     if (!media) {
         const DocumentSequence* found =
             self.state->project.FindTimeline(identifier.UTF8String ?: "");
@@ -5159,7 +6284,23 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)collectionView:(NSCollectionView*)collectionView
     didSelectItemsAtIndexPaths:(NSSet<NSIndexPath*>*)indexPaths {
     (void)collectionView;
-    (void)indexPaths;
+    NSIndexPath* path = indexPaths.anyObject;
+    if (path && path.item < self.visibleMediaIds.count) {
+        NSString* identifier = self.visibleMediaIds[path.item];
+        if (self.state->document.FindBin(identifier.UTF8String ?: "")) {
+            self.selectedBinId = identifier;
+            const NSInteger row = [self.binOutline rowForItem:identifier];
+            if (row >= 0) {
+                self.updatingBinControls = YES;
+                [self.binOutline
+                        selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
+                    byExtendingSelection:NO];
+                self.updatingBinControls = NO;
+            }
+            [self rebuildMediaList];
+            return;
+        }
+    }
     (void)[self selectedMediaId];
 }
 
@@ -5367,6 +6508,18 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->proxiesEnabled ? @"Proxies activés" : @"Originaux activés";
 }
 
+- (void)menuToggleAutomaticProxies:(id)sender {
+    (void)sender;
+    self.state->automaticProxiesEnabled = !self.state->automaticProxiesEnabled;
+    [NSUserDefaults.standardUserDefaults
+        setBool:self.state->automaticProxiesEnabled
+         forKey:kAutomaticProxyGenerationDefaultsKey];
+    self.infoLabel.stringValue =
+        self.state->automaticProxiesEnabled
+            ? @"Génération automatique des proxies activée"
+            : @"Génération automatique des proxies désactivée";
+}
+
 - (void)createBinPressed:(id)sender {
     (void)sender;
     const std::string parent =
@@ -5439,35 +6592,84 @@ DeleteGapOperation GapDeleteOperationForSelection(
 
 - (void)controlTextDidEndEditing:(NSNotification*)notification {
     NSTextField* field = notification.object;
-    if (![field isKindOfClass:NSTextField.class] ||
-        ![field.identifier hasPrefix:@"bin:"])
+    if (![field isKindOfClass:NSTextField.class]) return;
+    const BOOL sidebarRename = [field.identifier hasPrefix:@"bin:"];
+    const BOOL browserRename = [field.identifier hasPrefix:@"browser:"];
+    if (!sidebarRename && !browserRename) return;
+    const NSUInteger prefixLength = sidebarRename ? 4 : 8;
+    NSString* identifier = [field.identifier substringFromIndex:prefixLength];
+    const NSInteger movement =
+        [notification.userInfo[NSTextMovementUserInfoKey] integerValue];
+    if (movement == NSCancelTextMovement) {
+        [self refreshBinControlsSelecting:self.selectedBinId ?: @"__all__"];
         return;
-    NSString* identifier = [field.identifier substringFromIndex:4];
+    }
     const DocumentBin* bin =
         self.state->document.FindBin(identifier.UTF8String ?: "");
-    if (!bin) return;
     NSString* name = [field.stringValue
         stringByTrimmingCharactersInSet:NSCharacterSet
                                             .whitespaceAndNewlineCharacterSet];
-    if (name.length == 0 || bin->name == (name.UTF8String ?: "")) {
-        [self.binOutline reloadItem:identifier];
+    const DocumentSequence* timeline =
+        self.state->project.FindTimeline(identifier.UTF8String ?: "");
+    const LibraryMedia* media =
+        self.state->document.FindLibraryMedia(identifier.UTF8String ?: "");
+    const std::string currentName =
+        bin        ? bin->name
+        : timeline ? timeline->name
+        : media    ? RushDisplayName(self.state->project, *media)
+                   : std::string{};
+    if (name.length == 0 || currentName.empty() ||
+        currentName == (name.UTF8String ?: "")) {
+        [self refreshBinControlsSelecting:self.selectedBinId ?: @"__all__"];
         return;
     }
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(
-            self.state->document,
-            Operation{RenameBinOperation{identifier.UTF8String ?: "",
-                                         name.UTF8String ?: ""}},
-            error, message)) {
-        self.binSummaryLabel.stringValue = [NSString
-            stringWithFormat:@"Renommage refusé : %s", message.c_str()];
-        return;
+    if (bin) {
+        if (!self.state->editLog.Apply(
+                self.state->document,
+                Operation{RenameBinOperation{identifier.UTF8String ?: "",
+                                             name.UTF8String ?: ""}},
+                error, message) ||
+            ![self persistEdits:message]) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Renommage refusé : %s", message.c_str()];
+            return;
+        }
+    } else {
+        Project candidate = self.state->project;
+        ProjectEditLog projectLog = self.state->projectEditLog;
+        if (!projectLog.Apply(
+                candidate,
+                ProjectOperation{RenameProjectItemOperation{
+                    identifier.UTF8String ?: "", name.UTF8String ?: ""}},
+                error, message) ||
+            ![self commitProjectCandidate:candidate
+                                  editLog:self.state->editLog
+                               projectLog:projectLog
+                                  message:message]) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Renommage refusé : %s", message.c_str()];
+            return;
+        }
+        self.state->project = std::move(candidate);
+        self.state->projectEditLog = std::move(projectLog);
+        self.state->lastHistoryDomain = HistoryDomain::Project;
+        if (identifier.UTF8String &&
+            self.state->activeTimelineId == identifier.UTF8String) {
+            self.state->document =
+                self.state->project.MakeDocument(self.state->activeTimelineId);
+            self.programMonitorTitleLabel.stringValue = [NSString
+                stringWithFormat:@"RECORD — %s",
+                                 self.state->document.sequence.name.c_str()];
+            self.window.title = [NSString
+                stringWithFormat:@"CUTMACHINE — %s — %s",
+                                 self.state->project.name.c_str(),
+                                 self.state->document.sequence.name.c_str()];
+        }
+        self.state->overlayDirty = true;
     }
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist bin rename: %s\n",
-                     message.c_str());
-    [self refreshBinControlsSelecting:identifier];
+    [self refreshBinControlsSelecting:self.selectedBinId ?: @"__all__"];
 }
 
 - (void)assignMediaToBinPressed:(id)sender {
@@ -5604,7 +6806,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->tool = tool;
     for (NSInteger index = 0; index < self.timelineToolIcons.count; ++index) {
         self.timelineToolIcons[index].contentTintColor =
-            index == static_cast<NSInteger>(tool) ? CMAccentBlueColor()
+            index == static_cast<NSInteger>(tool) ? CMAccentColor()
                                                   : NSColor.secondaryLabelColor;
     }
     self.state->interaction->CancelDrag();
@@ -5788,8 +6990,12 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 
 - (NSString*)transportStatus {
-    if (self.state->playbackDirection > 0) return @"Lecture ▶";
-    if (self.state->playbackDirection < 0) return @"Lecture ◀";
+    if (self.state->playbackDirection > 0)
+        return [NSString
+            stringWithFormat:@"Lecture ▶ ×%d", self.state->playbackDirection];
+    if (self.state->playbackDirection < 0)
+        return [NSString
+            stringWithFormat:@"Lecture ◀ ×%d", -self.state->playbackDirection];
     return @"Pause";
 }
 
@@ -5800,10 +7006,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 
 - (void)setPlaybackDirection:(int)direction {
-    self.state->playbackDirection = std::clamp(direction, -1, 1);
+    self.state->playbackDirection = std::clamp(direction, -4, 4);
     self.state->playbackAnchor = self.state->requestedPosition;
     self.state->playbackStarted = std::chrono::steady_clock::now();
-    [self.transportView setPlaying:self.state->playbackDirection != 0];
     if (self.state->audioPlayback) {
         self.state->audioPlayback->Stop();
         if (self.state->playbackDirection != 0) {
@@ -5961,12 +7166,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
                      message.c_str());
 }
 
-- (void)linkedSelectionPressed:(NSButton*)sender {
-    self.state->linkedSelection = sender.state == NSControlStateValueOn;
+- (void)setLinkedSelectionEnabled:(BOOL)enabled {
+    self.state->linkedSelection = enabled;
     self.state->interaction->SetLinkedSelectionEnabled(
         self.state->linkedSelection);
-    sender.title = self.state->linkedSelection ? @"Sélection liée : ON"
-                                               : @"Sélection liée : OFF";
     const std::vector<Ulid> selected =
         self.state->interaction->SelectedClipIds();
     if (self.state->linkedSelection) {
@@ -5993,69 +7196,58 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->sourceMonitorActive = false;
     self.state->duplicateDragging = false;
     self.state->duplicateDragClipboard.clear();
+    self.state->zoomBarDrag.reset();
     const NSPoint point = [self timelinePointForEvent:event];
-    if (point.y < 0.0 || point.y > [self timelineHeight]) return;
+    const double timelineHeight = [self timelineHeight];
+    if (point.y < 0.0 || point.y > timelineHeight) return;
+    // The integrated strip shares its pure geometry with Metal rendering, so
+    // the visible handles and the draggable hit areas cannot drift apart.
+    if (point.y >= timelineHeight - kTimelineZoomBarHeight) {
+        const TimelineZoomBarGeometry geometry =
+            CalculateTimelineZoomBarGeometry(self.state->viewport,
+                                             self.state->duration,
+                                             self.metalView.bounds.size.width);
+        const TimelineZoomBarPart part = geometry.HitTest(point.x);
+        if (part != TimelineZoomBarPart::None)
+            self.state->zoomBarDrag = TimelineZoomBarDrag{
+                part, point.x, self.state->viewport, geometry};
+        return;
+    }
     const double addTrackY =
         kTimelineRulerHeight + self.state->document.sequence.tracks.size() *
                                    self.state->viewport.track_height;
     if (point.y >= kTimelineRulerHeight && point.y < addTrackY &&
-        point.x >= 50.0 && point.x < 74.0) {
+        point.x >= 40.0 && point.x < 92.0) {
         const auto tracks = TimelineTracksInDisplayOrder(self.state->document);
         const size_t index =
             static_cast<size_t>((point.y - kTimelineRulerHeight) /
                                 self.state->viewport.track_height);
         if (index < tracks.size()) {
-            const Ulid id = tracks[index]->id;
-            if (self.state->targetedTrackIds.count(id))
-                self.state->targetedTrackIds.erase(id);
-            else
-                self.state->targetedTrackIds.insert(id);
-            self.state->timelineTargetTracks[self.state->activeTimelineId] =
-                self.state->targetedTrackIds;
-            self.infoLabel.stringValue = self.state->targetedTrackIds.count(id)
-                                             ? @"Piste ciblée"
-                                             : @"Piste exclue du ciblage";
-            self.state->overlayDirty = true;
-        }
-        return;
-    }
-    if (point.y >= kTimelineRulerHeight && point.y < addTrackY &&
-        point.x >= 104.0 && point.x < 120.0) {
-        const auto tracks = TimelineTracksInDisplayOrder(self.state->document);
-        const size_t index =
-            static_cast<size_t>((point.y - kTimelineRulerHeight) /
-                                self.state->viewport.track_height);
-        if (index < tracks.size()) {
+            const DocumentTrack& track = *tracks[index];
+            const int control = point.x < 56.0 ? 0 : point.x < 74.0 ? 1 : 2;
             EditError error = EditError::None;
             std::string message;
             const RationalTime playhead = self.state->requestedPosition;
-            if (self.state->editLog.Apply(
-                    self.state->document,
-                    Operation{SetTrackLockOperation{tracks[index]->id,
-                                                    !tracks[index]->locked}},
-                    error, message)) {
-                [self refreshTimelineAfterEditFromPosition:playhead];
-                [self persistEdits:message];
-                self.state->overlayDirty = true;
+            bool applies = true;
+            Operation operation = SetTrackLockOperation{};
+            if (track.kind == "video" && control == 0) {
+                operation = SetTrackOutputOperation{track.id, !track.visible,
+                                                    track.muted, track.solo};
+            } else if (track.kind == "audio" && control == 0) {
+                operation = SetTrackOutputOperation{track.id, track.visible,
+                                                    track.muted, !track.solo};
+            } else if (track.kind == "audio" && control == 1) {
+                operation = SetTrackOutputOperation{track.id, track.visible,
+                                                    !track.muted, track.solo};
+            } else if ((track.kind == "video" && control == 1) ||
+                       (track.kind == "audio" && control == 2)) {
+                operation = SetTrackLockOperation{track.id, !track.locked};
+            } else {
+                applies = false;
             }
-        }
-        return;
-    }
-    if (point.y >= kTimelineRulerHeight && point.y < addTrackY &&
-        point.x >= 127.0 && point.x < 143.0) {
-        const auto tracks = TimelineTracksInDisplayOrder(self.state->document);
-        const size_t index =
-            static_cast<size_t>((point.y - kTimelineRulerHeight) /
-                                self.state->viewport.track_height);
-        if (index < tracks.size()) {
-            EditError error = EditError::None;
-            std::string message;
-            const RationalTime playhead = self.state->requestedPosition;
-            if (self.state->editLog.Apply(
-                    self.state->document,
-                    Operation{SetTrackSyncLockOperation{
-                        tracks[index]->id, !tracks[index]->sync_lock}},
-                    error, message)) {
+            if (applies && self.state->editLog.Apply(self.state->document,
+                                                     std::move(operation),
+                                                     error, message)) {
                 [self refreshTimelineAfterEditFromPosition:playhead];
                 [self persistEdits:message];
                 self.state->overlayDirty = true;
@@ -6068,14 +7260,25 @@ DeleteGapOperation GapDeleteOperationForSelection(
         [self addTrack:(point.x >= self.state->viewport.header_width * 0.5)];
         return;
     }
-    if (point.y < kTimelineRulerHeight && point.x >= 0.0 &&
-        point.x < self.state->viewport.header_width) {
-        constexpr double toolStart = 108.0;
-        constexpr double toolWidth = 17.0;
-        if (point.x >= toolStart) {
-            const int index = std::clamp(
-                static_cast<int>((point.x - toolStart) / toolWidth), 0, 4);
+    if (point.y < kTimelineToolbarHeight && point.x >= 0.0) {
+        constexpr double toolStart = 4.0;
+        constexpr double toolWidth = 24.0;
+        if (point.x >= toolStart && point.x < toolStart + toolWidth * 5.0) {
+            const int index =
+                static_cast<int>((point.x - toolStart) / toolWidth);
             [self setTimelineTool:static_cast<TimelineTool>(index)];
+        } else if (point.x >= 128.0 && point.x < 166.0) {
+            [self menuToggleSnapping:nil];
+        } else if (point.x >= 170.0 && point.x < 216.0) {
+            [self menuToggleLinkedSelection:nil];
+        } else if (point.x >= 222.0 && point.x < 294.0) {
+            const int index = static_cast<int>((point.x - 222.0) / 24.0);
+            if (index == 0)
+                [self menuPlayReverse:nil];
+            else if (index == 1)
+                [self menuStop:nil];
+            else
+                [self menuPlayForward:nil];
         }
         return;
     }
@@ -6131,6 +7334,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
         } else if (error != EditError::InvalidTimelineIn) {
             std::fprintf(stderr, "Cut rejected (%s): %s\n",
                          EditErrorName(error), message.c_str());
+            self.infoLabel.stringValue = [NSString
+                stringWithFormat:@"Coupe refusée (%s) : %s",
+                                 EditErrorName(error), message.c_str()];
         }
         return;
     }
@@ -6147,6 +7353,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self setPlaybackDirection:0];
     const bool optionGesture =
         (event.modifierFlags & NSEventModifierFlagOption) != 0;
+    const bool commandGesture =
+        (event.modifierFlags & NSEventModifierFlagCommand) != 0;
     const bool duplicateGesture =
         tool == TimelineTool::Select && selectionHit &&
         selectionHit->edge == TimelineHitEdge::None && optionGesture;
@@ -6154,6 +7362,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->linkedSelection && (!optionGesture || duplicateGesture);
     self.state->interaction->SetLinkedSelectionEnabled(
         self.state->linkedSelectionGesture);
+    self.state->interaction->SetPlayheadSnapTarget(
+        commandGesture
+            ? std::optional<RationalTime>(self.state->requestedPosition)
+            : std::nullopt);
     const TimelineTrimMode trimMode =
         tool == TimelineTool::Slip ? TimelineTrimMode::Slip
         : (event.modifierFlags & NSEventModifierFlagCommand) != 0
@@ -6165,10 +7377,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->interaction->PointerDown(point.x, point.y,
                                          self.metalView.bounds.size.width,
                                          [self playheadInputRate]);
-    if (self.state->linkedSelectionGesture && selectionHit) {
-        self.state->interaction->SelectClips(ExpandLinkedClipSelection(
-            self.state->document, {selectionHit->clip_id}));
-    }
+    // PointerDown owns linked-selection expansion because it also knows which
+    // linked members are protected by a locked track. Re-expanding here would
+    // undo that safety decision before the first drag event.
     self.state->editDragging = self.state->interaction->HasActiveDrag();
     self.state->duplicateDragging =
         duplicateGesture && self.state->editDragging;
@@ -6178,8 +7389,13 @@ DeleteGapOperation GapDeleteOperationForSelection(
     self.state->scrubDragging =
         self.state->interaction->RequestedPlayhead().has_value();
     if (self.state->interaction->RequestedPlayhead()) {
-        [self requestTimelinePosition:*self.state->interaction
-                                           ->RequestedPlayhead()];
+        RationalTime requested = *self.state->interaction->RequestedPlayhead();
+        if (commandGesture) {
+            const auto snapped = SnapTimelineTimeToEdit(
+                self.state->document, self.state->viewport, requested);
+            if (snapped) requested = *snapped;
+        }
+        [self requestTimelinePosition:requested];
         self.state->interaction->ClearRequestedPlayhead();
     }
     [self updateSelectionInfo];
@@ -6193,6 +7409,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
         return;
     }
     const NSPoint point = [self timelinePointForEvent:event];
+    if (self.state->zoomBarDrag) {
+        UpdateTimelineZoomBarDrag(
+            self.state->viewport, *self.state->zoomBarDrag, point.x,
+            self.state->duration, self.metalView.bounds.size.width,
+            self.state->duration.rate);
+        self.state->overlayDirty = true;
+        return;
+    }
     if (self.state->navigationDragging) {
         const double delta = self.state->navigationLastX - point.x;
         self.state->viewport.ScrollByPixels(delta, self.state->duration.rate);
@@ -6225,10 +7449,20 @@ DeleteGapOperation GapDeleteOperationForSelection(
         }
     }
     if (self.state->scrubDragging) {
-        [self requestTimelinePosition:self.state->viewport.XToTime(
-                                          point.x, [self playheadInputRate])];
+        RationalTime requested =
+            self.state->viewport.XToTime(point.x, [self playheadInputRate]);
+        if ((event.modifierFlags & NSEventModifierFlagCommand) != 0) {
+            const auto snapped = SnapTimelineTimeToEdit(
+                self.state->document, self.state->viewport, requested);
+            if (snapped) requested = *snapped;
+        }
+        [self requestTimelinePosition:requested];
         return;
     }
+    self.state->interaction->SetPlayheadSnapTarget(
+        (event.modifierFlags & NSEventModifierFlagCommand) != 0
+            ? std::optional<RationalTime>(self.state->requestedPosition)
+            : std::nullopt);
     self.state->interaction->PointerDrag(point.x, point.y,
                                          self.metalView.bounds.size.width);
     // AppKit may report Option only after the mouse-down event. Promote an
@@ -6249,8 +7483,35 @@ DeleteGapOperation GapDeleteOperationForSelection(
     [self applyToolCursor];
     self.state->cutPreviewX.reset();
     self.state->cutPreviewY.reset();
+    const NSPoint point = [self timelinePointForEvent:event];
+    const int previousHoveredTool = self.state->hoveredTimelineTool;
+    const Ulid previousHoveredTrack = self.state->hoveredTrackId;
+    const int previousHoveredControl = self.state->hoveredTrackControl;
+    self.state->hoveredTimelineTool = -1;
+    self.state->hoveredTrackId.clear();
+    self.state->hoveredTrackControl = -1;
+
+    if (point.y >= 0.0 && point.y < kTimelineToolbarHeight && point.x >= 4.0 &&
+        point.x < 124.0)
+        self.state->hoveredTimelineTool =
+            static_cast<int>((point.x - 4.0) / 24.0);
+    if (point.y >= kTimelineRulerHeight) {
+        const auto tracks = TimelineTracksInDisplayOrder(self.state->document);
+        const size_t trackIndex =
+            static_cast<size_t>((point.y - kTimelineRulerHeight) /
+                                self.state->viewport.track_height);
+        if (trackIndex < tracks.size() && point.x >= 40.0 && point.x < 92.0) {
+            self.state->hoveredTrackId = tracks[trackIndex]->id;
+            self.state->hoveredTrackControl = point.x < 56.0   ? 0
+                                              : point.x < 74.0 ? 1
+                                                               : 2;
+        }
+    }
+    const bool chromeHoverChanged =
+        previousHoveredTool != self.state->hoveredTimelineTool ||
+        previousHoveredTrack != self.state->hoveredTrackId ||
+        previousHoveredControl != self.state->hoveredTrackControl;
     if ([self effectiveTool] == TimelineTool::Select) {
-        const NSPoint point = [self timelinePointForEvent:event];
         const auto hit =
             HitTestTimeline(self.state->document, self.state->viewport, point.x,
                             point.y, self.metalView.bounds.size.width);
@@ -6266,11 +7527,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
                    (event.modifierFlags & NSEventModifierFlagOption) != 0) {
             self.infoLabel.stringValue = @"DUPLIQUER · Option-glisser le clip";
         }
-        self.state->overlayDirty = true;
+        if (chromeHoverChanged) self.state->overlayDirty = true;
         return;
     }
     if ([self effectiveTool] == TimelineTool::Slip) {
-        const NSPoint point = [self timelinePointForEvent:event];
         const auto hit =
             HitTestTimeline(self.state->document, self.state->viewport, point.x,
                             point.y, self.metalView.bounds.size.width);
@@ -6283,7 +7543,6 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->overlayDirty = true;
         return;
     }
-    const NSPoint point = [self timelinePointForEvent:event];
     if (point.y < kTimelineRulerHeight || point.y > [self timelineHeight]) {
         self.state->overlayDirty = true;
         return;
@@ -6369,7 +7628,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)rebuildVideoTrackIds {
     std::vector<const DocumentTrack*> tracks;
     for (const DocumentTrack& track : self.state->document.sequence.tracks)
-        if (track.kind == "video") tracks.push_back(&track);
+        if (track.kind == "video" && track.visible) tracks.push_back(&track);
     std::sort(tracks.begin(), tracks.end(),
               [](const DocumentTrack* left, const DocumentTrack* right) {
                   return left->index < right->index;
@@ -6428,6 +7687,12 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.window.firstResponder == self.sourceMonitorView)
         return;
     (void)event;
+    if (self.state->zoomBarDrag) {
+        self.state->zoomBarDrag.reset();
+        self.state->overlayDirty = true;
+        return;
+    }
+    self.state->interaction->SetPlayheadSnapTarget(std::nullopt);
     if (self.state->lassoCandidate) {
         const bool completedLasso = self.state->lassoDragging;
         self.state->lassoCandidate = false;
@@ -6492,15 +7757,19 @@ DeleteGapOperation GapDeleteOperationForSelection(
     if (self.window.firstResponder == self.sourceMonitorView) return;
     const NSPoint point = [self timelinePointForEvent:event];
     if (point.y < 0.0 || point.y > [self timelineHeight]) return;
-    const double delta = std::abs(event.scrollingDeltaX) > 0.01
-                             ? event.scrollingDeltaX
-                             : event.scrollingDeltaY;
+    const TimelineScrollIntent intent = ResolveTimelineScrollIntent(
+        event.scrollingDeltaX, event.scrollingDeltaY,
+        event.hasPreciseScrollingDeltas,
+        (event.modifierFlags & NSEventModifierFlagShift) != 0);
+    if (std::abs(intent.delta) <= 0.0001) return;
     try {
-        if ((event.modifierFlags & NSEventModifierFlagCommand) != 0) {
-            self.state->viewport.ZoomAroundX(point.x, std::exp(-delta * 0.01),
-                                             self.state->duration.rate);
+        if (intent.action == TimelineScrollAction::Zoom) {
+            const double exponent = std::clamp(-intent.delta * 0.12, -1.2, 1.2);
+            self.state->viewport.ZoomAroundX(
+                std::max(point.x, self.state->viewport.header_width),
+                std::exp(exponent), self.state->duration.rate);
         } else {
-            self.state->viewport.ScrollByPixels(delta,
+            self.state->viewport.ScrollByPixels(intent.delta,
                                                 self.state->duration.rate);
         }
         self.state->overlayDirty = true;
@@ -6510,9 +7779,30 @@ DeleteGapOperation GapDeleteOperationForSelection(
     }
 }
 
+- (void)timelineMagnify:(NSEvent*)event {
+    if (self.window.firstResponder == self.sourceMonitorView) return;
+    const NSPoint point = [self timelinePointForEvent:event];
+    if (point.y < 0.0 || point.y > [self timelineHeight]) return;
+    try {
+        self.state->viewport.ZoomAroundX(
+            std::max(point.x, self.state->viewport.header_width),
+            std::exp(std::clamp(static_cast<double>(event.magnification), -1.0,
+                                1.0)),
+            self.state->duration.rate);
+        self.state->overlayDirty = true;
+    } catch (const std::exception& exception) {
+        std::fprintf(stderr, "Viewport magnification rejected: %s\n",
+                     exception.what());
+    }
+}
+
 - (BOOL)timelineKeyDown:(NSEvent*)event {
     const NSEventModifierFlags modifiers =
         event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    if (self.videoFullscreenActive && event.keyCode == 53) {
+        [self toggleFullscreen:nil];
+        return YES;
+    }
     if (self.state->sourceMonitorActive && self.state->sourceMonitor) {
         const DocumentSource* source =
             self.state->document.FindSource(self.state->sourceMonitorId);
@@ -6624,7 +7914,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
         return YES;
     }
     if ([self event:event matchesShortcut:@"play.reverse"]) {
-        [self menuPlayReverse:nil];
+        [self setPlaybackDirection:NextShuttleSpeed(
+                                       self.state->playbackDirection, -1)];
         return YES;
     }
     if ([self event:event matchesShortcut:@"play.stop"]) {
@@ -6632,7 +7923,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
         return YES;
     }
     if ([self event:event matchesShortcut:@"play.forward"]) {
-        [self menuPlayForward:nil];
+        [self setPlaybackDirection:NextShuttleSpeed(
+                                       self.state->playbackDirection, 1)];
         return YES;
     }
     if ((modifiers & NSEventModifierFlagCommand) != 0) {
@@ -6677,6 +7969,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
     }
     if (event.keyCode == 119) {  // End
         [self requestTimelinePosition:self.state->duration];
+        return YES;
+    }
+    if (event.keyCode == 126 || event.keyCode == 125) {  // Up / down
+        [self setPlaybackDirection:0];
+        const bool forward = event.keyCode == 125;
+        const auto edit = AdjacentTimelineEdit(
+            self.state->document, self.state->requestedPosition, forward);
+        if (edit) [self requestTimelinePosition:*edit];
         return YES;
     }
     if (event.keyCode == 123 || event.keyCode == 124) {  // Left / right
@@ -6794,6 +8094,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
         (self.state->editLog.AppliedCount() == 0 &&
          self.state->projectEditLog.AppliedCount() > 0);
     if (projectHistory) {
+        const bool renameOnly =
+            std::holds_alternative<RenameProjectItemOperation>(
+                self.state->projectEditLog.AppliedEntries().back().op);
         Project candidate = self.state->project;
         ProjectEditLog projectLog = self.state->projectEditLog;
         if (!projectLog.Undo(candidate, error, message)) {
@@ -6813,8 +8116,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->project = std::move(candidate);
         self.state->projectEditLog = std::move(projectLog);
         self.state->lastHistoryDomain = HistoryDomain::Project;
-        [self rebuildMediaList];
-        [self refreshAfterProjectMutation];
+        if (renameOnly)
+            [self refreshAfterProjectRename];
+        else
+            [self refreshAfterProjectMutation];
         return;
     }
     const RationalTime playhead = self.state->requestedPosition;
@@ -6842,6 +8147,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
         (self.state->editLog.UndoneCount() == 0 &&
          self.state->projectEditLog.UndoneCount() > 0);
     if (projectHistory) {
+        const bool renameOnly =
+            std::holds_alternative<RenameProjectItemOperation>(
+                self.state->projectEditLog.UndoneEntries().back().op);
         Project candidate = self.state->project;
         ProjectEditLog projectLog = self.state->projectEditLog;
         if (!projectLog.Redo(candidate, error, message)) {
@@ -6861,8 +8169,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->project = std::move(candidate);
         self.state->projectEditLog = std::move(projectLog);
         self.state->lastHistoryDomain = HistoryDomain::Project;
-        [self rebuildMediaList];
-        [self refreshAfterProjectMutation];
+        if (renameOnly)
+            [self refreshAfterProjectRename];
+        else
+            [self refreshAfterProjectMutation];
         return;
     }
     const RationalTime playhead = self.state->requestedPosition;
@@ -6922,17 +8232,15 @@ DeleteGapOperation GapDeleteOperationForSelection(
     const std::vector<Ulid> ids = self.state->interaction->SelectedClipIds();
     if (!gap && ids.empty()) return NO;
     Operation operation =
-        gap ? Operation{GapDeleteOperationForSelection(
+        gap               ? Operation{GapDeleteOperationForSelection(
                   self.state->document, *gap, self.state->linkedSelection)}
-            : (ripple ? Operation{RemoveClipOperation{ids.front(), {}}}
-                      : Operation{ClearClipOperation{ids.front(), {}}});
-    if (!gap && self.state->linkedSelection && ids.size() > 1) {
-        const DocumentClip* first = self.state->document.FindClip(ids.front());
-        if (first && !first->link_group_id.empty())
-            operation = ripple ? Operation{RemoveLinkedClipsOperation{
-                                     first->link_group_id, ids, {}}}
-                               : Operation{ClearLinkedClipsOperation{
-                                     first->link_group_id, ids, {}}};
+        : ids.size() == 1 ? Operation{ClearClipOperation{ids.front(), {}}}
+                          : Operation{ClearClipsOperation{ids, {}}};
+    if (!gap && ripple) {
+        const auto rippleOperation =
+            BuildTimelineRippleDeleteSelection(self.state->document, ids);
+        if (!rippleOperation) return NO;
+        operation = *rippleOperation;
     }
     EditError error = EditError::None;
     std::string message;
@@ -7352,10 +8660,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 - (void)menuToggleLinkedSelection:(id)sender {
     (void)sender;
-    self.linkedSelectionButton.state = self.state->linkedSelection
-                                           ? NSControlStateValueOff
-                                           : NSControlStateValueOn;
-    [self linkedSelectionPressed:self.linkedSelectionButton];
+    [self setLinkedSelectionEnabled:!self.state->linkedSelection];
 }
 - (void)menuFitTimeline:(id)sender {
     (void)sender;
@@ -7457,26 +8762,6 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)menuPlayForward:(id)sender {
     (void)sender;
     [self setPlaybackDirection:1];
-}
-
-// F2.5 -- Transport panel actions. Frame-step reuses -stepPlayheadFrames:,
-// the same helper the Left/Right-arrow shortcut calls. Play/pause reuses
-// -menuPlayPause: directly (wired as the transport button's action in
-// -applicationDidFinishLaunching:), so there is exactly one play/pause
-// implementation, not two.
-- (void)transportStepBack:(id)sender {
-    (void)sender;
-    [self stepPlayheadFrames:-1];
-}
-- (void)transportStepForward:(id)sender {
-    (void)sender;
-    [self stepPlayheadFrames:1];
-}
-- (void)transportScrubChanged:(NSSlider*)sender {
-    const ScrubBarRange range{self.state->duration};
-    const RationalTime target =
-        range.FractionToTime(sender.doubleValue, [self playheadInputRate]);
-    [self requestTimelinePosition:target];
 }
 
 - (NSMenu*)timelineMenuForEvent:(NSEvent*)event {
@@ -8126,8 +9411,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
                 [](unsigned char character) {
                     return static_cast<char>(std::tolower(character));
                 });
-            if (replacement->width > 1920 || codec == "hevc" ||
-                codec == "h265" || codec == "av1")
+            if (self.state->automaticProxiesEnabled &&
+                (replacement->width > 1920 || codec == "hevc" ||
+                 codec == "h265" || codec == "av1"))
                 [self enqueueProxyForMediaIdentifier:identifier];
         }
         self.binSummaryLabel.stringValue =
@@ -8296,8 +9582,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
                 [](unsigned char character) {
                     return static_cast<char>(std::tolower(character));
                 });
-            if (media->width > 1920 || codec == "hevc" || codec == "h265" ||
-                codec == "av1")
+            if (self.state->automaticProxiesEnabled &&
+                (media->width > 1920 || codec == "hevc" || codec == "h265" ||
+                 codec == "av1"))
                 [self enqueueProxyForMediaIdentifier:identifier];
             if (self.state->sourceMonitorId == mediaId) {
                 self.sourceMonitorTitleLabel.stringValue = [NSString
@@ -8320,6 +9607,24 @@ DeleteGapOperation GapDeleteOperationForSelection(
                              result->incompatible == 1 ? @"" : @"s",
                              audioReady ? @"" : @" · audio indisponible"];
     }
+}
+
+- (void)refreshAfterProjectRename {
+    // A rename changes browser/title metadata only. Rehydrate the active
+    // document so a later timeline save cannot restore its previous name,
+    // while keeping decode workers and playback caches alive.
+    self.state->document =
+        self.state->project.MakeDocument(self.state->activeTimelineId);
+    self.programMonitorTitleLabel.stringValue =
+        [NSString stringWithFormat:@"RECORD — %s",
+                                   self.state->document.sequence.name.c_str()];
+    self.window.title =
+        [NSString stringWithFormat:@"CUTMACHINE — %s — %s",
+                                   self.state->project.name.c_str(),
+                                   self.state->document.sequence.name.c_str()];
+    [self refreshBinControlsSelecting:self.selectedBinId ?: @"__all__"];
+    [self updateSelectionInfo];
+    self.state->overlayDirty = true;
 }
 
 - (void)refreshAfterProjectMutation {
@@ -8362,6 +9667,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 
 - (void)reloadDecodeWorkers {
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+    if (gUiSmokeTesting) ++gUiSmokeDecodeReloads;
+#endif
     if (!self.state->frameCache) return;
     for (auto& worker : self.state->workers) worker.second->Stop();
     self.state->workers.clear();
@@ -8516,8 +9824,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
                        [](unsigned char character) {
                            return static_cast<char>(std::tolower(character));
                        });
-        if (media->width > 1920 || codec == "hevc" || codec == "h265" ||
-            codec == "av1")
+        if (self.state->automaticProxiesEnabled &&
+            (media->width > 1920 || codec == "hevc" || codec == "h265" ||
+             codec == "av1"))
             [self enqueueProxyForMediaIdentifier:
                       [NSString stringWithUTF8String:source.first.c_str()]];
         if (media->has_audio)
@@ -8554,6 +9863,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (TimelineRenderData)timelineRenderData {
     TimelineRenderData data;
     data.color_management = self.state->document.color_management;
+    data.display_sdr_preview = true;
     data.sequence_width = self.state->document.sequence.width;
     data.sequence_height = self.state->document.sequence.height;
     const double width = self.metalView.bounds.size.width;
@@ -8563,44 +9873,36 @@ DeleteGapOperation GapDeleteOperationForSelection(
     auto add = [&](double x, double y, double w, double h, float r, float g,
                    float b, float a = 1.0f) {
         if (w > 0.0 && h > 0.0)
-            data.rectangles.push_back({x, y, w, h, r, g, b, a});
+            data.overlays.emplace_back(MetalRect{x, y, w, h, r, g, b, a});
+    };
+    const auto addColor = [&](double x, double y, double w, double h,
+                              ui::theme::Color color) {
+        add(x, y, w, h, color.r, color.g, color.b, color.a);
+    };
+    const auto addV = [&](double x, double y, double w, double h,
+                          ui::theme::Color topColor,
+                          ui::theme::Color bottomColor) {
+        if (w > 0.0 && h > 0.0)
+            data.overlays.emplace_back(
+                MetalRect{x, y, w, h, topColor, bottomColor});
+    };
+    const auto addText =
+        [&](double x, double y, double maxWidth, double pointSize,
+            const std::string& text, ui::theme::Color color,
+            MetalFontFace face = MetalFontFace::Mono, bool bold = false) {
+            if (!text.empty() && maxWidth > 0.0)
+                data.overlays.emplace_back(MetalText{x, y, maxWidth, pointSize,
+                                                     text, color, face, bold});
+        };
+    const auto addIcon = [&](double x, double y, double size,
+                             const std::string& name, ui::theme::Color color) {
+        if (size > 0.0 && !name.empty())
+            data.overlays.emplace_back(
+                MetalIcon{x, y, size, size, name, color});
     };
     const auto addTinyText = [&](double x, double y, const std::string& text) {
-        const auto maskFor = [](char character) -> uint8_t {
-            static constexpr uint8_t digits[] = {0x3f, 0x06, 0x5b, 0x4f, 0x66,
-                                                 0x6d, 0x7d, 0x07, 0x7f, 0x6f};
-            if (character >= '0' && character <= '9')
-                return digits[character - '0'];
-            if (character == 'f') return 0x71;
-            if (character == 's') return 0x6d;
-            if (character == 'm') return 0x37;
-            if (character == 'p') return 0x73;
-            if (character == '-') return 0x40;
-            return 0;
-        };
-        double cursor = x;
-        for (char character : text) {
-            if (character == '+') {
-                add(cursor + 1.0, y + 3.0, 3.0, 1.0, 1.0f, 0.93f, 0.84f);
-                add(cursor + 2.0, y + 2.0, 1.0, 3.0, 1.0f, 0.93f, 0.84f);
-                cursor += 6.0;
-                continue;
-            }
-            const uint8_t mask = maskFor(character);
-            const auto segment = [&](uint8_t bit, double sx, double sy,
-                                     double sw, double sh) {
-                if (mask & bit)
-                    add(cursor + sx, y + sy, sw, sh, 1.0f, 0.93f, 0.84f);
-            };
-            segment(0x01, 1, 0, 3, 1);
-            segment(0x02, 4, 1, 1, 2);
-            segment(0x04, 4, 4, 1, 2);
-            segment(0x08, 1, 6, 3, 1);
-            segment(0x10, 0, 4, 1, 2);
-            segment(0x20, 0, 1, 1, 2);
-            segment(0x40, 1, 3, 3, 1);
-            cursor += 6.0;
-        }
+        addText(x, y, text.size() * 7.0, ui::theme::kFontSizeCaption, text,
+                ui::theme::kTextClip, MetalFontFace::Mono, true);
     };
 
     const auto topmost = std::find_if(
@@ -8610,18 +9912,86 @@ DeleteGapOperation GapDeleteOperationForSelection(
         self.state->offlineSourceIds.count(topmost->sourceId) != 0)
         add(0.0, 0.0, width, data.video_height, 0.025f, 0.025f, 0.025f);
 
-    add(0.0, top - 2.0, width, 2.0, 0.025f, 0.027f, 0.030f);
-    add(0.0, top, width, timelineHeight, 0.058f, 0.061f, 0.064f);
-    add(0.0, top, width, kTimelineRulerHeight, 0.095f, 0.098f, 0.102f);
-    constexpr double toolStart = 108.0;
-    constexpr double toolWidth = 17.0;
-    for (int index = 0; index < 4; ++index) {
+    addColor(0.0, top, width, timelineHeight, ui::theme::kSurfaceBase);
+    addV(0.0, top, width, kTimelineToolbarHeight, ui::theme::kSurfaceControl,
+         ui::theme::kSurfaceRaised);
+    addColor(0.0, top + kTimelineToolbarHeight, width, kTimelineScaleHeight,
+             ui::theme::kSurfaceRaised);
+    addColor(0.0, top + kTimelineToolbarHeight + kTimelineScaleHeight, width,
+             kTimelineRenderBandHeight, ui::theme::kSurfaceSunken);
+    addColor(0.0, top + kTimelineRulerHeight - 1.0, width, 1.0,
+             ui::theme::kSeparator);
+
+    constexpr double toolStart = 4.0;
+    constexpr double toolWidth = 24.0;
+    const std::array<const char*, 5> toolIcons{{
+        "mouse-pointer-2",
+        "hand",
+        "search",
+        "scissors",
+        "unfold-horizontal",
+    }};
+    for (int index = 0; index < 5; ++index) {
         const bool active = static_cast<int>([self effectiveTool]) == index;
+        const bool hovered = self.state->hoveredTimelineTool == index;
         const double x = toolStart + index * toolWidth;
-        add(x, top + 4.0, toolWidth - 1.0, kTimelineRulerHeight - 8.0,
-            active ? 0.16f : 0.075f, active ? 0.34f : 0.078f,
-            active ? 0.46f : 0.082f);
+        addV(x, top + 2.0, toolWidth - 2.0, 22.0,
+             active || hovered ? ui::theme::kSurfaceControlHi
+                               : ui::theme::kSurfaceControl,
+             active ? ui::theme::kSurfaceControl : ui::theme::kSurfaceRaised);
+        addColor(x, top + 2.0, toolWidth - 2.0, 1.0, ui::theme::kEdgeLight);
+        if (active)
+            addColor(x, top + 22.0, toolWidth - 2.0, 2.0, ui::theme::kAccent);
+        if (hovered)
+            addColor(x, top + 2.0, toolWidth - 2.0, 2.0,
+                     ui::theme::kTextPrimary);
+        addIcon(x + 5.0, top + 6.0, 12.0, toolIcons[index],
+                active ? ui::theme::kTextPrimary : ui::theme::kTextTertiary);
     }
+    const bool snapping = self.state->interaction->SnappingEnabled();
+    addV(128.0, top + 2.0, 38.0, 22.0,
+         snapping ? ui::theme::kSurfaceControlHi : ui::theme::kSurfaceControl,
+         ui::theme::kSurfaceRaised);
+    addColor(128.0, top + 2.0, 38.0, 1.0, ui::theme::kEdgeLight);
+    if (snapping) addColor(128.0, top + 22.0, 38.0, 2.0, ui::theme::kAccent);
+    addIcon(134.0, top + 7.0, 11.0, "magnet",
+            snapping ? ui::theme::kAccent : ui::theme::kTextTertiary);
+    addText(148.0, top + 6.0, 20.0, ui::theme::kFontSizeCaption, "8",
+            ui::theme::kTextSecondary, MetalFontFace::Mono, true);
+    addV(170.0, top + 2.0, 44.0, 22.0,
+         self.state->linkedSelection ? ui::theme::kSurfaceControlHi
+                                     : ui::theme::kSurfaceControl,
+         ui::theme::kSurfaceRaised);
+    addColor(170.0, top + 2.0, 44.0, 1.0, ui::theme::kEdgeLight);
+    if (self.state->linkedSelection)
+        addColor(170.0, top + 22.0, 44.0, 2.0, ui::theme::kAccent);
+    const ui::theme::Color linkColor = self.state->linkedSelection
+                                           ? ui::theme::kTextPrimary
+                                           : ui::theme::kTextTertiary;
+    addIcon(174.0, top + 7.0, 11.0, "link", linkColor);
+    addText(188.0, top + 6.0, 28.0, ui::theme::kFontSizeCaption, "A/V",
+            linkColor, MetalFontFace::Mono, true);
+    const std::array<const char*, 3> transportLabels{{"J", "K", "L"}};
+    for (int index = 0; index < 3; ++index) {
+        const bool active = index == 0   ? self.state->playbackDirection < 0
+                            : index == 1 ? self.state->playbackDirection == 0
+                                         : self.state->playbackDirection > 0;
+        const double x = 222.0 + index * 24.0;
+        addV(x, top + 2.0, 22.0, 22.0,
+             active ? ui::theme::kSurfaceControlHi : ui::theme::kSurfaceControl,
+             ui::theme::kSurfaceRaised);
+        addColor(x, top + 2.0, 22.0, 1.0, ui::theme::kEdgeLight);
+        if (active) addColor(x, top + 22.0, 22.0, 2.0, ui::theme::kAccent);
+        addText(x + 7.0, top + 6.0, 8.0, ui::theme::kFontSizeCaption,
+                transportLabels[index],
+                active ? ui::theme::kTextPrimary : ui::theme::kTextSecondary,
+                MetalFontFace::Mono, true);
+    }
+    addText(
+        std::max(300.0, width - 102.0), top + 6.0, 96.0,
+        ui::theme::kFontSizeCaption,
+        FormatTimecode(self.state->requestedPosition, [self playheadFrameRate]),
+        ui::theme::kTextSecondary, MetalFontFace::Mono, true);
     if ([self hasValidTimelineRange]) {
         const double rawIn =
             self.state->viewport.TimeToX(*self.state->timelineIn);
@@ -8630,139 +10000,161 @@ DeleteGapOperation GapDeleteOperationForSelection(
         const double left = std::max(self.state->viewport.header_width, rawIn);
         const double right = std::min(width, rawOut);
         if (right > left) {
-            add(left, top, right - left, kTimelineRulerHeight, 0.08f, 0.42f,
-                0.62f, 0.62f);
-            add(left, top + kTimelineRulerHeight, right - left,
-                std::max(0.0, timelineHeight - kTimelineRulerHeight), 0.05f,
-                0.28f, 0.42f, 0.12f);
+            add(left, top + kTimelineToolbarHeight, right - left,
+                kTimelineScaleHeight + kTimelineRenderBandHeight,
+                ui::theme::kAccent.r, ui::theme::kAccent.g,
+                ui::theme::kAccent.b, 0.18f);
         }
         if (rawIn >= self.state->viewport.header_width && rawIn <= width)
-            add(rawIn, top, 2.0, timelineHeight, ui::theme::kAccentGreen.r,
-                ui::theme::kAccentGreen.g, ui::theme::kAccentGreen.b);
+            addColor(rawIn, top + kTimelineToolbarHeight, 1.0,
+                     timelineHeight - kTimelineToolbarHeight,
+                     ui::theme::kMarkIn);
         if (rawOut >= self.state->viewport.header_width && rawOut <= width)
-            add(rawOut - 2.0, top, 2.0, timelineHeight,
-                ui::theme::kAccentOrange.r, ui::theme::kAccentOrange.g,
-                ui::theme::kAccentOrange.b);
+            addColor(rawOut - 1.0, top + kTimelineToolbarHeight, 1.0,
+                     timelineHeight - kTimelineToolbarHeight,
+                     ui::theme::kMarkOut);
     } else {
         if (self.state->timelineIn) {
             const double x =
                 self.state->viewport.TimeToX(*self.state->timelineIn);
             if (x >= self.state->viewport.header_width && x <= width)
-                add(x, top, 2.0, timelineHeight, ui::theme::kAccentGreen.r,
-                    ui::theme::kAccentGreen.g, ui::theme::kAccentGreen.b);
+                addColor(x, top + kTimelineToolbarHeight, 1.0,
+                         timelineHeight - kTimelineToolbarHeight,
+                         ui::theme::kMarkIn);
         }
         if (self.state->timelineOut) {
             const double x =
                 self.state->viewport.TimeToX(*self.state->timelineOut);
             if (x >= self.state->viewport.header_width && x <= width)
-                add(x - 2.0, top, 2.0, timelineHeight,
-                    ui::theme::kAccentOrange.r, ui::theme::kAccentOrange.g,
-                    ui::theme::kAccentOrange.b);
+                addColor(x - 1.0, top + kTimelineToolbarHeight, 1.0,
+                         timelineHeight - kTimelineToolbarHeight,
+                         ui::theme::kMarkOut);
         }
     }
     const auto tracks = TimelineTracksInDisplayOrder(self.state->document);
     bool sawVideoTrack = false;
     bool drewAudioDivider = false;
+    uint32_t videoNumber = static_cast<uint32_t>(std::count_if(
+        tracks.begin(), tracks.end(),
+        [](const DocumentTrack* track) { return track->kind == "video"; }));
+    uint32_t audioNumber = 0;
     for (size_t index = 0; index < tracks.size(); ++index) {
         const double y = top + kTimelineRulerHeight +
                          index * self.state->viewport.track_height;
         if (y >= top + timelineHeight) break;
         const bool video = tracks[index]->kind == "video";
+        const uint32_t trackNumber = video ? videoNumber-- : ++audioNumber;
         if (video) sawVideoTrack = true;
         if (!video && sawVideoTrack && !drewAudioDivider) {
-            add(0.0, y - 2.0, width, 2.0, 0.19f, 0.20f, 0.21f);
+            addColor(0.0, y - 2.0, width, 2.0, ui::theme::kBorderStrong);
             drewAudioDivider = true;
         }
-        const float trackShade = index % 2 == 0 ? 0.070f : 0.078f;
-        add(0.0, y, width, self.state->viewport.track_height, trackShade,
-            trackShade + 0.002f, trackShade + 0.004f);
-        add(0.0, y, self.state->viewport.header_width,
-            self.state->viewport.track_height, 0.090f, 0.093f, 0.097f);
-        {
-            const ui::theme::Color kindTint = ui::theme::TrackTint(video);
-            add(0.0, y, 3.0, self.state->viewport.track_height, kindTint.r,
-                kindTint.g, kindTint.b);
-        }
-        // Resolve-like patch/target cells and compact track controls.
-        add(50.0, y + 7.0, 24.0, 20.0, 0.070f, 0.073f, 0.077f);
-        add(50.0, y + 7.0, 2.0, 20.0, video ? 0.18f : 0.20f,
-            video ? 0.50f : 0.57f, video ? 0.73f : 0.34f);
-        add(81.0, y + 10.0, 16.0, 14.0, 0.13f, 0.135f, 0.14f);
-        add(104.0, y + 10.0, 16.0, 14.0, 0.13f, 0.135f, 0.14f);
-        add(127.0, y + 10.0, 16.0, 14.0, 0.13f, 0.135f, 0.14f);
-        add(150.0, y + 10.0, 16.0, 14.0, 0.13f, 0.135f, 0.14f);
-        if (self.state->targetedTrackIds.count(tracks[index]->id)) {
-            add(50.0, y + 7.0, 24.0, 20.0, video ? 0.10f : 0.08f,
-                video ? 0.31f : 0.34f, video ? 0.48f : 0.20f);
-            add(54.0, y + 16.0, 16.0, 2.0, video ? 0.48f : 0.42f,
-                video ? 0.82f : 0.88f, video ? 1.00f : 0.58f);
-        }
-        if (tracks[index]->sync_lock) {
-            add(127.0, y + 10.0, 16.0, 14.0, 0.10f, 0.25f, 0.31f);
-            // Two joined links distinguish sync lock from the hard padlock.
-            add(130.0, y + 15.0, 5.0, 2.0, 0.38f, 0.78f, 0.90f);
-            add(135.0, y + 18.0, 5.0, 2.0, 0.38f, 0.78f, 0.90f);
-            add(134.0, y + 16.0, 2.0, 3.0, 0.38f, 0.78f, 0.90f);
-        }
+        addColor(0.0, y, width, self.state->viewport.track_height,
+                 ui::theme::kSurfaceLane);
+        addV(0.0, y, self.state->viewport.header_width,
+             self.state->viewport.track_height, ui::theme::kSurfaceRaised,
+             ui::theme::kSurfacePanel);
+        addColor(0.0, y, 4.0, self.state->viewport.track_height,
+                 ui::theme::TrackTint(video));
+        addText(8.0, y + 4.0, 28.0, ui::theme::kFontSizeSmall,
+                std::string(video ? "V" : "A") + std::to_string(trackNumber),
+                ui::theme::kTextPrimary, MetalFontFace::Mono, true);
+        addText(8.0, y + 20.0, 30.0, ui::theme::kFontSizeCaption,
+                video ? "VID." : "AUD.", ui::theme::kTextTertiary,
+                MetalFontFace::Mono, true);
+
+        const auto addPill = [&](double x, const std::string& label,
+                                 bool active, int control,
+                                 bool disabled = false) {
+            const bool hovered =
+                self.state->hoveredTrackId == tracks[index]->id &&
+                self.state->hoveredTrackControl == control;
+            addV(x, y + 15.0, 16.0, 14.0,
+                 disabled            ? ui::theme::kSurfacePanel
+                 : active || hovered ? ui::theme::kSurfaceControlHi
+                                     : ui::theme::kSurfaceControl,
+                 ui::theme::kSurfaceRaised);
+            if (!disabled)
+                addColor(x, y + 15.0, 16.0, 1.0, ui::theme::kEdgeLight);
+            if (active) addColor(x, y + 27.0, 16.0, 2.0, ui::theme::kAccent);
+            if (hovered && !disabled)
+                addColor(x, y + 15.0, 16.0, 2.0, ui::theme::kTextPrimary);
+            addText(x + 5.0, y + 16.0, 8.0, ui::theme::kFontSizeCaption, label,
+                    disabled ? ui::theme::kTextTertiary
+                    : active ? ui::theme::kTextPrimary
+                             : ui::theme::kTextSecondary,
+                    MetalFontFace::Mono, true);
+        };
+        const auto addIconPill = [&](double x, const std::string& icon,
+                                     bool active, int control) {
+            const bool hovered =
+                self.state->hoveredTrackId == tracks[index]->id &&
+                self.state->hoveredTrackControl == control;
+            addV(x, y + 15.0, 16.0, 14.0,
+                 active || hovered ? ui::theme::kSurfaceControlHi
+                                   : ui::theme::kSurfaceControl,
+                 ui::theme::kSurfaceRaised);
+            addColor(x, y + 15.0, 16.0, 1.0, ui::theme::kEdgeLight);
+            if (active) addColor(x, y + 27.0, 16.0, 2.0, ui::theme::kAccent);
+            if (hovered)
+                addColor(x, y + 15.0, 16.0, 2.0, ui::theme::kTextPrimary);
+            addIcon(
+                x + 3.0, y + 17.0, 10.0, icon,
+                active ? ui::theme::kTextPrimary : ui::theme::kTextTertiary);
+        };
         if (video) {
-            // Eye and lock symbols.
-            add(85.0, y + 16.0, 8.0, 2.0, 0.55f, 0.57f, 0.60f);
-            add(88.0, y + 13.0, 2.0, 8.0, 0.55f, 0.57f, 0.60f);
-            add(108.0, y + 16.0, 8.0, 6.0, 0.48f, 0.50f, 0.53f);
-            add(110.0, y + 13.0, 4.0, 4.0, 0.48f, 0.50f, 0.53f);
+            addIconPill(40.0, "eye", tracks[index]->visible, 0);
+            addIconPill(58.0, "lock", tracks[index]->locked, 1);
         } else {
-            // Solo / mute glyphs as minimal geometry.
-            add(85.0, y + 14.0, 8.0, 2.0, 0.58f, 0.60f, 0.62f);
-            add(85.0, y + 18.0, 8.0, 2.0, 0.58f, 0.60f, 0.62f);
-            add(108.0, y + 14.0, 2.0, 7.0, 0.58f, 0.60f, 0.62f);
-            add(114.0, y + 14.0, 2.0, 7.0, 0.58f, 0.60f, 0.62f);
-            add(110.0, y + 14.0, 4.0, 2.0, 0.58f, 0.60f, 0.62f);
+            addPill(40.0, "S", tracks[index]->solo, 0);
+            addPill(58.0, "M", tracks[index]->muted, 1);
+            addIconPill(76.0, "lock", tracks[index]->locked, 2);
         }
-        if (tracks[index]->locked) {
-            add(104.0, y + 10.0, 16.0, 14.0, 0.34f, 0.12f, 0.10f);
-            add(108.0, y + 16.0, 8.0, 6.0, 0.92f, 0.46f, 0.34f);
-            add(110.0, y + 13.0, 4.0, 4.0, 0.92f, 0.46f, 0.34f);
-            add(self.state->viewport.header_width, y,
-                width - self.state->viewport.header_width,
-                self.state->viewport.track_height, 0.02f, 0.02f, 0.02f, 0.28f);
-        }
-        add(0.0, y + self.state->viewport.track_height - 1.0, width, 1.0, 0.13f,
-            0.132f, 0.135f);
+        addColor(0.0, y + self.state->viewport.track_height - 1.0, width, 1.0,
+                 ui::theme::kSeparator);
     }
     const double addTrackY = top + kTimelineRulerHeight +
                              tracks.size() * self.state->viewport.track_height;
     if (addTrackY < top + timelineHeight) {
-        add(0.0, addTrackY, width, kAddTrackRowHeight, 0.058f, 0.064f, 0.073f);
-        add(0.0, addTrackY, self.state->viewport.header_width,
-            kAddTrackRowHeight, 0.09f, 0.10f, 0.115f);
+        addColor(0.0, addTrackY, width, kAddTrackRowHeight,
+                 ui::theme::kSurfaceBase);
+        addColor(0.0, addTrackY, self.state->viewport.header_width,
+                 kAddTrackRowHeight, ui::theme::kSurfacePanel);
         const double split = self.state->viewport.header_width * 0.5;
-        add(split, addTrackY, 1.0, kAddTrackRowHeight, 0.16f, 0.18f, 0.20f);
+        addColor(split, addTrackY, 1.0, kAddTrackRowHeight,
+                 ui::theme::kBorderSubtle);
         for (int half = 0; half < 2; ++half) {
             const double centerX = split * (half + 0.5);
-            const float red = half == 0 ? 0.30f : 0.36f;
-            const float green = half == 0 ? 0.68f : 0.78f;
-            const float blue = half == 0 ? 0.90f : 0.48f;
-            add(centerX - 6.0, addTrackY + 11.0, 12.0, 2.0, red, green, blue);
-            add(centerX - 1.0, addTrackY + 6.0, 2.0, 12.0, red, green, blue);
+            addColor(centerX - 6.0, addTrackY + 10.0, 12.0, 2.0,
+                     ui::theme::kTextTertiary);
+            addColor(centerX - 1.0, addTrackY + 5.0, 2.0, 12.0,
+                     ui::theme::kTextTertiary);
         }
     }
-    add(self.state->viewport.header_width - 1.0, top, 1.0, timelineHeight,
-        0.26f, 0.26f, 0.28f);
+    addColor(self.state->viewport.header_width - 1.0,
+             top + kTimelineToolbarHeight, 1.0,
+             timelineHeight - kTimelineToolbarHeight, ui::theme::kBorderStrong);
     const std::vector<double> tickXs = self.state->viewport.TickXs(width);
     for (size_t tickIndex = 0; tickIndex < tickXs.size(); ++tickIndex) {
         const double tickX = tickXs[tickIndex];
-        add(tickX, top, 1.0, kTimelineRulerHeight, 0.38f, 0.39f, 0.41f);
-        add(tickX, top + kTimelineRulerHeight - 5.0, 1.0, 5.0, 0.65f, 0.66f,
-            0.70f);
+        const double rulerTop = top + kTimelineToolbarHeight;
+        addColor(tickX, rulerTop + kTimelineScaleHeight - 7.0, 1.0, 7.0,
+                 ui::theme::kTextTertiary);
         add(tickX, top + kTimelineRulerHeight, 1.0,
-            std::max(0.0, timelineHeight - kTimelineRulerHeight), 0.17f, 0.175f,
-            0.18f, 0.38f);
+            std::max(0.0, timelineHeight - kTimelineRulerHeight),
+            ui::theme::kLaneGrid.r, ui::theme::kLaneGrid.g,
+            ui::theme::kLaneGrid.b, 0.58f);
+        const RationalTime tickTime = self.state->viewport.XToTime(
+            tickX, self.state->document.sequence.frame_rate.num);
+        addText(tickX + 4.0, rulerTop + 4.0, 74.0, ui::theme::kFontSizeCaption,
+                FormatTimecode(tickTime, [self playheadFrameRate]),
+                ui::theme::kTextTertiary, MetalFontFace::Mono, true);
         if (tickIndex + 1 < tickXs.size()) {
             const double interval = tickXs[tickIndex + 1] - tickX;
             for (int subdivision = 1; subdivision < 4; ++subdivision) {
-                add(tickX + interval * subdivision / 4.0,
-                    top + kTimelineRulerHeight - 4.0, 1.0, 4.0, 0.30f, 0.32f,
-                    0.35f);
+                addColor(tickX + interval * subdivision / 4.0,
+                         rulerTop + kTimelineScaleHeight - 4.0, 1.0, 4.0,
+                         ui::theme::kBorderStrong);
             }
         }
     }
@@ -8784,19 +10176,16 @@ DeleteGapOperation GapDeleteOperationForSelection(
                                  self.state->viewport.track_height;
             if (right > left && y < top + timelineHeight) {
                 const double height = self.state->viewport.track_height;
-                add(left, y, right - left, height, 0.10f, 0.34f, 0.48f, 0.42f);
-                add(left, y, right - left, 2.0, ui::theme::kAccentBlue.r,
-                    ui::theme::kAccentBlue.g, ui::theme::kAccentBlue.b);
-                add(left, y + height - 2.0, right - left, 2.0,
-                    ui::theme::kAccentBlue.r, ui::theme::kAccentBlue.g,
-                    ui::theme::kAccentBlue.b);
-                add(left, y, 2.0, height, ui::theme::kAccentBlue.r,
-                    ui::theme::kAccentBlue.g, ui::theme::kAccentBlue.b);
-                add(right - 2.0, y, 2.0, height, ui::theme::kAccentBlue.r,
-                    ui::theme::kAccentBlue.g, ui::theme::kAccentBlue.b);
+                addColor(left, y, right - left, height,
+                         ui::theme::WithAlpha(ui::theme::kAccent, 0.18f));
+                addColor(left, y, right - left, 2.0, ui::theme::kAccent);
+                addColor(left, y + height - 2.0, right - left, 2.0,
+                         ui::theme::kAccent);
+                addColor(left, y, 2.0, height, ui::theme::kAccent);
+                addColor(right - 2.0, y, 2.0, height, ui::theme::kAccent);
                 for (double stripe = left + 8.0; stripe < right; stripe += 12.0)
-                    add(stripe, y + 5.0, 1.0, std::max(0.0, height - 10.0),
-                        0.20f, 0.58f, 0.72f, 0.55f);
+                    addColor(stripe, y + 5.0, 1.0, std::max(0.0, height - 10.0),
+                             ui::theme::WithAlpha(ui::theme::kAccentHi, 0.35f));
             }
         }
     }
@@ -8806,43 +10195,40 @@ DeleteGapOperation GapDeleteOperationForSelection(
                              self.state->interaction->SelectedClipIds(),
                              self.state->interaction->TrimPreview(),
                              self.state->interaction->MovePreview());
-    const bool singleClipSelection =
-        self.state->interaction->SelectedClipIds().size() == 1;
     for (const TimelineClipRect& clip : clips) {
         double left = std::min(clip.x, clip.x + clip.width);
         double right = std::max(clip.x, clip.x + clip.width);
         const bool headVisible =
             left >= self.state->viewport.header_width && left <= width;
-        const bool tailVisible =
-            right >= self.state->viewport.header_width && right <= width;
         left = std::max(left, self.state->viewport.header_width);
         right = std::min(right, width);
         if (right <= left) continue;
         const double y = top + clip.y;
         if (y >= top + timelineHeight) continue;
-        add(left + 1.0, y + 2.0, std::max(0.0, right - left), clip.height,
-            0.015f, 0.018f, 0.022f, 0.65f);
-        if (clip.moving) {
-            add(left - 2.0, y - 2.0, right - left + 4.0, clip.height + 4.0,
-                ui::theme::kAccentRed.r, ui::theme::kAccentRed.g,
-                ui::theme::kAccentRed.b, 0.82f);
-        }
-        if (clip.selected) {
-            add(left - 2.0, y - 2.0, right - left + 4.0, clip.height + 4.0,
-                clip.valid ? ui::theme::kAccentAmber.r : 1.0f,
-                clip.valid ? ui::theme::kAccentAmber.g : 0.16f,
-                clip.valid ? ui::theme::kAccentAmber.b : 0.12f);
-        }
         const auto color = ClipColor(clip.source_id, clip.audio);
         if (!clip.valid)
-            add(left, y, right - left, clip.height, 0.72f, 0.08f, 0.08f, 0.92f);
-        else
-            add(left, y, right - left, clip.height,
-                std::min(1.0f, color[0] + (clip.preview ? 0.12f : 0.0f)),
-                std::min(1.0f, color[1] + (clip.preview ? 0.12f : 0.0f)),
-                std::min(1.0f, color[2] + (clip.preview ? 0.12f : 0.0f)));
-        add(left, y, right - left, 3.0, std::min(1.0f, color[0] + 0.22f),
-            std::min(1.0f, color[1] + 0.22f), std::min(1.0f, color[2] + 0.22f));
+            addColor(left, y + 2.0, right - left, 40.0,
+                     ui::theme::WithAlpha(ui::theme::kError, 0.92f));
+        else {
+            const float previewLift = clip.preview ? 0.08f : 0.0f;
+            // The moving rectangle is the exact overwrite candidate, not a
+            // decorative ghost. Keep it opaque so the incoming result remains
+            // readable over the clip it is about to replace.
+            const float movingAlpha = 1.0f;
+            const ui::theme::Color clipTop{
+                std::min(1.0f, color[0] + 0.08f + previewLift),
+                std::min(1.0f, color[1] + 0.08f + previewLift),
+                std::min(1.0f, color[2] + 0.08f + previewLift), movingAlpha};
+            const ui::theme::Color clipBottom{
+                std::max(0.0f, color[0] - 0.05f + previewLift),
+                std::max(0.0f, color[1] - 0.05f + previewLift),
+                std::max(0.0f, color[2] - 0.05f + previewLift), movingAlpha};
+            addV(left, y + 2.0, right - left, 40.0, clipTop, clipBottom);
+        }
+        addColor(left, y + 2.0, right - left, 1.0, ui::theme::kEdgeLight);
+        if (headVisible)
+            addColor(left, y + 3.0, 3.0, 38.0,
+                     ui::theme::WithAlpha(ui::theme::kTextClip, 0.32f));
         if (clip.audio && clip.width > 0.0) {
             const auto waveform = self.state->waveforms.find(clip.source_id);
             const DocumentClip* documentClip =
@@ -8887,6 +10273,16 @@ DeleteGapOperation GapDeleteOperationForSelection(
                 }
             }
         }
+        const double clipSpan = right - left;
+        add(left, y + 28.0, clipSpan, 14.0, 0.0f, 0.0f, 0.0f, 0.40f);
+        if (clipSpan >= ui::theme::kTimelineClipNameMinWidth) {
+            addText(left + 5.0, y + 29.0, clipSpan - 10.0,
+                    ui::theme::kFontSizeSmall,
+                    TimelineClipName(self.state->document, self.state->project,
+                                     clip.source_id),
+                    ui::theme::kTextClip, MetalFontFace::Mono, true);
+        }
+        add(left, y + 40.0, clipSpan, 2.0, 0.0f, 0.0f, 0.0f, 0.28f);
         if (clip.audio && clip.sync_drift && clip.sync_drift->value != 0) {
             const std::string label =
                 SyncDriftLabel(*clip.sync_drift, [self playheadFrameRate]);
@@ -8902,40 +10298,90 @@ DeleteGapOperation GapDeleteOperationForSelection(
                     0.94f, 0.18f, 0.08f);
             }
         }
-        // Every edit boundary must remain readable when adjacent clips share
-        // the same source color. Fixed-point dark edges create a clear cut
-        // seam without depending on zoom or inserting a fake timeline gap.
+        // Every edit boundary remains readable when adjacent clips share the
+        // same source. Selection remains the only clip-level emphasis.
         const double outlineWidth = std::min(1.0, right - left);
-        add(left, y, outlineWidth, clip.height, 0.025f, 0.029f, 0.035f, 0.96f);
-        add(right - outlineWidth, y, outlineWidth, clip.height, 0.025f, 0.029f,
-            0.035f, 0.96f);
-        add(left, y + clip.height - 1.0, right - left, 1.0, 0.025f, 0.029f,
-            0.035f, 0.90f);
-        if (clip.selected && singleClipSelection) {
-            // Resolve-style trim handles: fixed point sizes, independent of
-            // zoom, with a grip bar and short top/bottom caps.
-            const double span = right - left;
-            const double gripWidth = std::min(3.0, span / 2.0);
-            const double capWidth = std::min(7.0, span);
-            if (headVisible) {
-                add(left, y, std::min(6.0, span), clip.height, 0.08f, 0.08f,
-                    0.09f, 0.42f);
-                add(left, y + 2.0, gripWidth, std::max(0.0, clip.height - 4.0),
-                    1.0f, 0.82f, 0.18f);
-                add(left, y, capWidth, 2.0, 1.0f, 0.82f, 0.18f);
-                add(left, y + clip.height - 2.0, capWidth, 2.0, 1.0f, 0.82f,
-                    0.18f);
-            }
-            if (tailVisible) {
-                add(std::max(left, right - 6.0), y, std::min(6.0, span),
-                    clip.height, 0.08f, 0.08f, 0.09f, 0.42f);
-                add(right - gripWidth, y + 2.0, gripWidth,
-                    std::max(0.0, clip.height - 4.0), 1.0f, 0.82f, 0.18f);
-                add(right - capWidth, y, capWidth, 2.0, 1.0f, 0.82f, 0.18f);
-                add(right - capWidth, y + clip.height - 2.0, capWidth, 2.0,
-                    1.0f, 0.82f, 0.18f);
+        addColor(left, y + 2.0, outlineWidth, 40.0, ui::theme::kSeparator);
+        addColor(right - outlineWidth, y + 2.0, outlineWidth, 40.0,
+                 ui::theme::kSeparator);
+        if (clip.selected) {
+            const ui::theme::Color selection =
+                clip.valid ? ui::theme::kTextPrimary : ui::theme::kError;
+            addColor(left, y + 2.0, clipSpan, 2.0, selection);
+            addColor(left, y + 40.0, clipSpan, 2.0, selection);
+            addColor(left, y + 2.0, std::min(2.0, clipSpan), 40.0, selection);
+            addColor(std::max(left, right - 2.0), y + 2.0,
+                     std::min(2.0, clipSpan), 40.0, selection);
+        }
+        if (clip.selected && self.window.firstResponder == self.metalView &&
+            clipSpan > 8.0) {
+            addColor(left + 4.0, y + 6.0, clipSpan - 8.0, 1.0,
+                     ui::theme::kAccent);
+            addColor(left + 4.0, y + 37.0, clipSpan - 8.0, 1.0,
+                     ui::theme::kAccent);
+            addColor(left + 4.0, y + 6.0, 1.0, 32.0, ui::theme::kAccent);
+            addColor(right - 5.0, y + 6.0, 1.0, 32.0, ui::theme::kAccent);
+        }
+        if (clip.moving) {
+            addColor(left, y + 2.0, clipSpan, 2.0, ui::theme::kAccent);
+            addColor(left, y + 40.0, clipSpan, 2.0, ui::theme::kAccent);
+            addColor(left, y + 2.0, std::min(2.0, clipSpan), 40.0,
+                     ui::theme::kAccent);
+            addColor(std::max(left, right - 2.0), y + 2.0,
+                     std::min(2.0, clipSpan), 40.0, ui::theme::kAccent);
+        }
+    }
+
+    // Locked lanes stay visible but receive a sparse diagonal safety hatch
+    // above their clips. Axis-aligned stair steps keep this compatible with
+    // the timeline's rectangle-only Metal display list.
+    for (size_t index = 0; index < tracks.size(); ++index) {
+        if (!tracks[index]->locked) continue;
+        const double y = top + kTimelineRulerHeight +
+                         index * self.state->viewport.track_height;
+        const double height = self.state->viewport.track_height;
+        if (y >= top + timelineHeight) continue;
+        add(self.state->viewport.header_width, y,
+            width - self.state->viewport.header_width, height, 0.0f, 0.0f, 0.0f,
+            0.26f);
+        for (double baseX = self.state->viewport.header_width - height;
+             baseX < width; baseX += 16.0) {
+            for (double offset = 0.0; offset < height; offset += 3.0) {
+                const double x = baseX + offset;
+                if (x >= self.state->viewport.header_width && x < width)
+                    add(x, y + offset, std::min(4.0, width - x), 1.5,
+                        ui::theme::kTextTertiary.r, ui::theme::kTextTertiary.g,
+                        ui::theme::kTextTertiary.b, 0.42f);
             }
         }
+    }
+
+    // The range belongs to the timeline, not to its empty background. Draw
+    // its translucent body after clips so In/Out remains readable across
+    // picture, waveform and gaps alike.
+    if ([self hasValidTimelineRange]) {
+        const double rawIn =
+            self.state->viewport.TimeToX(*self.state->timelineIn);
+        const double rawOut =
+            self.state->viewport.TimeToX(*self.state->timelineOut);
+        const double left = std::max(self.state->viewport.header_width, rawIn);
+        const double right = std::min(width, rawOut);
+        if (right > left)
+            add(left, top + kTimelineRulerHeight, right - left,
+                std::max(0.0, timelineHeight - kTimelineRulerHeight -
+                                  kTimelineZoomBarHeight),
+                ui::theme::kAccent.r, ui::theme::kAccent.g,
+                ui::theme::kAccent.b, 0.10f);
+        if (rawIn >= self.state->viewport.header_width && rawIn <= width)
+            addColor(
+                rawIn, top + kTimelineRulerHeight, 1.0,
+                timelineHeight - kTimelineRulerHeight - kTimelineZoomBarHeight,
+                ui::theme::kMarkIn);
+        if (rawOut >= self.state->viewport.header_width && rawOut <= width)
+            addColor(
+                rawOut - 1.0, top + kTimelineRulerHeight, 1.0,
+                timelineHeight - kTimelineRulerHeight - kTimelineZoomBarHeight,
+                ui::theme::kMarkOut);
     }
 
     for (const DocumentTransition& transition :
@@ -8976,12 +10422,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
                          4.0;
         const double height =
             std::max(8.0, self.state->viewport.track_height - 8.0);
-        add(leftX, y, rightX - leftX, height, 0.16f, 0.42f, 0.58f, 0.62f);
-        add(leftX, y, rightX - leftX, 2.0, 0.35f, 0.88f, 1.0f);
-        add(leftX, y + height - 2.0, rightX - leftX, 2.0, 0.35f, 0.88f, 1.0f);
+        addColor(leftX, y, rightX - leftX, height,
+                 ui::theme::WithAlpha(ui::theme::kSurfaceControlHi, 0.72f));
+        addColor(leftX, y, rightX - leftX, 2.0, ui::theme::kAccent);
+        addColor(leftX, y + height - 2.0, rightX - leftX, 2.0,
+                 ui::theme::kAccent);
         const double cutX =
             self.state->viewport.TimeToX(rightClip->timeline_in);
-        add(cutX - 1.0, y, 2.0, height, 0.75f, 0.96f, 1.0f);
+        addColor(cutX - 1.0, y, 2.0, height, ui::theme::kTextPrimary);
     }
 
     if (self.state->lassoDragging) {
@@ -8997,15 +10445,16 @@ DeleteGapOperation GapDeleteOperationForSelection(
         const double bottom =
             std::max(self.state->lassoStartY, self.state->lassoCurrentY);
         if (right > left && bottom > lassoTop) {
-            add(left, top + lassoTop, right - left, bottom - lassoTop, 0.12f,
-                0.52f, 0.78f, 0.18f);
-            add(left, top + lassoTop, right - left, 1.0, 0.28f, 0.78f, 1.0f);
-            add(left, top + bottom - 1.0, right - left, 1.0, 0.28f, 0.78f,
-                1.0f);
-            add(left, top + lassoTop, 1.0, bottom - lassoTop, 0.28f, 0.78f,
-                1.0f);
-            add(right - 1.0, top + lassoTop, 1.0, bottom - lassoTop, 0.28f,
-                0.78f, 1.0f);
+            addColor(left, top + lassoTop, right - left, bottom - lassoTop,
+                     ui::theme::WithAlpha(ui::theme::kAccent, 0.12f));
+            addColor(left, top + lassoTop, right - left, 1.0,
+                     ui::theme::kAccent);
+            addColor(left, top + bottom - 1.0, right - left, 1.0,
+                     ui::theme::kAccent);
+            addColor(left, top + lassoTop, 1.0, bottom - lassoTop,
+                     ui::theme::kAccent);
+            addColor(right - 1.0, top + lassoTop, 1.0, bottom - lassoTop,
+                     ui::theme::kAccent);
         }
     }
 
@@ -9013,19 +10462,45 @@ DeleteGapOperation GapDeleteOperationForSelection(
         const double snapX = self.state->viewport.TimeToX(
             *self.state->interaction->SnapGuideTime());
         if (snapX >= self.state->viewport.header_width && snapX <= width)
-            add(snapX, top + kTimelineRulerHeight, 1.0,
-                timelineHeight - kTimelineRulerHeight, 0.15f, 0.88f, 1.0f);
+            addColor(
+                snapX, top + kTimelineRulerHeight, 1.0,
+                timelineHeight - kTimelineRulerHeight - kTimelineZoomBarHeight,
+                ui::theme::kAccent);
     }
     if (self.state->cutPreviewX && self.state->cutPreviewY) {
-        add(*self.state->cutPreviewX - 1.0, top + *self.state->cutPreviewY, 2.0,
-            self.state->viewport.track_height, 1.0f, 0.16f, 0.12f);
+        addColor(*self.state->cutPreviewX - 1.0, top + *self.state->cutPreviewY,
+                 2.0, self.state->viewport.track_height, ui::theme::kAccent);
+    }
+
+    const double zoomY = top + timelineHeight - kTimelineZoomBarHeight;
+    addColor(0.0, zoomY, width, kTimelineZoomBarHeight,
+             ui::theme::kSurfaceSunken);
+    addColor(0.0, zoomY, self.state->viewport.header_width,
+             kTimelineZoomBarHeight, ui::theme::kSurfacePanel);
+    const TimelineZoomBarGeometry zoomGeometry =
+        CalculateTimelineZoomBarGeometry(self.state->viewport,
+                                         self.state->duration, width);
+    if (zoomGeometry.thumb_width > 0.0) {
+        addV(zoomGeometry.thumb_x, zoomY + 2.0, zoomGeometry.thumb_width, 10.0,
+             ui::theme::kSurfaceControlHi, ui::theme::kSurfaceControl);
+        addColor(zoomGeometry.thumb_x, zoomY + 2.0, zoomGeometry.handle_width,
+                 10.0, ui::theme::kTextTertiary);
+        addColor(zoomGeometry.thumb_x + zoomGeometry.thumb_width -
+                     zoomGeometry.handle_width,
+                 zoomY + 2.0, zoomGeometry.handle_width, 10.0,
+                 ui::theme::kTextTertiary);
+        if (self.state->zoomBarDrag)
+            addColor(zoomGeometry.thumb_x, zoomY, zoomGeometry.thumb_width, 2.0,
+                     ui::theme::kAccent);
     }
 
     const double playheadX =
         self.state->viewport.TimeToX(self.state->requestedPosition);
     if (playheadX >= self.state->viewport.header_width && playheadX <= width) {
-        add(playheadX - 4.0, top, 8.0, 6.0, 1.0f, 0.20f, 0.14f);
-        add(playheadX - 1.0, top, 2.0, timelineHeight, 1.0f, 0.22f, 0.16f);
+        addColor(
+            playheadX, top + kTimelineToolbarHeight, 1.0,
+            timelineHeight - kTimelineToolbarHeight - kTimelineZoomBarHeight,
+            ui::theme::kAccent);
     }
     return data;
 }
@@ -9060,16 +10535,17 @@ DeleteGapOperation GapDeleteOperationForSelection(
     if (self.state->overlayDirty || programChanged) {
         TimelineRenderData programData;
         programData.color_management = self.state->document.color_management;
+        programData.display_sdr_preview = true;
         programData.sequence_width = self.state->document.sequence.width;
         programData.sequence_height = self.state->document.sequence.height;
         programData.video_height = self.programMonitorView.bounds.size.height;
         programData.video_zoom = self.state->programMonitorZoom;
+        programData.video_scope = self.state->programVideoScope;
         programData.video_rotation_degrees.resize(candidates.size(), 0);
         programData.video_opacities.resize(candidates.size(), 1.0f);
-        // F1.3: read-only render-time consumer of DocumentClip::effects.
-        // Resolving here (rather than in Renderer.mm) keeps the renderer
-        // generic over Document/ClipEffect -- it only ever sees the already
-        // -resolved, already-float ResolvedColorGrade.
+        // Record is the canonical edited output: both monitors share the same
+        // SDR presentation transform, while Record additionally displays the
+        // clip's creative grade. Source remains the ungraded rush reference.
         programData.video_color_grades.resize(candidates.size());
         for (size_t slot = 0; slot < candidates.size(); ++slot) {
             if (!candidates[slot].active) continue;
@@ -9108,22 +10584,20 @@ DeleteGapOperation GapDeleteOperationForSelection(
             !(sourceCandidate == self.state->sourceRendered)) {
             TimelineRenderData sourceData;
             sourceData.color_management = self.state->document.color_management;
+            sourceData.display_sdr_preview = true;
+            // Both viewers use the sequence canvas. Portrait media is then
+            // letterboxed at the same scale in Source and Record.
+            sourceData.sequence_width = self.state->document.sequence.width;
+            sourceData.sequence_height = self.state->document.sequence.height;
             sourceData.video_height = self.sourceMonitorView.bounds.size.height;
             sourceData.video_zoom = self.state->sourceMonitorZoom;
             sourceData.video_rotation_degrees = {0};
             const auto metadata =
                 self.state->mediaMetadata.find(self.state->sourceMonitorId);
             if (metadata != self.state->mediaMetadata.end()) {
-                sourceData.sequence_width = metadata->second.width;
-                sourceData.sequence_height = metadata->second.height;
                 if (metadata->second.metadata_complete) {
                     sourceData.video_rotation_degrees[0] =
                         metadata->second.rotation_degrees;
-                    const int turns = static_cast<int>(
-                        std::lround(metadata->second.rotation_degrees / 90.0));
-                    if (std::abs(turns) % 2 == 1)
-                        std::swap(sourceData.sequence_width,
-                                  sourceData.sequence_height);
                 }
             }
             const std::vector<AVFrame*> sourceFrames{sourceFrame};
@@ -9202,6 +10676,16 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
 }
 
 - (CGFloat)splitView:(NSSplitView*)splitView
+    constrainSplitPosition:(CGFloat)proposedPosition
+               ofSubviewAt:(NSInteger)dividerIndex {
+    if (splitView == self.monitorSplitView && self.state &&
+        self.state->sourceMonitorVisible && dividerIndex == 0) {
+        return (splitView.bounds.size.width - splitView.dividerThickness) * 0.5;
+    }
+    return proposedPosition;
+}
+
+- (CGFloat)splitView:(NSSplitView*)splitView
     constrainMinCoordinate:(CGFloat)proposedMinimumPosition
                ofSubviewAt:(NSInteger)dividerIndex {
     const CGFloat divider = splitView.dividerThickness;
@@ -9230,7 +10714,8 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
             width - kRightDockMinWidth - divider);
     }
     if (splitView == self.editorSplitView)
-        return std::max<CGFloat>(180.0, splitView.bounds.size.height - 200.0);
+        return std::max<CGFloat>(
+            180.0, splitView.bounds.size.height - 200.0 - divider);
     if (splitView == self.monitorSplitView)
         return self.state && !self.state->sourceMonitorVisible
                    ? splitView.bounds.size.width
@@ -9245,10 +10730,717 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
 }
 
 - (void)splitViewDidResizeSubviews:(NSNotification*)notification {
+    (void)notification;
     if (!self.state) return;
     [self refreshTimelineChrome];
     self.state->overlayDirty = true;
 }
+
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+- (void)runUiSmokeTests {
+    // This is an in-process end-to-end smoke test: the real AppDelegate has
+    // loaded and locked a disposable project, built the actual AppKit tree,
+    // initialized Metal, and wired every target/action. It requires a macOS
+    // WindowServer, but no Accessibility permission or synthetic global input.
+    UiSmokeCheck(self.window != nil && self.state != nullptr,
+                 "application launches a real editor window");
+
+    NSButton* toggle = self.sourceMonitorToggleButton;
+    const NSPoint togglePoint =
+        NSMakePoint(NSMidX(toggle.frame), NSMidY(toggle.frame));
+    UiSmokeCheck([self.programMonitorView hitTest:togglePoint] == toggle,
+                 "Source toggle is hit-testable above the Metal view");
+    ClickControlThroughWindow(toggle);
+    UiSmokeCheck(!self.state->sourceMonitorVisible &&
+                     self.sourceMonitorPanel.superview == nil &&
+                     self.programMonitorPanel.frame.size.width ==
+                         self.monitorSplitView.bounds.size.width &&
+                     [toggle.title isEqualToString:@"SOURCE OFF"],
+                 "Source toggle collapses the Source monitor");
+    ClickControlThroughWindow(toggle);
+    const double viewerWidthDelta =
+        std::abs(self.sourceMonitorPanel.frame.size.width -
+                 self.programMonitorPanel.frame.size.width);
+    const double viewerHeightDelta =
+        std::abs(self.sourceMonitorPanel.frame.size.height -
+                 self.programMonitorPanel.frame.size.height);
+    UiSmokeCheck(
+        self.state->sourceMonitorVisible &&
+            self.sourceMonitorPanel.superview == self.monitorSplitView &&
+            viewerWidthDelta < 1.0 && viewerHeightDelta < 1.0 &&
+            [toggle.title isEqualToString:@"SOURCE ON"],
+        "Source toggle restores two equally sized monitors");
+
+    NSPopUpButton* scopePopup = self.programVideoScopePopup;
+    const NSPoint scopePoint =
+        NSMakePoint(NSMidX(scopePopup.frame), NSMidY(scopePopup.frame));
+    UiSmokeCheck([self.programMonitorView hitTest:scopePoint] == scopePopup,
+                 "Record scope selector is hit-testable above Metal");
+    const VideoScopeMode initialScope = self.state->programVideoScope;
+    [scopePopup
+        selectItemWithTag:static_cast<NSInteger>(VideoScopeMode::Waveform)];
+    [scopePopup sendAction:scopePopup.action to:scopePopup.target];
+    UiSmokeCheck(
+        self.state->programVideoScope == VideoScopeMode::Waveform &&
+            [NSUserDefaults.standardUserDefaults
+                integerForKey:kProgramVideoScopeDefaultsKey] ==
+                static_cast<NSInteger>(VideoScopeMode::Waveform),
+        "Record waveform toggle updates and persists local monitor state");
+    [self presentNearestFrameAtDeadline:NO];
+    UiSmokeCheck(!self.state->overlayDirty,
+                 "Record waveform executes the Metal scope render pass");
+    [scopePopup selectItemWithTag:static_cast<NSInteger>(initialScope)];
+    [scopePopup sendAction:scopePopup.action to:scopePopup.target];
+
+    std::optional<Ulid> initialTrackId;
+    std::optional<Ulid> initialClipId;
+    std::optional<Ulid> initialAudioTrackId;
+    for (const DocumentTrack& track : self.state->document.sequence.tracks) {
+        if (track.kind == "video" && !track.clips.empty()) {
+            initialTrackId = track.id;
+            initialClipId = track.clips.front().id;
+        }
+        if (track.kind == "audio") initialAudioTrackId = track.id;
+    }
+    UiSmokeCheck(initialTrackId.has_value() && initialClipId.has_value(),
+                 "UI fixture exposes a selectable video clip");
+    if (initialClipId) {
+        const double rulerTimelineY = kTimelineToolbarHeight + 8.0;
+        const NSPoint playheadPoint =
+            NSMakePoint(self.state->viewport.TimeToX({37, 25}),
+                        self.metalView.bounds.size.height - rulerTimelineY);
+        const NSPoint contentPoint =
+            [self.metalView convertPoint:playheadPoint
+                                  toView:self.window.contentView];
+        UiSmokeCheck(
+            [self.window.contentView hitTest:contentPoint] == self.metalView,
+            "Window hit-test routes timeline coordinates to Metal");
+        SendTimelineMouseGesture(self.metalView, playheadPoint, playheadPoint);
+        UiSmokeCheck(self.state->requestedPosition == RationalTime(37, 25),
+                     "Timeline click moves the playhead through AppKit");
+
+        const TimelineViewport savedViewport = self.state->viewport;
+        self.state->viewport.view_start = {0, 25};
+        self.state->viewport.pixels_per_second = 2000.0;
+        self.state->viewport.ScrollByPixels(-10000.0, 25);
+        UiSmokeCheck(self.state->viewport.view_start == RationalTime{0, 25},
+                     "Timeline navigation cannot expose time before zero");
+        TimelineZoomBarGeometry zoomGeometry = CalculateTimelineZoomBarGeometry(
+            self.state->viewport, self.state->duration,
+            self.metalView.bounds.size.width);
+        const double zoomBarViewY = kTimelineZoomBarHeight * 0.5;
+        const NSPoint thumbStart =
+            NSMakePoint(zoomGeometry.thumb_x + zoomGeometry.thumb_width * 0.5,
+                        zoomBarViewY);
+        const double beforeBarZoom = self.state->viewport.pixels_per_second;
+        SendTimelineMouseGesture(
+            self.metalView, thumbStart,
+            NSMakePoint(thumbStart.x + 40.0, thumbStart.y));
+        UiSmokeCheck(self.state->viewport.view_start > RationalTime{0, 25} &&
+                         std::abs(self.state->viewport.pixels_per_second -
+                                  beforeBarZoom) < 0.001 &&
+                         !self.state->zoomBarDrag,
+                     "Dragging the bottom thumb pans the visible timeline");
+        zoomGeometry = CalculateTimelineZoomBarGeometry(
+            self.state->viewport, self.state->duration,
+            self.metalView.bounds.size.width);
+        const NSPoint rightHandle =
+            NSMakePoint(zoomGeometry.thumb_x + zoomGeometry.thumb_width - 2.0,
+                        zoomBarViewY);
+        const double beforeHandleZoom = self.state->viewport.pixels_per_second;
+        SendTimelineMouseGesture(
+            self.metalView, rightHandle,
+            NSMakePoint(rightHandle.x - 40.0, rightHandle.y));
+        UiSmokeCheck(self.state->viewport.pixels_per_second > beforeHandleZoom,
+                     "Dragging a bottom-bar handle changes timeline zoom");
+        self.state->viewport = savedViewport;
+
+        const DocumentClip* beforeMove =
+            self.state->document.FindClip(*initialClipId);
+        const RationalTime originalTimelineIn =
+            beforeMove ? beforeMove->timeline_in : RationalTime{0, 25};
+        const size_t beforeMoveEdits = self.state->editLog.AppliedCount();
+        const double trackTimelineY =
+            kTimelineRulerHeight + self.state->viewport.track_height * 0.5;
+        const NSPoint dragStart =
+            NSMakePoint(self.state->viewport.TimeToX({25, 25}),
+                        self.metalView.bounds.size.height - trackTimelineY);
+        const NSPoint dragEnd = NSMakePoint(dragStart.x + 60.0, dragStart.y);
+        self.state->interaction->PointerDown(
+            dragStart.x, trackTimelineY, self.metalView.bounds.size.width, 25);
+        self.state->interaction->PointerDrag(dragEnd.x, trackTimelineY,
+                                             self.metalView.bounds.size.width);
+        const auto movingPreview = self.state->interaction->MovePreview();
+        const TimelineRenderData movingData = [self timelineRenderData];
+        const double movingX =
+            movingPreview
+                ? self.state->viewport.TimeToX(movingPreview->timeline_in)
+                : -1.0;
+        const double movingY = [self videoHeight] + kTimelineRulerHeight + 3.5;
+        const bool hasOpaqueMovingBody = std::any_of(
+            movingData.overlays.begin(), movingData.overlays.end(),
+            [&](const MetalDrawCommand& overlay) {
+                const MetalRect* rect = std::get_if<MetalRect>(&overlay);
+                return rect && std::abs(rect->x - movingX) < 0.01 &&
+                       std::abs(rect->y - movingY) < 0.01 &&
+                       std::abs(rect->height - 40.0) < 0.01 &&
+                       std::abs(rect->alpha - 1.0f) < 0.001f &&
+                       std::abs(rect->bottom_alpha - 1.0f) < 0.001f;
+            });
+        UiSmokeCheck(
+            movingPreview && movingPreview->valid && hasOpaqueMovingBody,
+            "Timeline overwrite preview remains fully opaque");
+        self.state->interaction->CancelDrag();
+        SendTimelineMouseGesture(self.metalView, dragStart, dragEnd);
+        const DocumentClip* afterMove =
+            self.state->document.FindClip(*initialClipId);
+        UiSmokeCheck(afterMove &&
+                         afterMove->timeline_in != originalTimelineIn &&
+                         self.state->editLog.AppliedCount() > beforeMoveEdits,
+                     "Timeline drag moves a clip through EditLog");
+
+        self.shortcutBindings[@"play.forward"] = @"L";
+        self.shortcutBindings[@"play.reverse"] = @"J";
+        self.shortcutBindings[@"play.stop"] = @"K";
+        SendKeyThroughWindow(self.metalView, @"l", 37);
+        SendKeyThroughWindow(self.metalView, @"l", 37);
+        UiSmokeCheck(self.state->playbackDirection == 2,
+                     "Second L press enables 2x forward shuttle");
+        SendKeyThroughWindow(self.metalView, @"k", 40);
+        SendKeyThroughWindow(self.metalView, @"j", 38);
+        SendKeyThroughWindow(self.metalView, @"j", 38);
+        UiSmokeCheck(self.state->playbackDirection == -2,
+                     "Second J press enables 2x reverse shuttle");
+        SendKeyThroughWindow(self.metalView, @"k", 40);
+        UiSmokeCheck(self.state->playbackDirection == 0,
+                     "K stops shuttle playback");
+        [self requestTimelinePosition:{0, 25}];
+        SendKeyThroughWindow(self.metalView, @"\uf701", 125);
+        const RationalTime nextCut = self.state->requestedPosition;
+        SendKeyThroughWindow(self.metalView, @"\uf700", 126);
+        UiSmokeCheck(nextCut > RationalTime{0, 25} &&
+                         self.state->requestedPosition == RationalTime{0, 25},
+                     "Down/Up navigate to the next/previous exact cut");
+
+        const auto clickTrackControl = [&](size_t trackIndex, double x) {
+            const double timelineY =
+                kTimelineRulerHeight +
+                trackIndex * self.state->viewport.track_height +
+                self.state->viewport.track_height * 0.5;
+            const NSPoint point =
+                NSMakePoint(x, self.metalView.bounds.size.height - timelineY);
+            SendTimelineMouseGesture(self.metalView, point, point);
+        };
+        const DocumentTrack* videoTrack =
+            self.state->document.FindTrack(*initialTrackId);
+        UiSmokeCheck(videoTrack && videoTrack->visible,
+                     "Video tracks start visible");
+        clickTrackControl(0, 48.0);
+        videoTrack = self.state->document.FindTrack(*initialTrackId);
+        UiSmokeCheck(videoTrack && !videoTrack->visible,
+                     "Video eye hides the track output");
+        clickTrackControl(0, 48.0);
+        clickTrackControl(0, 66.0);
+        videoTrack = self.state->document.FindTrack(*initialTrackId);
+        UiSmokeCheck(videoTrack && videoTrack->visible && videoTrack->locked,
+                     "Video lock rejects edits independently of visibility");
+        const TimelineRenderData lockedData = [self timelineRenderData];
+        const bool hasLockHatch = std::any_of(
+            lockedData.overlays.begin(), lockedData.overlays.end(),
+            [&](const MetalDrawCommand& overlay) {
+                const MetalRect* rect = std::get_if<MetalRect>(&overlay);
+                return rect && std::abs(rect->height - 1.5) < 0.001 &&
+                       std::abs(rect->alpha - 0.42f) < 0.001f &&
+                       rect->x >= self.state->viewport.header_width;
+            });
+        UiSmokeCheck(hasLockHatch,
+                     "Locked video track draws a hatch above its clips");
+        clickTrackControl(0, 66.0);
+
+        if (initialAudioTrackId) {
+            const DocumentTrack* audioTrack =
+                self.state->document.FindTrack(*initialAudioTrackId);
+            UiSmokeCheck(audioTrack && !audioTrack->solo && !audioTrack->muted,
+                         "Audio tracks start with Solo and Mute disabled");
+            clickTrackControl(1, 48.0);
+            clickTrackControl(1, 66.0);
+            clickTrackControl(1, 84.0);
+            audioTrack = self.state->document.FindTrack(*initialAudioTrackId);
+            UiSmokeCheck(audioTrack && audioTrack->solo && audioTrack->muted &&
+                             audioTrack->locked,
+                         "Audio S, M and lock controls persist their state");
+            clickTrackControl(1, 48.0);
+            clickTrackControl(1, 66.0);
+            clickTrackControl(1, 84.0);
+        }
+
+        self.state->timelineIn = RationalTime{10, 25};
+        self.state->timelineOut = RationalTime{30, 25};
+        const TimelineRenderData rangeData = [self timelineRenderData];
+        size_t clipCommand = rangeData.overlays.size();
+        size_t rangeCommand = rangeData.overlays.size();
+        for (size_t index = 0; index < rangeData.overlays.size(); ++index) {
+            const MetalRect* rect =
+                std::get_if<MetalRect>(&rangeData.overlays[index]);
+            if (!rect) continue;
+            if (clipCommand == rangeData.overlays.size() &&
+                rect->height == 40.0 &&
+                rect->x >= self.state->viewport.header_width)
+                clipCommand = index;
+            if (std::abs(rect->alpha - 0.10f) < 0.001f) rangeCommand = index;
+        }
+        UiSmokeCheck(clipCommand < rangeCommand &&
+                         rangeCommand < rangeData.overlays.size(),
+                     "In/Out overlay is drawn above timeline clips");
+        self.state->timelineIn.reset();
+        self.state->timelineOut.reset();
+
+        self.state->interaction->SelectClip(*initialClipId);
+        [self updateSelectionInfo];
+        NSMutableArray<NSSlider*>* sliders = [NSMutableArray array];
+        CollectSliders(self.inspectorView, sliders);
+        UiSmokeCheck(sliders.count == ui::inspector::GradeControls().size(),
+                     "Inspector exposes every grading slider");
+        if (sliders.count > 0) {
+            NSSlider* exposure = sliders.firstObject;
+            exposure.floatValue = 0.5f;
+            [exposure sendAction:exposure.action to:exposure.target];
+            NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:0.2];
+            while (deadline.timeIntervalSinceNow > 0.0)
+                [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode
+                                       beforeDate:deadline];
+            const DocumentClip* graded =
+                self.state->document.FindClip(*initialClipId);
+            const float value =
+                graded ? ui::inspector::CurrentGradeControlValue(
+                             graded->effects,
+                             ui::inspector::GradeControls().front())
+                       : 0.0f;
+            UiSmokeCheck(std::abs(value - 0.5f) < 0.001f,
+                         "Inspector slider commits through EditLog");
+            if (graded && initialTrackId && graded->duration.value > 1) {
+                const RationalTime cut = graded->timeline_in.add(
+                    {graded->duration.value / 2, graded->duration.rate});
+                const DocumentTrack* beforeTrack =
+                    self.state->document.FindTrack(*initialTrackId);
+                const size_t beforeCount =
+                    beforeTrack ? beforeTrack->clips.size() : 0;
+                SendKeyThroughApplication(exposure, @"c", 8);
+                UiSmokeCheck([self effectiveTool] == TimelineTool::Cut,
+                             "Inspector focus still accepts the Cut shortcut");
+                const double timelineY =
+                    kTimelineRulerHeight +
+                    self.state->viewport.track_height * 0.5;
+                const NSPoint cutPoint =
+                    NSMakePoint(self.state->viewport.TimeToX(cut),
+                                self.metalView.bounds.size.height - timelineY);
+                SendTimelineMouseGesture(self.metalView, cutPoint, cutPoint);
+                const DocumentTrack* afterTrack =
+                    self.state->document.FindTrack(*initialTrackId);
+                const DocumentClip* right = nullptr;
+                if (afterTrack) {
+                    for (const DocumentClip& candidate : afterTrack->clips) {
+                        if (candidate.timeline_in == cut) {
+                            right = &candidate;
+                            break;
+                        }
+                    }
+                }
+                UiSmokeCheck(
+                    afterTrack && afterTrack->clips.size() > beforeCount &&
+                        right && right->effects.size() == 1 &&
+                        std::abs(ui::inspector::CurrentGradeControlValue(
+                                     right->effects,
+                                     ui::inspector::GradeControls().front()) -
+                                 0.5f) < 0.001f,
+                    "Cutting from Inspector focus preserves grading");
+                [self setTimelineTool:TimelineTool::Select];
+            }
+        }
+
+        const DocumentTrack* multiTrack =
+            self.state->document.FindTrack(*initialTrackId);
+        if (multiTrack && multiTrack->clips.size() >= 2) {
+            const Ulid firstSelected = multiTrack->clips[0].id;
+            const Ulid secondSelected = multiTrack->clips[1].id;
+            const std::string beforeDelete =
+                self.state->document.SaveToString();
+            const size_t beforeDeleteEdits = self.state->editLog.AppliedCount();
+            self.state->interaction->SelectClips(
+                {firstSelected, secondSelected});
+            SendKeyThroughWindow(self.metalView, @"\x7f", 51);
+            UiSmokeCheck(
+                !self.state->document.FindClip(firstSelected) &&
+                    !self.state->document.FindClip(secondSelected) &&
+                    self.state->editLog.AppliedCount() ==
+                        beforeDeleteEdits + 1 &&
+                    std::holds_alternative<ClearClipsOperation>(
+                        self.state->editLog.AppliedEntries().back().op),
+                "Delete clears an arbitrary multi-clip selection atomically");
+            [self menuUndo:nil];
+            UiSmokeCheck(self.state->document.SaveToString() == beforeDelete,
+                         "Undo restores a multi-clip delete byte-for-byte");
+        }
+    }
+
+    const Ulid sourceId = self.state->document.sources.front().id;
+    NSString* sourceIdentifier =
+        [NSString stringWithUTF8String:sourceId.c_str()];
+    NSString* timelineIdentifier =
+        [NSString stringWithUTF8String:self.state->activeTimelineId.c_str()];
+    const NSUInteger timelineIconIndex =
+        [self.visibleMediaIds indexOfObject:timelineIdentifier];
+    id<NSPasteboardWriting> timelineWriter =
+        timelineIconIndex == NSNotFound
+            ? nil
+            : [self collectionView:self.mediaCollection
+                  pasteboardWriterForItemAtIndexPath:
+                      [NSIndexPath indexPathForItem:timelineIconIndex
+                                          inSection:0]];
+    UiSmokeCheck([(NSPasteboardItem*)timelineWriter
+                     stringForType:kCutmachineTimelinePasteboardType] != nil,
+                 "Timeline icon provides a bin-placement drag payload");
+
+    NSString* mediaBinIdentifier = [NSString
+        stringWithUTF8String:self.state->document.bins.back().id.c_str()];
+    [self refreshBinControlsSelecting:mediaBinIdentifier];
+    const NSUInteger iconIndex =
+        [self.visibleMediaIds indexOfObject:sourceIdentifier];
+    UiSmokeCheck(iconIndex == 0 && self.visibleMediaIds.count >= 7,
+                 "Nested 1_RUSHES fixture exposes its first rush at index 0");
+    id<NSPasteboardWriting> iconWriter =
+        iconIndex == NSNotFound
+            ? nil
+            : [self collectionView:self.mediaCollection
+                  pasteboardWriterForItemAtIndexPath:
+                      [NSIndexPath indexPathForItem:iconIndex inSection:0]];
+    NSSet<NSIndexPath*>* iconPaths =
+        iconIndex == NSNotFound
+            ? [NSSet set]
+            : [NSSet setWithObject:[NSIndexPath indexPathForItem:iconIndex
+                                                       inSection:0]];
+    NSEvent* iconDragEvent =
+        [NSEvent mouseEventWithType:NSEventTypeLeftMouseDragged
+                           location:NSZeroPoint
+                      modifierFlags:0
+                          timestamp:NSProcessInfo.processInfo.systemUptime
+                       windowNumber:self.window.windowNumber
+                            context:nil
+                        eventNumber:0
+                         clickCount:1
+                           pressure:1.0];
+    UiSmokeCheck([(NSPasteboardItem*)iconWriter
+                     stringForType:kCutmachineMediaPasteboardType] != nil,
+                 "Icon-mode media item provides a timeline drag payload");
+    UiSmokeCheck([self collectionView:self.mediaCollection
+                     canDragItemsAtIndexPaths:iconPaths
+                                    withEvent:iconDragEvent] &&
+                     self.mediaCollection.gestureRecognizers.count == 0,
+                 "Icon-mode drag is enabled without a competing click "
+                 "recognizer");
+    UiSmokeCheck((kMediaLocalDragOperations & NSDragOperationCopy) != 0 &&
+                     (kMediaLocalDragOperations & NSDragOperationMove) != 0,
+                 "Media drag supports timeline copy and bin move destinations");
+    UiSmokeCheck([self.mediaCollection.registeredDraggedTypes
+                     containsObject:kCutmachineMediaPasteboardType] &&
+                     [self.mediaCollection.registeredDraggedTypes
+                         containsObject:kCutmachineBinPasteboardType] &&
+                     [self.mediaCollection.registeredDraggedTypes
+                         containsObject:kCutmachineTimelinePasteboardType] &&
+                     [self.mediaCollection.registeredDraggedTypes
+                         containsObject:NSPasteboardTypeFileURL],
+                 "Icon grid accepts media, timeline, bin, and Finder drops");
+    if (iconIndex != NSNotFound && initialTrackId) {
+        NSIndexPath* iconPath = [NSIndexPath indexPathForItem:iconIndex
+                                                    inSection:0];
+        [self.mediaCollection
+            scrollToItemsAtIndexPaths:[NSSet setWithObject:iconPath]
+                       scrollPosition:
+                           NSCollectionViewScrollPositionNearestHorizontalEdge |
+                           NSCollectionViewScrollPositionNearestVerticalEdge];
+        [self.mediaCollection layoutSubtreeIfNeeded];
+        NSCollectionViewItem* iconItem =
+            [self.mediaCollection itemAtIndexPath:iconPath];
+        NSCollectionViewLayoutAttributes* iconAttributes =
+            [self.mediaCollection.collectionViewLayout
+                layoutAttributesForItemAtIndexPath:iconPath];
+        const NSRect visualIconFrame =
+            iconItem ? [iconItem.view convertRect:iconItem.view.bounds
+                                           toView:self.mediaCollection]
+                     : NSZeroRect;
+        const double timelineY =
+            kTimelineRulerHeight + self.state->viewport.track_height * 0.5;
+        const NSPoint destination =
+            NSMakePoint(self.state->viewport.TimeToX({60, 25}),
+                        self.metalView.bounds.size.height - timelineY);
+        NSIndexPath* resolvedIconPath =
+            iconItem
+                ? [(ContextCollectionView*)self.mediaCollection
+                      iconIndexPathAtPoint:NSMakePoint(NSMidX(visualIconFrame),
+                                                       NSMidY(visualIconFrame))]
+                : nil;
+        UiSmokeCheck(resolvedIconPath.item == iconPath.item,
+                     "Icon hit testing preserves top-to-bottom coordinates");
+        bool gridSpansMultipleRows = false;
+        for (NSCollectionViewItem* visibleItem in self.mediaCollection
+                 .visibleItems) {
+            const NSRect visibleFrame =
+                [visibleItem.view convertRect:visibleItem.view.bounds
+                                       toView:self.mediaCollection];
+            if (std::abs(NSMidY(visibleFrame) - NSMidY(visualIconFrame)) >
+                NSHeight(visualIconFrame) * 0.5) {
+                gridSpansMultipleRows = true;
+                break;
+            }
+        }
+        UiSmokeCheck(gridSpansMultipleRows,
+                     "Icon click fixture covers multiple visual rows");
+        if (iconItem) {
+            // Reproduce AppKit cell reuse after entering a bin: even if a
+            // tile forwards an obsolete lower index, current visual geometry
+            // must win.
+            ((MediaIconView*)iconItem.view).indexPath =
+                [NSIndexPath indexPathForItem:self.visibleMediaIds.count - 1
+                                    inSection:0];
+            self.mediaCollection.selectionIndexPaths = [NSSet set];
+            SendWindowClick(
+                self.mediaCollection,
+                NSMakePoint(NSMidX(visualIconFrame), NSMidY(visualIconFrame)));
+            UiSmokeCheck([self.mediaCollection.selectionIndexPaths
+                             containsObject:iconPath],
+                         "A physical click selects the first rush tile");
+        }
+        if (iconItem) {
+            const NSPoint labelCenterInCollection = [iconItem.textField
+                convertPoint:NSMakePoint(NSMidX(iconItem.textField.bounds),
+                                         NSMidY(iconItem.textField.bounds))
+                      toView:self.mediaCollection];
+            NSIndexPath* labelPath =
+                [(ContextCollectionView*)self.mediaCollection
+                    iconIndexPathAtPoint:labelCenterInCollection];
+            const NSPoint labelCenter = [iconItem.view
+                convertPoint:NSMakePoint(NSMidX(iconItem.textField.bounds),
+                                         NSMidY(iconItem.textField.bounds))
+                    fromView:iconItem.textField];
+            UiSmokeCheck(
+                labelPath.item == iconPath.item &&
+                    [iconItem.view hitTest:labelCenter] == iconItem.view &&
+                    iconItem.textField.editable,
+                "The first rush label resolves to its own icon item");
+            const NSPoint labelWindowPoint =
+                [self.mediaCollection convertPoint:labelCenterInCollection
+                                            toView:nil];
+            NSEvent* rightClick = [NSEvent
+                mouseEventWithType:NSEventTypeRightMouseDown
+                          location:labelWindowPoint
+                     modifierFlags:0
+                         timestamp:NSProcessInfo.processInfo.systemUptime
+                      windowNumber:self.window.windowNumber
+                           context:nil
+                       eventNumber:0
+                        clickCount:1
+                          pressure:1.0];
+            NSView* content = self.window.contentView;
+            NSView* physicalHit = [content
+                hitTest:[content convertPoint:labelWindowPoint fromView:nil]];
+            UiSmokeCheck(
+                [physicalHit isKindOfClass:MediaIconView.class] ||
+                    physicalHit == self.mediaCollection,
+                "Window hit-test routes the icon label to the unified tile "
+                "handler");
+            NSMenu* physicalMenu = [physicalHit menuForEvent:rightClick];
+            UiSmokeCheck(physicalMenu == self.mediaCollection.menu,
+                         "A physical right-click reaches the icon context "
+                         "menu");
+            UiSmokeCheck([self.mediaCollection.selectionIndexPaths
+                             containsObject:iconPath],
+                         "A physical right-click selects its icon item");
+            self.mediaCollection.selectionIndexPaths = [NSSet set];
+            SendWindowClick(self.mediaCollection, labelCenterInCollection);
+            UiSmokeCheck([self.mediaCollection.selectionIndexPaths
+                             containsObject:iconPath] &&
+                             iconItem.textField.currentEditor != nil,
+                         "A physical name click starts inline editing "
+                         "immediately on the first rush");
+            NSTextView* editor = (NSTextView*)iconItem.textField.currentEditor;
+            if (editor) {
+                editor.string = @"Rush renommé par clic";
+                [self.window makeFirstResponder:self.mediaCollection];
+            }
+            const ProjectBinMetadata* clickedRename =
+                self.state->project.FindBinMetadata(sourceId);
+            UiSmokeCheck(clickedRename && clickedRename->display_name ==
+                                              "Rush renommé par clic",
+                         "Physical icon rename persists through the project "
+                         "edit log");
+            const int reloadsBeforeRenameHistory = gUiSmokeDecodeReloads;
+            [self menuUndo:nil];
+            const ProjectBinMetadata* undoneRename =
+                self.state->project.FindBinMetadata(sourceId);
+            UiSmokeCheck(
+                (!undoneRename ||
+                 undoneRename->display_name != "Rush renommé par clic") &&
+                    gUiSmokeDecodeReloads == reloadsBeforeRenameHistory,
+                "Undoing a rename does not restart media decoders");
+            [self menuRedo:nil];
+            const ProjectBinMetadata* redoneRename =
+                self.state->project.FindBinMetadata(sourceId);
+            UiSmokeCheck(
+                redoneRename &&
+                    redoneRename->display_name == "Rush renommé par clic" &&
+                    gUiSmokeDecodeReloads == reloadsBeforeRenameHistory,
+                "Redoing a rename stays on the lightweight refresh path");
+        }
+        [self.mediaCollection layoutSubtreeIfNeeded];
+        iconItem = [self.mediaCollection itemAtIndexPath:iconPath];
+        iconAttributes = [self.mediaCollection.collectionViewLayout
+            layoutAttributesForItemAtIndexPath:iconPath];
+        if (iconItem) {
+            const NSRect dragFrame =
+                [iconItem.view convertRect:iconItem.view.bounds
+                                    toView:self.mediaCollection];
+            SendWindowDragGesture(
+                self.mediaCollection,
+                NSMakePoint(NSMidX(dragFrame), NSMidY(dragFrame)),
+                self.metalView, destination);
+        }
+        UiSmokeCheck(gUiSmokeIconMouseDown,
+                     "Physical icon drag reaches the collection mouseDown");
+        UiSmokeCheck(gUiSmokeIconDragSession,
+                     "Physical icon gesture starts an AppKit drag session");
+        UiSmokeCheck(iconItem && iconAttributes,
+                     "Physical icon drag uses a visible collection item");
+    }
+    NSTableColumn* nameColumn =
+        [self.mediaTable tableColumnWithIdentifier:@"name"];
+    BOOL everyListNameIsEditable = nameColumn != nil;
+    for (NSInteger row = 0;
+         row < (NSInteger)self.visibleMediaIds.count && everyListNameIsEditable;
+         ++row) {
+        NSTableCellView* cell =
+            (NSTableCellView*)[self tableView:self.mediaTable
+                           viewForTableColumn:nameColumn
+                                          row:row];
+        everyListNameIsEditable =
+            [cell.textField isKindOfClass:BrowserRenameTextField.class] &&
+            cell.textField.editable &&
+            [cell.textField.identifier hasPrefix:@"browser:"];
+    }
+    UiSmokeCheck(everyListNameIsEditable,
+                 "List-mode names are inline-editable for every item kind");
+
+    const auto commitInlineName = [&](NSString* identifier, NSString* name) {
+        NSTextField* field = [NSTextField textFieldWithString:name];
+        field.identifier = [@"browser:" stringByAppendingString:identifier];
+        NSNotification* ended = [NSNotification
+            notificationWithName:NSControlTextDidEndEditingNotification
+                          object:field
+                        userInfo:@{
+                            NSTextMovementUserInfoKey : @(NSReturnTextMovement)
+                        }];
+        [self controlTextDidEndEditing:ended];
+    };
+    NSString* smokeBinIdentifier = [NSString
+        stringWithUTF8String:self.state->document.bins.front().id.c_str()];
+    commitInlineName(smokeBinIdentifier, @"Chutier renommé");
+    commitInlineName(timelineIdentifier, @"Timeline renommée");
+    commitInlineName(sourceIdentifier, @"Rush renommé");
+    const ProjectBinMetadata* renamedMetadata =
+        self.state->project.FindBinMetadata(sourceId);
+    UiSmokeCheck(
+        self.state->document.bins.front().name == "Chutier renommé" &&
+            self.state->project.FindTimeline(self.state->activeTimelineId)
+                    ->name == "Timeline renommée" &&
+            renamedMetadata &&
+            renamedMetadata->display_name == "Rush renommé" &&
+            self.state->document.FindLibraryMedia(sourceId)->filename ==
+                "00-fixture.mov",
+        "Inline names persist for bins, timelines, and rushes without "
+        "renaming the source file");
+    self.state->sourceMonitor = true;
+    self.state->sourceMonitorActive = true;
+    self.state->sourceMonitorId = sourceId;
+    self.state->sourceIn.reset();
+    self.state->sourceOut.reset();
+    self.state->timelineIn.reset();
+    self.state->timelineOut.reset();
+    self.state->requestedPosition = {0, 25};
+    NSButton* insert = FindButtonWithTitle(self.sourceMonitorView, @"INSÉRER");
+    UiSmokeCheck(insert != nil, "Source Insert button exists");
+    if (insert && initialTrackId) {
+        const NSPoint insertPoint =
+            NSMakePoint(NSMidX(insert.frame), NSMidY(insert.frame));
+        UiSmokeCheck([self.sourceMonitorView hitTest:insertPoint] == insert,
+                     "Source Insert button is hit-testable above Metal");
+        const DocumentTrack* beforeTrack =
+            self.state->document.FindTrack(*initialTrackId);
+        const size_t before = beforeTrack ? beforeTrack->clips.size() : 0;
+        [insert performClick:nil];
+        const DocumentTrack* edited =
+            self.state->document.FindTrack(*initialTrackId);
+        UiSmokeCheck(edited && edited->clips.size() > before,
+                     "Source Insert button performs a persisted edit");
+    }
+
+    NSButton* overwrite =
+        FindButtonWithTitle(self.sourceMonitorView, @"ÉCRASER");
+    UiSmokeCheck(overwrite != nil, "Source Overwrite button exists");
+    if (overwrite) {
+        const NSPoint overwritePoint =
+            NSMakePoint(NSMidX(overwrite.frame), NSMidY(overwrite.frame));
+        UiSmokeCheck(
+            [self.sourceMonitorView hitTest:overwritePoint] == overwrite,
+            "Source Overwrite button is hit-testable above Metal");
+        const size_t before = self.state->editLog.AppliedCount();
+        [overwrite performClick:nil];
+        UiSmokeCheck(self.state->editLog.AppliedCount() > before &&
+                         [self.infoLabel.stringValue containsString:@"écrasé"],
+                     "Source Overwrite button performs a persisted edit");
+    }
+
+    if (initialTrackId) {
+        const size_t before = self.state->editLog.AppliedCount();
+        const double timelineY =
+            kTimelineRulerHeight + self.state->viewport.track_height * 0.5;
+        const NSPoint point =
+            NSMakePoint(self.state->viewport.TimeToX({75, 25}),
+                        self.metalView.bounds.size.height - timelineY);
+        const BOOL accepted = [self
+            timelineDropMedia:[NSString stringWithUTF8String:sourceId.c_str()]
+                  atViewPoint:point];
+        UiSmokeCheck(accepted && self.state->editLog.AppliedCount() > before,
+                     "Media drop performs a persisted timeline edit");
+    }
+
+    CAMetalLayer* sourceLayer = (CAMetalLayer*)self.sourceMonitorView.layer;
+    CAMetalLayer* programLayer = (CAMetalLayer*)self.programMonitorView.layer;
+    UiSmokeCheck(sourceLayer.pixelFormat == programLayer.pixelFormat &&
+                     sourceLayer.colorspace != nullptr &&
+                     programLayer.colorspace != nullptr &&
+                     CFEqual(sourceLayer.colorspace, programLayer.colorspace) &&
+                     sourceLayer.wantsExtendedDynamicRangeContent ==
+                         programLayer.wantsExtendedDynamicRangeContent,
+                 "Source and Record use the same Metal presentation policy");
+
+    std::fprintf(stdout, "UI smoke: %d failure(s)\n", gUiSmokeFailures);
+    std::fflush(stdout);
+    // -terminate: exits the process before main can return the failure count.
+    // Stop the run loop and wake it with a harmless application event so
+    // ctest receives a non-zero status for every failed smoke assertion.
+    [NSApp stop:nil];
+    NSEvent* wake =
+        [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                           location:NSZeroPoint
+                      modifierFlags:0
+                          timestamp:NSProcessInfo.processInfo.systemUptime
+                       windowNumber:self.window.windowNumber
+                            context:nil
+                            subtype:0
+                              data1:0
+                              data2:0];
+    [NSApp postEvent:wake atStart:NO];
+}
+#endif
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
     (void)notification;
@@ -9258,6 +11450,10 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
     if (self.state->audioPlayback) self.state->audioPlayback->Stop();
     [self.displayTimer invalidate];
     self.displayTimer = nil;
+    if (self.timelineShortcutMonitor) {
+        [NSEvent removeMonitor:self.timelineShortcutMonitor];
+        self.timelineShortcutMonitor = nil;
+    }
     for (auto& worker : self.state->workers) {
         worker.second->Stop();
     }
@@ -9270,12 +11466,25 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
 
 - (void)dealloc {
     [_displayTimer invalidate];
+    if (_timelineShortcutMonitor)
+        [NSEvent removeMonitor:_timelineShortcutMonitor];
     delete _state;
 }
 
 @end
 
 int main(int argc, char* argv[]) {
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+    if (argc == 2 && std::string(argv[1]) == "--ui-smoke") {
+        std::string error;
+        if (!PrepareUiSmokeProject(error)) {
+            std::fprintf(stderr, "Unable to prepare UI smoke project: %s\n",
+                         error.c_str());
+            return 1;
+        }
+        gUiSmokeTesting = true;
+    }
+#endif
     if (argc == 3 && std::string(argv[1]) == "--describe") {
         std::string output;
         const int result = DescribeCommand(argv[2], output);
@@ -9386,7 +11595,11 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
-    if (argc > 2 || (argc == 2 && argv[1][0] == '-')) {
+    if (argc > 2 || (argc == 2 && argv[1][0] == '-'
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+                     && !gUiSmokeTesting
+#endif
+                     )) {
         std::fprintf(
             stderr,
             "Usage: %s [/path/to/project.cutmachine.json]\n"
@@ -9411,12 +11624,26 @@ int main(int argc, char* argv[]) {
 
     @autoreleasepool {
         [NSApplication sharedApplication];
-        NSString* documentPath =
-            argc == 2 ? [NSString stringWithUTF8String:argv[1]] : nil;
+        NSString* documentPath = nil;
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+        if (gUiSmokeTesting)
+            documentPath =
+                [NSString stringWithUTF8String:gUiSmokeProjectPath.c_str()];
+        else
+#endif
+            documentPath =
+                argc == 2 ? [NSString stringWithUTF8String:argv[1]] : nil;
         AppDelegate* delegate =
             [[AppDelegate alloc] initWithDocumentPath:documentPath];
         NSApp.delegate = delegate;
         [NSApp run];
     }
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+    if (gUiSmokeTesting) {
+        std::error_code ignored;
+        std::filesystem::remove_all(gUiSmokeRoot, ignored);
+        return gUiSmokeFailures == 0 ? 0 : 1;
+    }
+#endif
     return 0;
 }

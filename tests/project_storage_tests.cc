@@ -92,6 +92,14 @@ int main() {
     Check(CommitStoredProjectAndLogs(sourceProject, project, logs, projectLog,
                                      error),
           "source project and histories save: " + error);
+    CollectionIntegrityReport sourceIntegrity;
+    Check(VerifyPortableProject(sourceProject, sourceIntegrity, error) &&
+              sourceIntegrity.verified_media == 0 &&
+              sourceIntegrity.missing_media.empty() &&
+              sourceIntegrity.modified_media.empty(),
+          "external media absent from the collection manifest is not "
+          "reported as modified: " +
+              error);
 
     const fs::path destination = root / "Portable Film.cutmachine-project";
     PortableProjectResult result;

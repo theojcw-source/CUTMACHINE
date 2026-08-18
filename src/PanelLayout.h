@@ -6,8 +6,7 @@
 #include <vector>
 
 // F2.1 -- ROADMAP.md. This header is the entire layout policy for the
-// panels F2.2 (Inspector), F2.3 (Media), F2.4 (Chat) and F2.5 (playback
-// transport) build on top of.
+// panels F2.2 (Inspector), F2.3 (Media) and F2.4 (Chat) build on top of.
 //
 // PHILOSOPHY.md's amended non-buts allow remembering interface state (which
 // theme, which tab was last open, whether a panel is shown) as a *local*
@@ -24,9 +23,9 @@
 // Document/ProjectStorage.
 namespace ui {
 
-enum class PanelSlot { Inspector, Media, Chat, Transport };
+enum class PanelSlot { Inspector, Media, Chat };
 
-enum class PanelDock { Left, Right, Bottom };
+enum class PanelDock { Left, Right };
 
 struct PanelSlotDescriptor {
     PanelSlot slot;
@@ -40,18 +39,15 @@ struct PanelSlotDescriptor {
 // browser already has dedicated screen real estate (main.mm's existing
 // left-hand mediaPanel, built before this ticket); it is listed here so the
 // registry and its local-preference keys stay complete and every panel
-// slot -- present or future -- is described in exactly one place, even
-// though F2.3 does not need CMPanelHostView's tab chrome to be reachable.
-// F2.3 landed its own Media/Audio/Captions sub-tabs *inside* this one slot
-// (MediaPanelModel.h, UiComponents.h's CMTabStripView) -- a second, smaller
-// tab strip that switches content within PanelSlot::Media, not a second
-// dock-level slot of its own.
-inline const std::array<PanelSlotDescriptor, 4>& FixedPanelLayout() {
-    static const std::array<PanelSlotDescriptor, 4> kLayout{{
+// slot -- present or future -- is described in exactly one place. The
+// ATELIER redesign integrates transport controls into the timeline and gives
+// the Media dock one static purpose, so neither is represented by another
+// tab or dock slot.
+inline const std::array<PanelSlotDescriptor, 3>& FixedPanelLayout() {
+    static const std::array<PanelSlotDescriptor, 3> kLayout{{
         {PanelSlot::Media, "media", "Médiathèque", PanelDock::Left, 0},
         {PanelSlot::Inspector, "inspector", "Inspecteur", PanelDock::Right, 0},
         {PanelSlot::Chat, "chat", "Agent", PanelDock::Right, 1},
-        {PanelSlot::Transport, "transport", "Lecture", PanelDock::Bottom, 0},
     }};
     return kLayout;
 }
@@ -94,8 +90,6 @@ inline std::string LastActiveTabPreferenceKey(PanelDock dock) {
             return "ui.dock.left.lastActiveTab";
         case PanelDock::Right:
             return "ui.dock.right.lastActiveTab";
-        case PanelDock::Bottom:
-            return "ui.dock.bottom.lastActiveTab";
     }
     return "ui.dock.unknown.lastActiveTab";
 }

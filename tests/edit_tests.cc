@@ -245,6 +245,44 @@ int main() {
               "ripple delete closes the removed clip interval");
     });
 
+    Test("clearing an arbitrary multi-selection is one exact operation", [] {
+        Document document = EditDocument();
+        const std::string original = document.SaveToString();
+        const Ulid firstId = "01K20000000000000000000004";
+        const Ulid lastId = "01K20000000000000000000006";
+        const Ulid untouchedId = "01K20000000000000000000005";
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+
+        Check(Apply(log, document, ClearClipsOperation{{firstId, lastId}, {}},
+                    "multi-clear"),
+              "multi-clear applies");
+        Check(!document.FindClip(firstId) && !document.FindClip(lastId) &&
+                  document.FindClip(untouchedId),
+              "multi-clear removes every selected clip and no other clip");
+        const std::string cleared = document.SaveToString();
+        const std::string json =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(json, parsed, error, message) &&
+                  std::holds_alternative<ClearClipsOperation>(parsed) &&
+                  SerializeOperation(parsed) == json,
+              "ClearClips JSON round-trips canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == original,
+              "multi-clear undo restores exact document bytes");
+        Check(log.Redo(document, error, message) &&
+                  document.SaveToString() == cleared,
+              "multi-clear redo restores every gap exactly");
+
+        Document locked = EditDocument();
+        locked.sequence.tracks.front().locked = true;
+        ExpectRejected(locked, ClearClipsOperation{{firstId, lastId}, {}},
+                       EditError::LockedTrack,
+                       "multi-clear touching a locked track");
+    });
+
     Test("paste duplicates linked clips as one exact operation", [] {
         Document document = EditDocument();
         DocumentClip& video = document.sequence.tracks[0].clips[0];
@@ -1113,6 +1151,29 @@ int main() {
         Check(log.Undo(document, error, message) &&
                   document.sequence.tracks[0].sync_lock,
               "undo restores sync lock");
+    });
+
+    Test("track output state round-trips and is undoable", [] {
+        Document document = EditDocument();
+        EditLog log;
+        const std::string original = document.SaveToString();
+        const Ulid trackId = document.sequence.tracks[0].id;
+        SetTrackOutputOperation change{trackId, false, true, true};
+        Check(Apply(log, document, change, "change track output"),
+              "track output operation applies");
+        const DocumentTrack* changed = document.FindTrack(trackId);
+        Check(changed && !changed->visible && changed->muted && changed->solo,
+              "all output flags are stored");
+        const std::string serialized = SerializeOperation(change);
+        Operation parsed = RemoveTrackOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(serialized, parsed, error, message) &&
+                  SerializeOperation(parsed) == serialized,
+              "SetTrackOutput JSON round-trips");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == original,
+              "undo restores canonical bytes exactly");
     });
 
     Test("ripple trim shifts downstream and sync-locked tracks atomically", [] {

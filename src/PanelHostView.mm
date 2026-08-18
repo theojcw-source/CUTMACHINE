@@ -24,6 +24,27 @@ NSAttributedString* CMTabTitle(NSString* title, NSColor* color) {
                                            attributes:attributes];
 }
 
+void CMSetTopEdge(NSButton* button, bool visible) {
+    button.wantsLayer = YES;
+    CALayer* edge = nil;
+    for (CALayer* layer in button.layer.sublayers) {
+        if ([layer.name isEqualToString:@"CMActiveTopEdge"]) {
+            edge = layer;
+            break;
+        }
+    }
+    if (!edge) {
+        edge = [CALayer layer];
+        edge.name = @"CMActiveTopEdge";
+        [button.layer addSublayer:edge];
+    }
+    edge.backgroundColor = CMThemeColor(ui::theme::kAccent).CGColor;
+    edge.frame =
+        CGRectMake(0.0, std::max<CGFloat>(0.0, button.bounds.size.height - 2.0),
+                   button.bounds.size.width, 2.0);
+    edge.hidden = !visible;
+}
+
 }  // namespace
 
 @interface CMPanelHostView ()
@@ -119,7 +140,9 @@ NSAttributedString* CMTabTitle(NSString* title, NSColor* color) {
 }
 
 - (void)cmLayoutHostForSize:(NSSize)size {
-    const CGFloat tabStripHeight = CGF(ui::theme::kTabStripHeight);
+    const CGFloat tabStripHeight =
+        _slots.size() <= 1 ? 0.0 : CGF(ui::theme::kTabStripHeight);
+    _tabStrip.hidden = tabStripHeight == 0.0;
     _tabStrip.frame = NSMakeRect(0.0, size.height - tabStripHeight, size.width,
                                  tabStripHeight);
     _contentContainer.frame =
@@ -133,6 +156,7 @@ NSAttributedString* CMTabTitle(NSString* title, NSColor* color) {
             _tabButtons[@(static_cast<NSInteger>(_slots[index]->slot))];
         button.frame = NSMakeRect(static_cast<CGFloat>(index) * tabWidth, 0.0,
                                   tabWidth, tabStripHeight);
+        CMSetTopEdge(button, _slots[index]->slot == _selectedSlot);
     }
     for (NSView* contentView in _slotContentViews.allValues)
         contentView.frame = _contentContainer.bounds;
@@ -150,11 +174,15 @@ NSAttributedString* CMTabTitle(NSString* title, NSColor* color) {
         const BOOL active = descriptor->slot == _selectedSlot;
         button.wantsLayer = YES;
         button.layer.backgroundColor =
-            active ? CMThemeColor(ui::theme::kSurfaceControlActive).CGColor
-                   : NSColor.clearColor.CGColor;
+            CMThemeColor(active ? ui::theme::kSurfaceControlHi
+                                : ui::theme::kSurfaceControl)
+                .CGColor;
+        button.layer.cornerRadius = 0.0;
+        CMSetTopEdge(button, active);
         button.attributedTitle =
             CMTabTitle([NSString stringWithUTF8String:descriptor->title],
-                       active ? CMAccentBlueColor() : CMTextSecondaryColor());
+                       active ? CMTextPrimaryColor()
+                              : CMThemeColor(ui::theme::kTextTertiary));
     }
 }
 

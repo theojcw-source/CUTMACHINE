@@ -31,7 +31,7 @@ void Test(const std::string& name, Function function) {
 int main() {
     Test("the layout has exactly one descriptor per panel slot", [] {
         const auto& layout = ui::FixedPanelLayout();
-        Check(layout.size() == 4, "expected exactly 4 fixed panel slots");
+        Check(layout.size() == 3, "expected exactly 3 fixed panel slots");
         std::set<ui::PanelSlot> seenSlots;
         for (const auto& descriptor : layout) seenSlots.insert(descriptor.slot);
         Check(seenSlots.size() == layout.size(),
@@ -50,8 +50,7 @@ int main() {
     });
 
     Test("within each dock, order values are unique -- no tab-order ties", [] {
-        for (ui::PanelDock dock : {ui::PanelDock::Left, ui::PanelDock::Right,
-                                   ui::PanelDock::Bottom}) {
+        for (ui::PanelDock dock : {ui::PanelDock::Left, ui::PanelDock::Right}) {
             std::set<int> orders;
             for (const auto* descriptor : ui::PanelSlotsInDock(dock))
                 orders.insert(descriptor->order);
@@ -108,14 +107,13 @@ int main() {
 
     Test("local-preference keys are stable and unique per dock", [] {
         std::set<std::string> keys;
-        for (ui::PanelDock dock : {ui::PanelDock::Left, ui::PanelDock::Right,
-                                   ui::PanelDock::Bottom}) {
+        for (ui::PanelDock dock : {ui::PanelDock::Left, ui::PanelDock::Right}) {
             const std::string key = ui::LastActiveTabPreferenceKey(dock);
             Check(key == ui::LastActiveTabPreferenceKey(dock),
                   "the same dock must always produce the same key");
             keys.insert(key);
         }
-        Check(keys.size() == 3, "each dock must have a distinct key");
+        Check(keys.size() == 2, "each dock must have a distinct key");
     });
 
     return failures == 0 ? 0 : 1;

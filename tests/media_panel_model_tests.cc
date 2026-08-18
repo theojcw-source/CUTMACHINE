@@ -133,6 +133,38 @@ int main() {
         }
     });
 
+    Test("DirectChildBins exposes only one folder level", [] {
+        DocumentBin rootB;
+        rootB.name = "B rushes";
+        DocumentBin rootA;
+        rootA.name = "A interviews";
+        DocumentBin nested;
+        nested.name = "Nested";
+        nested.parent_id = rootA.id;
+        const std::vector<DocumentBin> bins{rootB, nested, rootA};
+
+        const auto root = DirectChildBins(bins, {}, "");
+        Check(root.size() == 2, "root should contain its two direct bins");
+        if (root.size() == 2) {
+            Check(root[0]->id == rootA.id, "root bins should sort by name");
+            Check(root[1]->id == rootB.id, "root bins should sort by name");
+        }
+        const auto children = DirectChildBins(bins, rootA.id, "nest");
+        Check(children.size() == 1 && children.front()->id == nested.id,
+              "a bin should expose its matching direct child");
+
+        const auto tree = BinNavigationTree(bins);
+        Check(tree.size() == 3, "navigation should contain every bin");
+        if (tree.size() == 3) {
+            Check(tree[0].bin->id == rootA.id && tree[0].depth == 0,
+                  "first root folder should start at depth zero");
+            Check(tree[1].bin->id == nested.id && tree[1].depth == 1,
+                  "a child should immediately follow its parent");
+            Check(tree[2].bin->id == rootB.id && tree[2].depth == 0,
+                  "the next root folder should return to depth zero");
+        }
+    });
+
     Test("DescribeCaptionStyle is deterministic and includes every field", [] {
         CaptionStyle style;
         style.font_family = "Helvetica";

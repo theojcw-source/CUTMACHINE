@@ -36,6 +36,16 @@ std::string Quote(const std::string& value) {
     return result + "'";
 }
 
+size_t Count(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    size_t offset = 0;
+    while ((offset = text.find(needle, offset)) != std::string::npos) {
+        ++count;
+        offset += needle.size();
+    }
+    return count;
+}
+
 Document Fixture(const std::string& mediaPath) {
     Document document;
     const Ulid sourceId = "01K40000000000000000000001";
@@ -133,6 +143,16 @@ int main() {
     Check(plan.filter_graph.find("setpts=PTS-STARTPTS+(5/25)/TB") !=
               std::string::npos,
           "clip placement remains rational in the filter graph");
+
+    Document outputStateDocument = Fixture(media.string());
+    outputStateDocument.sequence.tracks[1].visible = false;
+    outputStateDocument.sequence.tracks[2].muted = true;
+    ExportPlan outputStatePlan;
+    Check(Exporter::BuildPlan(outputStateDocument, project.string(), settings,
+                              outputStatePlan, error) &&
+              Count(outputStatePlan.filter_graph, "overlay=") == 1 &&
+              outputStatePlan.filter_graph.find("amix=") == std::string::npos,
+          "export honors video visibility and audio mute state");
 
     Document transitionDocument = Fixture(media.string());
     DocumentClip incoming{"01K40000000000000000000008",

@@ -11,12 +11,17 @@
 // tests/transport_bar_tests.cc).
 //
 // FractionToTime only crosses the fraction -> time boundary; it does not
-// itself snap to a frame or sample grid. Callers (TransportView.mm, wired
-// up in main.mm) still run the result through TimelineView.h's
-// QuantizePlayheadPosition before it becomes the authoritative playhead --
-// exactly as the main timeline's ruler-drag scrub already does for
-// TimelineViewport::XToTime. No raw pixel/fraction value is ever stored as
-// playhead state; only the RationalTime this produces is.
+// itself snap to a frame or sample grid. A caller must run the result through
+// TimelineView.h's QuantizePlayheadPosition before it becomes the
+// authoritative playhead -- exactly as the main timeline's ruler-drag scrub
+// already does for TimelineViewport::XToTime. No raw pixel/fraction value is
+// ever stored as playhead state; only the RationalTime this produces is.
+//
+// UI-2026-08 -- ScrubBarRange currently has no caller: the ATELIER redesign
+// removed the transport dock slot and deleted the AppKit view that used it.
+// It stays because it is the tested statement of that boundary, and a
+// re-slotted transport needs the same rule rather than a fresh approximation
+// of it. NextShuttleSpeed below is live, called from main.mm's J/K/L handling.
 
 #include "RationalTime.h"
 
@@ -24,6 +29,16 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+
+// Repeated J/L presses ramp shuttle playback through 1x, 2x and 4x. Pressing
+// the opposite direction starts that direction at 1x; K remains zero.
+inline int NextShuttleSpeed(int current, int direction) {
+    if (direction == 0) return 0;
+    const int sign = direction < 0 ? -1 : 1;
+    if ((current < 0 ? -1 : current > 0 ? 1 : 0) != sign) return sign;
+    const int magnitude = std::abs(current);
+    return sign * (magnitude < 2 ? 2 : 4);
+}
 
 struct ScrubBarRange {
     // The sequence's total duration. A scrub fraction of 0.0 is time zero;

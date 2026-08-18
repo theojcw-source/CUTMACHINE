@@ -23,6 +23,7 @@ public:
     size_t DecodedSourceCount() const;
     size_t PlannedClipCount() const;
     uint64_t ScrubTriggerCount() const;
+    int ShuttleSpeed() const;
 
 private:
     struct Impl;

@@ -36,6 +36,17 @@ void Test(const std::string& name, Function function) {
 }  // namespace
 
 int main() {
+    Test("J/L shuttle ramps and reverses deterministically", [] {
+        Check(NextShuttleSpeed(0, 1) == 1, "first L press -> +1x");
+        Check(NextShuttleSpeed(1, 1) == 2, "second L press -> +2x");
+        Check(NextShuttleSpeed(2, 1) == 4, "third L press -> +4x");
+        Check(NextShuttleSpeed(4, 1) == 4, "L remains capped at +4x");
+        Check(NextShuttleSpeed(4, -1) == -1, "J reverses direction at -1x");
+        Check(NextShuttleSpeed(-1, -1) == -2, "second J press -> -2x");
+        Check(NextShuttleSpeed(-2, -1) == -4, "third J press -> -4x");
+        Check(NextShuttleSpeed(-4, 0) == 0, "K stops shuttle playback");
+    });
+
     Test("TimeToFraction: start and end of the range map to 0 and 1", [] {
         const ScrubBarRange range{RationalTime{100, 25}};  // 4 seconds @25fps
         Check(range.TimeToFraction({0, 25}) == 0.0, "time zero -> 0.0");

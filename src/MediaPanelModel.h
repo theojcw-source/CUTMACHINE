@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <functional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -82,6 +84,51 @@ inline bool MatchesBin(const Ulid& itemBinId, bool anyBin, bool wantRoot,
 }
 
 }  // namespace detail
+
+// Returns the folders displayed by a Finder-like bin browser at one level.
+// The root is represented by an empty parent id; descendants never leak into
+// the current directory and names are ordered deterministically.
+inline std::vector<const DocumentBin*> DirectChildBins(
+    const std::vector<DocumentBin>& bins, const Ulid& parentId,
+    const std::string& search) {
+    const std::string searchLower = detail::Lower(search);
+    std::vector<const DocumentBin*> result;
+    for (const DocumentBin& bin : bins) {
+        if (bin.parent_id != parentId) continue;
+        if (!searchLower.empty() &&
+            !detail::ContainsInsensitive(bin.name, searchLower))
+            continue;
+        result.push_back(&bin);
+    }
+    std::stable_sort(result.begin(), result.end(),
+                     [](const DocumentBin* left, const DocumentBin* right) {
+                         return left->name < right->name;
+                     });
+    return result;
+}
+
+struct BinNavigationEntry {
+    const DocumentBin* bin = nullptr;
+    size_t depth = 0;
+};
+
+// Flattens the hierarchy in display order while preserving each folder's
+// depth. The visited set keeps malformed cyclic input from trapping the UI.
+inline std::vector<BinNavigationEntry> BinNavigationTree(
+    const std::vector<DocumentBin>& bins) {
+    std::vector<BinNavigationEntry> result;
+    std::set<Ulid> visited;
+    std::function<void(const Ulid&, size_t)> append = [&](const Ulid& parentId,
+                                                          size_t depth) {
+        for (const DocumentBin* bin : DirectChildBins(bins, parentId, "")) {
+            if (!visited.insert(bin->id).second) continue;
+            result.push_back({bin, depth});
+            append(bin->id, depth + 1);
+        }
+    };
+    append({}, 0);
+    return result;
+}
 
 // ---- Audio tab -----------------------------------------------------------
 //

@@ -11,6 +11,112 @@ CGFloat CGF(double value) { return static_cast<CGFloat>(value); }
 
 }  // namespace
 
+@interface CMIndustrialButton : NSButton
+@end
+
+@implementation CMIndustrialButton {
+    NSTrackingArea* _trackingArea;
+    BOOL _hovered;
+    CALayer* _hoverEdge;
+    CALayer* _activeEdge;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.bordered = NO;
+        self.wantsLayer = YES;
+        self.focusRingType = NSFocusRingTypeExterior;
+        _hoverEdge = [CALayer layer];
+        _activeEdge = [CALayer layer];
+        [self.layer addSublayer:_hoverEdge];
+        [self.layer addSublayer:_activeEdge];
+    }
+    return self;
+}
+
+- (BOOL)wantsUpdateLayer {
+    return YES;
+}
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (_trackingArea) [self removeTrackingArea:_trackingArea];
+    _trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+             options:NSTrackingInVisibleRect | NSTrackingMouseEnteredAndExited |
+                     NSTrackingActiveInActiveApp
+               owner:self
+            userInfo:nil];
+    [self addTrackingArea:_trackingArea];
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+    (void)event;
+    _hovered = YES;
+    self.needsDisplay = YES;
+}
+
+- (void)mouseExited:(NSEvent*)event {
+    (void)event;
+    _hovered = NO;
+    self.needsDisplay = YES;
+}
+
+- (void)setEnabled:(BOOL)enabled {
+    [super setEnabled:enabled];
+    self.needsDisplay = YES;
+}
+
+- (void)setState:(NSControlStateValue)state {
+    [super setState:state];
+    self.needsDisplay = YES;
+}
+
+- (void)setTitle:(NSString*)title {
+    [super setTitle:title];
+    self.needsDisplay = YES;
+}
+
+- (void)updateLayer {
+    const BOOL pressed = self.highlighted;
+    const BOOL active = self.state == NSControlStateValueOn;
+    ui::theme::Color background = ui::theme::kSurfaceControl;
+    if (!self.enabled)
+        background = ui::theme::kSurfacePanel;
+    else if (pressed)
+        background = ui::theme::Mix(ui::theme::kSurfaceControl,
+                                    ui::theme::kSurfaceBase, 0.20f);
+    else if (_hovered || active)
+        background = ui::theme::kSurfaceControlHi;
+    self.layer.backgroundColor = CMThemeColor(background).CGColor;
+    self.layer.cornerRadius = 0.0;
+
+    const ui::theme::Color textColor =
+        self.enabled
+            ? (active ? ui::theme::kTextPrimary : ui::theme::kTextSecondary)
+            : ui::theme::kTextTertiary;
+    NSMutableParagraphStyle* style = [[NSMutableParagraphStyle alloc] init];
+    style.alignment = NSTextAlignmentCenter;
+    self.attributedTitle = [[NSAttributedString alloc]
+        initWithString:self.title ?: @""
+            attributes:@{
+                NSForegroundColorAttributeName : CMThemeColor(textColor),
+                NSFontAttributeName :
+                    CMFont(ui::theme::kFontSizeSmall, NSFontWeightSemibold),
+                NSParagraphStyleAttributeName : style,
+            }];
+
+    _hoverEdge.frame = CGRectMake(0.0, self.bounds.size.height - 2.0,
+                                  self.bounds.size.width, 2.0);
+    _hoverEdge.backgroundColor = CMThemeColor(ui::theme::kTextPrimary).CGColor;
+    _hoverEdge.hidden = !_hovered || pressed || !self.enabled;
+    _activeEdge.frame = CGRectMake(0.0, 0.0, self.bounds.size.width, 2.0);
+    _activeEdge.backgroundColor = CMThemeColor(ui::theme::kAccent).CGColor;
+    _activeEdge.hidden = !active || !self.enabled;
+}
+
+@end
+
 @interface CMPanelChromeView ()
 - (void)layoutChromeForSize:(NSSize)size;
 @end
@@ -157,19 +263,36 @@ CGFloat CGF(double value) { return static_cast<CGFloat>(value); }
 @end
 
 NSTextField* CMMakeSectionHeader(NSString* title) {
-    NSTextField* header =
-        [NSTextField labelWithString:title.uppercaseString ?: @""];
+    NSString* caption =
+        [NSString stringWithFormat:@"— %@", title.uppercaseString ?: @""];
+    NSTextField* header = [NSTextField labelWithString:caption];
     header.font = CMFont(ui::theme::kFontSizeCaption, NSFontWeightSemibold);
     header.textColor = CMThemeColor(ui::theme::kTextTertiary);
+    NSMutableAttributedString* attributed = [[NSMutableAttributedString alloc]
+        initWithString:caption
+            attributes:@{
+                NSForegroundColorAttributeName :
+                    CMThemeColor(ui::theme::kTextTertiary),
+                NSFontAttributeName :
+                    CMFont(ui::theme::kFontSizeCaption, NSFontWeightSemibold),
+            }];
+    [attributed
+        addAttributes:@{
+            NSForegroundColorAttributeName : CMThemeColor(ui::theme::kAccent),
+            NSFontAttributeName :
+                CMFont(ui::theme::kFontSizeCaption, NSFontWeightBold),
+        }
+                range:NSMakeRange(0, std::min<NSUInteger>(1, caption.length))];
+    header.attributedStringValue = attributed;
     return header;
 }
 
 NSButton* CMMakeStyledButton(NSString* title, id target, SEL action) {
-    NSButton* button = [NSButton buttonWithTitle:title
-                                          target:target
-                                          action:action];
-    button.bezelStyle = NSBezelStyleRounded;
-    button.controlSize = NSControlSizeSmall;
+    CMIndustrialButton* button =
+        [[CMIndustrialButton alloc] initWithFrame:NSZeroRect];
+    button.title = title ?: @"";
+    button.target = target;
+    button.action = action;
     button.font = CMFont(ui::theme::kFontSizeSmall, NSFontWeightMedium);
     return button;
 }
@@ -188,6 +311,7 @@ NSSlider* CMMakeStyledSlider(double minValue, double maxValue, id target,
     slider.target = target;
     slider.action = action;
     slider.controlSize = NSControlSizeSmall;
+    slider.trackFillColor = CMThemeColor(ui::theme::kAccent);
     return slider;
 }
 
@@ -245,16 +369,35 @@ NSSlider* CMMakeStyledSlider(double minValue, double maxValue, id target,
         const BOOL active = static_cast<NSInteger>(index) == _selectedIndex;
         button.wantsLayer = YES;
         button.layer.backgroundColor =
-            active ? CMThemeColor(ui::theme::kSurfaceControlActive).CGColor
-                   : NSColor.clearColor.CGColor;
+            CMThemeColor(active ? ui::theme::kSurfaceControlHi
+                                : ui::theme::kSurfaceControl)
+                .CGColor;
+        button.layer.cornerRadius = 0.0;
+        CALayer* edge = nil;
+        for (CALayer* candidate in button.layer.sublayers) {
+            if ([candidate.name isEqualToString:@"CMTabTopEdge"]) {
+                edge = candidate;
+                break;
+            }
+        }
+        if (!edge) {
+            edge = [CALayer layer];
+            edge.name = @"CMTabTopEdge";
+            [button.layer addSublayer:edge];
+        }
+        edge.frame = CGRectMake(
+            0.0, std::max<CGFloat>(0.0, button.bounds.size.height - 2.0),
+            button.bounds.size.width, 2.0);
+        edge.backgroundColor = CMThemeColor(ui::theme::kAccent).CGColor;
+        edge.hidden = !active;
         NSMutableParagraphStyle* style = [[NSMutableParagraphStyle alloc] init];
         style.alignment = NSTextAlignmentCenter;
         button.attributedTitle = [[NSAttributedString alloc]
             initWithString:button.title
                 attributes:@{
                     NSForegroundColorAttributeName : active
-                        ? CMAccentBlueColor()
-                        : CMTextSecondaryColor(),
+                        ? CMTextPrimaryColor()
+                        : CMThemeColor(ui::theme::kTextTertiary),
                     NSFontAttributeName :
                         CMFont(ui::theme::kFontSizeSmall, NSFontWeightMedium),
                     NSParagraphStyleAttributeName : style,
