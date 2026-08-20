@@ -1,11 +1,11 @@
 #pragma once
 
-// A small, general-purpose JSON value tree used only at the MCP HTTP/
-// JSON-RPC boundary (see McpServer.h/McpTools.h). This is deliberately not
-// shared with Operations.cc's internal reader/writer: that one serializes a
-// fixed, positional field order for Operation/EditLog values and is not a
-// general parser. This one accepts arbitrary key order, so it can validate
-// caller-supplied tool arguments and reject unknown keys.
+// A small, general-purpose JSON value tree used at the MCP HTTP/JSON-RPC and
+// recovery-envelope boundaries. This is deliberately not shared with
+// Operations.cc's internal reader/writer: that one serializes a fixed,
+// positional field order for Operation/EditLog values and is not a general
+// parser. This one accepts arbitrary key order, so callers can validate input
+// objects and reject unknown keys.
 //
 // Numbers are kept as their exact source text rather than converted to a
 // double. Callers that need a time value must go through AsInt64(), which

@@ -36,6 +36,24 @@ std::string Read(const std::filesystem::path& path) {
     return output.str();
 }
 
+std::string Hex(const std::string& input) {
+    constexpr char kDigits[] = "0123456789abcdef";
+    std::string output;
+    for (const unsigned char byte : input) {
+        output.push_back(kDigits[byte >> 4]);
+        output.push_back(kDigits[byte & 0xf]);
+    }
+    return output;
+}
+
+std::string MediaManifestSection(const std::string& manifest) {
+    const size_t begin = manifest.find("\"media\":");
+    const size_t end = manifest.rfind(']');
+    if (begin == std::string::npos || end == std::string::npos || end < begin)
+        return {};
+    return manifest.substr(begin, end - begin + 1);
+}
+
 }  // namespace
 
 int main() {
@@ -136,6 +154,35 @@ int main() {
     Check(Read(destination / "manifest.json").find("\"sha256\"") !=
               std::string::npos,
           "collection manifest fingerprints originals");
+    const std::string collectedMediaManifest =
+        MediaManifestSection(Read(destination / "manifest.json"));
+    Project withTransientTimeline = collected;
+    DocumentSequence transientTimeline;
+    transientTimeline.id = "01K50000000000000000000004";
+    transientTimeline.name = "Temporaire";
+    withTransientTimeline.timelines.push_back(transientTimeline);
+    Check(
+        CommitStoredProject(result.project_path, withTransientTimeline, error),
+        "adding a timeline commits package metadata: " + error);
+    Check(Read(destination / "manifest.json").find(transientTimeline.id) !=
+                  std::string::npos &&
+              fs::is_regular_file(destination / "Timelines" /
+                                  (transientTimeline.id + ".json")) &&
+              fs::is_regular_file(TimelineEditLogPathForProject(
+                  result.project_path, transientTimeline.id)),
+          "manifest, physical timeline, and history advance together");
+    Check(CommitStoredProject(result.project_path, collected, error),
+          "removing a timeline commits package metadata: " + error);
+    Check(Read(destination / "manifest.json").find(transientTimeline.id) ==
+                  std::string::npos &&
+              !fs::exists(destination / "Timelines" /
+                          (transientTimeline.id + ".json")) &&
+              !fs::exists(TimelineEditLogPathForProject(result.project_path,
+                                                        transientTimeline.id)),
+          "obsolete timeline state and history are removed atomically");
+    Check(MediaManifestSection(Read(destination / "manifest.json")) ==
+              collectedMediaManifest,
+          "timeline commits preserve collected-media paths and fingerprints");
     const fs::path rejectedPackage = root / "Rejected.cutmachine-project";
     fs::copy(destination, rejectedPackage, fs::copy_options::recursive);
     std::string rejectedManifest = Read(rejectedPackage / "manifest.json");
@@ -226,6 +273,36 @@ int main() {
     Check(secondLock.Acquire(sourceProject, owner, error),
           "lock can be reacquired after clean release: " + error);
     secondLock.Release();
+
+    const fs::path interrupted = root / "Interrupted.cutmachine-project";
+    fs::create_directories(interrupted / "Timelines");
+    const std::string nonce = ".cutmachine-01K50000000000000000000005";
+    const fs::path replaced = interrupted / "project.cutmachine.json";
+    const fs::path created = interrupted / "new.editlog.json";
+    const fs::path removed = interrupted / "Timelines/removed.json";
+    Write(replaced, "partially-published-new");
+    Write(replaced.string() + nonce + ".bak", "previous-project");
+    Write(created, "partially-published-new-log");
+    Write(removed.string() + nonce + ".bak", "previous-timeline");
+    Write(created.string() + nonce + ".tmp", "unused-temporary");
+    std::ostringstream transaction;
+    transaction << "CUTMACHINE_TRANSACTION_V1\n"
+                << nonce << "\n1 " << Hex("project.cutmachine.json") << "\n0 "
+                << Hex("new.editlog.json") << "\n1 "
+                << Hex("Timelines/removed.json") << '\n';
+    Write(interrupted / ".cutmachine-transaction", transaction.str());
+    Check(RecoverTextArtifactTransaction(interrupted.string(), error),
+          "an interrupted multi-file commit is recoverable: " + error);
+    Check(Read(replaced) == "previous-project" && !fs::exists(created) &&
+              Read(removed) == "previous-timeline" &&
+              !fs::exists(interrupted / ".cutmachine-transaction") &&
+              !fs::exists(created.string() + nonce + ".tmp"),
+          "recovery restores the complete previous generation and cleans "
+          "transaction files");
+    Write(replaced.string() + nonce + ".bak", "stale-backup");
+    Check(RecoverTextArtifactTransaction(interrupted.string(), error) &&
+              !fs::exists(replaced.string() + nonce + ".bak"),
+          "leftovers from an already committed generation are cleaned");
 
     fs::remove_all(root);
     if (failures) {
