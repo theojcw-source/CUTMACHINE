@@ -7,6 +7,7 @@
 
 #include <CommonCrypto/CommonDigest.h>
 
+#include <fcntl.h>
 #include <unistd.h>
 #include <array>
 #include <cerrno>
@@ -17,12 +18,47 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <set>
 #include <sstream>
 #include <system_error>
 
 namespace {
 
 namespace fs = std::filesystem;
+
+// S2 -- SAVING_ROADMAP.md. Renames alone do not make a generation durable;
+// file contents and the directory carrying each rename must both land.
+bool SynchronizePath(const fs::path& path, bool directory, std::string& error) {
+    // Read-only originals remain valid collected media; fsync does not require
+    // a writable descriptor on the supported POSIX/macOS filesystems.
+    const int descriptor = open(path.c_str(), O_RDONLY);
+    if (descriptor < 0) {
+        error = "unable to open '" + path.string() +
+                "' for synchronization: " + std::strerror(errno);
+        return false;
+    }
+#ifdef F_FULLFSYNC
+    const bool synchronized =
+        directory
+            ? fsync(descriptor) == 0
+            : (fcntl(descriptor, F_FULLFSYNC) == 0 || fsync(descriptor) == 0);
+#else
+    const bool synchronized = fsync(descriptor) == 0;
+#endif
+    if (!synchronized) {
+        const int savedError = errno;
+        close(descriptor);
+        error = "unable to synchronize '" + path.string() +
+                "': " + std::strerror(savedError);
+        return false;
+    }
+    if (close(descriptor) != 0) {
+        error =
+            "unable to close '" + path.string() + "': " + std::strerror(errno);
+        return false;
+    }
+    return true;
+}
 
 class StagingDirectory {
 public:
@@ -204,6 +240,61 @@ bool ReadFile(const fs::path& path, std::string& contents, std::string& error) {
     return true;
 }
 
+bool ExtractManifestArray(const std::string& json, const std::string& key,
+                          std::string& array, std::string& error) {
+    const size_t keyPosition = json.find("\"" + key + "\"");
+    const size_t begin = keyPosition == std::string::npos
+                             ? keyPosition
+                             : json.find('[', keyPosition);
+    if (begin == std::string::npos) {
+        error = "collection manifest has no " + key + " array";
+        return false;
+    }
+    bool quoted = false;
+    bool escaped = false;
+    size_t depth = 0;
+    for (size_t index = begin; index < json.size(); ++index) {
+        const char character = json[index];
+        if (quoted) {
+            if (escaped)
+                escaped = false;
+            else if (character == '\\')
+                escaped = true;
+            else if (character == '"')
+                quoted = false;
+            continue;
+        }
+        if (character == '"') {
+            quoted = true;
+        } else if (character == '[') {
+            ++depth;
+        } else if (character == ']' && --depth == 0) {
+            array = json.substr(begin, index - begin + 1);
+            return true;
+        }
+    }
+    error = "collection manifest has an invalid " + key + " array";
+    return false;
+}
+
+std::string BuildManifest(const Project& project,
+                          const std::string& mediaArray) {
+    std::ostringstream manifest;
+    manifest << "{\n  \"format\":\"cutmachine-collection\",\n"
+             << "  \"version\":2,\n"
+             << "  \"project\":\"project.cutmachine.json\",\n"
+             << "  \"timelines\":[";
+    for (size_t index = 0; index < project.timelines.size(); ++index) {
+        const DocumentSequence& timeline = project.timelines[index];
+        manifest << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
+                 << EscapeJson(timeline.id) << "\",\"path\":\"Timelines/"
+                 << EscapeJson(timeline.id) << ".json\"}";
+    }
+    if (!project.timelines.empty()) manifest << '\n';
+    manifest << "  ],\n  \"media\":" << mediaArray << "\n}\n";
+    return manifest.str();
+}
+
 Document StandaloneTimelineDocument(const Project& project,
                                     const DocumentSequence& timeline) {
     Document document;
@@ -215,8 +306,11 @@ Document StandaloneTimelineDocument(const Project& project,
 }  // namespace
 
 bool IsPortableProjectV2(const std::string& projectPath) {
-    const fs::path manifest =
-        fs::path(projectPath).parent_path() / "manifest.json";
+    const fs::path package = fs::path(projectPath).parent_path();
+    std::string recoveryError;
+    if (!RecoverTextArtifactTransaction(package.string(), recoveryError))
+        return false;
+    const fs::path manifest = package / "manifest.json";
     std::string contents;
     std::string error;
     return ReadFile(manifest, contents, error) &&
@@ -251,21 +345,9 @@ bool CreatePortableProject(const std::string& destinationDirectory,
         error = "unable to create project package: " + pathError.message();
         return false;
     }
-    std::ostringstream manifest;
-    manifest << "{\n  \"format\":\"cutmachine-collection\",\n"
-             << "  \"version\":2,\n"
-             << "  \"project\":\"project.cutmachine.json\",\n"
-             << "  \"timelines\":[";
-    for (size_t index = 0; index < project.timelines.size(); ++index) {
-        const DocumentSequence& timeline = project.timelines[index];
-        manifest << (index == 0 ? "\n" : ",\n") << "    {\"id\":\""
-                 << EscapeJson(timeline.id) << "\",\"path\":\"Timelines/"
-                 << EscapeJson(timeline.id) << ".json\"}";
-    }
-    if (!project.timelines.empty()) manifest << '\n';
-    manifest << "  ],\n  \"media\":[]\n}\n";
-    if (!CommitTextArtifacts(
-            {{(staging / "manifest.json").string(), manifest.str()}}, error))
+    if (!CommitTextArtifacts({{(staging / "manifest.json").string(),
+                               BuildManifest(project, "[]")}},
+                             error))
         return false;
 
     std::map<std::string, EditLog> logs;
@@ -280,6 +362,7 @@ bool CreatePortableProject(const std::string& destinationDirectory,
         error = "unable to publish project package: " + pathError.message();
         return false;
     }
+    if (!SynchronizePath(destination.parent_path(), true, error)) return false;
     cleanup.Commit();
     projectPath = (destination / "project.cutmachine.json").string();
     error.clear();
@@ -288,6 +371,9 @@ bool CreatePortableProject(const std::string& destinationDirectory,
 
 bool LoadStoredProject(const std::string& projectPath, Project& project,
                        std::string& error) {
+    if (!RecoverTextArtifactTransaction(
+            fs::path(projectPath).parent_path().string(), error))
+        return false;
     if (!IsPortableProjectV2(projectPath)) {
         error = "unsupported project package (CUTMACHINE package v2 required)";
         return false;
@@ -324,6 +410,9 @@ bool LoadStoredProject(const std::string& projectPath, Project& project,
 
 bool CommitStoredProject(const std::string& projectPath, const Project& project,
                          std::string& error) {
+    if (!RecoverTextArtifactTransaction(
+            fs::path(projectPath).parent_path().string(), error))
+        return false;
     std::map<std::string, EditLog> timelineLogs;
     if (!LoadTimelineLogs(projectPath, project, timelineLogs, error))
         return false;
@@ -348,6 +437,9 @@ bool CommitStoredProjectAndLogs(
     const std::string& projectPath, const Project& project,
     const std::map<std::string, EditLog>& timelineLogs,
     const ProjectEditLog& projectLog, std::string& error) {
+    if (!RecoverTextArtifactTransaction(
+            fs::path(projectPath).parent_path().string(), error))
+        return false;
     if (!IsPortableProjectV2(projectPath)) {
         error = "unsupported project package (CUTMACHINE package v2 required)";
         return false;
@@ -356,12 +448,26 @@ bool CommitStoredProjectAndLogs(
     std::vector<std::pair<std::string, std::string>> artifacts;
     artifacts.push_back({projectPath, project.SaveToString()});
     const fs::path base = fs::path(projectPath).parent_path();
+    std::string manifestJson;
+    if (!ReadFile(base / "manifest.json", manifestJson, error)) return false;
+    std::string mediaArray;
+    if (!ExtractManifestArray(manifestJson, "media", mediaArray, error))
+        return false;
+    artifacts.push_back({(base / "manifest.json").string(),
+                         BuildManifest(project, mediaArray)});
     const fs::path timelines = base / "Timelines";
     std::error_code directoryError;
     fs::create_directories(timelines, directoryError);
     if (directoryError) {
         error =
             "unable to create timeline directory: " + directoryError.message();
+        return false;
+    }
+    const fs::file_status timelineStatus =
+        fs::symlink_status(timelines, directoryError);
+    if (directoryError || fs::is_symlink(timelineStatus) ||
+        !fs::is_directory(timelineStatus)) {
+        error = "timeline directory must be a package-local directory";
         return false;
     }
     for (const DocumentSequence& timeline : project.timelines) {
@@ -376,7 +482,48 @@ bool CommitStoredProjectAndLogs(
     }
     artifacts.push_back(
         {ProjectEditLogPathForProject(projectPath), projectLog.Serialize()});
-    return CommitTextArtifacts(artifacts, error);
+    std::set<std::string> activeTimelineIds;
+    for (const DocumentSequence& timeline : project.timelines)
+        activeTimelineIds.insert(timeline.id);
+    std::vector<std::string> removals;
+    for (fs::directory_iterator item(timelines, directoryError), end;
+         !directoryError && item != end; item.increment(directoryError)) {
+        if (item->is_regular_file(directoryError) &&
+            item->path().extension() == ".json" &&
+            !activeTimelineIds.count(item->path().stem().string()))
+            removals.push_back(item->path().string());
+        directoryError.clear();
+    }
+    if (directoryError) {
+        error =
+            "unable to inspect timeline directory: " + directoryError.message();
+        return false;
+    }
+    const std::string logPrefix =
+        fs::path(projectPath).filename().string() + ".timeline-";
+    constexpr char kLogSuffix[] = ".editlog.json";
+    for (fs::directory_iterator item(base, directoryError), end;
+         !directoryError && item != end; item.increment(directoryError)) {
+        const std::string filename = item->path().filename().string();
+        if (item->is_regular_file(directoryError) &&
+            filename.rfind(logPrefix, 0) == 0 &&
+            filename.size() > logPrefix.size() + std::strlen(kLogSuffix) &&
+            filename.compare(filename.size() - std::strlen(kLogSuffix),
+                             std::strlen(kLogSuffix), kLogSuffix) == 0) {
+            const std::string timelineId = filename.substr(
+                logPrefix.size(),
+                filename.size() - logPrefix.size() - std::strlen(kLogSuffix));
+            if (!activeTimelineIds.count(timelineId))
+                removals.push_back(item->path().string());
+        }
+        directoryError.clear();
+    }
+    if (directoryError) {
+        error =
+            "unable to inspect project histories: " + directoryError.message();
+        return false;
+    }
+    return CommitTextArtifactsAndRemove(artifacts, removals, error);
 }
 
 ProjectSessionLock::ProjectSessionLock() = default;
@@ -471,6 +618,8 @@ bool VerifyPortableProject(const std::string& projectPath,
                            std::string& error) {
     report = {};
     const fs::path project(projectPath);
+    if (!RecoverTextArtifactTransaction(project.parent_path().string(), error))
+        return false;
     const fs::path manifestPath = project.parent_path() / "manifest.json";
     std::ifstream input(manifestPath, std::ios::binary);
     if (!input) {
@@ -626,6 +775,7 @@ bool CollectPortableProject(const std::string& sourceProjectPath,
                     "': " + pathError.message();
             return false;
         }
+        if (!SynchronizePath(copied, false, error)) return false;
         const uint64_t bytes = fs::file_size(copied, pathError);
         if (pathError) {
             error = "unable to inspect copied media: " + pathError.message();
@@ -645,6 +795,7 @@ bool CollectPortableProject(const std::string& sourceProjectPath,
         result.media_count++;
         result.media_bytes += bytes;
     }
+    if (!SynchronizePath(mediaDirectory, true, error)) return false;
 
     std::ofstream manifestOutput(staging / "manifest.json",
                                  std::ios::binary | std::ios::trunc);
@@ -706,6 +857,7 @@ bool CollectPortableProject(const std::string& sourceProjectPath,
         error = "unable to publish collected project: " + pathError.message();
         return false;
     }
+    if (!SynchronizePath(parent, true, error)) return false;
     cleanup.Commit();
     result.directory_path = destination.string();
     result.project_path = (destination / "project.cutmachine.json").string();
