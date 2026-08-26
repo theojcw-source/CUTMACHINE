@@ -183,6 +183,7 @@ struct MixPlan {
 struct AudioPlayback::Impl {
     AVAudioEngine* engine = nil;
     AVAudioSourceNode* sourceNode = nil;
+    std::filesystem::path baseDirectory;
     std::map<Ulid, std::shared_ptr<const PCMSource>> sources;
     std::shared_ptr<const MixPlan> plan = std::make_shared<MixPlan>();
     std::atomic<int64_t> cursor{0};
@@ -205,30 +206,7 @@ AudioPlayback::~AudioPlayback() {
 bool AudioPlayback::Open(const Document& document,
                          const std::string& baseDirectory, std::string& error) {
     impl_->sources.clear();
-    // AudioPlayback owns the decoded PCM for the active timeline, not a cache
-    // for the whole media library. Decoding unused rushes here made launch
-    // time and memory scale with every imported file.
-    std::set<Ulid> audibleSourceIds;
-    for (const DocumentTrack& track : document.sequence.tracks) {
-        if (track.kind != "audio") continue;
-        for (const DocumentClip& clip : track.clips)
-            audibleSourceIds.insert(clip.source_id);
-    }
-    for (const DocumentSource& source : document.sources) {
-        if (audibleSourceIds.count(source.id) == 0) continue;
-        std::filesystem::path path(source.path);
-        if (path.is_relative())
-            path = std::filesystem::path(baseDirectory) / path;
-        auto decoded = std::make_shared<PCMSource>();
-        std::string decodeError;
-        if (DecodeSource(path.lexically_normal().string(), *decoded,
-                         decodeError)) {
-            impl_->sources[source.id] = std::move(decoded);
-        } else if (decodeError != "no audio stream") {
-            std::fprintf(stderr, "Audio disabled for %s: %s\n",
-                         path.string().c_str(), decodeError.c_str());
-        }
-    }
+    impl_->baseDirectory = baseDirectory;
     RebuildTimeline(document);
 
     impl_->engine = [[AVAudioEngine alloc] init];
@@ -319,6 +297,39 @@ bool AudioPlayback::Open(const Document& document,
 }
 
 void AudioPlayback::RebuildTimeline(const Document& document) {
+    // Keep decoded PCM scoped to sources used by the active timeline. Sources
+    // can become audible after Open when a rush is dropped onto an audio
+    // track, so synchronizing the cache belongs to every rebuild.
+    std::set<Ulid> audibleSourceIds;
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        if (track.kind != "audio") continue;
+        for (const DocumentClip& clip : track.clips)
+            audibleSourceIds.insert(clip.source_id);
+    }
+    for (auto source = impl_->sources.begin();
+         source != impl_->sources.end();) {
+        if (audibleSourceIds.count(source->first) == 0)
+            source = impl_->sources.erase(source);
+        else
+            ++source;
+    }
+    for (const DocumentSource& source : document.sources) {
+        if (audibleSourceIds.count(source.id) == 0 ||
+            impl_->sources.count(source.id) != 0)
+            continue;
+        std::filesystem::path path(source.path);
+        if (path.is_relative()) path = impl_->baseDirectory / path;
+        auto decoded = std::make_shared<PCMSource>();
+        std::string decodeError;
+        if (DecodeSource(path.lexically_normal().string(), *decoded,
+                         decodeError)) {
+            impl_->sources[source.id] = std::move(decoded);
+        } else if (decodeError != "no audio stream") {
+            std::fprintf(stderr, "Audio disabled for %s: %s\n",
+                         path.string().c_str(), decodeError.c_str());
+        }
+    }
+
     auto plan = std::make_shared<MixPlan>();
     const bool hasSolo = std::any_of(
         document.sequence.tracks.begin(), document.sequence.tracks.end(),

@@ -1,9 +1,15 @@
 #include "Cli.h"
 #include "Document.h"
 #include "Ingest.h"
+#include "MediaSource.h"
 #include "Operations.h"
 #include "ProjectStorage.h"
 #include "Ulid.h"
+
+extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/pixdesc.h>
+}
 
 #include <cstdlib>
 #include <filesystem>
@@ -48,6 +54,8 @@ int main() {
         std::filesystem::temp_directory_path() / (GenerateUlid() + "-ingest");
     const std::filesystem::path mediaDirectory = root / "media";
     const std::filesystem::path rawPath = root / "raw.mp4";
+    const std::filesystem::path variableRatePath = root / "variable-rate.mp4";
+    const std::filesystem::path alphaPath = root / "transparent.mov";
     const std::filesystem::path videoPath = mediaDirectory / "rotated.mp4";
     std::filesystem::create_directories(mediaDirectory);
 
@@ -73,6 +81,58 @@ int main() {
         Quote(rawPath) + " -c copy " + Quote(videoPath);
     Check(std::system(rotate.c_str()) == 0,
           "FFmpeg must attach a display matrix");
+    const std::string generateVariableRate =
+        Quote(FFMPEG_EXECUTABLE) +
+        " -hide_banner -loglevel error "
+        "-f lavfi -i 'testsrc2=size=64x32:rate=30:duration=1' "
+        "-vf \"select='not(eq(n,15))'\" -fps_mode vfr -c:v mpeg4 " +
+        Quote(variableRatePath);
+    Check(std::system(generateVariableRate.c_str()) == 0,
+          "FFmpeg must generate the variable-rate media fixture");
+    const std::string generateAlpha =
+        Quote(FFMPEG_EXECUTABLE) +
+        " -hide_banner -loglevel error -f lavfi "
+        "-i 'color=c=red@0.5:s=16x16:r=25:d=0.2,format=rgba' "
+        "-c:v qtrle -pix_fmt argb " +
+        Quote(alphaPath);
+    Check(std::system(generateAlpha.c_str()) == 0,
+          "FFmpeg must generate the transparent video fixture");
+    MediaSource alphaSource;
+    Check(alphaSource.Open(alphaPath.string()),
+          "transparent video decode source opens");
+    const AVFrame* alphaFrame = nullptr;
+    int64_t alphaPts = 0;
+    Check(alphaSource.DecodeFrame(0, alphaFrame, alphaPts) && alphaFrame,
+          "transparent video frame decodes");
+    if (alphaFrame) {
+        const AVPixFmtDescriptor* pixel =
+            av_pix_fmt_desc_get(static_cast<AVPixelFormat>(alphaFrame->format));
+        Check(pixel && pixel->nb_components == 4 &&
+                  (pixel->flags & AV_PIX_FMT_FLAG_ALPHA) &&
+                  pixel->comp[0].plane != pixel->comp[1].plane &&
+                  pixel->comp[0].plane != pixel->comp[2].plane &&
+                  pixel->comp[3].plane != pixel->comp[0].plane,
+              "packed source alpha is normalized to four Metal-ready planes");
+        if (pixel && pixel->nb_components == 4) {
+            const int alphaPlane = pixel->comp[3].plane;
+            const uint16_t alpha = reinterpret_cast<const uint16_t*>(
+                alphaFrame->data[alphaPlane])[0];
+            Check(alpha > 30000 && alpha < 36000,
+                  "the normalized alpha plane preserves 50 percent coverage");
+        }
+    }
+    LibraryMedia variableRateMetadata;
+    Check(ProbeMediaMetadata(variableRatePath.string(), variableRateMetadata,
+                             error),
+          "variable-rate metadata probe succeeds: " + error);
+    MediaSource variableRateSource;
+    Check(variableRateSource.Open(variableRatePath.string()),
+          "variable-rate decode source opens");
+    Check(variableRateMetadata.rate.num ==
+                  variableRateSource.FrameRateNumerator() &&
+              variableRateMetadata.rate.den ==
+                  variableRateSource.FrameRateDenominator(),
+          "ingest and decode retain the same exact variable frame rate");
 
     {
         std::ofstream text(mediaDirectory / "notes.txt");

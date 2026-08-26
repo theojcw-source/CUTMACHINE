@@ -13,7 +13,15 @@
 #include <thread>
 #include <vector>
 
-enum class MediaTaskKind { Probe, Thumbnail, Waveform, Proxy, Relink, Beat };
+enum class MediaTaskKind {
+    Probe,
+    Thumbnail,
+    Waveform,
+    Proxy,
+    Relink,
+    Beat,
+    Transcription
+};
 enum class MediaTaskState { Queued, Running, Succeeded, Failed, Cancelled };
 
 struct MediaTaskSnapshot {

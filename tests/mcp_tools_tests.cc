@@ -17,6 +17,7 @@
 #include "Json.h"
 #include "McpBackend.h"
 #include "McpServer.h"
+#include "McpTools.h"
 #include "Operations.h"
 #include "Ulid.h"
 
@@ -28,6 +29,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -64,6 +66,10 @@ Document Fixture() {
            {10, 25},
            {20, 25}}}},
     };
+    document.sequence.tracks[0].clips[0].link_group_id =
+        "01K30000000000000000000005";
+    document.sequence.tracks[0].clips[1].link_group_id =
+        "01K30000000000000000000005";
     return document;
 }
 
@@ -125,12 +131,29 @@ public:
         return true;
     }
 
+    bool ReadTimelineTranscript(std::string& json, std::string&) override {
+        json =
+            R"({"timeline_id":"fixture","spans":[{"span_id":"S1","source_id":"01K30000000000000000000001","source_in":{"value":100,"rate":25},"duration":{"value":10,"rate":25},"text":"A strong hook."}]})";
+        return true;
+    }
+
+    bool ApplyProjectEdit(ProjectOperation operation, std::string& resultJson,
+                          std::string&, std::string&) override {
+        project_operation_ = std::move(operation);
+        resultJson = "{\"ok\":true}";
+        return true;
+    }
+
     const Document& CurrentDocument() const { return document_; }
     EditLog& Log() { return log_; }
+    const ProjectOperation* LastProjectOperation() const {
+        return project_operation_ ? &*project_operation_ : nullptr;
+    }
 
 private:
     Document document_;
     EditLog log_;
+    std::optional<ProjectOperation> project_operation_;
 };
 
 // Minimal blocking HTTP client: sends one POST and reads the response until
@@ -192,7 +215,91 @@ int main() {
     // "expected" comparison below copies this same fixture rather than
     // calling Fixture() again.
     const Document fixture = Fixture();
+    IdResolver fixtureResolver(fixture);
+    Ulid resolvedLinkGroup;
+    std::string resolutionError;
+    Check(fixtureResolver.Resolve("link_group_id", "01K30000000000000000000005",
+                                  resolvedLinkGroup, resolutionError) &&
+              resolvedLinkGroup == "01K30000000000000000000005",
+          "ID resolver includes the shared IDs required by linked tools: " +
+              resolutionError);
+    Ulid resolvedAlias;
+    Check(fixtureResolver.Resolve("clip_id", "A1", resolvedAlias,
+                                  resolutionError) &&
+              resolvedAlias == "01K30000000000000000000003",
+          "ID resolver accepts the clip aliases exposed by describe: " +
+              resolutionError);
+
+    McpToolRegistry intentRegistry;
+    InMemoryBackend intentBackend(fixture);
+    mcp_json::Value previewArguments;
+    std::string intentParseError;
+    Check(
+        mcp_json::Value::Parse(
+            R"({"clip_id":"A1","edge":"Tail","amount":1,"unit":"Frames","preview":true})",
+            previewArguments, intentParseError),
+        "shorten intent preview arguments parse: " + intentParseError);
+    const std::string intentBefore =
+        intentBackend.CurrentDocument().SaveToString();
+    const McpToolCallOutcome previewOutcome = intentRegistry.Call(
+        intentBackend, "shorten_linked_clip", previewArguments);
+    Check(previewOutcome.ok && previewOutcome.result_json.find(
+                                   "\"preview\":true") != std::string::npos,
+          "shorten_linked_clip previews one deterministic linked operation: " +
+              previewOutcome.message);
+    Check(intentBackend.CurrentDocument().SaveToString() == intentBefore,
+          "shorten_linked_clip preview leaves the document byte-identical");
+
+    previewArguments.Set("preview", mcp_json::Value::MakeBool(false));
+    const McpToolCallOutcome shortenOutcome = intentRegistry.Call(
+        intentBackend, "shorten_linked_clip", previewArguments);
+    Check(shortenOutcome.ok,
+          "shorten_linked_clip applies through the backend: " +
+              shortenOutcome.message);
+    Document intentExpected = fixture;
+    EditLog intentExpectedLog;
+    EditError intentExpectedError = EditError::None;
+    std::string intentExpectedMessage;
+    Check(intentExpectedLog.Apply(
+              intentExpected,
+              TrimLinkedClipsOperation{
+                  "01K30000000000000000000005",
+                  {{"01K30000000000000000000003", TrimEdge::Tail, {-1, 25}},
+                   {"01K30000000000000000000004", TrimEdge::Tail, {-1, 25}}},
+                  {}},
+              intentExpectedError, intentExpectedMessage),
+          "reference deterministic linked trim succeeds: " +
+              intentExpectedMessage);
+    Check(intentBackend.CurrentDocument().SaveToString() ==
+              intentExpected.SaveToString(),
+          "shorten_linked_clip computes IDs, sign and frame time exactly");
+
     InMemoryBackend backend(fixture);
+    McpToolRegistry shortRegistry;
+    const McpToolCallOutcome transcriptOutcome = shortRegistry.Call(
+        backend, "get_timeline_transcript", mcp_json::Value::MakeObject());
+    Check(transcriptOutcome.ok && transcriptOutcome.result_json.find(
+                                      "A strong hook") != std::string::npos,
+          "get_timeline_transcript returns the backend's semantic spans");
+    mcp_json::Value shortArguments;
+    std::string shortParseError;
+    Check(
+        mcp_json::Value::Parse(
+            R"({"name":"Short test","segments":[{"source_id":"01K30000000000000000000001","source_in":{"value":100,"rate":25},"duration":{"value":10,"rate":25}}]})",
+            shortArguments, shortParseError),
+        "short tool arguments parse: " + shortParseError);
+    const McpToolCallOutcome shortOutcome =
+        shortRegistry.Call(backend, "create_interview_short", shortArguments);
+    const ProjectOperation* captured = backend.LastProjectOperation();
+    Check(
+        shortOutcome.ok && captured &&
+            std::holds_alternative<CreateProjectTimelineFromSegmentsOperation>(
+                *captured) &&
+            std::get<CreateProjectTimelineFromSegmentsOperation>(*captured)
+                    .segments[0]
+                    .source_in == RationalTime{100, 25},
+        "create_interview_short forwards exact transcript ranges as one "
+        "project operation");
     McpServer server(backend);
     std::string startError;
     Check(server.Start(0, startError),
@@ -219,6 +326,8 @@ int main() {
     bool sawInsertClip = false;
     bool sawClearClips = false;
     bool sawTrimClip = false;
+    bool sawSetColorManagement = false;
+    bool sawSetClipOpacity = false;
     bool sawUndo = false;
     if (toolsField) {
         for (const mcp_json::Value& tool : toolsField->AsArray()) {
@@ -227,6 +336,10 @@ int main() {
             if (name->AsString() == "insert_clip") sawInsertClip = true;
             if (name->AsString() == "clear_clips") sawClearClips = true;
             if (name->AsString() == "trim_clip") sawTrimClip = true;
+            if (name->AsString() == "set_color_management")
+                sawSetColorManagement = true;
+            if (name->AsString() == "set_clip_opacity")
+                sawSetClipOpacity = true;
             if (name->AsString() == "undo") sawUndo = true;
             // Multicam operations are stubbed pending F1.5; must not be
             // offered as a working tool.
@@ -238,6 +351,8 @@ int main() {
     Check(sawInsertClip, "tools/list includes insert_clip");
     Check(sawClearClips, "tools/list includes clear_clips");
     Check(sawTrimClip, "tools/list includes trim_clip");
+    Check(sawSetColorManagement, "tools/list includes set_color_management");
+    Check(sawSetClipOpacity, "tools/list includes set_clip_opacity");
     Check(sawUndo, "tools/list includes undo");
 
     // ---- tools/call: trim_clip, compared against a direct EditLog::Apply ----
@@ -347,6 +462,50 @@ int main() {
     Check(backend.CurrentDocument().SaveToString() == expected.SaveToString(),
           "tools/call insert_clip changes the document exactly as a direct "
           "EditLog::Apply/--apply-op call would");
+
+    const std::string opacityRequest =
+        std::string(R"({"jsonrpc":"2.0","id":11,"method":"tools/call",)") +
+        R"("params":{"name":"set_clip_opacity","arguments":{"clip_id":")" +
+        insertedClipId + R"(","opacity":{"num":3,"den":5}}}})";
+    const std::string opacityResponse =
+        HttpPostJson(server.Port(), "/mcp", opacityRequest);
+    Check(opacityResponse.find("\"isError\":false") != std::string::npos,
+          "tools/call set_clip_opacity is not an error");
+    Check(expectedLog.Apply(expected,
+                            SetClipOpacityOperation{insertedClipId, {3, 5}},
+                            expectedError, expectedMessage),
+          "reference direct EditLog::Apply(opacity) succeeds: " +
+              expectedMessage);
+    Check(backend.CurrentDocument().SaveToString() == expected.SaveToString(),
+          "set_clip_opacity matches a direct operation");
+
+    // ---- tools/call: project color state through the shared operation ----
+    const std::string colorRequest =
+        R"({"jsonrpc":"2.0","id":10,"method":"tools/call",)"
+        R"("params":{"name":"set_color_management","arguments":{)"
+        R"("enabled":true,"input_gamut":"sony_sgamut3_cine",)"
+        R"("input_transfer":"sony_slog3","input_ycbcr_matrix":"bt709",)"
+        R"("input_range":"full","working_gamut":"acescct",)"
+        R"("output_gamut":"rec2020","output_transfer":"hlg"}}})";
+    const std::string colorResponse =
+        HttpPostJson(server.Port(), "/mcp", colorRequest);
+    Check(colorResponse.find("\"isError\":false") != std::string::npos,
+          "tools/call set_color_management is not an error");
+    ColorManagementSettings colorSettings;
+    colorSettings.enabled = true;
+    colorSettings.input_gamut = "sony_sgamut3_cine";
+    colorSettings.input_transfer = "sony_slog3";
+    colorSettings.input_ycbcr_matrix = "bt709";
+    colorSettings.input_range = "full";
+    colorSettings.working_gamut = "acescct";
+    colorSettings.output_gamut = "rec2020";
+    colorSettings.output_transfer = "hlg";
+    Check(
+        expectedLog.Apply(expected, SetColorManagementOperation{colorSettings},
+                          expectedError, expectedMessage),
+        "reference direct EditLog::Apply(color) succeeds: " + expectedMessage);
+    Check(backend.CurrentDocument().SaveToString() == expected.SaveToString(),
+          "set_color_management matches a direct operation");
 
     // ---- undo/redo tools ----
     const std::string undoRequest =

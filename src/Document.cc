@@ -678,11 +678,15 @@ bool Document::LoadFromString(const std::string& json, Document& output,
     try {
         const JsonValue root = JsonParser(json).Parse();
         Document parsed;
-        parsed.version = Int32(root, "version", "document");
-        if (parsed.version != 4) {
+        const int32_t storedVersion = Int32(root, "version", "document");
+        if (storedVersion != 4 && storedVersion != 5) {
             throw std::runtime_error("unsupported document version " +
-                                     std::to_string(parsed.version));
+                                     std::to_string(storedVersion));
         }
+        // ALPHA-2026-08 -- v4 clips predate compositing opacity. Loading them
+        // as fully opaque keeps existing projects usable while the next save
+        // emits the canonical v5 representation.
+        parsed.version = 5;
 
         if (const JsonValue* color =
                 Optional(root, "color_management", JsonValue::Type::Object,
@@ -1119,10 +1123,16 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                         Optional(clipValue, "caption_group_id",
                                  JsonValue::Type::String, clipContext)) {
                     clip.caption_group_id = captionGroup->string;
-                    clip.caption_text =
-                        Require(clipValue, "caption_text",
-                                JsonValue::Type::String, clipContext)
-                            .string;
+                }
+                if (const JsonValue* captionText =
+                        Optional(clipValue, "caption_text",
+                                 JsonValue::Type::String, clipContext))
+                    clip.caption_text = captionText->string;
+                if (storedVersion >= 5) {
+                    clip.opacity = ParseEffectParamValue(
+                        Require(clipValue, "opacity", JsonValue::Type::Object,
+                                clipContext),
+                        clipContext + ".opacity");
                 }
                 track.clips.push_back(std::move(clip));
             }
@@ -1251,9 +1261,12 @@ std::string Document::SaveToString() const {
             output << "]";
             if (!clip.caption_group_id.empty())
                 output << ",\"caption_group_id\":\""
-                       << Escape(clip.caption_group_id)
-                       << "\",\"caption_text\":\"" << Escape(clip.caption_text)
+                       << Escape(clip.caption_group_id) << "\"";
+            if (!clip.caption_text.empty())
+                output << ",\"caption_text\":\"" << Escape(clip.caption_text)
                        << "\"";
+            output << ",\"opacity\":";
+            WriteEffectParamValue(output, clip.opacity);
             output << "}";
         }
         if (!track.clips.empty()) output << '\n';
@@ -1369,7 +1382,7 @@ std::string Document::SaveToString() const {
 }
 
 bool Document::Validate(std::string& error) const {
-    if (version != 4) {
+    if (version != 5) {
         error = "unsupported document version " + std::to_string(version);
         return false;
     }
@@ -1405,6 +1418,24 @@ bool Document::Validate(std::string& error) const {
         color_management.output_gamut != "rec2020") {
         error = "HLG output requires the rec2020 output gamut";
         return false;
+    }
+    if (color_management.enabled) {
+        const bool supportedInput =
+            (color_management.input_transfer == "sony_slog3" &&
+             (color_management.input_gamut == "sony_sgamut3_cine" ||
+              color_management.input_gamut == "sony_sgamut3")) ||
+            (color_management.input_transfer == "rec709" &&
+             (color_management.input_gamut == "rec709" ||
+              color_management.input_gamut == "rec2020")) ||
+            (color_management.input_transfer == "linear" &&
+             (color_management.input_gamut == "rec709" ||
+              color_management.input_gamut == "rec2020"));
+        if (!supportedInput) {
+            error =
+                "color_management input gamut/transfer combination is "
+                "not available in the embedded OpenColorIO config";
+            return false;
+        }
     }
 
     std::set<Ulid> ids;
@@ -1577,7 +1608,14 @@ bool Document::Validate(std::string& error) const {
                         "') has an incomplete link synchronization state";
                 return false;
             }
-            if (sourceIds.find(clip.source_id) == sourceIds.end()) {
+            const bool captionClip = track.kind == "caption";
+            if (captionClip && !clip.source_id.empty()) {
+                error = context + " ('" + clip.id +
+                        "') caption clip must not reference media";
+                return false;
+            }
+            if (!captionClip &&
+                sourceIds.find(clip.source_id) == sourceIds.end()) {
                 error = context + " ('" + clip.id +
                         "') references unknown source_id '" + clip.source_id +
                         "'";
@@ -1604,9 +1642,17 @@ bool Document::Validate(std::string& error) const {
                         "') has timeline_in before zero";
                 return false;
             }
-            const DocumentSource* source = FindSource(clip.source_id);
+            if (clip.opacity.den <= 0 || clip.opacity.num < 0 ||
+                clip.opacity.num > clip.opacity.den) {
+                error = context + " ('" + clip.id +
+                        "') has opacity outside the exact [0, 1] range";
+                return false;
+            }
+            const DocumentSource* source =
+                captionClip ? nullptr : FindSource(clip.source_id);
             try {
-                if (clip.source_in.add(clip.duration) > source->duration) {
+                if (!captionClip &&
+                    clip.source_in.add(clip.duration) > source->duration) {
                     error = context + " ('" + clip.id +
                             "') has source_in + duration outside source bounds";
                     return false;
@@ -1628,6 +1674,11 @@ bool Document::Validate(std::string& error) const {
             } catch (const std::exception& exception) {
                 error = context + " has invalid rational time arithmetic: " +
                         exception.what();
+                return false;
+            }
+            if (captionClip && clip.caption_text.empty()) {
+                error = context + " ('" + clip.id +
+                        "') caption text must not be empty";
                 return false;
             }
             for (size_t effectIndex = 0; effectIndex < clip.effects.size();

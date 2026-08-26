@@ -18,6 +18,11 @@ public:
     bool SnapshotDocument(Document& document, std::string& message) override;
     bool ApplyOperation(Operation operation, std::string& resultJson,
                         std::string& errorName, std::string& message) override;
+    bool ApplyProjectEdit(ProjectOperation operation, std::string& resultJson,
+                          std::string& errorName,
+                          std::string& message) override;
+    bool ReadTimelineTranscript(std::string& json,
+                                std::string& message) override;
     bool Undo(std::string& resultJson, std::string& errorName,
               std::string& message) override;
     bool Redo(std::string& resultJson, std::string& errorName,

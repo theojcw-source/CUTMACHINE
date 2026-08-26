@@ -8,7 +8,7 @@ duration)`. Un trou ne déclenche aucun décodage et est rendu en noir.
 ## Build et tests
 
 Prérequis : macOS, CMake 3.24+, pkg-config et FFmpeg (`libavformat`,
-`libavcodec`, `libavutil`, `libswresample`).
+`libavcodec`, `libavutil`, `libswresample`, `libswscale`).
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -31,7 +31,14 @@ ctest --test-dir build -R cutmachine_ui_smoke_tests --output-on-failure
 
 La compilation produit une application macOS dans `build/CUTMACHINE.app`.
 Ouvrez-la par double-clic dans le Finder, depuis Spotlight après l’avoir copiée
-dans Applications, ou avec :
+dans Applications, ou compilez-la si nécessaire puis lancez-la avec la cible
+`run-app` :
+
+```sh
+cmake --build build --target run-app -j
+```
+
+Pour ouvrir directement un bundle déjà compilé :
 
 ```sh
 open build/CUTMACHINE.app
@@ -112,6 +119,10 @@ pas au répertoire courant du processus.
   temps ne transite en `double` pour cette quantification.
 - Les pistes vidéo sont classées par leur champ `index` et compositées du bas
   vers le haut. Un trou sur une piste supérieure révèle les pistes inférieures.
+- Les médias vidéo portant un canal alpha sont composités dans Metal. Chaque
+  clip vidéo possède aussi une opacité exacte `num/den`, modifiable dans
+  l’Inspecteur ou par l’opération `SetClipOpacity`; les fondus multiplient cette
+  valeur et l’export opaque en tient compte.
 
 ## Timeline graphique
 
@@ -442,10 +453,10 @@ L’export compose les pistes vidéo dans leur ordre, conserve les zones noires,
 respecte les rotations et le ratio des sources, puis mixe les clips audio sans
 normalisation automatique. Il écrit d’abord un fichier temporaire voisin et ne
 remplace la destination qu’après un encodage réussi. Pour les projets Sony,
-l’export construit une LUT 3D 65³ à partir des mêmes fonctions de transfert et
-matrices que le shader Metal : S-Log3/S-Gamut3.Cine → AP1 → Rec.2020 HLG. Le
-flux HEVC Main10 est marqué explicitement BT.2020 non constant, ARIB STD-B67 et
-plage légale.
+l’export construit avec OpenColorIO une LUT 3D 65³ issue de la configuration
+ACES Studio intégrée : S-Log3/S-Gamut3.Cine → ACEScg/ACEScct → Rec.2020 HLG.
+Le flux HEVC Main10 est marqué explicitement BT.2020 non constant,
+ARIB STD-B67 et plage légale.
 
 ## Séquence
 
@@ -493,13 +504,22 @@ espace wide gamut de grading et une sortie Rec.2020/HLG. La plage et la matrice
 peuvent aussi suivre automatiquement les métadonnées FFmpeg de chaque frame.
 
 Chaque frame YUV planaire 8 à 16 bits est d'abord normalisée selon sa profondeur
-et sa plage, puis l'IDT l'amène en ACES AP1. Le point de grading est encodé en
-ACEScct ; la composition des pistes se fait ensuite en AP1 linéaire dans
-une texture flottante 16 bits. L'export conserve la transformation de sortie du
-projet, notamment Rec.2020/HLG. Les moniteurs de montage en dérivent une vue
-locale Rec.709/SDR afin que macOS ne présente pas le master HLG comme une couche
-EDR au milieu de l'interface. Cette préférence d'affichage ne modifie ni le
-document ni le rendu exporté.
+et sa plage. OpenColorIO 2.5.2 applique ensuite les transformations de la
+configuration intégrée et figée
+`studio-config-v2.2.0_aces-v1.3_ocio-v2.4` : aucune variable `$OCIO` ni aucun
+fichier externe n'intervient dans le rendu. Le player échantillonne les
+processeurs OCIO en deux LUT 3D 65³ mises en cache par Metal, avant et après le
+grading ACEScct ; la composition des pistes reste en AP1 linéaire dans une
+texture flottante 16 bits. L'export utilise le même processeur OCIO sous forme
+de LUT `.cube`. Les moniteurs de montage dérivent une vue locale Rec.709/SDR du
+réglage de livraison afin que macOS ne présente pas le master HLG comme une
+couche EDR au milieu de l'interface. Cette préférence d'affichage ne modifie ni
+le document ni le rendu exporté.
+
+Les réglages passent par l'opération réversible `SetColorManagement`, disponible
+également via `--apply-op` et l'outil MCP `set_color_management`. Une combinaison
+gamut/courbe d'entrée absente de la configuration intégrée est refusée avant le
+rendu plutôt que remplacée silencieusement.
 
 `--apply-op`
 réutilise le format canonique de `SerializeOperation`, remplace le document de
@@ -511,6 +531,42 @@ modifiés.
 de métadonnées de chutier et de relink. Son historique distinct est conservé
 dans `<document>.project-editlog.json` et les commandes `--undo-project-op` et
 `--redo-project-op` le parcourent sans initialiser l’interface graphique.
+
+## Agent intégré et clé utilisateur
+
+Le panneau **Agent** contacte directement soit l’API Messages d’Anthropic, soit
+l’API locale native d’Ollama. Le bouton **Configurer le moteur
+IA…**, placé sous la conversation, permet de choisir le fournisseur, le modèle,
+l’URL de base et la clé API. Le même dialogue est disponible dans **CUTMACHINE
+→ Moteur IA…**.
+
+Pour utiliser le modèle Qwen Coder déjà installé sur la machine, choisissez
+**Ollama local**. Le dialogue préremplit le modèle `qwen2.5-coder:7b` et l’URL
+`http://localhost:11434`. Ollama local ne
+nécessite aucune clé API. Les appels d’outils restent disponibles : le modèle
+peut donc observer et modifier le montage via les mêmes opérations réversibles
+que le moteur Anthropic.
+
+Le transport Ollama utilise `/api/chat` et demande un contexte de 32K tokens.
+Avant de renvoyer `describe` au modèle local, l’app conserve la timeline, les
+sources utilisées, les aliases de médiathèque, les chutiers et les marqueurs,
+mais retire les métadonnées média redondantes. Pour les modèles anciens qui
+écrivent un appel sous la forme JSON `{name, arguments}` au lieu d’un vrai
+`tool_calls`, ce format n’est exécuté que si l’objet est strict et désigne un
+outil réellement publié par CUTMACHINE.
+
+Pour les raccourcissements A/V courants, l’outil MCP
+`shorten_linked_clip` reçoit seulement un clip, un bord et une quantité en
+images ou secondes. CUTMACHINE résout lui-même tous les membres liés, le signe
+du trim et le `RationalTime` exact, puis applique une seule opération atomique.
+Avec `preview=true`, la même opération est validée sur une copie via `EditLog`
+et renvoyée sans modifier le projet.
+
+Le modèle et l’URL sont des préférences locales `NSUserDefaults`. La clé est
+conservée séparément dans le Trousseau macOS : elle n’est écrite ni dans le
+document projet, ni dans son journal, ni dans les préférences. Les variables
+`ANTHROPIC_API_KEY`, `CUTMACHINE_ANTHROPIC_MODEL` et
+`CUTMACHINE_ANTHROPIC_URL` restent utilisables comme valeurs de repli.
 
 ## Sidecar conversationnel
 

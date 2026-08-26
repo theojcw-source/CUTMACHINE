@@ -159,6 +159,50 @@ int main() {
     stored.bin_metadata[source.id] = {"Hero shot", 5, {"select", "day"}, 7};
     Check(stored.Validate(error), "serializable project: " + error);
 
+    Project shortProject = stored;
+    ProjectEditLog shortLog;
+    const std::string beforeShort = shortProject.SaveToString();
+    CreateProjectTimelineFromSegmentsOperation shortOperation;
+    shortOperation.name = "Short dynamique";
+    shortOperation.width = stored.ActiveTimeline()->width;
+    shortOperation.height = stored.ActiveTimeline()->height;
+    shortOperation.frame_rate = stored.ActiveTimeline()->frame_rate;
+    shortOperation.segments = {
+        {source.id, {50, 25}, {25, 25}},
+        {source.id, {0, 25}, {50, 25}},
+    };
+    Check(shortLog.Apply(shortProject, ProjectOperation{shortOperation},
+                         editError, error),
+          "create short timeline: " + error);
+    const auto& appliedShort =
+        std::get<CreateProjectTimelineFromSegmentsOperation>(
+            shortLog.AppliedEntries().back().op);
+    const std::string afterShort = shortProject.SaveToString();
+    Check(shortProject.active_timeline_id == appliedShort.timeline_id &&
+              shortProject.ActiveTimeline()->tracks.size() == 2 &&
+              shortProject.ActiveTimeline()->tracks[0].clips.size() == 2 &&
+              shortProject.ActiveTimeline()->tracks[1].clips.size() == 2 &&
+              shortProject.ActiveTimeline()->tracks[0].clips[1].timeline_in ==
+                  RationalTime{25, 25},
+          "short assembly creates linked A/V clips in the requested order");
+    ProjectOperation decodedShort;
+    Check(DeserializeProjectOperation(
+              SerializeProjectOperation(shortLog.AppliedEntries().back().op),
+              decodedShort, editError, error),
+          "short operation round-trip: " + error);
+    Check(std::get<CreateProjectTimelineFromSegmentsOperation>(decodedShort)
+                  .segments[0]
+                  .video_clip_id == appliedShort.segments[0].video_clip_id,
+          "short operation retains generated clip IDs");
+    Check(shortLog.Undo(shortProject, editError, error),
+          "undo short timeline: " + error);
+    Check(shortProject.SaveToString() == beforeShort,
+          "undo short timeline restores byte-identical project JSON");
+    Check(shortLog.Redo(shortProject, editError, error),
+          "redo short timeline: " + error);
+    Check(shortProject.SaveToString() == afterShort,
+          "redo short timeline restores byte-identical project JSON");
+
     const std::string serialized = stored.SaveToString();
     Project loaded("placeholder");
     Check(Project::LoadFromString(serialized, loaded, error),

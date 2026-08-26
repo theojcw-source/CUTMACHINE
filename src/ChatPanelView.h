@@ -37,4 +37,9 @@
 // whole lifetime. Call once, before the view is shown.
 - (void)configureWithBackend:(McpBackend&)backend;
 
+// Presents the local BYOK configuration. The model and endpoint are ordinary
+// interface preferences; the API key is stored in the macOS Keychain and is
+// never written to a project or NSUserDefaults.
+- (void)showConfigurationWindow;
+
 @end

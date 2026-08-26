@@ -122,6 +122,7 @@ int main() {
     Check(std::system(generate.c_str()) == 0, "source fixture is generated");
 
     Document document = Fixture(media.string());
+    document.sequence.tracks[0].clips[0].opacity = {1, 2};
     std::string error;
     Check(document.Save(project.string(), error), "project saves: " + error);
 
@@ -143,6 +144,9 @@ int main() {
     Check(plan.filter_graph.find("setpts=PTS-STARTPTS+(5/25)/TB") !=
               std::string::npos,
           "clip placement remains rational in the filter graph");
+    Check(plan.filter_graph.find("colorchannelmixer=aa=(1/2)") !=
+              std::string::npos,
+          "opaque export composites the clip's exact opacity");
 
     Document outputStateDocument = Fixture(media.string());
     outputStateDocument.sequence.tracks[1].visible = false;

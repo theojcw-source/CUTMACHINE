@@ -214,6 +214,27 @@ int main() {
                       parsed.source_rate.num == 25,
                   "parsed transcript matches the cache contents exactly");
 
+            const std::filesystem::path rounded =
+                root / "legacy-rounded.transcript";
+            std::ofstream(rounded)
+                << "{\"version\":1,\"media_id\":\"01K300000000000000000000AA\","
+                   "\"whisper_model\":\"ggml-base.en.bin\",\"source_rate\":{"
+                   "\"num\":25,\"den\":1},\"words\":["
+                   "{\"text\":\"first\",\"start\":{\"value\":0,\"rate\":25},"
+                   "\"end\":{\"value\":3,\"rate\":25}},"
+                   "{\"text\":\"tiny\",\"start\":{\"value\":2,\"rate\":25},"
+                   "\"end\":{\"value\":2,\"rate\":25}},"
+                   "{\"text\":\"next\",\"start\":{\"value\":2,\"rate\":25},"
+                   "\"end\":{\"value\":5,\"rate\":25}}]}\n";
+            Transcript normalized;
+            Check(LoadAudioTranscript(rounded.string(), normalized, error) &&
+                      normalized.words.size() == 2 &&
+                      normalized.words[0].end == RationalTime{3, 25} &&
+                      normalized.words[1].start == RationalTime{3, 25} &&
+                      normalized.words[1].text == "tiny next",
+                  "normalizes legacy frame collisions without losing text: " +
+                      error);
+
             const std::filesystem::path outOfOrder =
                 root / "out-of-order.transcript";
             std::ofstream(outOfOrder)

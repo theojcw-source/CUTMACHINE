@@ -1,6 +1,7 @@
 #include "McpProjectBackend.h"
 
 #include "Cli.h"
+#include "InterviewShort.h"
 #include "Json.h"
 #include "Project.h"
 #include "ProjectStorage.h"
@@ -58,6 +59,29 @@ bool McpProjectBackend::ApplyOperation(Operation operation,
         ApplyOperationCommand(project_path_, operationJson, output);
     return ParseCommandResult(output, result == 0, resultJson, errorName,
                               message);
+}
+
+bool McpProjectBackend::ApplyProjectEdit(ProjectOperation operation,
+                                         std::string& resultJson,
+                                         std::string& errorName,
+                                         std::string& message) {
+    std::string output;
+    const int result = ApplyProjectOperationCommand(
+        project_path_, SerializeProjectOperation(operation), output);
+    return ParseCommandResult(output, result == 0, resultJson, errorName,
+                              message);
+}
+
+bool McpProjectBackend::ReadTimelineTranscript(std::string& json,
+                                               std::string& message) {
+    Project project;
+    if (!LoadStoredProject(project_path_, project, message)) return false;
+    const std::filesystem::path projectPath =
+        std::filesystem::absolute(project_path_);
+    return DescribeTimelineTranscriptForAgent(
+        project.MakeActiveDocument(),
+        projectPath.parent_path() / ".cutmachine" / "transcripts", json,
+        message);
 }
 
 bool McpProjectBackend::Undo(std::string& resultJson, std::string& errorName,

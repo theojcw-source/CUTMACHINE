@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 project(CUTMACHINE LANGUAGES C CXX OBJC OBJCXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ language standard" FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD 17)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,7 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavcodec
     libavutil
     libswresample
+    libswscale
 )
 # The MCP server (HttpServer.cc/McpServer.cc) uses std::thread for its
 # accept loop.
@@ -41,6 +42,32 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(whispercpp)
+
+# COLOR-2026-08 -- OpenColorIO owns the project color transforms rather than
+# keeping a second, hand-written approximation in the player and exporter.
+# Pin both the library and the built-in config selected in ColorManagement.cc:
+# upgrading either changes rendered pixels and therefore needs an explicit
+# project decision. Only the C++ core is built; CUTMACHINE neither ships nor
+# needs OCIO's applications, language bindings, plug-ins, or own test suite.
+set(OCIO_BUILD_APPS OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_GPU_TESTS OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_JAVA OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_NUKE OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_OPENFX OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(OCIO_INSTALL_EXT_PACKAGES ALL CACHE STRING "" FORCE)
+FetchContent_Declare(
+    opencolorio
+    GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/OpenColorIO.git
+    GIT_TAG        v2.5.2
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(opencolorio)
+set(OCIO_LICENSE_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/OpenColorIO-LICENSE")
+configure_file("${opencolorio_SOURCE_DIR}/LICENSE" "${OCIO_LICENSE_RESOURCE}"
+    COPYONLY)
 
 # Treat whisper.cpp's headers as system headers. Without this they are
 # ordinary includes, so every translation unit that pulls in whisper.h
@@ -107,6 +134,7 @@ add_library(cutmachine_model
     src/HttpServer.cc
     src/IdResolver.cc
     src/Ingest.cc
+    src/InterviewShort.cc
     src/Json.cc
     src/MediaTaskManager.cc
     src/EditLog.cc
@@ -123,6 +151,7 @@ add_library(cutmachine_model
     src/ProjectStorage.cc
     src/Proxy.cc
     src/Relink.cc
+    src/Subtitles.cc
     src/Thumbnail.cc
     src/Timeline.cc
     src/TimelineView.cc
@@ -132,7 +161,12 @@ add_library(cutmachine_model
     src/Waveform.cc
 )
 target_include_directories(cutmachine_model PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(cutmachine_model PUBLIC PkgConfig::FFMPEG whisper Threads::Threads)
+target_link_libraries(cutmachine_model PUBLIC
+    PkgConfig::FFMPEG
+    OpenColorIO
+    whisper
+    Threads::Threads
+)
 
 set(CUTMACHINE_APP_SOURCES
     src/main.mm
@@ -180,6 +214,7 @@ target_link_libraries(cutmachine PRIVATE
     "-framework Foundation"
     "-framework Metal"
     "-framework QuartzCore"
+    "-framework Security"
     "-framework UniformTypeIdentifiers"
 )
 
@@ -190,6 +225,7 @@ add_executable(cutmachine_app MACOSX_BUNDLE
     src/shader.metal
     ${CUTMACHINE_ICON_PNGS}
     assets/icons/LICENSE
+    ${OCIO_LICENSE_RESOURCE}
 )
 set_source_files_properties(src/shader.metal PROPERTIES
     MACOSX_PACKAGE_LOCATION Resources
@@ -199,6 +235,9 @@ set_source_files_properties(${CUTMACHINE_ICON_PNGS} PROPERTIES
 )
 set_source_files_properties(assets/icons/LICENSE PROPERTIES
     MACOSX_PACKAGE_LOCATION Resources/icons
+)
+set_source_files_properties(${OCIO_LICENSE_RESOURCE} PROPERTIES
+    MACOSX_PACKAGE_LOCATION Resources/licenses
 )
 add_dependencies(cutmachine_app cutmachine_ui_icons)
 set_target_properties(cutmachine_app PROPERTIES
@@ -225,7 +264,17 @@ target_link_libraries(cutmachine_app PRIVATE
     "-framework Foundation"
     "-framework Metal"
     "-framework QuartzCore"
+    "-framework Security"
     "-framework UniformTypeIdentifiers"
+)
+
+# DEV-2026-08 -- keep the build-and-launch path in CMake so every generator
+# opens the exact bundle it just produced, including non-default build dirs.
+add_custom_target(run-app
+    COMMAND /usr/bin/open "$<TARGET_BUNDLE_DIR:cutmachine_app>"
+    DEPENDS cutmachine_app
+    COMMENT "Launching CUTMACHINE.app"
+    VERBATIM
 )
 
 include(CTest)
@@ -307,6 +356,13 @@ if(BUILD_TESTING)
     target_link_libraries(cutmachine_project_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_project_tests COMMAND cutmachine_project_tests)
 
+    add_executable(cutmachine_interview_short_tests
+                   tests/interview_short_tests.cc)
+    target_link_libraries(cutmachine_interview_short_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_interview_short_tests
+             COMMAND cutmachine_interview_short_tests)
+
     add_executable(cutmachine_project_storage_tests
                    tests/project_storage_tests.cc)
     target_link_libraries(cutmachine_project_storage_tests
@@ -325,7 +381,10 @@ if(BUILD_TESTING)
     )
     add_test(NAME cutmachine_export_tests COMMAND cutmachine_export_tests)
 
-    add_executable(cutmachine_ingest_tests tests/ingest_tests.cc)
+    add_executable(cutmachine_ingest_tests
+        tests/ingest_tests.cc
+        src/MediaSource.mm
+    )
     target_link_libraries(cutmachine_ingest_tests PRIVATE cutmachine_model)
     target_compile_definitions(cutmachine_ingest_tests PRIVATE
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
@@ -357,6 +416,10 @@ if(BUILD_TESTING)
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
     add_test(NAME cutmachine_transcription_tests
              COMMAND cutmachine_transcription_tests)
+
+    add_executable(cutmachine_subtitle_tests tests/subtitle_tests.cc)
+    target_link_libraries(cutmachine_subtitle_tests PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_subtitle_tests COMMAND cutmachine_subtitle_tests)
 
     add_executable(cutmachine_thumbnail_tests tests/thumbnail_tests.cc)
     target_link_libraries(cutmachine_thumbnail_tests PRIVATE cutmachine_model)
@@ -482,6 +545,7 @@ if(BUILD_TESTING)
         "-framework Foundation"
         "-framework Metal"
         "-framework QuartzCore"
+        "-framework Security"
         "-framework UniformTypeIdentifiers"
     )
     add_test(NAME cutmachine_ui_smoke_tests

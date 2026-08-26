@@ -335,6 +335,24 @@ int main() {
                   loaded.color_management.output_transfer == "hlg",
               "all color pipeline stages must round-trip");
 
+        OpenColorIoLutPair luts;
+        Check(BuildOpenColorIoLuts(document.color_management, luts, error),
+              "embedded OCIO config must build Metal LUTs: " + error);
+        const size_t expectedValues = static_cast<size_t>(kOpenColorIoLutEdge) *
+                                      kOpenColorIoLutEdge *
+                                      kOpenColorIoLutEdge * 4;
+        Check(luts.input_to_working.edge == kOpenColorIoLutEdge &&
+                  luts.working_to_display.edge == kOpenColorIoLutEdge &&
+                  luts.input_to_working.rgba.size() == expectedValues &&
+                  luts.working_to_display.rgba.size() == expectedValues,
+              "OCIO LUTs use deterministic 65^3 RGBA storage");
+
+        ColorManagementSettings legacyRec2020 = document.color_management;
+        legacyRec2020.input_gamut = "rec2020";
+        legacyRec2020.input_transfer = "rec709";
+        Check(BuildOpenColorIoLuts(legacyRec2020, luts, error),
+              "legacy Rec.2020/Rec.709 input builds through OCIO: " + error);
+
         loaded.color_management.output_gamut = "rec709";
         Check(!loaded.Validate(error) && error.find("HLG") != std::string::npos,
               "HLG with a non-Rec.2020 gamut must be rejected");
@@ -343,6 +361,11 @@ int main() {
         Check(!loaded.Validate(error) &&
                   error.find("color_management") != std::string::npos,
               "unknown transfer functions must be rejected");
+        loaded = document;
+        loaded.color_management.input_gamut = "rec2020";
+        Check(!loaded.Validate(error) &&
+                  error.find("OpenColorIO") != std::string::npos,
+              "unsupported OCIO gamut/transfer pairs are rejected early");
     });
 
     Test("timeline resolution", [] {
@@ -381,6 +404,8 @@ int main() {
         "cross dissolve persists, validates handles and resolves two layers",
         [] {
             Document document = ValidDocument();
+            document.sequence.tracks[0].clips[0].opacity = {4, 5};
+            document.sequence.tracks[0].clips[1].opacity = {3, 5};
             document.sequence.transitions = {{
                 "01K00000000000000000000008",
                 document.sequence.tracks[0].id,
@@ -406,17 +431,20 @@ int main() {
             Check(beforeCut.size() == 2 &&
                       beforeCut[0].frame.source_frame == 101 &&
                       beforeCut[1].frame.source_frame == 9 &&
+                      std::abs(beforeCut[0].opacity - 0.8f) < 0.0001f &&
                       beforeCut[1].opacity == 0.0f,
                   "transition begins with outgoing image and incoming head "
                   "handle");
             const auto atCut = timeline.ResolveTrackLayers(track, {2, 25});
             Check(atCut.size() == 2 && atCut[0].frame.source_frame == 102 &&
                       atCut[1].frame.source_frame == 10 &&
-                      std::abs(atCut[1].opacity - 0.5f) < 0.0001f,
+                      std::abs(atCut[0].opacity - 0.8f) < 0.0001f &&
+                      std::abs(atCut[1].opacity - 0.3f) < 0.0001f,
                   "cut center resolves both source handles at 50 percent");
             const auto after = timeline.ResolveTrackLayers(track, {3, 25});
             Check(
-                after.size() == 1 && after[0].frame.source_frame == 11,
+                after.size() == 1 && after[0].frame.source_frame == 11 &&
+                    std::abs(after[0].opacity - 0.6f) < 0.0001f,
                 "transition end is half-open and returns to normal resolution");
 
             document.sequence.tracks[0].clips[1].source_in = {0, 25};
@@ -658,20 +686,36 @@ int main() {
               "an angle must reference an existing clip on a video track");
     });
 
-    Test("document schema version 3 is rejected without migration", [] {
-        const std::string json =
-            "{\"version\":3,\"sequence\":{\"id\":"
-            "\"01K92000000000000000000001\",\"name\":\"Legacy sequence\","
-            "\"width\":1920,\"height\":1080,\"frame_rate\":{\"num\":25,"
-            "\"den\":1}},\"library\":[],\"bins\":[],\"markers\":[],"
-            "\"transitions\":[],\"tracks\":[],\"sources\":[]}";
+    Test("document schema version 4 migrates clips to opaque", [] {
+        std::string json = ValidDocument().SaveToString();
+        const std::string version5 = "\"version\": 5";
+        const size_t versionPosition = json.find(version5);
+        Check(versionPosition != std::string::npos,
+              "canonical fixture contains its schema version");
+        json.replace(versionPosition, version5.size(), "\"version\": 4");
+        const std::string opacity = ",\"opacity\":{\"num\":1,\"den\":1}";
+        size_t opacityPosition = 0;
+        while ((opacityPosition = json.find(opacity, opacityPosition)) !=
+               std::string::npos) {
+            json.erase(opacityPosition, opacity.size());
+        }
         Document document;
         std::string error;
-        Check(!Document::LoadFromString(json, document, error) &&
-                  error.find("unsupported document version 3") !=
-                      std::string::npos,
-              "version 3 (pre-effects/caption/multicam schema) must be "
-              "rejected explicitly, like v1 and v2");
+        Check(Document::LoadFromString(json, document, error),
+              "version 4 loads through the opacity migration: " + error);
+        Check(document.version == 5,
+              "the migrated document uses the current schema version");
+        bool allOpaque = true;
+        for (const DocumentTrack& track : document.sequence.tracks) {
+            for (const DocumentClip& clip : track.clips) {
+                allOpaque =
+                    allOpaque && clip.opacity.num == 1 && clip.opacity.den == 1;
+            }
+        }
+        Check(allOpaque, "every migrated clip defaults to exact full opacity");
+        Check(
+            document.SaveToString().find("\"version\": 5") != std::string::npos,
+            "saving a migrated document emits canonical version 5");
     });
 
     Test("track lock state persists", [] {

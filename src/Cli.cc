@@ -569,18 +569,26 @@ std::string Describe(const Document& document) {
                 firstItem = false;
             }
             if (!firstItem) output << ',';
-            output << "{\"type\":\"clip\",\"alias\":\""
-                   << AliasPrefix(trackOrdinal) << (clipIndex + 1)
-                   << "\",\"id\":\"" << EscapeJson(clip.id)
-                   << "\",\"source_id\":\"" << EscapeJson(clip.source_id)
-                   << "\",\"source_in\":";
-            WriteTime(output, clip.source_in, source->rate);
+            output << "{\"type\":\""
+                   << (track.kind == "caption" ? "caption" : "clip")
+                   << "\",\"alias\":\"" << AliasPrefix(trackOrdinal)
+                   << (clipIndex + 1) << "\",\"id\":\"" << EscapeJson(clip.id)
+                   << '"';
+            if (track.kind != "caption") {
+                output << ",\"source_id\":\"" << EscapeJson(clip.source_id)
+                       << "\",\"source_in\":";
+                WriteTime(output, clip.source_in, source->rate);
+            }
             output << ",\"timeline_in\":";
             WriteTime(output, clip.timeline_in, timelineRate);
             output << ",\"duration\":";
             WriteTime(output, clip.duration, timelineRate);
-            output << ",\"include_audio\":"
-                   << (clip.include_audio ? "true" : "false");
+            if (track.kind == "caption")
+                output << ",\"text\":\"" << EscapeJson(clip.caption_text)
+                       << '"';
+            else
+                output << ",\"include_audio\":"
+                       << (clip.include_audio ? "true" : "false");
             if (!clip.link_group_id.empty())
                 output << ",\"link_group_id\":\""
                        << EscapeJson(clip.link_group_id) << "\"";

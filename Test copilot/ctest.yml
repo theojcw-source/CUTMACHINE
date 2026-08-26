@@ -1,0 +1,196 @@
+# .github/workflows/ctest.yml
+#
+# Exécute la suite CTest complète à chaque PR et chaque push sur main.
+# C'est le garde-fou manquant identifié dans CLAUDE.md :
+# "ctest --test-dir build --output-on-failure n'est lancé par aucun job de CI."
+#
+# Architecture :
+#   job "test"       : build normal + ctest complet (bloque le merge)
+#   job "sanitize"   : build sanitizé + ctest portable (bloque le merge)
+#   job "repeat"     : ctest --repeat sur les tests concurrents (nightly seulement)
+
+name: CTest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly à 02h00 UTC pour le job "repeat"
+    - cron: "0 2 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Job principal : build standard + suite CTest complète
+  # -----------------------------------------------------------------------
+  test:
+    name: Build & CTest (standard)
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies (Homebrew)
+        run: |
+          brew bundle --no-lock
+          # Vérifier que ffmpeg est disponible
+          ffmpeg -version | head -1
+
+      - name: Configure CMake
+        run: |
+          cmake -B build-ci \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Build
+        run: cmake --build build-ci --parallel $(sysctl -n hw.logicalcpu)
+
+      - name: Run CTest (suite complète)
+        run: |
+          ctest --test-dir build-ci \
+            --output-on-failure \
+            --timeout 120 \
+            --parallel 4
+        env:
+          # Certains tests ouvrent une fenêtre AppKit (ui_smoke_tests) :
+          # ils nécessitent un WindowServer actif, disponible sur macos-latest.
+          CUTMACHINE_TEST_RESOURCES: ${{ github.workspace }}
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-results-standard
+          path: |
+            build-ci/Testing/
+            build-ci/LastTest.log
+          retention-days: 7
+
+  # -----------------------------------------------------------------------
+  # Job sanitizé : ASan + UBSan sur les tests C++ portables
+  # (les tests AppKit/Metal sont exclus : ASan + AppKit = pas compatible)
+  # -----------------------------------------------------------------------
+  sanitize:
+    name: Build & CTest (ASan + UBSan)
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: brew bundle --no-lock
+
+      - name: Configure CMake (sanitizers)
+        run: |
+          cmake -B build-sanitize \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build-sanitize --parallel $(sysctl -n hw.logicalcpu)
+
+      - name: Run CTest (tests portables sans AppKit)
+        run: |
+          ctest --test-dir build-sanitize \
+            --output-on-failure \
+            --timeout 180 \
+            --parallel 2 \
+            --exclude-regex "ui_smoke|audio_playback"
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1:detect_stack_use_after_return=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          # Nécessaire sur macOS pour ASan + dylibs système
+          DYLD_INSERT_LIBRARIES: ""
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-results-sanitize
+          path: |
+            build-sanitize/Testing/
+          retention-days: 7
+
+  # -----------------------------------------------------------------------
+  # Job de répétition des tests concurrents (nightly seulement)
+  # Fait sortir les races et les flaky tests que --repeat until-fail révèle
+  # -----------------------------------------------------------------------
+  repeat-concurrent:
+    name: CTest concurrence (repeat until-fail)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    # Ne tourne que sur les pushes sur main ET le cron nightly
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: brew bundle --no-lock
+
+      - name: Configure (ThreadSanitizer -- build séparé car incompatible ASan)
+        run: |
+          cmake -B build-tsan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+            -DCMAKE_C_FLAGS="-fsanitize=thread" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build (TSan)
+        run: cmake --build build-tsan --parallel $(sysctl -n hw.logicalcpu)
+
+      - name: Répétition tests concurrents (50 fois, stop au premier échec)
+        run: |
+          ctest --test-dir build-tsan \
+            --output-on-failure \
+            --timeout 30 \
+            --repeat until-fail:50 \
+            --tests-regex "media_task|audio_playback|mcp_tools"
+        env:
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+
+      - name: Upload results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-results-tsan-repeat
+          path: build-tsan/Testing/
+          retention-days: 14
+
+  # -----------------------------------------------------------------------
+  # Résumé de statut -- ce job est la "required status check" à configurer
+  # dans les branch protection rules de GitHub.
+  # Avantage : un seul check à surveiller, même si les jobs évoluent.
+  # -----------------------------------------------------------------------
+  all-tests-passed:
+    name: All tests passed
+    needs: [test, sanitize]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "::error::Le job 'test' a échoué"
+            exit 1
+          fi
+          if [[ "${{ needs.sanitize.result }}" != "success" ]]; then
+            echo "::error::Le job 'sanitize' a échoué"
+            exit 1
+          fi
+          echo "Tous les tests obligatoires passent."

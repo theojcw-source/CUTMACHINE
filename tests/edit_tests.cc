@@ -103,6 +103,36 @@ void ExpectRejected(Document document, Operation operation, EditError expected,
 }  // namespace
 
 int main() {
+    Test("color management is serializable and byte-exact on undo", [] {
+        Document document = EditDocument();
+        const std::string before = document.SaveToString();
+        ColorManagementSettings settings;
+        settings.enabled = true;
+        settings.input_gamut = "sony_sgamut3_cine";
+        settings.input_transfer = "sony_slog3";
+        settings.input_ycbcr_matrix = "bt709";
+        settings.input_range = "full";
+        settings.working_gamut = "acescct";
+        settings.output_gamut = "rec2020";
+        settings.output_transfer = "hlg";
+        EditLog log;
+        Check(Apply(log, document, SetColorManagementOperation{settings},
+                    "set color management"),
+              "color operation applies");
+        const std::string operationJson =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(operationJson, parsed, error, message) &&
+                  std::holds_alternative<SetColorManagementOperation>(parsed) &&
+                  SerializeOperation(parsed) == operationJson,
+              "SetColorManagement JSON is canonical");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "color operation undo restores byte-identical document");
+    });
+
     Test("transition operations are exact, serializable and undoable", [] {
         Document document = EditDocument();
         document.sequence.tracks[0].clips[1].timeline_in = {10, 25};
@@ -204,6 +234,39 @@ int main() {
                   RationalTime{40, 25},
               "remove restores every following position");
     });
+
+    Test("arbitrary multi-clip move is atomic, serializable and reversible",
+         [] {
+             Document document = EditDocument();
+             const std::string before = document.SaveToString();
+             const Ulid trackId = document.sequence.tracks[0].id;
+             const Ulid firstId = document.sequence.tracks[0].clips[0].id;
+             const Ulid secondId = document.sequence.tracks[0].clips[1].id;
+             EditLog log;
+             MoveClipsOperation move{
+                 {{firstId, trackId, {50, 25}}, {secondId, trackId, {70, 25}}},
+                 {}};
+             Check(Apply(log, document, move, "multi-clip move"),
+                   "multi-clip move applies as one entry");
+             Check(document.FindClip(firstId)->timeline_in ==
+                           RationalTime{50, 25} &&
+                       document.FindClip(secondId)->timeline_in ==
+                           RationalTime{70, 25} &&
+                       log.AppliedCount() == 1,
+                   "every selected clip keeps its ID and relative spacing");
+             const std::string json =
+                 SerializeOperation(log.AppliedEntries().back().op);
+             Operation parsed = RemoveClipOperation{};
+             EditError error = EditError::None;
+             std::string message;
+             Check(DeserializeOperation(json, parsed, error, message) &&
+                       std::holds_alternative<MoveClipsOperation>(parsed) &&
+                       SerializeOperation(parsed) == json,
+                   "MoveClips canonical JSON round-trips");
+             Check(log.Undo(document, error, message) &&
+                       document.SaveToString() == before,
+                   "multi-clip move undo restores byte-identical state");
+         });
 
     Test("clear and ripple delete are distinct operations", [] {
         Document document = EditDocument();
@@ -369,11 +432,20 @@ int main() {
               "canonical paste contains its overwrite field");
         if (appendedAt != std::string::npos)
             legacyPaste.erase(appendedAt, appendedField.size());
+        const std::string opacityField = ",\"opacity\":{\"num\":1,\"den\":1}";
+        size_t opacityAt = 0;
+        while ((opacityAt = legacyPaste.find(opacityField, opacityAt)) !=
+               std::string::npos) {
+            legacyPaste.erase(opacityAt, opacityField.size());
+        }
         Operation parsedLegacy = RemoveClipOperation{};
         Check(DeserializeOperation(legacyPaste, parsedLegacy, error, message) &&
                   std::holds_alternative<PasteClipsOperation>(parsedLegacy) &&
-                  !std::get<PasteClipsOperation>(parsedLegacy).overwrite,
-              "legacy PasteClips logs without overwrite remain readable");
+                  !std::get<PasteClipsOperation>(parsedLegacy).overwrite &&
+                  SerializeOperation(parsedLegacy).find(opacityField) !=
+                      std::string::npos,
+              "legacy PasteClips logs without overwrite or opacity remain "
+              "readable");
         Check(log.Undo(document, error, message) &&
                   document.SaveToString() == before,
               "paste undo restores byte-identical document JSON");
@@ -1513,6 +1585,40 @@ int main() {
             ExpectRejected(document, setEffects, EditError::LockedTrack,
                            "clip effects reject a locked track");
         });
+
+    Test("clip opacity is exact, addressable and byte-exactly reversible", [] {
+        Document document = EditDocument();
+        const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+        const std::string original = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(Apply(log, document, SetClipOpacityOperation{clipId, {425, 1000}},
+                    "set clip opacity"),
+              "clip opacity applies");
+        const std::string changed = document.SaveToString();
+        Check(document.FindClip(clipId)->opacity.num == 425,
+              "exact opacity is stored on the addressed clip");
+        const std::string json =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(json, parsed, error, message) &&
+                  SerializeOperation(parsed) == json,
+              "SetClipOpacity JSON round-trips canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == original,
+              "SetClipOpacity undo restores byte-identical JSON");
+        Check(log.Redo(document, error, message) &&
+                  document.SaveToString() == changed,
+              "SetClipOpacity redo restores byte-identical JSON");
+        ExpectRejected(document, SetClipOpacityOperation{clipId, {11, 10}},
+                       EditError::ValidationFailed,
+                       "opacity above one is rejected");
+        document.sequence.tracks[0].locked = true;
+        ExpectRejected(document, SetClipOpacityOperation{clipId, {1, 2}},
+                       EditError::LockedTrack,
+                       "clip opacity rejects a locked track");
+    });
 
     Test(
         "caption styles and per-clip captions are addressable, "

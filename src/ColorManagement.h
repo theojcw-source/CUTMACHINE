@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
 struct ColorManagementSettings;
 
 struct RgbColor {
@@ -21,6 +25,25 @@ struct YuvMatrixParameters {
     float green_from_cb = -0.187324f;
     float green_from_cr = -0.468124f;
     float blue_from_cb = 1.8556f;
+};
+
+// COLOR-2026-08 -- the OCIO library and config are both pinned because their
+// output is part of the deterministic render contract. The config is compiled
+// into OpenColorIO itself, so rendering never consults $OCIO or the filesystem.
+inline constexpr const char* kOpenColorIoConfig =
+    "studio-config-v2.2.0_aces-v1.3_ocio-v2.4";
+inline constexpr int32_t kOpenColorIoLutEdge = 65;
+
+struct OpenColorIoLut3D {
+    int32_t edge = 0;
+    // R is the fastest-varying coordinate. RGBA storage maps directly to a
+    // Metal RGBA32Float 3D texture; alpha remains one.
+    std::vector<float> rgba;
+};
+
+struct OpenColorIoLutPair {
+    OpenColorIoLut3D input_to_working;
+    OpenColorIoLut3D working_to_display;
 };
 
 YuvCodeParameters BuildYuvCodeParameters(int bitDepth, bool fullRange);
@@ -55,3 +78,14 @@ RgbColor TransformColorForOutput(const ColorManagementSettings& settings,
 // cannot be interpreted as EDR by the desktop compositor a second time.
 ColorManagementSettings ColorManagementForSdrPreview(
     const ColorManagementSettings& settings);
+
+// Resolves the document's readable legacy names through the pinned OCIO
+// config and samples the processors into deterministic 65^3 LUTs. The pair is
+// used by Metal; the combined .cube is consumed by FFmpeg during export.
+bool BuildOpenColorIoLuts(const ColorManagementSettings& settings,
+                          OpenColorIoLutPair& output, std::string& error);
+bool BuildOpenColorIoCube(const ColorManagementSettings& settings,
+                          std::string& output, std::string& error);
+
+// Stable cache key for renderer-owned Metal textures.
+std::string OpenColorIoCacheKey(const ColorManagementSettings& settings);

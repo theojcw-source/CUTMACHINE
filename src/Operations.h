@@ -133,6 +133,14 @@ struct LinkedClipMove {
     RationalTime timeline_in;
 };
 
+// UI-2026-08 -- dragging an arbitrary timeline selection is one intention and
+// therefore one undoable operation. Members need not share an A/V link group;
+// each keeps its stable clip ID and receives an exact destination.
+struct MoveClipsOperation {
+    std::vector<LinkedClipMove> moves;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 struct MoveLinkedClipsOperation {
     Ulid link_group_id;
     std::vector<LinkedClipMove> moves;
@@ -229,6 +237,12 @@ struct UpdateSequenceOperation {
     int32_t width = 1920;
     int32_t height = 1080;
     MediaRate frame_rate{25, 1};
+};
+
+// COLOR-2026-08 -- project color is authoritative document state, so UI,
+// CLI, and MCP must all change it through the same reversible operation.
+struct SetColorManagementOperation {
+    ColorManagementSettings settings;
 };
 
 struct RemoveTrackOperation {
@@ -402,6 +416,13 @@ struct SetClipEffectsOperation {
     std::vector<ClipEffect> effects;
 };
 
+// ALPHA-2026-08 -- per-clip opacity is independently addressable from the
+// creative color stack and has a compact, byte-exact inverse.
+struct SetClipOpacityOperation {
+    Ulid clip_id;
+    EffectParamValue opacity{1, 1};
+};
+
 struct AddCaptionStyleOperation {
     CaptionStyle style;
     // -1 appends on first application. Exact inverse operations carry the
@@ -476,17 +497,18 @@ struct RemoveWordsOperation {
 using Operation = std::variant<
     InsertClipOperation, RemoveClipOperation, ClearClipOperation,
     ClearClipsOperation, PasteClipsOperation, TrimClipOperation,
-    MoveClipOperation, DeleteGapOperation, DetachAudioOperation,
-    MoveLinkedClipsOperation, TrimLinkedClipsOperation, RippleTrimOperation,
-    RollEditOperation, SlipEditOperation, RemoveLinkedClipsOperation,
-    ClearLinkedClipsOperation, AddTrackOperation, RemoveTrackOperation,
-    SetTrackLockOperation, SetTrackSyncLockOperation, SetTrackOutputOperation,
-    UpdateSequenceOperation, SplitClipOperation, SplitLinkedClipsOperation,
+    MoveClipOperation, MoveClipsOperation, DeleteGapOperation,
+    DetachAudioOperation, MoveLinkedClipsOperation, TrimLinkedClipsOperation,
+    RippleTrimOperation, RollEditOperation, SlipEditOperation,
+    RemoveLinkedClipsOperation, ClearLinkedClipsOperation, AddTrackOperation,
+    RemoveTrackOperation, SetTrackLockOperation, SetTrackSyncLockOperation,
+    SetTrackOutputOperation, UpdateSequenceOperation,
+    SetColorManagementOperation, SplitClipOperation, SplitLinkedClipsOperation,
     JoinClipOperation, AddBinOperation, RemoveBinOperation, RenameBinOperation,
     MoveBinOperation, SetMediaBinOperation, AddMarkerOperation,
     RemoveMarkerOperation, UpdateMarkerOperation, AddTransitionOperation,
     RemoveTransitionOperation, UpdateTransitionOperation, SetClipLinkOperation,
-    SetClipEffectsOperation, AddCaptionStyleOperation,
+    SetClipEffectsOperation, SetClipOpacityOperation, AddCaptionStyleOperation,
     RemoveCaptionStyleOperation, SetClipCaptionOperation,
     AddMulticamGroupOperation, RemoveMulticamGroupOperation,
     SetMulticamActiveAngleOperation, RemoveWordsOperation,
@@ -521,6 +543,32 @@ struct AddProjectTimelineOperation {
     Ulid timeline_id;
     Ulid video_track_id;
     Ulid audio_track_id;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
+// ALPHA-2026-08 -- An agent chooses editorial source ranges, while the engine
+// owns the deterministic assembly, generated identities and exact timeline
+// positions. This keeps a natural-language "make a short" request on the
+// same reversible project-operation path as every other edit.
+struct ProjectTimelineSourceSegment {
+    Ulid source_id;
+    RationalTime source_in;
+    RationalTime duration;
+    Ulid video_clip_id;
+    Ulid audio_clip_id;
+    Ulid link_group_id;
+};
+
+struct CreateProjectTimelineFromSegmentsOperation {
+    std::string name = "Interview short";
+    int32_t width = 1920;
+    int32_t height = 1080;
+    MediaRate frame_rate{25, 1};
+    std::vector<ProjectTimelineSourceSegment> segments;
+    Ulid timeline_id;
+    Ulid video_track_id;
+    Ulid audio_track_id;
+    bool make_active = true;
     std::optional<ExactProjectState> exact_project_result;
 };
 
@@ -559,9 +607,11 @@ struct RelinkProjectMediaOperation {
 };
 
 using ProjectOperation =
-    std::variant<AddProjectTimelineOperation, RemoveProjectTimelineOperation,
-                 SetProjectBinMetadataOperation, SetProjectTimelineBinOperation,
-                 RenameProjectItemOperation, RelinkProjectMediaOperation>;
+    std::variant<AddProjectTimelineOperation,
+                 CreateProjectTimelineFromSegmentsOperation,
+                 RemoveProjectTimelineOperation, SetProjectBinMetadataOperation,
+                 SetProjectTimelineBinOperation, RenameProjectItemOperation,
+                 RelinkProjectMediaOperation>;
 
 // On success, operation is enriched with generated IDs and exact redo state.
 // Both document and operation remain unchanged on failure.

@@ -129,6 +129,10 @@ struct DocumentClip {
     Ulid caption_group_id;
     // This clip's slice of the caption run's text.
     std::string caption_text;
+    // ALPHA-2026-08 -- compositing changes the rendered project, so opacity
+    // belongs to the canonical clip rather than to an Inspector preference.
+    // Keep it exact until Timeline resolves the render-only float boundary.
+    EffectParamValue opacity{1, 1};
 };
 
 enum class TransitionAlignment { Center, StartAtCut, EndAtCut };
@@ -210,7 +214,7 @@ struct DocumentSequence {
 
 class Document {
 public:
-    int32_t version = 4;
+    int32_t version = 5;
     DocumentSequence sequence;
     ColorManagementSettings color_management;
     std::vector<LibraryMedia> library;

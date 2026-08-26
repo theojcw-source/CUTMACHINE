@@ -9,12 +9,132 @@
 #import "UiComponents.h"
 #import "UiThemeAppKit.h"
 
+#import <Security/Security.h>
+
 #include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace {
+
+NSString* const kAiModelDefaultsKey = @"AiEngine.Model.v1";
+NSString* const kAiBaseUrlDefaultsKey = @"AiEngine.BaseUrl.v1";
+NSString* const kAiProviderDefaultsKey = @"AiEngine.Provider.v1";
+NSString* const kAiKeychainService = @"com.cutmachine.editor.ai";
+NSString* const kAnthropicKeychainAccount = @"anthropic-messages-api-key";
+NSString* const kOpenAiKeychainAccount = @"openai-compatible-api-key";
+
+NSDictionary* AiKeychainIdentity(chat::ChatLlmProvider provider) {
+    NSString* account = provider == chat::ChatLlmProvider::AnthropicMessages
+                            ? kAnthropicKeychainAccount
+                            : kOpenAiKeychainAccount;
+    return @{
+        (__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService : kAiKeychainService,
+        (__bridge id)kSecAttrAccount : account,
+    };
+}
+
+std::string SecurityError(OSStatus status) {
+    CFStringRef text = SecCopyErrorMessageString(status, nullptr);
+    NSString* message = CFBridgingRelease(text);
+    return message.UTF8String ?: "unknown Keychain error";
+}
+
+bool ReadAiApiKey(chat::ChatLlmProvider provider, std::string& key,
+                  std::string& error) {
+    key.clear();
+    error.clear();
+    NSMutableDictionary* query = [AiKeychainIdentity(provider) mutableCopy];
+    query[(__bridge id)kSecReturnData] = @YES;
+    query[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
+    CFTypeRef result = nullptr;
+    const OSStatus status =
+        SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+    if (status == errSecItemNotFound) return true;
+    if (status != errSecSuccess) {
+        error = "unable to read the API key from Keychain: " +
+                SecurityError(status);
+        return false;
+    }
+    NSData* data = CFBridgingRelease(result);
+    NSString* value = [[NSString alloc] initWithData:data
+                                            encoding:NSUTF8StringEncoding];
+    if (!value) {
+        error = "the API key stored in Keychain is not valid UTF-8";
+        return false;
+    }
+    key = value.UTF8String ?: "";
+    return true;
+}
+
+bool WriteAiApiKey(chat::ChatLlmProvider provider, const std::string& key,
+                   std::string& error) {
+    error.clear();
+    NSDictionary* identity = AiKeychainIdentity(provider);
+    if (key.empty()) {
+        const OSStatus status =
+            SecItemDelete((__bridge CFDictionaryRef)identity);
+        if (status == errSecSuccess || status == errSecItemNotFound)
+            return true;
+        error = "unable to delete the API key from Keychain: " +
+                SecurityError(status);
+        return false;
+    }
+    NSData* data = [NSData dataWithBytes:key.data() length:key.size()];
+    const NSDictionary* values = @{(__bridge id)kSecValueData : data};
+    OSStatus status = SecItemUpdate((__bridge CFDictionaryRef)identity,
+                                    (__bridge CFDictionaryRef)values);
+    if (status == errSecItemNotFound) {
+        NSMutableDictionary* item = [identity mutableCopy];
+        item[(__bridge id)kSecValueData] = data;
+        status = SecItemAdd((__bridge CFDictionaryRef)item, nullptr);
+    }
+    if (status == errSecSuccess) return true;
+    error = "unable to save the API key in Keychain: " + SecurityError(status);
+    return false;
+}
+
+chat::ChatLlmConfig LoadAiConfiguration(std::string& configurationError) {
+    chat::ChatLlmConfig config =
+        chat::ChatLlmConfig::FromEnvironment(&configurationError);
+    NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
+    NSString* provider = [defaults stringForKey:kAiProviderDefaultsKey];
+    if ([provider isEqualToString:@"openai-compatible"] ||
+        [provider isEqualToString:@"ollama"])
+        config.provider = chat::ChatLlmProvider::Ollama;
+    NSString* model = [defaults stringForKey:kAiModelDefaultsKey];
+    NSString* baseUrl = [defaults stringForKey:kAiBaseUrlDefaultsKey];
+    if (config.provider == chat::ChatLlmProvider::Ollama) {
+        config.api_key.clear();
+        if (model.length == 0) config.model = "qwen2.5-coder:7b";
+        if (baseUrl.length == 0) {
+            config.base_url = "http://localhost:11434";
+        } else if ([baseUrl hasSuffix:@"/v1"]) {
+            baseUrl = [baseUrl substringToIndex:baseUrl.length - 3];
+        }
+    }
+    if (model.length > 0) config.model = model.UTF8String ?: config.model;
+    if (baseUrl.length > 0)
+        config.base_url = baseUrl.UTF8String ?: config.base_url;
+
+    std::string storedKey;
+    std::string keychainError;
+    if (!ReadAiApiKey(config.provider, storedKey, keychainError)) {
+        configurationError = keychainError;
+    } else if (!storedKey.empty()) {
+        config.api_key = std::move(storedKey);
+    }
+    if (config.provider == chat::ChatLlmProvider::AnthropicMessages &&
+        config.api_key.empty()) {
+        if (keychainError.empty())
+            configurationError = "Moteur IA non configuré.";
+    } else if (keychainError.empty()) {
+        configurationError.clear();
+    }
+    return config;
+}
 
 // ---------------------------------------------------------------------
 // MainThreadBackend: wraps the live McpLiveBackend so every actual document
@@ -43,6 +163,26 @@ public:
         __block bool ok = false;
         dispatch_sync(dispatch_get_main_queue(), ^{
           ok = live_.ApplyOperation(operation, resultJson, errorName, message);
+        });
+        return ok;
+    }
+
+    bool ApplyProjectEdit(ProjectOperation operation, std::string& resultJson,
+                          std::string& errorName,
+                          std::string& message) override {
+        __block bool ok = false;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          ok =
+              live_.ApplyProjectEdit(operation, resultJson, errorName, message);
+        });
+        return ok;
+    }
+
+    bool ReadTimelineTranscript(std::string& json,
+                                std::string& message) override {
+        __block bool ok = false;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          ok = live_.ReadTimelineTranscript(json, message);
         });
         return ok;
     }
@@ -83,9 +223,8 @@ private:
 // the point, it is what makes ChatLlmClient::SendMessages a plain blocking
 // call from ChatSession's point of view, matching sidecar/planner.py's own
 // synchronous urllib-based _post_json.
-bool AnthropicUrlSessionTransport(const chat::ChatHttpRequest& request,
-                                  chat::ChatHttpResponse& response,
-                                  std::string& error) {
+bool UrlSessionTransport(const chat::ChatHttpRequest& request,
+                         chat::ChatHttpResponse& response, std::string& error) {
     NSURL* url = [NSURL
         URLWithString:[NSString stringWithUTF8String:request.url.c_str()]];
     if (!url) {
@@ -257,6 +396,9 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
 - (NSString*)cmDisplayTextForEntry:(const chat::ChatTranscriptEntry&)entry;
 - (void)appendTranscriptEntry:(const chat::ChatTranscriptEntry&)entry;
 - (void)cmScrollToBottom;
+- (void)cmReloadConfiguration;
+- (void)configurePressed:(id)sender;
+- (void)presetChanged:(id)sender;
 - (void)sendPressed:(id)sender;
 @end
 
@@ -265,6 +407,8 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
     NSView* _transcriptContainer;  // flipped; rows stack top to bottom
     NSTextField* _inputField;
     NSButton* _sendButton;
+    NSButton* _configureButton;
+    NSPopUpButton* _presetPopup;
     NSTextField* _statusLabel;
 
     McpBackend* _liveBackend;  // not owned; see -configureWithBackend:
@@ -310,6 +454,19 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
             CMMakeStyledButton(@"Envoyer", self, @selector(sendPressed:));
         [self addSubview:_sendButton];
 
+        _presetPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect];
+        [_presetPopup addItemWithTitle:@"Prompt libre"];
+        [_presetPopup addItemWithTitle:@"Short interview dynamique — 60 s"];
+        _presetPopup.target = self;
+        _presetPopup.action = @selector(presetChanged:);
+        _presetPopup.identifier = @"chat.prompt_preset";
+        [self addSubview:_presetPopup];
+
+        _configureButton = CMMakeStyledButton(@"Configurer le moteur IA…", self,
+                                              @selector(configurePressed:));
+        _configureButton.identifier = @"chat.configure_engine";
+        [self addSubview:_configureButton];
+
         [self cmLayoutForSize:frame.size];
     }
     return self;
@@ -320,10 +477,15 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
     _mainThreadBackend = std::make_unique<MainThreadBackend>(backend);
     _registry = std::make_unique<McpToolRegistry>();
 
-    chat::ChatLlmConfig config =
-        chat::ChatLlmConfig::FromEnvironment(&_missingKeyError);
+    [self cmReloadConfiguration];
+}
+
+- (void)cmReloadConfiguration {
+    if (!_mainThreadBackend || !_registry) return;
+    _missingKeyError.clear();
+    chat::ChatLlmConfig config = LoadAiConfiguration(_missingKeyError);
     _llm = std::make_unique<chat::ChatLlmClient>(std::move(config),
-                                                 AnthropicUrlSessionTransport);
+                                                 UrlSessionTransport);
 
     __weak CMChatPanelView* weakSelf = self;
     _session = std::make_unique<chat::ChatSession>(
@@ -340,12 +502,15 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
             });
         });
 
-    if (!_missingKeyError.empty()) {
+    if (_missingKeyError.empty()) {
+        _statusLabel.hidden = YES;
+        _statusLabel.stringValue = @"";
+    } else {
         _statusLabel.stringValue =
             [NSString stringWithUTF8String:_missingKeyError.c_str()];
         _statusLabel.hidden = NO;
-        [self cmLayoutForSize:self.bounds.size];
     }
+    [self cmLayoutForSize:self.bounds.size];
 }
 
 - (void)setFrameSize:(NSSize)newSize {
@@ -357,23 +522,38 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
     const CGFloat inset = CGF(ui::theme::kSpaceS);
     const CGFloat inputHeight = CGF(ui::theme::kControlRowHeight);
     const CGFloat sendWidth = 76.0;
+    const CGFloat configureHeight = 28.0;
+    const CGFloat presetHeight = 28.0;
     const CGFloat statusHeight = _statusLabel.hidden ? 0.0 : 28.0;
 
-    _statusLabel.frame =
-        NSMakeRect(inset, inputHeight + inset, size.width - 2 * inset,
-                   std::max<CGFloat>(0.0, statusHeight - inset));
+    _statusLabel.frame = NSMakeRect(
+        inset, inputHeight + presetHeight + configureHeight + 3 * inset,
+        size.width - 2 * inset, std::max<CGFloat>(0.0, statusHeight - inset));
     _inputField.frame =
         NSMakeRect(inset, inset,
                    std::max<CGFloat>(0.0, size.width - sendWidth - 3 * inset),
                    inputHeight);
     _sendButton.frame = NSMakeRect(size.width - sendWidth - inset, inset,
                                    sendWidth, inputHeight);
+    _presetPopup.frame = NSMakeRect(inset, inputHeight + 2 * inset,
+                                    size.width - 2 * inset, presetHeight);
+    _configureButton.frame =
+        NSMakeRect(inset, inputHeight + presetHeight + 3 * inset,
+                   size.width - 2 * inset, configureHeight);
 
-    const CGFloat scrollTop = inputHeight + statusHeight + 2 * inset;
+    const CGFloat scrollTop =
+        inputHeight + presetHeight + configureHeight + statusHeight + 5 * inset;
     _scrollView.frame =
         NSMakeRect(0, scrollTop, size.width,
                    std::max<CGFloat>(0.0, size.height - scrollTop));
     [self cmRelayoutTranscript];
+}
+
+- (void)presetChanged:(id)sender {
+    (void)sender;
+    _inputField.placeholderString = _presetPopup.indexOfSelectedItem == 1
+                                        ? @"Angle ou consigne facultative…"
+                                        : @"Décrire une modification…";
 }
 
 // Re-stacks every row top to bottom at the scroll view's current content
@@ -451,13 +631,179 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
     [_transcriptContainer scrollPoint:bottom];
 }
 
+- (void)configurePressed:(id)sender {
+    (void)sender;
+    [self showConfigurationWindow];
+}
+
+- (void)showConfigurationWindow {
+    if (_turnInFlight) {
+        NSBeep();
+        return;
+    }
+    const chat::ChatLlmConfig current =
+        _llm ? _llm->Config() : chat::ChatLlmConfig::FromEnvironment();
+    NSString* currentModel =
+        [NSString stringWithUTF8String:current.model.c_str()] ?: @"";
+    NSString* currentBaseUrl =
+        [NSString stringWithUTF8String:current.base_url.c_str()] ?: @"";
+
+    while (true) {
+        NSAlert* alert = [NSAlert new];
+        alert.messageText = @"Moteur IA";
+        alert.informativeText =
+            @"Choisissez Anthropic ou un serveur local Ollama compatible "
+             "OpenAI. Une éventuelle clé reste dans le Trousseau de ce Mac "
+             "et ne fait jamais partie du projet.";
+        [alert addButtonWithTitle:@"Enregistrer"];
+        [alert addButtonWithTitle:@"Annuler"];
+
+        NSView* form =
+            [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 480, 190)];
+        const auto addLabel = [&](NSString* title, CGFloat y) {
+            NSTextField* label = [NSTextField labelWithString:title];
+            label.frame = NSMakeRect(0, y + 3, 128, 20);
+            label.font = CMFont(ui::theme::kFontSizeBody, NSFontWeightRegular);
+            [form addSubview:label];
+        };
+
+        addLabel(@"Protocole", 156);
+        NSPopUpButton* protocol =
+            [[NSPopUpButton alloc] initWithFrame:NSMakeRect(136, 152, 344, 28)];
+        [protocol addItemWithTitle:@"Anthropic Messages API"];
+        [protocol addItemWithTitle:@"Ollama local"];
+        [protocol
+            selectItemAtIndex:current.provider == chat::ChatLlmProvider::Ollama
+                                  ? 1
+                                  : 0];
+        protocol.identifier = @"ai_engine.provider";
+        [form addSubview:protocol];
+
+        addLabel(@"Modèle", 116);
+        NSTextField* model =
+            [[NSTextField alloc] initWithFrame:NSMakeRect(136, 112, 344, 26)];
+        model.stringValue = currentModel;
+        model.placeholderString = @"qwen2.5-coder:7b";
+        model.identifier = @"ai_engine.model";
+        [form addSubview:model];
+
+        addLabel(@"URL de base", 76);
+        NSTextField* baseUrl =
+            [[NSTextField alloc] initWithFrame:NSMakeRect(136, 72, 344, 26)];
+        baseUrl.stringValue = currentBaseUrl;
+        baseUrl.placeholderString = @"http://localhost:11434";
+        baseUrl.identifier = @"ai_engine.base_url";
+        [form addSubview:baseUrl];
+
+        addLabel(@"Clé API", 36);
+        NSSecureTextField* apiKey = [[NSSecureTextField alloc]
+            initWithFrame:NSMakeRect(136, 32, 344, 26)];
+        apiKey.placeholderString = current.api_key.empty()
+                                       ? @"Facultative avec Ollama local"
+                                       : @"Laisser vide pour conserver la clé";
+        apiKey.identifier = @"ai_engine.api_key";
+        [form addSubview:apiKey];
+
+        NSButton* removeKey =
+            [NSButton checkboxWithTitle:@"Supprimer la clé enregistrée"
+                                 target:nil
+                                 action:nil];
+        removeKey.frame = NSMakeRect(136, 0, 344, 22);
+        removeKey.identifier = @"ai_engine.remove_key";
+        [form addSubview:removeKey];
+        alert.accessoryView = form;
+
+        if ([alert runModal] != NSAlertFirstButtonReturn) return;
+        NSString* selectedModel = [model.stringValue
+            stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSString* selectedBaseUrl = [baseUrl.stringValue
+            stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        const chat::ChatLlmProvider selectedProvider =
+            protocol.indexOfSelectedItem == 1
+                ? chat::ChatLlmProvider::Ollama
+                : chat::ChatLlmProvider::AnthropicMessages;
+        if (selectedProvider != current.provider) {
+            if ([selectedModel isEqualToString:currentModel])
+                selectedModel =
+                    selectedProvider == chat::ChatLlmProvider::Ollama
+                        ? @"qwen2.5-coder:7b"
+                        : @"claude-sonnet-4-5";
+            if ([selectedBaseUrl isEqualToString:currentBaseUrl])
+                selectedBaseUrl =
+                    selectedProvider == chat::ChatLlmProvider::Ollama
+                        ? @"http://localhost:11434"
+                        : @"https://api.anthropic.com";
+        }
+        while ([selectedBaseUrl hasSuffix:@"/"])
+            selectedBaseUrl =
+                [selectedBaseUrl substringToIndex:selectedBaseUrl.length - 1];
+        NSURLComponents* components =
+            [NSURLComponents componentsWithString:selectedBaseUrl];
+        const BOOL validScheme =
+            [components.scheme.lowercaseString isEqualToString:@"https"] ||
+            [components.scheme.lowercaseString isEqualToString:@"http"];
+        if (selectedModel.length == 0 || selectedBaseUrl.length == 0 ||
+            !validScheme || components.host.length == 0) {
+            NSAlert* invalid = [NSAlert new];
+            invalid.alertStyle = NSAlertStyleWarning;
+            invalid.messageText = @"Configuration IA invalide";
+            invalid.informativeText =
+                @"Renseignez un modèle et une URL HTTP(S) complète, sans le "
+                 "chemin final /messages ou /chat/completions.";
+            [invalid runModal];
+            continue;
+        }
+
+        std::string keychainError;
+        if (removeKey.state == NSControlStateValueOn) {
+            if (!WriteAiApiKey(selectedProvider, {}, keychainError)) {
+                NSAlert* failure = [NSAlert new];
+                failure.alertStyle = NSAlertStyleCritical;
+                failure.messageText = @"Trousseau inaccessible";
+                failure.informativeText =
+                    [NSString stringWithUTF8String:keychainError.c_str()];
+                [failure runModal];
+                continue;
+            }
+        } else if (apiKey.stringValue.length > 0) {
+            const std::string key = apiKey.stringValue.UTF8String ?: "";
+            if (!WriteAiApiKey(selectedProvider, key, keychainError)) {
+                NSAlert* failure = [NSAlert new];
+                failure.alertStyle = NSAlertStyleCritical;
+                failure.messageText = @"Trousseau inaccessible";
+                failure.informativeText =
+                    [NSString stringWithUTF8String:keychainError.c_str()];
+                [failure runModal];
+                continue;
+            }
+        }
+
+        NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
+        [defaults setObject:selectedProvider == chat::ChatLlmProvider::Ollama
+                                ? @"ollama"
+                                : @"anthropic-messages"
+                     forKey:kAiProviderDefaultsKey];
+        [defaults setObject:selectedModel forKey:kAiModelDefaultsKey];
+        [defaults setObject:selectedBaseUrl forKey:kAiBaseUrlDefaultsKey];
+        for (NSView* row in [_transcriptContainer.subviews copy])
+            [row removeFromSuperview];
+        [self cmReloadConfiguration];
+        [self cmRelayoutTranscript];
+        [self.window makeFirstResponder:_inputField];
+        return;
+    }
+}
+
 - (void)sendPressed:(id)sender {
     (void)sender;
     if (_turnInFlight || !_session) return;
     NSString* text = [_inputField.stringValue
         stringByTrimmingCharactersInSet:NSCharacterSet
                                             .whitespaceAndNewlineCharacterSet];
-    if (text.length == 0) return;
+    const BOOL shortPreset = _presetPopup.indexOfSelectedItem == 1;
+    if (text.length == 0 && !shortPreset) return;
     if (!_missingKeyError.empty()) {
         _statusLabel.hidden = NO;
         [self cmLayoutForSize:self.bounds.size];
@@ -469,7 +815,22 @@ typedef NS_ENUM(NSInteger, CMChatRowStyle) {
     _sendButton.enabled = NO;
     _turnInFlight = YES;
 
-    const std::string instruction = text.UTF8String ? text.UTF8String : "";
+    std::string instruction = text.UTF8String ? text.UTF8String : "";
+    if (shortPreset) {
+        instruction =
+            "Exécute le preset « Short interview dynamique — 60 s ». "
+            "Appelle d'abord get_timeline_transcript. Choisis uniquement des "
+            "spans présents, pour une durée totale cible de 50 à 65 secondes. "
+            "Réordonne-les pour ouvrir sur l'accroche la plus forte, garder "
+            "un développement concis et finir sur une chute claire. Élimine "
+            "les répétitions et les digressions. Copie source_id, source_in "
+            "et duration exactement, sans calcul ni modification, puis "
+            "appelle create_interview_short une seule fois. Ne modifie pas "
+            "la timeline d'origine.";
+        if (text.length > 0)
+            instruction += " Consigne éditoriale supplémentaire : " +
+                           std::string(text.UTF8String ?: "");
+    }
     chat::ChatSession* session = _session.get();
     __weak CMChatPanelView* weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{

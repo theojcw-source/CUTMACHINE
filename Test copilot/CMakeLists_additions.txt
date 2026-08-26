@@ -1,0 +1,76 @@
+# -----------------------------------------------------------------------
+# Extrait à ajouter dans le bloc BUILD_TESTING de CMakeLists.txt
+# Mettre APRÈS les tests existants, avant la fermeture du if(BUILD_TESTING)
+# -----------------------------------------------------------------------
+
+# P-001 : Propriétés RationalTime
+# Test auto-suffisant, tourne aussi sur Linux sans FFmpeg ni AppKit.
+add_executable(cutmachine_rational_time_property_tests
+               tests/rational_time_property_tests.cc)
+target_link_libraries(cutmachine_rational_time_property_tests
+                      PRIVATE cutmachine_model)
+add_test(NAME cutmachine_rational_time_property_tests
+         COMMAND cutmachine_rational_time_property_tests)
+
+# P-002 : Séquences d'opérations (stateful testing)
+# Dépend de Document, EditLog, Operations -- pas de FFmpeg.
+add_executable(cutmachine_edit_sequence_tests
+               tests/edit_sequence_tests.cc)
+target_link_libraries(cutmachine_edit_sequence_tests
+                      PRIVATE cutmachine_model)
+add_test(NAME cutmachine_edit_sequence_tests
+         COMMAND cutmachine_edit_sequence_tests)
+
+# P-003 : Robustesse du stockage (injection de pannes)
+# Dépend de ProjectStorage, ProjectRecovery, EditLog -- pas de FFmpeg.
+add_executable(cutmachine_storage_fault_injection_tests
+               tests/storage_fault_injection_tests.cc)
+target_link_libraries(cutmachine_storage_fault_injection_tests
+                      PRIVATE cutmachine_model)
+add_test(NAME cutmachine_storage_fault_injection_tests
+         COMMAND cutmachine_storage_fault_injection_tests)
+
+# -----------------------------------------------------------------------
+# Labels pour filtrer les suites dans la CI
+# -----------------------------------------------------------------------
+# Tests portables (Linux, CI légère) -- pas de FFmpeg, pas d'AppKit
+set_tests_properties(
+    cutmachine_rational_time_property_tests
+    cutmachine_edit_sequence_tests
+    cutmachine_storage_fault_injection_tests
+    PROPERTIES LABELS "portable;regression"
+)
+
+# Tests qui touchent au stockage -- utile pour TSan ciblé
+set_tests_properties(
+    cutmachine_storage_fault_injection_tests
+    cutmachine_project_recovery_tests
+    cutmachine_project_storage_tests
+    PROPERTIES LABELS "storage"
+)
+
+# -----------------------------------------------------------------------
+# Commandes rapides pour le développement local (dans CLAUDE.md / AGENTS.md)
+# -----------------------------------------------------------------------
+#
+# Suite complète :
+#   ctest --test-dir build --output-on-failure
+#
+# Propriétés RationalTime seules (< 1s) :
+#   cmake --build build --target cutmachine_rational_time_property_tests &&
+#   ctest --test-dir build -R rational_time_property
+#
+# Séquences d'opérations (< 5s) :
+#   cmake --build build --target cutmachine_edit_sequence_tests &&
+#   ctest --test-dir build -R edit_sequence
+#
+# Stockage (< 3s) :
+#   cmake --build build --target cutmachine_storage_fault_injection_tests &&
+#   ctest --test-dir build -R storage_fault
+#
+# Tests portables uniquement :
+#   ctest --test-dir build -L portable --output-on-failure
+#
+# Tests avec répétition (débusquer les flaky) :
+#   ctest --test-dir build -R "edit_sequence|rational_time" \
+#         --repeat until-fail:100 --output-on-failure

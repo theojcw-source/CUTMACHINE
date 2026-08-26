@@ -52,19 +52,22 @@ int main() {
            {25, 25},
            {0, 25},
            true}}},
-        {"01KA0000000000000000000004",
-         "audio",
-         1,
-         {{"01KA0000000000000000000005",
-           sourceId,
-           {0, 25},
-           {25, 25},
-           {0, 25},
-           true}}},
     };
     AudioPlayback playback;
     std::string error;
     const bool opened = playback.Open(document, root.string(), error);
+    const bool unusedBeforeInsert =
+        playback.DecodedSourceCount() == 0 && playback.PlannedClipCount() == 0;
+    document.sequence.tracks.push_back({"01KA0000000000000000000004",
+                                        "audio",
+                                        1,
+                                        {{"01KA0000000000000000000005",
+                                          sourceId,
+                                          {0, 25},
+                                          {25, 25},
+                                          {0, 25},
+                                          true}}});
+    playback.RebuildTimeline(document);
     const bool decoded = playback.DecodedSourceCount() == 1;
     const bool planned = playback.PlannedClipCount() == 1;
     document.sequence.tracks[1].muted = true;
@@ -102,10 +105,10 @@ int main() {
         playback.ScrubTriggerCount() == 2;
     playback.Stop();
     std::filesystem::remove_all(root);
-    if (!opened || !decoded || !planned || !muteSuppressesTrack ||
-        !soloSuppressesOtherTracks || !allUnmutedTracksMix || !started ||
-        !shuttleSpeedPreserved || !scrubbed || !sameFrameSuppressed ||
-        !nextFrameTriggered) {
+    if (!opened || !unusedBeforeInsert || !decoded || !planned ||
+        !muteSuppressesTrack || !soloSuppressesOtherTracks ||
+        !allUnmutedTracksMix || !started || !shuttleSpeedPreserved ||
+        !scrubbed || !sameFrameSuppressed || !nextFrameTriggered) {
         std::cerr << "FAIL: audio decode/mix plan: " << error << '\n';
         return 1;
     }

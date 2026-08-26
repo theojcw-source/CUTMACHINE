@@ -68,31 +68,6 @@ std::string TemporaryOutputPath(const std::filesystem::path& destination) {
     return (destination.parent_path() / filename).string();
 }
 
-std::string BuildColorLut(const ColorManagementSettings& settings) {
-    constexpr int kSize = 65;
-    std::ostringstream output;
-    output.imbue(std::locale::classic());
-    output << "TITLE \"CUTMACHINE display transform\"\n"
-           << "LUT_3D_SIZE " << kSize << "\n"
-           << "DOMAIN_MIN 0.0 0.0 0.0\n"
-           << "DOMAIN_MAX 1.0 1.0 1.0\n"
-           << std::fixed << std::setprecision(10);
-    // .cube ordering increments red first, then green, then blue.
-    for (int blue = 0; blue < kSize; ++blue) {
-        for (int green = 0; green < kSize; ++green) {
-            for (int red = 0; red < kSize; ++red) {
-                const RgbColor transformed = TransformColorForOutput(
-                    settings, {static_cast<double>(red) / (kSize - 1),
-                               static_cast<double>(green) / (kSize - 1),
-                               static_cast<double>(blue) / (kSize - 1)});
-                output << transformed.red << ' ' << transformed.green << ' '
-                       << transformed.blue << '\n';
-            }
-        }
-    }
-    return output.str();
-}
-
 void AppendTail(std::string& destination, const char* bytes, size_t count) {
     constexpr size_t kMaximumErrorBytes = 32768;
     destination.append(bytes, count);
@@ -323,6 +298,7 @@ bool Exporter::BuildPlan(const Document& document,
 
     std::vector<InputClip> inputs;
     for (const DocumentTrack* track : tracks) {
+        if (track->kind == "caption") continue;
         if ((track->kind == "video" && !track->visible) ||
             (track->kind == "audio" &&
              (track->muted || (hasAudioSolo && !track->solo))))
@@ -415,9 +391,15 @@ bool Exporter::BuildPlan(const Document& document,
               << ",scale=" << settings.width << ':' << settings.height
               << ":force_original_aspect_ratio=decrease:flags=lanczos"
               << ",setsar=1";
+        const bool translucent =
+            input.clip->opacity.num != input.clip->opacity.den;
+        if (input.fade_in || translucent) graph << ",format=yuva444p10le";
+        if (translucent)
+            graph << ",colorchannelmixer=aa=(" << input.clip->opacity.num << '/'
+                  << input.clip->opacity.den << ')';
         if (input.fade_in)
-            graph << ",format=yuva444p10le,fade=t=in:st=0:d="
-                  << FilterSeconds(*input.fade_in) << ":alpha=1";
+            graph << ",fade=t=in:st=0:d=" << FilterSeconds(*input.fade_in)
+                  << ":alpha=1";
         graph << ",setpts=PTS-STARTPTS+" << position << "/TB[v" << videoOrdinal
               << "];" << "[base" << videoOrdinal << "][v" << videoOrdinal
               << "]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=pass:repeatlast=0:"
@@ -431,7 +413,11 @@ bool Exporter::BuildPlan(const Document& document,
         output.temporary_lut_path = (std::filesystem::temp_directory_path() /
                                      ("cutmachine-" + GenerateUlid() + ".cube"))
                                         .string();
-        output.color_lut = BuildColorLut(document.color_management);
+        if (!BuildOpenColorIoCube(document.color_management, output.color_lut,
+                                  error)) {
+            error = "unable to build OpenColorIO export transform: " + error;
+            return false;
+        }
         graph << "scale=";
         bool hasInputOption = false;
         if (document.color_management.input_range != "auto") {
@@ -452,7 +438,7 @@ bool Exporter::BuildPlan(const Document& document,
         if (hasInputOption) graph << ':';
         graph << "out_range=full,format=gbrp16le,lut3d=file='"
               << output.temporary_lut_path
-              << "':interp=tetrahedral,scale=out_range=tv:out_color_matrix="
+              << "':interp=trilinear,scale=out_range=tv:out_color_matrix="
               << (document.color_management.output_gamut == "rec2020" ? "bt2020"
                                                                       : "bt709")
               << ',';

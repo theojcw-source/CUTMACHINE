@@ -19,6 +19,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
 extern char** environ;
@@ -213,6 +214,64 @@ std::vector<TranscriptWord> GroupWordsFromWhisper(whisper_context* ctx,
     }
     flush();
     return words;
+}
+
+bool AppendWordText(std::string& destination, const std::string& text) {
+    if (text.empty()) return false;
+    constexpr std::string_view kPunctuation = ".,!?;:%)]}";
+    if (!destination.empty() &&
+        kPunctuation.find(text.front()) == std::string_view::npos)
+        destination.push_back(' ');
+    destination += text;
+    return true;
+}
+
+// Outward frame rounding can make neighboring words share one source frame,
+// and Whisper occasionally emits a zero-centisecond token. Keep the text in
+// order while assigning only representable, non-overlapping frame spans.
+// Words too short to own a frame join the next representable word (or the
+// preceding one at EOF); this is preferable to caching an artifact our exact
+// time model must reject later.
+bool NormalizeTranscriptWords(std::vector<TranscriptWord>& words,
+                              std::string& error) {
+    std::vector<TranscriptWord> normalized;
+    normalized.reserve(words.size());
+    std::string pendingText;
+    RationalTime previousRawStart{-1, 1};
+    bool first = true;
+    for (TranscriptWord& word : words) {
+        if (word.text.empty()) {
+            error = "transcript word is empty";
+            return false;
+        }
+        if (!first && word.start < previousRawStart) {
+            error = "transcript words are not in chronological order";
+            return false;
+        }
+        previousRawStart = word.start;
+        first = false;
+        if (!normalized.empty() && word.start < normalized.back().end)
+            word.start = normalized.back().end;
+        if (word.end <= word.start) {
+            AppendWordText(pendingText, word.text);
+            continue;
+        }
+        if (!pendingText.empty()) {
+            AppendWordText(pendingText, word.text);
+            word.text = std::move(pendingText);
+            pendingText.clear();
+        }
+        normalized.push_back(std::move(word));
+    }
+    if (!pendingText.empty()) {
+        if (normalized.empty()) {
+            error = "transcript contains no frame-representable words";
+            return false;
+        }
+        AppendWordText(normalized.back().text, pendingText);
+    }
+    words = std::move(normalized);
+    return true;
 }
 
 void WriteJsonString(std::ostringstream& output, const std::string& value) {
@@ -514,6 +573,7 @@ bool GenerateAudioTranscript(const std::string& inputPath,
         error = "transcription produced no words";
         return false;
     }
+    if (!NormalizeTranscriptWords(transcript.words, error)) return false;
     context.SetProgress(1.0, "Transcript prêt");
     return SaveTranscript(outputPath, transcript, error);
 }
@@ -556,8 +616,6 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
         parsed.source_rate = {static_cast<int32_t>(num),
                               static_cast<int32_t>(den)};
         if (!reader.Consume("]")) {
-            RationalTime previousEnd{-1, 1};
-            bool first = true;
             while (true) {
                 TranscriptWord word;
                 reader.Expect("{\"text\":");
@@ -567,16 +625,6 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
                 reader.Expect(",\"end\":");
                 word.end = ReadTime(reader);
                 reader.Expect("}");
-                if (word.text.empty() || word.start >= word.end) {
-                    throw std::runtime_error(
-                        "transcript word has a non-positive duration");
-                }
-                if (!first && word.start < previousEnd) {
-                    throw std::runtime_error(
-                        "transcript words are not in chronological order");
-                }
-                previousEnd = word.end;
-                first = false;
                 parsed.words.push_back(std::move(word));
                 if (reader.Consume("]")) break;
                 reader.Expect(",");
@@ -584,6 +632,7 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
         }
         reader.Expect("}");
         reader.Finish();
+        if (!NormalizeTranscriptWords(parsed.words, error)) return false;
         transcript = std::move(parsed);
         return true;
     } catch (const std::exception& exception) {

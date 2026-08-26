@@ -46,6 +46,23 @@ public:
                                 std::string& errorName,
                                 std::string& message) = 0;
 
+    // Project-level edit used by agent-created timelines. Backends that only
+    // expose a standalone Document may leave this unsupported.
+    virtual bool ApplyProjectEdit(ProjectOperation, std::string&,
+                                  std::string& errorName,
+                                  std::string& message) {
+        errorName = "UnsupportedOperation";
+        message = "this backend cannot create project timelines";
+        return false;
+    }
+
+    // Read-only cached transcript view. Kept behind the backend because the
+    // cache directory belongs to the open project, not the Document JSON.
+    virtual bool ReadTimelineTranscript(std::string&, std::string& message) {
+        message = "this backend has no project transcript cache";
+        return false;
+    }
+
     virtual bool Undo(std::string& resultJson, std::string& errorName,
                       std::string& message) = 0;
     virtual bool Redo(std::string& resultJson, std::string& errorName,

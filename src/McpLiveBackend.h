@@ -40,6 +40,9 @@
 
 class McpLiveBackend : public McpBackend {
 public:
+    using ProjectApplyCallback = std::function<bool(
+        ProjectOperation, std::string&, std::string&, std::string&)>;
+    using TranscriptCallback = std::function<bool(std::string&, std::string&)>;
     // Neither reference is owned; both must outlive this backend. `onApplied`
     // (optional) is invoked after every successful ApplyOperation/Undo/Redo,
     // before the call returns -- main.mm wires it to the same
@@ -50,11 +53,18 @@ public:
     // whatever thread calls ApplyOperation/Undo/Redo -- see ChatPanelView.mm
     // for why that is always the main thread.
     McpLiveBackend(Document& document, EditLog& editLog,
-                   std::function<void()> onApplied = nullptr);
+                   std::function<void()> onApplied = nullptr,
+                   ProjectApplyCallback applyProject = nullptr,
+                   TranscriptCallback readTranscript = nullptr);
 
     bool SnapshotDocument(Document& document, std::string& message) override;
     bool ApplyOperation(Operation operation, std::string& resultJson,
                         std::string& errorName, std::string& message) override;
+    bool ApplyProjectEdit(ProjectOperation operation, std::string& resultJson,
+                          std::string& errorName,
+                          std::string& message) override;
+    bool ReadTimelineTranscript(std::string& json,
+                                std::string& message) override;
     bool Undo(std::string& resultJson, std::string& errorName,
               std::string& message) override;
     bool Redo(std::string& resultJson, std::string& errorName,
@@ -65,4 +75,6 @@ private:
     Document& document_;
     EditLog& edit_log_;
     std::function<void()> on_applied_;
+    ProjectApplyCallback apply_project_;
+    TranscriptCallback read_transcript_;
 };

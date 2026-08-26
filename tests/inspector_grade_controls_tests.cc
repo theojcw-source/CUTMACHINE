@@ -18,9 +18,11 @@ void Check(bool condition, const std::string& message) {
 
 int main() {
     using ui::inspector::ClampToGradeControlRange;
+    using ui::inspector::CurrentClipOpacity;
     using ui::inspector::CurrentGradeControlValue;
     using ui::inspector::FindGradeControlSpec;
     using ui::inspector::GradeControls;
+    using ui::inspector::QuantizeClipOpacity;
     using ui::inspector::QuantizeGradeControlValue;
     using ui::inspector::WithGradeControlValue;
 
@@ -59,6 +61,16 @@ int main() {
     }
 
     // --- The exact float -> EffectParamValue boundary ----------------------
+    {
+        const EffectParamValue opacity = QuantizeClipOpacity(0.4254f);
+        Check(opacity.num == 425 && opacity.den == 1000,
+              "clip opacity quantizes deterministically to 1/1000");
+        Check(CurrentClipOpacity(opacity) == 0.425f,
+              "clip opacity reads back through the render float boundary");
+        Check(QuantizeClipOpacity(-1.0f).num == 0 &&
+                  QuantizeClipOpacity(2.0f).num == 1000,
+              "clip opacity clamps to the canonical [0, 1] range");
+    }
     {
         const ui::inspector::GradeControlSpec* exposure =
             FindGradeControlSpec("color.exposure");

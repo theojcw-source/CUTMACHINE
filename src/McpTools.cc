@@ -1,7 +1,9 @@
 #include "McpTools.h"
 
 #include "Document.h"
+#include "EditLog.h"
 #include "RationalTime.h"
+#include "Subtitles.h"
 #include "Ulid.h"
 
 #include <algorithm>
@@ -47,6 +49,11 @@ std::string BoolSchema(const std::string& description) {
 std::string IntSchema(const std::string& description) {
     return "{\"type\":\"integer\",\"description\":\"" + Esc(description) +
            "\"}";
+}
+
+std::string PositiveIntSchema(const std::string& description) {
+    return "{\"type\":\"integer\",\"minimum\":1,\"description\":\"" +
+           Esc(description) + "\"}";
 }
 
 std::string EnumSchema(const std::vector<std::string>& values,
@@ -628,6 +635,38 @@ bool DispatchMoveLinkedClips(McpBackend& backend, const IdResolver& resolver,
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
+bool DispatchMoveClips(McpBackend& backend, const IdResolver& resolver,
+                       const Value& args, std::string& resultJson,
+                       std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"moves"};
+    if (!CheckKnownKeys(args, kAllowed, "move_clips", message))
+        return Fail(errorName, message, message);
+    MoveClipsOperation op;
+    const Value* moves = args.Find("moves");
+    if (!moves || !moves->IsArray() || moves->AsArray().size() < 2)
+        return Fail(errorName, message,
+                    "'move_clips.moves' must contain at least two items");
+    for (size_t index = 0; index < moves->AsArray().size(); ++index) {
+        const Value& item = moves->AsArray()[index];
+        const std::string path =
+            "move_clips.moves[" + std::to_string(index) + "]";
+        static const std::vector<std::string> kMoveKeys = {
+            "clip_id", "track_id", "timeline_in"};
+        if (!CheckKnownKeys(item, kMoveKeys, path, message))
+            return Fail(errorName, message, message);
+        LinkedClipMove move;
+        if (!ReadId(item, "clip_id", path, resolver, true, move.clip_id,
+                    message) ||
+            !ReadId(item, "track_id", path, resolver, true, move.track_id,
+                    message) ||
+            !ReadTime(item, "timeline_in", path, true, move.timeline_in,
+                      message))
+            return Fail(errorName, message, message);
+        op.moves.push_back(move);
+    }
+    return backend.ApplyOperation(op, resultJson, errorName, message);
+}
+
 bool DispatchTrimLinkedClips(McpBackend& backend, const IdResolver& resolver,
                              const Value& args, std::string& resultJson,
                              std::string& errorName, std::string& message) {
@@ -659,6 +698,99 @@ bool DispatchTrimLinkedClips(McpBackend& backend, const IdResolver& resolver,
         op.trims.push_back(trim);
     }
     return backend.ApplyOperation(op, resultJson, errorName, message);
+}
+
+bool DispatchShortenLinkedClip(McpBackend& backend, const IdResolver& resolver,
+                               const Value& args, std::string& resultJson,
+                               std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {
+        "clip_id", "edge", "amount", "unit", "preview"};
+    if (!CheckKnownKeys(args, kAllowed, "shorten_linked_clip", message))
+        return Fail(errorName, message, message);
+
+    Ulid clipId;
+    TrimEdge edge = TrimEdge::Tail;
+    int64_t amount = 0;
+    std::string unit;
+    bool preview = false;
+    if (!ReadId(args, "clip_id", "shorten_linked_clip", resolver, true, clipId,
+                message) ||
+        !ReadEdge(args, "edge", "shorten_linked_clip", edge, message) ||
+        !ReadInt64(args, "amount", "shorten_linked_clip", true, 0, amount,
+                   message) ||
+        !ReadString(args, "unit", "shorten_linked_clip", true, "", unit,
+                    message) ||
+        !ReadBool(args, "preview", "shorten_linked_clip", false, preview,
+                  message))
+        return Fail(errorName, message, message);
+    if (amount <= 0)
+        return Fail(errorName, message,
+                    "'shorten_linked_clip.amount' must be positive");
+
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    const DocumentClip* anchor = document.FindClip(clipId);
+    if (!anchor)
+        return Fail(errorName, message,
+                    "'shorten_linked_clip.clip_id' is not a clip");
+    if (anchor->link_group_id.empty())
+        return Fail(errorName, message,
+                    "'shorten_linked_clip.clip_id' is not A/V-linked");
+
+    RationalTime magnitude;
+    if (unit == "Seconds") {
+        magnitude = {amount, 1};
+    } else if (unit == "Frames") {
+        if (document.sequence.frame_rate.num <= 0 ||
+            document.sequence.frame_rate.den <= 0)
+            return Fail(errorName, message,
+                        "the sequence frame rate must be positive");
+        const __int128 ticks =
+            static_cast<__int128>(amount) * document.sequence.frame_rate.den;
+        if (ticks > std::numeric_limits<int64_t>::max())
+            return Fail(errorName, message,
+                        "'shorten_linked_clip.amount' overflows RationalTime");
+        magnitude = {static_cast<int64_t>(ticks),
+                     document.sequence.frame_rate.num};
+    } else {
+        return Fail(errorName, message,
+                    "'shorten_linked_clip.unit' must be 'Frames' or 'Seconds'");
+    }
+    if (edge == TrimEdge::Tail) magnitude.value = -magnitude.value;
+
+    TrimLinkedClipsOperation operation;
+    operation.link_group_id = anchor->link_group_id;
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        for (const DocumentClip& clip : track.clips) {
+            if (clip.link_group_id == operation.link_group_id)
+                operation.trims.push_back({clip.id, edge, magnitude});
+        }
+    }
+    if (operation.trims.size() < 2)
+        return Fail(errorName, message,
+                    "the linked group has fewer than two members");
+
+    if (!preview)
+        return backend.ApplyOperation(operation, resultJson, errorName,
+                                      message);
+
+    Document candidate = document;
+    EditLog previewLog;
+    EditError previewError = EditError::None;
+    std::string previewMessage;
+    Operation previewOperation = operation;
+    if (!previewLog.Apply(candidate, previewOperation, previewError,
+                          previewMessage)) {
+        errorName = EditErrorName(previewError);
+        message = previewMessage;
+        return false;
+    }
+    resultJson = "{\"ok\":true,\"preview\":true,\"operation\":" +
+                 SerializeOperation(operation) + "}";
+    return true;
 }
 
 bool DispatchRippleTrim(McpBackend& backend, const IdResolver& resolver,
@@ -896,6 +1028,34 @@ bool DispatchAddTrack(McpBackend& backend, const IdResolver&, const Value& args,
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
+bool DispatchImportSrt(McpBackend& backend, const IdResolver&,
+                       const Value& args, std::string& resultJson,
+                       std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"path", "index"};
+    if (!CheckKnownKeys(args, kAllowed, "import_srt", message))
+        return Fail(errorName, message, message);
+    std::string path;
+    int64_t index = -1;
+    if (!ReadString(args, "path", "import_srt", true, "", path, message) ||
+        !ReadInt64(args, "index", "import_srt", false, -1, index, message))
+        return Fail(errorName, message, message);
+    Document document;
+    if (!backend.SnapshotDocument(document, message))
+        return Fail(errorName, message, message);
+    if (index < 0) {
+        index = 0;
+        for (const DocumentTrack& track : document.sequence.tracks)
+            index = std::max(index, static_cast<int64_t>(track.index) + 1);
+    }
+    if (index > std::numeric_limits<int32_t>::max())
+        return Fail(errorName, message, "'import_srt.index' is out of range");
+    std::vector<SubtitleCue> cues;
+    if (!LoadSrt(path, cues, message)) return Fail(errorName, message, message);
+    return backend.ApplyOperation(
+        BuildSubtitleTrackEdit(cues, static_cast<int32_t>(index)), resultJson,
+        errorName, message);
+}
+
 bool DispatchRemoveTrack(McpBackend& backend, const IdResolver& resolver,
                          const Value& args, std::string& resultJson,
                          std::string& errorName, std::string& message) {
@@ -983,6 +1143,36 @@ bool DispatchUpdateSequence(McpBackend& backend, const IdResolver& resolver,
     if (op.frame_rate.den <= 0 || op.frame_rate.num <= 0)
         return Fail(errorName, message,
                     "'update_sequence.frame_rate' must be positive");
+    return backend.ApplyOperation(op, resultJson, errorName, message);
+}
+
+bool DispatchSetColorManagement(McpBackend& backend, const IdResolver& resolver,
+                                const Value& args, std::string& resultJson,
+                                std::string& errorName, std::string& message) {
+    (void)resolver;
+    static const std::vector<std::string> kAllowed = {
+        "enabled",     "input_gamut",   "input_transfer", "input_ycbcr_matrix",
+        "input_range", "working_gamut", "output_gamut",   "output_transfer"};
+    if (!CheckKnownKeys(args, kAllowed, "set_color_management", message))
+        return Fail(errorName, message, message);
+    SetColorManagementOperation op;
+    if (!ReadBool(args, "enabled", "set_color_management", false,
+                  op.settings.enabled, message) ||
+        !ReadString(args, "input_gamut", "set_color_management", true, "",
+                    op.settings.input_gamut, message) ||
+        !ReadString(args, "input_transfer", "set_color_management", true, "",
+                    op.settings.input_transfer, message) ||
+        !ReadString(args, "input_ycbcr_matrix", "set_color_management", true,
+                    "", op.settings.input_ycbcr_matrix, message) ||
+        !ReadString(args, "input_range", "set_color_management", true, "",
+                    op.settings.input_range, message) ||
+        !ReadString(args, "working_gamut", "set_color_management", true, "",
+                    op.settings.working_gamut, message) ||
+        !ReadString(args, "output_gamut", "set_color_management", true, "",
+                    op.settings.output_gamut, message) ||
+        !ReadString(args, "output_transfer", "set_color_management", true, "",
+                    op.settings.output_transfer, message))
+        return Fail(errorName, message, message);
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
@@ -1243,6 +1433,23 @@ bool DispatchSetClipEffects(McpBackend& backend, const IdResolver& resolver,
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
+bool DispatchSetClipOpacity(McpBackend& backend, const IdResolver& resolver,
+                            const Value& args, std::string& resultJson,
+                            std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"clip_id", "opacity"};
+    if (!CheckKnownKeys(args, kAllowed, "set_clip_opacity", message))
+        return Fail(errorName, message, message);
+    SetClipOpacityOperation op;
+    if (!ReadId(args, "clip_id", "set_clip_opacity", resolver, true, op.clip_id,
+                message))
+        return Fail(errorName, message, message);
+    const Value* opacity = args.Find("opacity");
+    if (!opacity || !ReadFractionValue(*opacity, "set_clip_opacity.opacity",
+                                       op.opacity.num, op.opacity.den, message))
+        return Fail(errorName, message, message);
+    return backend.ApplyOperation(op, resultJson, errorName, message);
+}
+
 bool DispatchAddCaptionStyle(McpBackend& backend, const IdResolver&,
                              const Value& args, std::string& resultJson,
                              std::string& errorName, std::string& message) {
@@ -1310,6 +1517,65 @@ bool DispatchDescribe(McpBackend& backend, const IdResolver&, const Value& args,
         return false;
     }
     return true;
+}
+
+bool DispatchGetTimelineTranscript(McpBackend& backend, const IdResolver&,
+                                   const Value& args, std::string& resultJson,
+                                   std::string& errorName,
+                                   std::string& message) {
+    if (!CheckKnownKeys(args, {}, "get_timeline_transcript", message))
+        return Fail(errorName, message, message);
+    if (!backend.ReadTimelineTranscript(resultJson, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    return true;
+}
+
+bool DispatchCreateInterviewShort(McpBackend& backend,
+                                  const IdResolver& resolver, const Value& args,
+                                  std::string& resultJson,
+                                  std::string& errorName,
+                                  std::string& message) {
+    static const std::vector<std::string> kAllowed = {"name", "segments"};
+    if (!CheckKnownKeys(args, kAllowed, "create_interview_short", message))
+        return Fail(errorName, message, message);
+    CreateProjectTimelineFromSegmentsOperation operation;
+    if (!ReadString(args, "name", "create_interview_short", false,
+                    "Short interview — 60 s", operation.name, message))
+        return Fail(errorName, message, message);
+    const Value* segments = args.Find("segments");
+    if (!segments || !segments->IsArray() || segments->AsArray().empty())
+        return Fail(errorName, message,
+                    "'create_interview_short.segments' must be a non-empty "
+                    "array");
+    for (size_t index = 0; index < segments->AsArray().size(); ++index) {
+        const Value& value = segments->AsArray()[index];
+        const std::string path =
+            "create_interview_short.segments[" + std::to_string(index) + "]";
+        if (!CheckKnownKeys(value, {"source_id", "source_in", "duration"}, path,
+                            message))
+            return Fail(errorName, message, message);
+        std::string sourceInput;
+        ProjectTimelineSourceSegment segment;
+        if (!ReadString(value, "source_id", path, true, "", sourceInput,
+                        message) ||
+            !resolver.Resolve(path + ".source_id", sourceInput,
+                              segment.source_id, message) ||
+            !ReadTime(value, "source_in", path, true, segment.source_in,
+                      message) ||
+            !ReadTime(value, "duration", path, true, segment.duration, message))
+            return Fail(errorName, message, message);
+        operation.segments.push_back(std::move(segment));
+    }
+    Document document;
+    if (!backend.SnapshotDocument(document, message))
+        return Fail(errorName, message, message);
+    operation.width = document.sequence.width;
+    operation.height = document.sequence.height;
+    operation.frame_rate = document.sequence.frame_rate;
+    return backend.ApplyProjectEdit(std::move(operation), resultJson, errorName,
+                                    message);
 }
 
 bool DispatchUndo(McpBackend& backend, const IdResolver&, const Value& args,
@@ -1394,6 +1660,23 @@ McpToolRegistry::McpToolRegistry() {
             .Field("timeline_in", kTimeSchemaText, true)
             .Build("move_clip arguments"),
         DispatchMoveClip);
+
+    add("move_clips",
+        "Move an arbitrary selection of clips atomically, preserving every "
+        "clip ID and using one undo step.",
+        SchemaBuilder()
+            .Field("moves",
+                   ArraySchema(
+                       "{\"type\":\"object\",\"properties\":{\"clip_id\":" +
+                           IdSchema("") + ",\"track_id\":" + IdSchema("") +
+                           ",\"timeline_in\":" + std::string(kTimeSchemaText) +
+                           "},\"required\":[\"clip_id\",\"track_id\","
+                           "\"timeline_in\"],\"additionalProperties\":false}",
+                       "One exact destination per selected clip (at least "
+                       "two)."),
+                   true)
+            .Build("move_clips arguments"),
+        DispatchMoveClips);
 
     add("split_clip",
         "Split one clip into two at an exact timeline position strictly "
@@ -1484,6 +1767,28 @@ McpToolRegistry::McpToolRegistry() {
                    true)
             .Build("trim_linked_clips arguments"),
         DispatchTrimLinkedClips);
+
+    add("shorten_linked_clip",
+        "Shorten one A/V-linked plan by an editing amount. Prefer this over "
+        "trim_linked_clips when the user says to remove N frames or seconds: "
+        "CUTMACHINE resolves every linked member and computes the edge sign "
+        "and exact RationalTime deterministically. Set preview=true to "
+        "validate and return the resolved operation without changing the "
+        "project.",
+        SchemaBuilder()
+            .Field("clip_id",
+                   IdSchema("Any video or audio member of the linked plan."),
+                   true)
+            .Field("edge", EnumSchema({"Head", "Tail"}, "Edge to shorten."),
+                   true)
+            .Field("amount", PositiveIntSchema("Positive editing amount."),
+                   true)
+            .Field("unit", EnumSchema({"Frames", "Seconds"}, "Amount unit."),
+                   true)
+            .Field("preview",
+                   BoolSchema("Validate without modifying the project."), false)
+            .Build("shorten_linked_clip arguments"),
+        DispatchShortenLinkedClip);
 
     add("ripple_trim",
         "Trim one clip's edge and shift every downstream clip on its track "
@@ -1606,9 +1911,12 @@ McpToolRegistry::McpToolRegistry() {
         DispatchPasteClips);
 
     add("add_track",
-        "Append a new, empty video or audio track at an unused index.",
+        "Append a new, empty video, audio or caption track at an unused "
+        "index.",
         SchemaBuilder()
-            .Field("kind", EnumSchema({"video", "audio"}, "Track kind."), true)
+            .Field("kind",
+                   EnumSchema({"video", "audio", "caption"}, "Track kind."),
+                   true)
             .Field("index", IntSchema("Unique, non-negative track index."),
                    true)
             .Field("locked", BoolSchema("Start the track locked."), false)
@@ -1621,6 +1929,17 @@ McpToolRegistry::McpToolRegistry() {
             .Field("solo", BoolSchema("Initial audio solo state."), false)
             .Build("add_track arguments"),
         DispatchAddTrack);
+
+    add("import_srt",
+        "Import a SubRip file as one exact, reversible caption track.",
+        SchemaBuilder()
+            .Field("path", StringSchema("Path to the UTF-8 .srt file."), true)
+            .Field(
+                "index",
+                IntSchema("Optional unique track index; appends by default."),
+                false)
+            .Build("import_srt arguments"),
+        DispatchImportSrt);
 
     add("remove_track", "Remove a track and every clip on it.",
         SchemaBuilder()
@@ -1665,6 +1984,40 @@ McpToolRegistry::McpToolRegistry() {
             .Field("frame_rate", kFractionSchemaText, true)
             .Build("update_sequence arguments"),
         DispatchUpdateSequence);
+
+    add("set_color_management",
+        "Configure the pinned OpenColorIO input, working, and output pipeline.",
+        SchemaBuilder()
+            .Field("enabled", BoolSchema("Enable project color management."),
+                   false)
+            .Field("input_gamut",
+                   EnumSchema({"rec709", "sony_sgamut3_cine", "sony_sgamut3",
+                               "rec2020"},
+                              "Source RGB primaries."),
+                   true)
+            .Field("input_transfer",
+                   EnumSchema({"rec709", "sony_slog3", "linear"},
+                              "Source transfer function."),
+                   true)
+            .Field("input_ycbcr_matrix",
+                   EnumSchema({"auto", "bt709", "bt2020_ncl"},
+                              "YUV decoding matrix."),
+                   true)
+            .Field(
+                "input_range",
+                EnumSchema({"auto", "full", "limited"}, "Input signal range."),
+                true)
+            .Field("working_gamut",
+                   EnumSchema({"acescct", "rec2020", "rec709"},
+                              "Creative grading working space."),
+                   true)
+            .Field("output_gamut",
+                   EnumSchema({"rec709", "rec2020"}, "Delivery RGB primaries."),
+                   true)
+            .Field("output_transfer",
+                   EnumSchema({"rec709", "hlg"}, "Delivery transfer."), true)
+            .Build("set_color_management arguments"),
+        DispatchSetColorManagement);
 
     add("add_bin",
         "Create a new media bin, optionally nested under an existing one.",
@@ -1814,6 +2167,14 @@ McpToolRegistry::McpToolRegistry() {
             .Build("set_clip_effects arguments"),
         DispatchSetClipEffects);
 
+    add("set_clip_opacity",
+        "Set a video clip's compositing opacity as an exact fraction.",
+        SchemaBuilder()
+            .Field("clip_id", IdSchema("Video clip to update."), true)
+            .Field("opacity", kFractionSchemaText, true)
+            .Build("set_clip_opacity arguments"),
+        DispatchSetClipOpacity);
+
     add("add_caption_style", "Add a new caption style to the sequence.",
         SchemaBuilder()
             .Field("font_family", StringSchema("Font family name."), false)
@@ -1855,6 +2216,33 @@ McpToolRegistry::McpToolRegistry() {
         "Return the same JSON snapshot of the project as `--describe`: "
         "sequence, tracks, clips, sources, library, bins and markers.",
         SchemaBuilder().Build("describe takes no arguments"), DispatchDescribe);
+
+    add("get_timeline_transcript",
+        "Read the cached transcript of audible clips as selectable semantic "
+        "spans. Call this before planning an interview edit; copy source_id, "
+        "source_in and duration exactly from its spans.",
+        SchemaBuilder().Build("get_timeline_transcript takes no arguments"),
+        DispatchGetTimelineTranscript);
+
+    const std::string segmentSchema =
+        "{\"type\":\"object\",\"properties\":{\"source_id\":" +
+        IdSchema("Source copied from a transcript span.") +
+        ",\"source_in\":" + kTimeSchemaText +
+        ",\"duration\":" + kTimeSchemaText +
+        "},\"required\":[\"source_id\",\"source_in\",\"duration\"],"
+        "\"additionalProperties\":false}";
+    add("create_interview_short",
+        "Create and activate a new timeline from transcript ranges, leaving "
+        "the original timeline unchanged. Preserve exact span values and "
+        "order them as hook, concise development, then payoff.",
+        SchemaBuilder()
+            .Field("name", StringSchema("Name of the new timeline."), false)
+            .Field("segments",
+                   ArraySchema(segmentSchema,
+                               "Transcript spans in final editorial order."),
+                   true)
+            .Build("create_interview_short arguments"),
+        DispatchCreateInterviewShort);
 
     add("undo",
         "Undo the most recently applied operation on the active timeline, "

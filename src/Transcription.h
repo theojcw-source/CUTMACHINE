@@ -71,9 +71,9 @@ bool GenerateAudioTranscript(const std::string& inputPath,
                              MediaTaskContext& context, std::string& error);
 
 // Loads a transcript previously written by GenerateAudioTranscript. Rejects
-// (rather than silently repairing) a cache file with out-of-order or
-// zero/negative-duration words: a hand-edited or corrupted cache must not be
-// read as if it were exact.
+// genuinely out-of-order input, while deterministically folding legacy
+// zero-frame and outward-rounding collisions into neighboring words. Every
+// returned word is therefore exact, positive and non-overlapping.
 bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
                          std::string& error);
 

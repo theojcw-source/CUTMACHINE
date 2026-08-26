@@ -5,6 +5,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 }
 
 #include <algorithm>
@@ -27,6 +28,8 @@ struct MediaSource::Impl {
     int streamIndex = -1;
     AVPacket* packet = nullptr;
     AVFrame* frame = nullptr;
+    AVFrame* planarAlphaFrame = nullptr;
+    SwsContext* alphaConversion = nullptr;
     AVRational frameRate = {0, 1};
     int64_t frameCount = 0;
     bool draining = false;
@@ -35,6 +38,8 @@ struct MediaSource::Impl {
 MediaSource::MediaSource() : impl_(new Impl()) {}
 
 MediaSource::~MediaSource() {
+    sws_freeContext(impl_->alphaConversion);
+    av_frame_free(&impl_->planarAlphaFrame);
     av_frame_free(&impl_->frame);
     av_packet_free(&impl_->packet);
     avcodec_free_context(&impl_->decoder);
@@ -104,13 +109,16 @@ bool MediaSource::Open(const std::string& path, int threadCount,
 
     impl_->packet = av_packet_alloc();
     impl_->frame = av_frame_alloc();
-    if (!impl_->packet || !impl_->frame) {
+    impl_->planarAlphaFrame = av_frame_alloc();
+    if (!impl_->packet || !impl_->frame || !impl_->planarAlphaFrame) {
         std::fprintf(stderr, "Unable to allocate FFmpeg packet/frame\n");
         return false;
     }
 
-    impl_->frameRate =
-        av_guess_frame_rate(impl_->format, impl_->stream, nullptr);
+    // Ingest persists avg_frame_rate as the exact source time basis. Using
+    // av_guess_frame_rate here can replace it with a nominal rate for VFR
+    // phone footage, making the same media fail its own reopen check.
+    impl_->frameRate = impl_->stream->avg_frame_rate;
     if (impl_->frameRate.num <= 0 || impl_->frameRate.den <= 0) {
         std::fprintf(stderr, "Unable to determine video frame rate\n");
         return false;
@@ -206,7 +214,53 @@ bool MediaSource::DecodeNextFrame(const AVFrame*& outFrame, int64_t& outPts) {
             if (outPts == AV_NOPTS_VALUE) {
                 outPts = impl_->frame->pts;
             }
-            outFrame = impl_->frame;
+            const AVPixFmtDescriptor* pixel = av_pix_fmt_desc_get(
+                static_cast<AVPixelFormat>(impl_->frame->format));
+            const bool hasAlpha = pixel && pixel->nb_components >= 4 &&
+                                  (pixel->flags & AV_PIX_FMT_FLAG_ALPHA);
+            const bool planar = hasAlpha &&
+                                pixel->comp[0].plane != pixel->comp[1].plane &&
+                                pixel->comp[0].plane != pixel->comp[2].plane &&
+                                pixel->comp[1].plane != pixel->comp[2].plane &&
+                                pixel->comp[3].plane != pixel->comp[0].plane &&
+                                pixel->comp[3].plane != pixel->comp[1].plane &&
+                                pixel->comp[3].plane != pixel->comp[2].plane;
+            if (hasAlpha && !planar) {
+                // ALPHA-2026-08 -- Metal consumes separate component planes.
+                // Packed PNG/WebP frames are normalized to planar GBR+A here;
+                // RGB values remain untransformed until the project's OCIO
+                // input stage and the alpha plane stays independent.
+                av_frame_unref(impl_->planarAlphaFrame);
+                impl_->planarAlphaFrame->format = AV_PIX_FMT_GBRAP16LE;
+                impl_->planarAlphaFrame->width = impl_->frame->width;
+                impl_->planarAlphaFrame->height = impl_->frame->height;
+                if (av_frame_get_buffer(impl_->planarAlphaFrame, 64) < 0) {
+                    std::fprintf(stderr,
+                                 "Unable to allocate planar alpha frame\n");
+                    return false;
+                }
+                impl_->alphaConversion = sws_getCachedContext(
+                    impl_->alphaConversion, impl_->frame->width,
+                    impl_->frame->height,
+                    static_cast<AVPixelFormat>(impl_->frame->format),
+                    impl_->frame->width, impl_->frame->height,
+                    AV_PIX_FMT_GBRAP16LE, SWS_POINT, nullptr, nullptr, nullptr);
+                if (!impl_->alphaConversion ||
+                    sws_scale(impl_->alphaConversion, impl_->frame->data,
+                              impl_->frame->linesize, 0, impl_->frame->height,
+                              impl_->planarAlphaFrame->data,
+                              impl_->planarAlphaFrame->linesize) !=
+                        impl_->frame->height ||
+                    av_frame_copy_props(impl_->planarAlphaFrame, impl_->frame) <
+                        0) {
+                    std::fprintf(stderr,
+                                 "Unable to normalize packed alpha frame\n");
+                    return false;
+                }
+                outFrame = impl_->planarAlphaFrame;
+            } else {
+                outFrame = impl_->frame;
+            }
             return true;
         }
         if (result == AVERROR_EOF) {

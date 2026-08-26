@@ -80,6 +80,8 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
                                valueLabel:(NSTextField* __strong*)outValueLabel;
 - (void)cmLayoutForSize:(NSSize)size;
 - (void)cmGradeSliderChanged:(NSSlider*)sender;
+- (void)cmOpacitySliderChanged:(NSSlider*)sender;
+- (void)cmCommitOpacity:(float)value;
 - (void)cmScheduleGradeCommitAtIndex:(NSInteger)index value:(float)value;
 - (void)cmCommitGradeAtIndex:(NSInteger)index value:(float)value;
 - (void)cmInvalidateAllGradeTimers;
@@ -92,6 +94,7 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
     // ui::inspector::WithGradeControlValue (InspectorGradeControls.h),
     // never a direct mutation -- see the file comment in InspectorView.h.
     std::vector<ClipEffect> _effects;
+    EffectParamValue _opacity;
 
     NSTextField* _placeholderLabel;
     NSView* _body;  // Everything else; hidden while _placeholderLabel shows.
@@ -104,6 +107,10 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
     NSTextField* _trackValueField;
     NSTextField* _startValueField;
     NSTextField* _durationValueField;
+    CMControlRowView* _opacityRow;
+    NSSlider* _opacitySlider;
+    NSTextField* _opacityValueLabel;
+    NSTimer* _opacityDebounceTimer;
 
     NSMutableArray<NSSlider*>* _gradeSliders;
     NSMutableArray<NSTextField*>* _gradeValueLabels;
@@ -123,6 +130,7 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
 - (instancetype)initWithFrame:(NSRect)frame {
     if ((self = [super initWithFrame:frame])) {
         _clipId = Ulid{};
+        _opacity = {1, 1};
 
         _placeholderLabel =
             [NSTextField labelWithString:@"Aucun clip sélectionné"];
@@ -146,6 +154,20 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
                                          valueField:&_startValueField];
         _durationRow = [self cmAddPropertyRowWithLabel:@"Durée"
                                             valueField:&_durationValueField];
+
+        NSTextField* compositionHeader = CMMakeSectionHeader(@"Composition");
+        [_body addSubview:compositionHeader];
+        _opacityRow = [[CMControlRowView alloc] initWithFrame:NSZeroRect
+                                                    labelText:@"Opacité"];
+        _opacitySlider = CMMakeStyledSlider(0.0, 1.0, self,
+                                            @selector(cmOpacitySliderChanged:));
+        _opacitySlider.continuous = YES;
+        _opacitySlider.autoresizingMask =
+            NSViewWidthSizable | NSViewHeightSizable;
+        _opacitySlider.frame = _opacityRow.controlContainer.bounds;
+        [_opacityRow.controlContainer addSubview:_opacitySlider];
+        _opacityValueLabel = _opacityRow.valueLabel;
+        [_body addSubview:_opacityRow];
 
         NSTextField* gradeHeader =
             CMMakeSectionHeader(@"Correction colorimétrique");
@@ -179,6 +201,10 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
         _layoutItems.push_back({_startRow, CGF(ui::theme::kControlRowHeight)});
         _layoutItems.push_back(
             {_durationRow, CGF(ui::theme::kControlRowHeight)});
+        _layoutItems.push_back({nil, CGF(ui::theme::kSpaceM)});  // spacer
+        _layoutItems.push_back({compositionHeader, kSectionHeaderHeight});
+        _layoutItems.push_back(
+            {_opacityRow, CGF(ui::theme::kControlRowHeight)});
         _layoutItems.push_back({nil, CGF(ui::theme::kSpaceM)});  // spacer
         _layoutItems.push_back({gradeHeader, kSectionHeaderHeight});
         for (CMControlRowView* row : gradeRows)
@@ -292,6 +318,7 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
     if (!clip) {
         _clipId = Ulid{};
         _effects.clear();
+        _opacity = {1, 1};
         _placeholderLabel.hidden = NO;
         _body.hidden = YES;
         return;
@@ -299,6 +326,7 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
 
     _clipId = clipId;
     _effects = clip->effects;
+    _opacity = clip->opacity;
     _placeholderLabel.hidden = YES;
     _body.hidden = NO;
 
@@ -315,6 +343,11 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
     } else {
         _trackValueField.stringValue = @"—";
     }
+    const float opacity = ui::inspector::CurrentClipOpacity(_opacity);
+    _opacitySlider.floatValue = opacity;
+    _opacitySlider.enabled = track && track->kind == "video";
+    _opacityValueLabel.stringValue =
+        [NSString stringWithFormat:@"%.0f %%", opacity * 100.0f];
 
     const MediaRate rate = document.sequence.frame_rate;
     _startValueField.stringValue =
@@ -346,6 +379,29 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
     // committed operation is debounced (see below).
     _gradeValueLabels[index].stringValue = CMFormatGradeValue(spec, value);
     [self cmScheduleGradeCommitAtIndex:index value:value];
+}
+
+- (void)cmOpacitySliderChanged:(NSSlider*)sender {
+    const float value = sender.floatValue;
+    _opacityValueLabel.stringValue =
+        [NSString stringWithFormat:@"%.0f %%", value * 100.0f];
+    [_opacityDebounceTimer invalidate];
+    __weak CMInspectorView* weakSelf = self;
+    _opacityDebounceTimer =
+        [NSTimer scheduledTimerWithTimeInterval:kGradeCommitDebounceSeconds
+                                        repeats:NO
+                                          block:^(NSTimer* _Nonnull timer) {
+                                            (void)timer;
+                                            [weakSelf cmCommitOpacity:value];
+                                          }];
+}
+
+- (void)cmCommitOpacity:(float)value {
+    _opacityDebounceTimer = nil;
+    if (_clipId.empty() || !self.delegate) return;
+    _opacity = ui::inspector::QuantizeClipOpacity(value);
+    [self.delegate inspectorView:self
+            didCommitClipOpacity:SetClipOpacityOperation{_clipId, _opacity}];
 }
 
 - (void)cmScheduleGradeCommitAtIndex:(NSInteger)index value:(float)value {
@@ -389,6 +445,8 @@ NSString* CMFormatGradeValue(const ui::inspector::GradeControlSpec& spec,
 }
 
 - (void)cmInvalidateAllGradeTimers {
+    [_opacityDebounceTimer invalidate];
+    _opacityDebounceTimer = nil;
     for (NSUInteger index = 0; index < _gradeDebounceTimers.count; ++index) {
         id timer = _gradeDebounceTimers[index];
         if ([timer isKindOfClass:[NSTimer class]]) [(NSTimer*)timer invalidate];

@@ -46,6 +46,14 @@ long double Seconds(const RationalTime& time) {
     return static_cast<long double>(time.value) / time.rate;
 }
 
+long double ZoomBarRulerSeconds(long double durationSeconds,
+                                long double visibleSeconds) {
+    // Once the whole program is visible, retain one additional viewport of
+    // virtual space. The thumb stays movable instead of filling the rail.
+    return durationSeconds > visibleSeconds ? durationSeconds
+                                            : visibleSeconds * 2.0L;
+}
+
 int64_t RoundNonNegativeRatio(__int128 numerator, __int128 denominator) {
     if (numerator < 0 || denominator <= 0)
         throw std::invalid_argument("invalid playhead quantization ratio");
@@ -152,7 +160,9 @@ void TimelineViewport::ZoomAroundX(double x, double factor, int32_t rate) {
     if (!std::isfinite(factor) || factor <= 0.0)
         throw std::invalid_argument("zoom factor must be positive");
     const RationalTime anchor = XToTime(x, rate);
-    pixels_per_second = std::clamp(pixels_per_second * factor, 4.0, 4000.0);
+    pixels_per_second =
+        std::clamp(pixels_per_second * factor, kTimelineMinPixelsPerSecond,
+                   kTimelineMaxPixelsPerSecond);
     const RationalTime displaced = XToTime(x, rate);
     view_start = view_start.add(anchor.sub(displaced));
     ClampViewportStartToZero(*this);
@@ -172,7 +182,8 @@ void TimelineViewport::FitDuration(RationalTime duration, double width) {
         static_cast<long double>(duration.value) / duration.rate;
     const long double available = std::max(1.0, width - header_width - 24.0);
     pixels_per_second =
-        std::clamp(static_cast<double>(available / seconds), 4.0, 4000.0);
+        std::clamp(static_cast<double>(available / seconds),
+                   kTimelineMinPixelsPerSecond, kTimelineMaxPixelsPerSecond);
 }
 
 TimelineScrollIntent ResolveTimelineScrollIntent(double deltaX, double deltaY,
@@ -213,7 +224,8 @@ TimelineZoomBarGeometry CalculateTimelineZoomBarGeometry(
     const long double durationSeconds = std::max(0.0L, Seconds(duration));
     const long double visibleSeconds =
         geometry.rail_width / viewport.pixels_per_second;
-    const long double rulerSeconds = std::max(durationSeconds, visibleSeconds);
+    const long double rulerSeconds =
+        ZoomBarRulerSeconds(durationSeconds, visibleSeconds);
     if (rulerSeconds <= 0.0L) return geometry;
 
     const double rawWidth = geometry.rail_width *
@@ -246,8 +258,9 @@ void UpdateTimelineZoomBarDrag(TimelineViewport& viewport,
         const double travel = geometry.rail_width - geometry.thumb_width;
         const long double visibleSeconds =
             geometry.rail_width / viewport.pixels_per_second;
-        const long double maximumStart =
-            std::max(0.0L, Seconds(duration) - visibleSeconds);
+        const long double maximumStart = std::max(
+            0.0L, ZoomBarRulerSeconds(Seconds(duration), visibleSeconds) -
+                      visibleSeconds);
         if (travel <= 0.0 || maximumStart <= 0.0L) return;
         const long double initialStart = Seconds(viewport.view_start);
         const long double requested =
@@ -267,12 +280,11 @@ void UpdateTimelineZoomBarDrag(TimelineViewport& viewport,
     } else {
         requestedWidth += delta;
     }
-    requestedWidth =
-        std::clamp(requestedWidth, minimumWidth, geometry.rail_width);
-    if (requestedWidth >= geometry.rail_width - 0.5) {
-        viewport.FitDuration(duration, width);
-        return;
-    }
+    // Keep following the pointer beyond the physical rail. Clamping the
+    // requested width to the rail used to turn the rightmost position into a
+    // hard "fit duration" stop, which made the bottom bar unable to zoom out
+    // further even though wheel and magnify gestures still could.
+    requestedWidth = std::max(requestedWidth, minimumWidth);
     if (geometry.thumb_width <= 0.0) return;
     viewport.ZoomAroundX(anchorX, geometry.thumb_width / requestedWidth, rate);
 }
@@ -323,7 +335,13 @@ std::vector<const DocumentTrack*> TimelineTracksInDisplayOrder(
         tracks.push_back(&track);
     std::stable_sort(tracks.begin(), tracks.end(),
                      [](const DocumentTrack* a, const DocumentTrack* b) {
-                         if (a->kind != b->kind) return a->kind == "video";
+                         const auto rank = [](const std::string& kind) {
+                             if (kind == "caption") return 0;
+                             if (kind == "video") return 1;
+                             return 2;
+                         };
+                         if (a->kind != b->kind)
+                             return rank(a->kind) < rank(b->kind);
                          // Like Resolve: the highest video layer is displayed
                          // at the top, while audio counts downward from A1.
                          return a->kind == "video" ? a->index > b->index
@@ -554,12 +572,16 @@ void TimelineInteraction::PointerDown(double x, double y, double width,
     }
     if (trim_mode_ == TimelineTrimMode::Slip) hit->edge = TimelineHitEdge::None;
     selected_gap_.reset();
-    selected_clip_id_ = hit->clip_id;
+    const bool preserveSelection =
+        hit->edge == TimelineHitEdge::None && selected_clip_ids_.size() > 1 &&
+        std::find(selected_clip_ids_.begin(), selected_clip_ids_.end(),
+                  hit->clip_id) != selected_clip_ids_.end();
+    selected_clip_id_ = preserveSelection ? Ulid{} : hit->clip_id;
     primary_clip_id_ = hit->clip_id;
-    selected_clip_ids_ = {hit->clip_id};
+    if (!preserveSelection) selected_clip_ids_ = {hit->clip_id};
     const DocumentTrack* selectedTrack = document_.FindTrack(hit->track_id);
     if (selectedTrack && selectedTrack->locked) return;
-    if (linked_selection_enabled_) {
+    if (linked_selection_enabled_ && !preserveSelection) {
         std::vector<Ulid> linked =
             ExpandLinkedClipSelection(document_, selected_clip_ids_);
         const bool lockedPartner =
@@ -653,9 +675,19 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
         }
         TimelineMovePreview preview;
         preview.clip_id = clip->id;
-        preview.timeline_in = clip->timeline_in.add(delta);
-        if (preview.timeline_in < RationalTime{0, 1})
-            preview.timeline_in = {0, preview.timeline_in.rate};
+        RationalTime selectionStart = clip->timeline_in;
+        if (selected_clip_ids_.size() > 1) {
+            for (const Ulid& id : selected_clip_ids_) {
+                const DocumentClip* member = document_.FindClip(id);
+                if (member && member->timeline_in < selectionStart)
+                    selectionStart = member->timeline_in;
+            }
+        }
+        const RationalTime zero{0, selectionStart.rate};
+        const RationalTime wallDelta = zero.sub(selectionStart);
+        const RationalTime constrainedDelta =
+            delta < wallDelta ? wallDelta : delta;
+        preview.timeline_in = clip->timeline_in.add(constrainedDelta);
         const auto tracks = TimelineTracksInDisplayOrder(document_);
         if (y >= kTimelineRulerHeight) {
             const size_t index = static_cast<size_t>(std::floor(
@@ -669,38 +701,59 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
             RationalTime unsnapped = preview.timeline_in;
             std::optional<RationalTime> snappedBoundary;
             if ((snapping_enabled_ || playhead_snap_target_) && targetTrack) {
-                const auto startSnap =
-                    FindSnapTime(unsnapped, *targetTrack, clip->id, true);
-                const RationalTime end = unsnapped.add(clip->duration);
-                const auto endSnap = FindSnapTime(end, *targetTrack, clip->id);
-                if (startSnap && endSnap) {
-                    const double startDistance =
-                        std::abs(viewport_.TimeToX(*startSnap) -
-                                 viewport_.TimeToX(unsnapped));
-                    const double endDistance = std::abs(
-                        viewport_.TimeToX(*endSnap) - viewport_.TimeToX(end));
-                    if (startDistance <= endDistance) {
+                const RationalTime selectionCandidate =
+                    selectionStart.add(constrainedDelta);
+                const double wallDistance =
+                    std::abs(viewport_.TimeToX(selectionCandidate) -
+                             viewport_.TimeToX(zero));
+                if (selected_clip_ids_.size() > 1 &&
+                    wallDistance <= kTimelineSnapDistance) {
+                    preview.timeline_in = clip->timeline_in.add(wallDelta);
+                    snappedBoundary = zero;
+                } else {
+                    const auto startSnap =
+                        FindSnapTime(unsnapped, *targetTrack, clip->id, true);
+                    const RationalTime end = unsnapped.add(clip->duration);
+                    const auto endSnap =
+                        FindSnapTime(end, *targetTrack, clip->id);
+                    if (startSnap && endSnap) {
+                        const double startDistance =
+                            std::abs(viewport_.TimeToX(*startSnap) -
+                                     viewport_.TimeToX(unsnapped));
+                        const double endDistance =
+                            std::abs(viewport_.TimeToX(*endSnap) -
+                                     viewport_.TimeToX(end));
+                        if (startDistance <= endDistance) {
+                            preview.timeline_in = *startSnap;
+                            snappedBoundary = startSnap;
+                        } else {
+                            preview.timeline_in = endSnap->sub(clip->duration);
+                            snappedBoundary = endSnap;
+                        }
+                    } else if (startSnap) {
                         preview.timeline_in = *startSnap;
                         snappedBoundary = startSnap;
-                    } else {
+                    } else if (endSnap) {
                         preview.timeline_in = endSnap->sub(clip->duration);
                         snappedBoundary = endSnap;
                     }
-                } else if (startSnap) {
-                    preview.timeline_in = *startSnap;
-                    snappedBoundary = startSnap;
-                } else if (endSnap) {
-                    preview.timeline_in = endSnap->sub(clip->duration);
-                    snappedBoundary = endSnap;
                 }
             }
             const auto buildOperation = [&](RationalTime anchorTimeline) {
                 preview.linked_moves.clear();
                 preview.link_group_id.clear();
-                const bool linked = linked_selection_enabled_ &&
-                                    selected_clip_ids_.size() > 1 &&
-                                    !clip->link_group_id.empty();
-                if (linked) {
+                const bool multiSelection = selected_clip_ids_.size() > 1;
+                const bool linked =
+                    linked_selection_enabled_ && multiSelection &&
+                    !clip->link_group_id.empty() &&
+                    std::all_of(selected_clip_ids_.begin(),
+                                selected_clip_ids_.end(), [&](const Ulid& id) {
+                                    const DocumentClip* member =
+                                        document_.FindClip(id);
+                                    return member && member->link_group_id ==
+                                                         clip->link_group_id;
+                                });
+                if (multiSelection) {
                     const RationalTime groupDelta =
                         anchorTimeline.sub(clip->timeline_in);
                     const DocumentTrack* anchorTrack =
@@ -721,9 +774,7 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
                         const DocumentClip* member = document_.FindClip(id);
                         const DocumentTrack* memberTrack =
                             document_.FindTrackForClip(id);
-                        if (!member || !memberTrack ||
-                            member->link_group_id != clip->link_group_id)
-                            continue;
+                        if (!member || !memberTrack) continue;
                         Ulid destinationTrack;
                         if (trackOffset) {
                             const auto memberOrdinal =
@@ -753,9 +804,13 @@ void TimelineInteraction::UpdatePreview(double x, double y, double width) {
                              member->timeline_in.add(groupDelta)});
                     }
                     if (preview.linked_moves.size() > 1) {
-                        preview.link_group_id = clip->link_group_id;
-                        return Operation{MoveLinkedClipsOperation{
-                            clip->link_group_id, preview.linked_moves, {}}};
+                        if (linked) {
+                            preview.link_group_id = clip->link_group_id;
+                            return Operation{MoveLinkedClipsOperation{
+                                clip->link_group_id, preview.linked_moves, {}}};
+                        }
+                        return Operation{
+                            MoveClipsOperation{preview.linked_moves, {}}};
                     }
                 }
                 return Operation{MoveClipOperation{
@@ -948,7 +1003,8 @@ RationalTime TimelineInteraction::ConstrainTrimDelta(const DocumentClip& clip,
                                                      RationalTime delta) const {
     const DocumentSource* source = document_.FindSource(clip.source_id);
     const DocumentTrack* track = document_.FindTrackForClip(clip.id);
-    if (!source || !track) return delta;
+    if (!track || (!source && track->kind != "caption")) return delta;
+    const bool captionClip = track->kind == "caption";
     const RationalTime zero{0, 1};
     const RationalTime minimumDuration{1, drag_rate_};
     const auto found = std::find_if(
@@ -960,7 +1016,8 @@ RationalTime TimelineInteraction::ConstrainTrimDelta(const DocumentClip& clip,
     RationalTime lower;
     RationalTime upper;
     if (edge == TrimEdge::Head) {
-        lower = MaxTime(zero.sub(clip.source_in), zero.sub(clip.timeline_in));
+        lower = zero.sub(clip.timeline_in);
+        if (!captionClip) lower = MaxTime(lower, zero.sub(clip.source_in));
         if (index > 0) {
             const DocumentClip& previous = track->clips[index - 1];
             lower = MaxTime(lower, previous.timeline_in.add(previous.duration)
@@ -969,11 +1026,16 @@ RationalTime TimelineInteraction::ConstrainTrimDelta(const DocumentClip& clip,
         upper = clip.duration.sub(minimumDuration);
     } else {
         lower = minimumDuration.sub(clip.duration);
-        upper = source->duration.sub(clip.source_in.add(clip.duration));
         if (index + 1 < track->clips.size()) {
             const DocumentClip& next = track->clips[index + 1];
-            upper = MinTime(upper, next.timeline_in.sub(
-                                       clip.timeline_in.add(clip.duration)));
+            upper = next.timeline_in.sub(clip.timeline_in.add(clip.duration));
+            if (!captionClip)
+                upper = MinTime(upper, source->duration.sub(
+                                           clip.source_in.add(clip.duration)));
+        } else if (!captionClip) {
+            upper = source->duration.sub(clip.source_in.add(clip.duration));
+        } else {
+            return delta < lower ? lower : delta;
         }
     }
     if (delta < lower) return lower;
@@ -1032,9 +1094,15 @@ std::optional<Operation> TimelineInteraction::PendingOperation() const {
         if (move_preview_->target_track_id == originalTrack->id &&
             move_preview_->timeline_in == clip->timeline_in)
             return std::nullopt;
-        if (move_preview_->linked_moves.size() > 1)
-            return Operation{MoveLinkedClipsOperation{
-                move_preview_->link_group_id, move_preview_->linked_moves, {}}};
+        if (move_preview_->linked_moves.size() > 1) {
+            if (!move_preview_->link_group_id.empty())
+                return Operation{
+                    MoveLinkedClipsOperation{move_preview_->link_group_id,
+                                             move_preview_->linked_moves,
+                                             {}}};
+            return Operation{
+                MoveClipsOperation{move_preview_->linked_moves, {}}};
+        }
         return Operation{MoveClipOperation{drag_hit_->clip_id,
                                            move_preview_->target_track_id,
                                            move_preview_->timeline_in}};

@@ -4,10 +4,14 @@
 #include "Operations.h"
 
 McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
-                               std::function<void()> onApplied)
+                               std::function<void()> onApplied,
+                               ProjectApplyCallback applyProject,
+                               TranscriptCallback readTranscript)
     : document_(document),
       edit_log_(editLog),
-      on_applied_(std::move(onApplied)) {}
+      on_applied_(std::move(onApplied)),
+      apply_project_(std::move(applyProject)),
+      read_transcript_(std::move(readTranscript)) {}
 
 bool McpLiveBackend::SnapshotDocument(Document& document, std::string&) {
     document = document_;
@@ -26,6 +30,27 @@ bool McpLiveBackend::ApplyOperation(Operation operation,
     resultJson = "{\"ok\":true}";
     if (on_applied_) on_applied_();
     return true;
+}
+
+bool McpLiveBackend::ApplyProjectEdit(ProjectOperation operation,
+                                      std::string& resultJson,
+                                      std::string& errorName,
+                                      std::string& message) {
+    if (!apply_project_) {
+        errorName = "UnsupportedOperation";
+        message = "the live backend cannot create project timelines";
+        return false;
+    }
+    return apply_project_(std::move(operation), resultJson, errorName, message);
+}
+
+bool McpLiveBackend::ReadTimelineTranscript(std::string& json,
+                                            std::string& message) {
+    if (!read_transcript_) {
+        message = "the live backend has no transcript reader";
+        return false;
+    }
+    return read_transcript_(json, message);
 }
 
 bool McpLiveBackend::Undo(std::string& resultJson, std::string& errorName,

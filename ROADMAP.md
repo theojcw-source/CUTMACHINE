@@ -124,7 +124,7 @@ une fois F0 mergé.
 | Ticket | Statut |
 |---|---|
 | F0.1–F0.4 | fait |
-| F1.1–F1.2 | fait (serveur MCP natif + 38 tools) |
+| F1.1–F1.2 | fait (serveur MCP natif + 39 tools) |
 | F1.3 | fait (grading couleur, rendu Metal non vérifiable hors macOS) |
 | F1.4 | fait (transcription whisper.cpp + coupe par mot) |
 | F1.5 | fait (multicam) |

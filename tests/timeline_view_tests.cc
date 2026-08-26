@@ -422,6 +422,69 @@ int main() {
               "every lasso member receives selected rendering");
     });
 
+    Test("dragging one member preserves and moves an arbitrary selection", [] {
+        Document document = Fixture();
+        const std::string before = document.SaveToString();
+        const Ulid first = document.sequence.tracks[0].clips[0].id;
+        const Ulid second = document.sequence.tracks[0].clips[1].id;
+        TimelineViewport viewport = Viewport();
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        interaction.SelectClips({first, second});
+        const double trackY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(250.0, trackY, 700.0, 10);
+        Check(interaction.SelectedClipIds().size() == 2,
+              "mouse-down on a selected clip keeps the group selected");
+        interaction.PointerDrag(350.0, trackY, 700.0);
+        const auto pending = interaction.PendingOperation();
+        Check(pending && std::holds_alternative<MoveClipsOperation>(*pending),
+              "group drag emits the canonical multi-clip operation");
+        EditError error = EditError::None;
+        std::string message;
+        Check(
+            interaction.PointerUp(error, message) &&
+                document.FindClip(first)->timeline_in == RationalTime{20, 10} &&
+                document.FindClip(second)->timeline_in == RationalTime{50, 10},
+            "both clips move by the same exact delta");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "group drag undo restores byte-identical state");
+    });
+
+    Test("group drag treats timeline zero as a magnetic wall", [] {
+        Document document = Fixture();
+        const Ulid first = document.sequence.tracks[0].clips[0].id;
+        const Ulid second = document.sequence.tracks[0].clips[1].id;
+        TimelineViewport viewport = Viewport();
+        EditLog log;
+        TimelineInteraction interaction(document, log, viewport);
+        interaction.SelectClips({first, second});
+        const double trackY = kTimelineRulerHeight + 20.0;
+        interaction.PointerDown(500.0, trackY, 700.0, 10);
+        interaction.PointerDrag(0.0, trackY, 700.0);
+        Check(interaction.MovePreview() && interaction.MovePreview()->valid &&
+                  interaction.MovePreview()->linked_moves[0].timeline_in ==
+                      RationalTime{0, 10} &&
+                  interaction.MovePreview()->linked_moves[1].timeline_in ==
+                      RationalTime{30, 10},
+              "the earliest selected clip cannot cross timeline zero");
+
+        TimelineViewport magneticViewport = Viewport();
+        magneticViewport.pixels_per_second = 50.0;
+        TimelineInteraction magnetic(document, log, magneticViewport);
+        magnetic.SelectClips({first, second});
+        magnetic.PointerDown(275.0, trackY, 700.0, 10);
+        magnetic.PointerDrag(230.0, trackY, 700.0);
+        Check(magnetic.MovePreview() && magnetic.MovePreview()->valid &&
+                  magnetic.MovePreview()->linked_moves[0].timeline_in ==
+                      RationalTime{0, 10} &&
+                  magnetic.MovePreview()->linked_moves[1].timeline_in ==
+                      RationalTime{30, 10} &&
+                  magnetic.SnapGuideTime() &&
+                  *magnetic.SnapGuideTime() == RationalTime{0, 10},
+              "the full selection snaps when its earliest clip nears zero");
+    });
+
     Test("deleting a gap closes one track atomically and undo restores bytes",
          [] {
              Document document = Fixture();
@@ -800,7 +863,7 @@ int main() {
               "linked clips land on V2/A2 without sync drift");
     });
 
-    Test("invalid linked move emits nothing and sync drift is exact", [] {
+    Test("linked move respects the zero wall and sync drift is exact", [] {
         Document document = Fixture();
         document.sequence.tracks.push_back(
             {"01KT0000000000000000000005", "audio", 1, {}});
@@ -841,12 +904,15 @@ int main() {
         const double y = kTimelineRulerHeight + 20.0;
         interaction.PointerDown(125.0, y, 700.0, 10);
         interaction.PointerDrag(50.0, y, 700.0);
-        Check(interaction.MovePreview() && !interaction.MovePreview()->valid,
-              "partner crossing timeline zero invalidates the whole preview");
+        Check(interaction.MovePreview() && interaction.MovePreview()->valid &&
+                  interaction.MovePreview()->timeline_in ==
+                      RationalTime{10, 10} &&
+                  interaction.SnapGuideTime() == RationalTime{0, 10},
+              "a partner at zero stops the whole linked selection");
         Check(!interaction.PointerUp(error, message) &&
                   document.SaveToString() == beforeInvalid &&
                   log.AppliedCount() == logCount,
-              "invalid linked drop emits nothing and preserves exact bytes");
+              "a drop against the wall emits no edit and preserves bytes");
     });
 
     Test("linked trim previews and commits one atomic operation", [] {
@@ -995,6 +1061,14 @@ int main() {
                    "fit starts at timeline zero");
              Check(viewport.TimeToX({200, 10}) <= 1000.0,
                    "fit keeps the timeline end visible");
+
+             const RationalTime longFormDuration{6 * 60 * 60, 1};
+             viewport.FitDuration(longFormDuration, 1000.0);
+             Check(viewport.pixels_per_second < 4.0,
+                   "long-form fit can zoom out past the former three-minute "
+                   "floor");
+             Check(viewport.TimeToX(longFormDuration) <= 1000.0,
+                   "six-hour timelines fit in an ordinary editor pane");
          });
 
     Test("timeline navigation never exposes negative time", [] {
@@ -1053,9 +1127,23 @@ int main() {
         Check(zoomed.pixels_per_second < 100.0,
               "dragging the right handle outward zooms out");
         UpdateTimelineZoomBarDrag(zoomed, right, 2000.0, duration, width, 10);
-        Check(zoomed.view_start == RationalTime{0, 10} &&
-                  zoomed.TimeToX(duration) <= width,
-              "expanding the thumb fully fits the timeline");
+        Check(
+            zoomed.TimeToX(duration) < width && zoomed.pixels_per_second < 40.0,
+            "dragging beyond the rail continues zooming past fit duration");
+        const TimelineZoomBarGeometry zoomedOutGeometry =
+            CalculateTimelineZoomBarGeometry(zoomed, duration, width);
+        Check(std::abs(zoomedOutGeometry.thumb_width -
+                       zoomedOutGeometry.rail_width * 0.5) < 0.001,
+              "fully visible content keeps a half-width movable thumb");
+        TimelineZoomBarDrag zoomedOutBody{
+            TimelineZoomBarPart::Body,
+            zoomedOutGeometry.thumb_x + zoomedOutGeometry.thumb_width * 0.5,
+            zoomed, zoomedOutGeometry};
+        UpdateTimelineZoomBarDrag(zoomed, zoomedOutBody,
+                                  zoomedOutBody.pointer_x + 100.0, duration,
+                                  width, 10);
+        Check(zoomed.view_start > RationalTime{50, 10},
+              "the zoomed-out thumb remains pannable");
     });
 
     Test("simulated trim emits the canonical operation and undo restores hash",
