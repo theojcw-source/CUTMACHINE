@@ -98,9 +98,31 @@ const char kDefaultSystemPrompt[] =
     "d'intention déterministes comme `shorten_linked_clip` aux opérations "
     "brutes lorsqu'ils correspondent exactement à la demande.\n"
     "Pour monter une interview depuis sa transcription, appelle "
-    "`get_timeline_transcript`, sélectionne seulement les spans retournés "
-    "et recopie leurs temps exacts dans `create_interview_short`. Cet outil "
-    "crée une nouvelle timeline et préserve l'originale.\n"
+    "`get_timeline_transcript`, puis désigne les spans retenus par leur "
+    "`span_id` dans `create_interview_short`. Ne recopie jamais un temps : "
+    "CUTMACHINE résout lui-même chaque span_id en position exacte, ce qui "
+    "garantit qu'une coupe ne tombe pas au milieu d'un mot. Quand une idée "
+    "couvre plusieurs spans consécutifs, donne `span_id` et `end_span_id` : "
+    "le moteur les fusionne en une seule plage. Cet outil crée une nouvelle "
+    "timeline et préserve l'originale.\n"
+    "Pour retirer les hésitations d'un plan, appelle `clean_disfluencies` "
+    "plutôt que d'énumérer des mots toi-même : la détection est "
+    "déterministe et la coupe tient en une seule opération réversible. "
+    "Utilise `list_disfluencies` seulement quand l'utilisateur veut "
+    "valider la liste avant de couper. Les répétitions ne sont retirées "
+    "que sur demande explicite, parce qu'un mot répété peut être une "
+    "insistance voulue.\n"
+    "Avant de placer une illustration ou un plan de coupe, appelle "
+    "`list_shot_quality` et écarte ce qui est `needs_attention`. Ces notes "
+    "sont mesurées sur les images, pas jugées : ne les contredis pas. Un "
+    "plan listé sous `unanalyzed` n'est pas mauvais, il est inconnu : lance "
+    "`analyze_shot_quality` sur son média plutôt que de l'utiliser à "
+    "l'aveugle.\n"
+    "La mesure ne dit pas tout. Avant de poser une illustration, regarde-la "
+    "avec `read_frame` : un plan peut être parfaitement net et stable et "
+    "rester inutilisable, par exemple s'il montre quelqu'un en train de "
+    "parler — le spectateur verra une bouche articuler autre chose que ce "
+    "qu'il entend. Ce jugement-là t'appartient, aucun seuil ne le remplace.\n"
     "Si une demande est ambiguë ou impossible avec les outils disponibles, "
     "explique pourquoi en texte plutôt que d'appeler un outil au hasard. "
     "Si un outil échoue, le message d'erreur t'est renvoyé : corrige ton "
@@ -194,10 +216,20 @@ bool ChatSession::SubmitUserMessage(const std::string& text,
             resultEntry.text = resultText;
             Emit(std::move(resultEntry));
 
+            // The picture, when the tool returned one, goes to the model
+            // alongside the text -- but only where the provider can carry it.
+            // Anthropic accepts an image inside a tool result; the local
+            // Ollama path here does not, and dropping it is better than
+            // substituting a description the model would then treat as
+            // observation.
+            const bool carriesImages =
+                llm_.Config().provider == ChatLlmProvider::AnthropicMessages;
             toolResultsMessage.content.push_back(
-                ChatContentBlock::MakeToolResult(use.tool_use_id,
-                                                 modelResultText, !outcome.ok,
-                                                 use.tool_name));
+                ChatContentBlock::MakeToolResult(
+                    use.tool_use_id, modelResultText, !outcome.ok,
+                    use.tool_name,
+                    carriesImages ? outcome.image_base64 : std::string(),
+                    carriesImages ? outcome.image_mime : std::string()));
         }
         messages_.push_back(std::move(toolResultsMessage));
     }

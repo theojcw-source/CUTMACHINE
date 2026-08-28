@@ -3415,9 +3415,10 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
         for (const ExactTrackState& state : operation.exact_track_result)
             candidate.FindTrack(state.track_id)->clips = state.clips;
         if (!ValidateResult(candidate, error, message)) return false;
-        inverse = RemoveWordsOperation{operation.clip_id, operation.ranges,
-                                       operation.gap_padding,
-                                       operation.sync_track_ids, before};
+        inverse = RemoveWordsOperation{
+            operation.clip_id,        operation.ranges,
+            operation.gap_padding,    operation.linked_clip_ids,
+            operation.sync_track_ids, before};
         return true;
     }
 
@@ -3450,34 +3451,58 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
         }
     }
 
-    DocumentTrack* track = candidate.FindTrackForClip(operation.clip_id);
-    if (!track) {
-        Fail(EditError::UnknownClip,
-             "unknown clip_id '" + operation.clip_id + "'", error, message);
-        return false;
-    }
-    const auto found = std::find_if(
-        track->clips.begin(), track->clips.end(),
-        [&](const DocumentClip& clip) { return clip.id == operation.clip_id; });
-    const size_t index =
-        static_cast<size_t>(std::distance(track->clips.begin(), found));
-    const DocumentClip original = *found;
-    const RationalTime clipSourceStart = original.source_in;
-    const RationalTime clipSourceEnd =
-        original.source_in.add(original.duration);
-    for (const WordRemovalRange& range : operation.ranges) {
-        if (range.source_start < clipSourceStart ||
-            range.source_end > clipSourceEnd) {
-            Fail(EditError::SourceOutOfBounds,
-                 "RemoveWords range falls outside the source range of "
-                 "clip_id '" +
-                     operation.clip_id + "'",
+    // The anchor, plus every linked clip named alongside it. Each is cut by
+    // the same source ranges and ripple-closed on its own track, inside one
+    // operation. An A/V pair has to lose the same frames of picture and
+    // sound or it drifts apart, and splitting the cleanup into two
+    // operations would make one editorial gesture two undo steps.
+    std::vector<Ulid> cutClipIds;
+    cutClipIds.push_back(operation.clip_id);
+    for (const Ulid& linkedId : operation.linked_clip_ids) {
+        if (std::find(cutClipIds.begin(), cutClipIds.end(), linkedId) !=
+            cutClipIds.end()) {
+            Fail(EditError::DuplicateId,
+                 "RemoveWords linked_clip_ids repeats '" + linkedId + "'",
                  error, message);
             return false;
         }
+        cutClipIds.push_back(linkedId);
     }
 
-    addTrack(track->id);
+    // Every clip is resolved and validated before any of them is touched, so
+    // a partially applied cut is not a state this function can leave behind.
+    struct CutTarget {
+        DocumentTrack* track = nullptr;
+        DocumentClip original;
+    };
+    std::vector<CutTarget> targets;
+    for (const Ulid& cutId : cutClipIds) {
+        DocumentTrack* cutTrack = candidate.FindTrackForClip(cutId);
+        if (!cutTrack) {
+            Fail(EditError::UnknownClip, "unknown clip_id '" + cutId + "'",
+                 error, message);
+            return false;
+        }
+        const auto found = std::find_if(
+            cutTrack->clips.begin(), cutTrack->clips.end(),
+            [&](const DocumentClip& clip) { return clip.id == cutId; });
+        const DocumentClip original = *found;
+        const RationalTime sourceEnd =
+            original.source_in.add(original.duration);
+        for (const WordRemovalRange& range : operation.ranges) {
+            if (range.source_start < original.source_in ||
+                range.source_end > sourceEnd) {
+                Fail(EditError::SourceOutOfBounds,
+                     "RemoveWords range falls outside the source range of "
+                     "clip_id '" +
+                         cutId + "'",
+                     error, message);
+                return false;
+            }
+        }
+        targets.push_back({cutTrack, original});
+        addTrack(cutTrack->id);
+    }
     for (const Ulid& id : operation.sync_track_ids) {
         if (!candidate.FindTrack(id)) {
             Fail(EditError::UnknownTrack,
@@ -3493,50 +3518,88 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
         RationalTime source_start;
         RationalTime source_end;
     };
-    std::vector<Fragment> fragments;
-    RationalTime cursor = clipSourceStart;
-    for (const WordRemovalRange& range : operation.ranges) {
-        if (range.source_start > cursor)
-            fragments.push_back({cursor, range.source_start});
-        cursor = range.source_end;
-    }
-    if (cursor < clipSourceEnd) fragments.push_back({cursor, clipSourceEnd});
-
     std::vector<DocumentClip> newClips;
-    RationalTime timelineCursor = original.timeline_in;
-    for (size_t fragmentIndex = 0; fragmentIndex < fragments.size();
-         ++fragmentIndex) {
-        if (fragmentIndex > 0)
-            timelineCursor = timelineCursor.add(operation.gap_padding);
-        DocumentClip fragment = original;
-        fragment.id = fragmentIndex == 0 ? original.id : GenerateUlid();
-        fragment.source_in = fragments[fragmentIndex].source_start;
-        fragment.duration = fragments[fragmentIndex].source_end.sub(
-            fragments[fragmentIndex].source_start);
-        fragment.timeline_in = timelineCursor;
-        timelineCursor = timelineCursor.add(fragment.duration);
-        newClips.push_back(std::move(fragment));
-    }
-    const RationalTime newEnd =
-        fragments.empty() ? original.timeline_in : timelineCursor;
-    const RationalTime originalEnd =
-        original.timeline_in.add(original.duration);
-    const RationalTime shiftDelta = newEnd.sub(originalEnd);
+    RationalTime anchorOriginalEnd{0, 1};
+    RationalTime anchorShiftDelta{0, 1};
+    for (size_t targetIndex = 0; targetIndex < targets.size(); ++targetIndex) {
+        DocumentTrack* cutTrack = targets[targetIndex].track;
+        const DocumentClip original = targets[targetIndex].original;
+        const RationalTime clipSourceStart = original.source_in;
+        const RationalTime clipSourceEnd =
+            original.source_in.add(original.duration);
 
-    for (size_t next = index + 1; next < track->clips.size(); ++next)
-        track->clips[next].timeline_in =
-            track->clips[next].timeline_in.add(shiftDelta);
-    track->clips.erase(track->clips.begin() +
-                       static_cast<std::ptrdiff_t>(index));
-    track->clips.insert(
-        track->clips.begin() + static_cast<std::ptrdiff_t>(index),
-        newClips.begin(), newClips.end());
+        std::vector<Fragment> fragments;
+        RationalTime cursor = clipSourceStart;
+        for (const WordRemovalRange& range : operation.ranges) {
+            if (range.source_start > cursor)
+                fragments.push_back({cursor, range.source_start});
+            cursor = range.source_end;
+        }
+        if (cursor < clipSourceEnd)
+            fragments.push_back({cursor, clipSourceEnd});
+
+        std::vector<DocumentClip> targetClips;
+        RationalTime timelineCursor = original.timeline_in;
+        for (size_t fragmentIndex = 0; fragmentIndex < fragments.size();
+             ++fragmentIndex) {
+            if (fragmentIndex > 0)
+                timelineCursor = timelineCursor.add(operation.gap_padding);
+            DocumentClip fragment = original;
+            fragment.id = fragmentIndex == 0 ? original.id : GenerateUlid();
+            fragment.source_in = fragments[fragmentIndex].source_start;
+            fragment.duration = fragments[fragmentIndex].source_end.sub(
+                fragments[fragmentIndex].source_start);
+            fragment.timeline_in = timelineCursor;
+            timelineCursor = timelineCursor.add(fragment.duration);
+            targetClips.push_back(std::move(fragment));
+        }
+        const RationalTime newEnd =
+            fragments.empty() ? original.timeline_in : timelineCursor;
+        const RationalTime originalEnd =
+            original.timeline_in.add(original.duration);
+        const RationalTime shiftDelta = newEnd.sub(originalEnd);
+        if (targetIndex == 0) {
+            anchorOriginalEnd = originalEnd;
+            anchorShiftDelta = shiftDelta;
+        }
+
+        // Re-found rather than remembered: an earlier target may already have
+        // spliced this same track, which moves every index after it.
+        const auto position = std::find_if(
+            cutTrack->clips.begin(), cutTrack->clips.end(),
+            [&](const DocumentClip& clip) { return clip.id == original.id; });
+        if (position == cutTrack->clips.end()) {
+            Fail(EditError::UnknownClip,
+                 "RemoveWords lost clip_id '" + original.id + "' while cutting",
+                 error, message);
+            return false;
+        }
+        const size_t positionIndex = static_cast<size_t>(
+            std::distance(cutTrack->clips.begin(), position));
+        for (size_t next = positionIndex + 1; next < cutTrack->clips.size();
+             ++next)
+            cutTrack->clips[next].timeline_in =
+                cutTrack->clips[next].timeline_in.add(shiftDelta);
+        cutTrack->clips.erase(cutTrack->clips.begin() +
+                              static_cast<std::ptrdiff_t>(positionIndex));
+        cutTrack->clips.insert(cutTrack->clips.begin() +
+                                   static_cast<std::ptrdiff_t>(positionIndex),
+                               targetClips.begin(), targetClips.end());
+        newClips.insert(newClips.end(), targetClips.begin(), targetClips.end());
+    }
+
+    // Sync tracks shift by the anchor's delta. A track that was itself cut
+    // above has already closed up around its own fragments, so shifting it
+    // again here would move it twice.
     for (const Ulid& id : operation.sync_track_ids) {
-        if (id == track->id) continue;
+        const bool alreadyCut = std::any_of(
+            targets.begin(), targets.end(),
+            [&](const CutTarget& target) { return target.track->id == id; });
+        if (alreadyCut) continue;
         DocumentTrack* syncTrack = candidate.FindTrack(id);
         for (DocumentClip& clip : syncTrack->clips)
-            if (clip.timeline_in >= originalEnd)
-                clip.timeline_in = clip.timeline_in.add(shiftDelta);
+            if (clip.timeline_in >= anchorOriginalEnd)
+                clip.timeline_in = clip.timeline_in.add(anchorShiftDelta);
     }
 
     for (const DocumentClip& fragment : newClips) {
@@ -3554,9 +3617,10 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
     }
     if (!ValidateResult(candidate, error, message)) return false;
     operation.exact_track_result = snapshots(trackIds);
-    inverse = RemoveWordsOperation{operation.clip_id, operation.ranges,
-                                   operation.gap_padding,
-                                   operation.sync_track_ids, before};
+    inverse = RemoveWordsOperation{
+        operation.clip_id,        operation.ranges,
+        operation.gap_padding,    operation.linked_clip_ids,
+        operation.sync_track_ids, before};
     return true;
 }
 
@@ -4420,7 +4484,13 @@ std::string SerializeOperation(const Operation& operation) {
         }
         output << "],\"gap_padding\":";
         WriteTime(output, removeWords->gap_padding);
-        output << ",\"sync_track_ids\":[";
+        output << ",\"linked_clip_ids\":[";
+        for (size_t index = 0; index < removeWords->linked_clip_ids.size();
+             ++index) {
+            if (index) output << ',';
+            WriteString(output, removeWords->linked_clip_ids[index]);
+        }
+        output << "],\"sync_track_ids\":[";
         for (size_t index = 0; index < removeWords->sync_track_ids.size();
              ++index) {
             if (index) output << ',';
@@ -5305,6 +5375,19 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             }
             reader.Expect(",\"gap_padding\":");
             value.gap_padding = ReadTime(reader);
+            // Optional on read, always written: an edit log recorded before
+            // linked cuts existed still replays, and every log this build
+            // writes is canonical. Same strict-writer / tolerant-reader split
+            // Transcription.cc uses for its own cache.
+            if (reader.Consume(",\"linked_clip_ids\":[")) {
+                if (!reader.Consume("]")) {
+                    while (true) {
+                        value.linked_clip_ids.push_back(reader.String());
+                        if (reader.Consume("]")) break;
+                        reader.Expect(",");
+                    }
+                }
+            }
             reader.Expect(",\"sync_track_ids\":[");
             if (!reader.Consume("]")) {
                 while (true) {
@@ -5780,6 +5863,16 @@ bool ApplyProjectOperation(Project& project, ProjectOperation& operation,
                 }
                 candidate.bin_metadata[value.item_id].display_name = value.name;
                 return true;
+            } else if constexpr (std::is_same_v<
+                                     T, SetActiveProjectTimelineOperation>) {
+                if (!candidate.FindTimeline(value.timeline_id)) {
+                    Fail(EditError::UnknownSequence,
+                         "unknown timeline_id '" + value.timeline_id + "'",
+                         error, message);
+                    return false;
+                }
+                candidate.active_timeline_id = value.timeline_id;
+                return true;
             } else if constexpr (std::is_same_v<T,
                                                 RelinkProjectMediaOperation>) {
                 if (value.replacements.empty()) {
@@ -5933,6 +6026,11 @@ std::string SerializeProjectOperation(const ProjectOperation& operation) {
                 WriteString(output, value.item_id);
                 output << ",\"name\":";
                 WriteString(output, value.name);
+            } else if constexpr (std::is_same_v<
+                                     T, SetActiveProjectTimelineOperation>) {
+                output << "{\"type\":\"SetActiveProjectTimeline\","
+                          "\"timeline_id\":";
+                WriteString(output, value.timeline_id);
             } else if constexpr (std::is_same_v<T,
                                                 RelinkProjectMediaOperation>) {
                 output << "{\"type\":\"RelinkProjectMedia\",\"replacements\":[";
@@ -6070,6 +6168,14 @@ bool DeserializeProjectOperation(const std::string& json,
             value.timeline_id = reader.String();
             reader.Expect(",\"bin_id\":");
             value.bin_id = reader.String();
+            reader.Expect(",\"exact_project_hex\":");
+            value.exact_project_result = ReadExactProject(reader);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "SetActiveProjectTimeline") {
+            SetActiveProjectTimelineOperation value;
+            reader.Expect(",\"timeline_id\":");
+            value.timeline_id = reader.String();
             reader.Expect(",\"exact_project_hex\":");
             value.exact_project_result = ReadExactProject(reader);
             reader.Expect("}");

@@ -417,6 +417,19 @@ Ces commandes s'exécutent avant toute initialisation d'AppKit, de Metal ou du
 décodage média :
 
 ```sh
+./build/cutmachine --create-project ./Film.cutmachine-project "Film"
+./build/cutmachine --transcribe \
+  ./Film.cutmachine-project/project.cutmachine.json '<media-id>' \
+  ./models/ggml-large-v3.bin fr --verbatim
+./build/cutmachine --disfluencies \
+  ./Film.cutmachine-project/project.cutmachine.json '<clip-id>'
+./build/cutmachine --remove-words \
+  ./Film.cutmachine-project/project.cutmachine.json '<clip-id>' \
+  '[{"start_word_index":40,"end_word_index":40}]'
+./build/cutmachine --shot-quality \
+  ./Film.cutmachine-project/project.cutmachine.json '<media-id>'
+./build/cutmachine --shot-quality-report \
+  ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --describe ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --apply-op ./Film.cutmachine-project/project.cutmachine.json \
   '{"type":"TrimClip","clip_id":"01K00000000000000000000003","edge":"Tail","delta":{"value":-1,"rate":25},"exact_clip":null}'
@@ -427,6 +440,126 @@ décodage média :
 ./build/cutmachine --ingest ./Film.cutmachine-project/project.cutmachine.json ./rushes --recursive
 ./build/cutmachine --export ./Film.cutmachine-project/project.cutmachine.json ./film.mp4
 ```
+
+## Transcription verbatim et nettoyage des hésitations
+
+`--transcribe` accepte une langue explicite et un mode `--verbatim`.
+
+L'auto-détection de langue se trompe sur un rush long et majoritairement non
+parlé (mesuré : gallois détecté sur une interview française). Nomme la langue.
+
+Sans `--verbatim`, Whisper nettoie ce qu'il entend : sur une interview de
+7 min 35 il n'a conservé que 3 tics sur les 20 réellement prononcés. Le mode
+verbatim place devant chaque fenêtre de 30 s un prompt qui biaise le décodage
+vers les hésitations, les répétitions et les faux départs — d'où 607 mots
+transcrits au lieu de 390, et les « euh », « heu », « ben » et « bah »
+présents dans le cache. Le drapeau fait partie de l'identité du transcript :
+une transcription verbatim n'est jamais réutilisée à la place d'une
+transcription standard, ni l'inverse.
+
+Le nettoyage se fait ensuite en deux temps, et jamais par un modèle :
+
+1. `--disfluencies` (MCP : `list_disfluencies`) liste ce qui est *prouvable* —
+   les syllabes qui ne sont pas des mots français, et les mots répétés
+   immédiatement — sous forme d'index de mots, avec leur texte pour relecture.
+   Ce qui relève du jugement (« ce "donc" est-il un tic ? ») n'est
+   volontairement pas proposé.
+2. `--remove-words` (MCP : `remove_words`) applique la coupe. Il ne prend que
+   des **index de mots** : c'est `ResolveWordRemoval` qui calcule les images,
+   jamais l'appelant. La coupe est une seule `RemoveWordsOperation`,
+   réversible, qui referme la timeline.
+
+Un modèle peut donc proposer une sélection et la justifier, sans jamais
+calculer un timecode.
+
+`clean_disfluencies` (MCP) réunit les deux étapes en une seule intention :
+CUTMACHINE détecte, calcule les images et applique **une** opération
+réversible pour tout le plan. Le modèle n'énumère rien. Les répétitions ne
+sont retirées que si `include_repetitions` est demandé — un mot répété peut
+être une insistance voulue, une syllabe d'hésitation jamais.
+
+Une paire A/V liée est coupée des deux côtés dans la **même** opération.
+`RemoveWordsOperation` porte un champ `linked_clip_ids` : chaque clip nommé
+perd exactement les mêmes images source et referme sa propre piste. Sans ça,
+nettoyer le son d'une interview raccourcirait la bande et laisserait l'image,
+et un seul `undo` ne suffirait plus à revenir en arrière. Les outils
+`clean_disfluencies` et `remove_words` résolvent eux-mêmes les membres du
+groupe de liaison qui couvrent réellement la coupe ; l'opération, elle, reste
+stricte — un clip nommé explicitement qui ne contient pas les plages est
+refusé (`SourceOutOfBounds`), jamais coupé à moitié.
+
+## Contrôle qualité des plans
+
+Un plan flou ou bougé ne se juge pas, il se mesure. `--shot-quality` analyse
+un média image par image et écrit un cache dans
+`.cutmachine/shotquality/<media-id>.json` ; `--shot-quality-report` (MCP :
+`list_shot_quality`) note chaque clip de la timeline active.
+
+Deux mesures, aucune inférence :
+
+- **Netteté** — variance du laplacien sur le plan de luminance, notée par
+  rapport à la médiane du média lui-même. Le relatif est volontaire : la
+  variance du laplacien n'a pas de sens absolu d'un contenu à l'autre, alors
+  qu'à l'intérieur d'un même rush, même caméra et même optique, la comparaison
+  tient. Le prix de ce choix est énoncé plutôt que caché — un média flou de
+  bout en bout note tous ses plans « Sharp », d'où la publication des médianes
+  absolues à côté de la note.
+- **Bougé** — différence absolue moyenne de luminance entre deux échantillons,
+  notée en absolu : la grandeur veut dire la même chose sur n'importe quel
+  rush.
+
+Le grade porte sur le **décile le plus mauvais**, pas sur la médiane : un plan
+qui perd le point à mi-course reste sain en médiane et reste inutilisable.
+
+Mesuré sur une prise réelle (interview à la main, Sony FX30, 6,72 s, quatre
+échantillons par seconde, 1,7 s d'analyse) : le corps du plan tient entre
+4 055 et 4 481 de netteté, et les cinq derniers échantillons s'effondrent à
+3 499, 3 691, 2 616, 1 461 puis 336 pendant que le bougé passe de 5 000–36 000
+à 67 624. Vérifié à l'image : la caméra quitte le sujet en fin de prise, le
+cadre part sur un mur et la dernière image n'est plus qu'une bouillie. C'est
+exactement ce que la mesure doit attraper. Un clip posé sur cette fin est noté
+`Blurry` / `Shaky`, celui posé sur le corps `Sharp` / `Steady`.
+
+Les seuils de bougé sont calés sur cette prise unique. C'est un point
+d'ancrage, pas un étalonnage : chaque note est publiée avec le nombre qui l'a
+produite, précisément pour qu'ils se déplacent sur preuve.
+
+Un média jamais analysé apparaît sous `unanalyzed`, jamais parmi les plans
+propres. L'absence de mesure n'est pas un feu vert : `analyze_shot_quality`
+(MCP) lance l'analyse depuis l'agent, sans passer par la ligne de commande.
+
+La note tient compte du recouvrement. Un plan mou entièrement caché par une
+illustration posée au-dessus n'est pas un défaut à corriger, puisque personne
+ne le voit — chaque entrée porte donc sa note (`clean`, ce qui est mesuré), sa
+durée encore visible (`visible`, ce que dit le document) et `needs_attention`,
+qui est la conjonction des deux. Sans ça, la vue réclamait de recouper des
+plans invisibles.
+
+## Regarder un plan
+
+Mesurer ne suffit pas, et le manque s'est constaté sur un vrai montage : un
+plan noté `Sharp` / `Steady` — donc parfaitement propre — était inutilisable
+en coupe parce qu'il montrait quelqu'un **en train de parler**. Le spectateur
+voyait une bouche articuler autre chose que ce qu'il entendait. Aucun seuil
+sur la variance du laplacien n'attrape ça ; un monteur l'attrape d'un coup
+d'œil.
+
+`read_frame` (MCP) renvoie donc l'image elle-même, en JPEG, à côté de sa
+réponse texte. Soit `clip_id` avec une `position` (`Start`, `Middle`, `End`
+— jamais un timecode, le moteur résout l'image), soit `media_id` avec un
+`source_in` exact pour inspecter un rush qui n'est pas encore monté.
+
+Le partage du travail reste le même que partout ailleurs : ce qui est
+**prouvable** est décidé par le code ([`ShotQuality.h`](src/ShotQuality.h)),
+ce qui demande un regard reçoit une image
+([`FrameCapture.h`](src/FrameCapture.h)). Rien dans `FrameCapture` ne décide,
+il rend.
+
+Côté transport, l'image traverse MCP comme un bloc `image` à côté du bloc
+`text`, et le chat intégré la fait suivre au modèle dans le `tool_result`.
+Elle n'est transmise qu'aux fournisseurs dont l'API accepte une image dans un
+résultat d'outil ; ailleurs le texte passe et l'image est écartée, plutôt que
+remplacée par une description que le modèle prendrait pour une observation.
 
 ## Export vidéo final
 
@@ -554,6 +687,17 @@ mais retire les métadonnées média redondantes. Pour les modèles anciens qui
 écrivent un appel sous la forme JSON `{name, arguments}` au lieu d’un vrai
 `tool_calls`, ce format n’est exécuté que si l’objet est strict et désigne un
 outil réellement publié par CUTMACHINE.
+
+Pour monter une interview, `get_timeline_transcript` renvoie des spans
+sélectionnables et `create_interview_short` **n'accepte que leurs `span_id`**.
+Le modèle ne recopie aucun temps : c'est le moteur qui résout chaque
+identifiant en position exacte, ce qui rend une coupe au milieu d'un mot
+inexprimable au lieu de simplement déconseillée. Quand une idée dépasse un
+span — ils sont découpés pour la lisibilité d'un sous-titre, environ
+42 caractères, ce qui n'est pas une unité de montage — `span_id` et
+`end_span_id` désignent un intervalle contigu que le moteur fusionne en une
+seule plage. Un intervalle qui enjambe un silence ou change de source est
+refusé, jamais recousu en silence.
 
 Pour les raccourcissements A/V courants, l’outil MCP
 `shorten_linked_clip` reçoit seulement un clip, un bord et une quantité en

@@ -256,7 +256,7 @@ bool SubtitleCuesForClip(const Transcript& transcript, const DocumentClip& clip,
     };
 
     constexpr size_t kMaximumCharacters = 42;
-    const RationalTime kMaximumGap{7, 10};
+    const RationalTime kMaximumGap = kSubtitleCueMaximumGap;
     const RationalTime kMaximumDuration{5, 1};
     for (const TranscriptWord& word : transcript.words) {
         if (word.end <= clip.source_in || word.start >= sourceEnd) continue;

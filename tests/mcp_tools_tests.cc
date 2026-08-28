@@ -19,6 +19,8 @@
 #include "McpServer.h"
 #include "McpTools.h"
 #include "Operations.h"
+#include "ShotQuality.h"
+#include "Transcription.h"
 #include "Ulid.h"
 
 #include <arpa/inet.h>
@@ -82,6 +84,36 @@ public:
     explicit InMemoryBackend(Document document)
         : document_(std::move(document)) {}
 
+    // Cache artifacts the real backends read from the project package. Held
+    // here so the tools that consume them can be exercised without a
+    // ProjectStorage dependency.
+    void SetSourceTranscript(Transcript transcript) {
+        transcript_ = std::move(transcript);
+    }
+    void SetSourceShotQuality(ShotQualityReport report) {
+        shot_quality_ = std::move(report);
+    }
+
+    bool ReadSourceTranscript(const Ulid&, Transcript& transcript,
+                              std::string& message) override {
+        if (transcript_.words.empty()) {
+            message = "no transcript in this fixture";
+            return false;
+        }
+        transcript = transcript_;
+        return true;
+    }
+
+    bool ReadSourceShotQuality(const Ulid&, ShotQualityReport& report,
+                               std::string& message) override {
+        if (shot_quality_.samples.empty()) {
+            message = "no shot quality report in this fixture";
+            return false;
+        }
+        report = shot_quality_;
+        return true;
+    }
+
     bool SnapshotDocument(Document& document, std::string&) override {
         document = document_;
         return true;
@@ -131,9 +163,15 @@ public:
         return true;
     }
 
+    // S1 and S2 butt together; S3 sits after a gap. That shape is what lets
+    // the tests below tell a legitimate merge from one that would silently
+    // swallow a silence.
     bool ReadTimelineTranscript(std::string& json, std::string&) override {
         json =
-            R"({"timeline_id":"fixture","spans":[{"span_id":"S1","source_id":"01K30000000000000000000001","source_in":{"value":100,"rate":25},"duration":{"value":10,"rate":25},"text":"A strong hook."}]})";
+            R"({"timeline_id":"fixture","spans":[)"
+            R"({"span_id":"S1","source_id":"01K30000000000000000000001","source_in":{"value":100,"rate":25},"duration":{"value":10,"rate":25},"timeline_in":{"value":0,"rate":25},"text":"A strong hook."},)"
+            R"({"span_id":"S2","source_id":"01K30000000000000000000001","source_in":{"value":110,"rate":25},"duration":{"value":15,"rate":25},"timeline_in":{"value":10,"rate":25},"text":"It keeps going."},)"
+            R"({"span_id":"S3","source_id":"01K30000000000000000000001","source_in":{"value":200,"rate":25},"duration":{"value":12,"rate":25},"timeline_in":{"value":25,"rate":25},"text":"And the payoff."}]})";
         return true;
     }
 
@@ -154,6 +192,8 @@ private:
     Document document_;
     EditLog log_;
     std::optional<ProjectOperation> project_operation_;
+    Transcript transcript_;
+    ShotQualityReport shot_quality_;
 };
 
 // Minimal blocking HTTP client: sends one POST and reads the response until
@@ -281,25 +321,351 @@ int main() {
     Check(transcriptOutcome.ok && transcriptOutcome.result_json.find(
                                       "A strong hook") != std::string::npos,
           "get_timeline_transcript returns the backend's semantic spans");
-    mcp_json::Value shortArguments;
-    std::string shortParseError;
+    // Segments are named by span id and resolved by the engine. A caller
+    // that could state a source_in could state one landing mid-word, and
+    // ApplyOperation would accept it: it only checks that a range sits
+    // inside the media. Refusing the field is what makes that unbuildable.
+    const auto callShort = [&](const std::string& argumentsJson) {
+        mcp_json::Value arguments;
+        std::string parseFailure;
+        Check(mcp_json::Value::Parse(argumentsJson, arguments, parseFailure),
+              "short tool arguments parse: " + parseFailure);
+        return shortRegistry.Call(backend, "create_interview_short", arguments);
+    };
+    const auto capturedSegments = [&]() {
+        const ProjectOperation* captured = backend.LastProjectOperation();
+        return captured && std::holds_alternative<
+                               CreateProjectTimelineFromSegmentsOperation>(
+                               *captured)
+                   ? std::get<CreateProjectTimelineFromSegmentsOperation>(
+                         *captured)
+                         .segments
+                   : std::vector<ProjectTimelineSourceSegment>{};
+    };
+
     Check(
-        mcp_json::Value::Parse(
-            R"({"name":"Short test","segments":[{"source_id":"01K30000000000000000000001","source_in":{"value":100,"rate":25},"duration":{"value":10,"rate":25}}]})",
-            shortArguments, shortParseError),
-        "short tool arguments parse: " + shortParseError);
-    const McpToolCallOutcome shortOutcome =
-        shortRegistry.Call(backend, "create_interview_short", shortArguments);
-    const ProjectOperation* captured = backend.LastProjectOperation();
+        callShort(R"({"name":"Short test","segments":[{"span_id":"S1"}]})").ok,
+        "create_interview_short accepts a span id");
+    Check(capturedSegments().size() == 1 &&
+              capturedSegments()[0].source_in == RationalTime{100, 25} &&
+              capturedSegments()[0].duration == RationalTime{10, 25} &&
+              capturedSegments()[0].source_id == "01K30000000000000000000001",
+          "a span id resolves to that span's exact source range");
+
+    Check(callShort(R"({"segments":[{"span_id":"S1","end_span_id":"S2"}]})").ok,
+          "create_interview_short accepts a contiguous span run");
+    Check(capturedSegments().size() == 1 &&
+              capturedSegments()[0].source_in == RationalTime{100, 25} &&
+              capturedSegments()[0].duration == RationalTime{25, 25},
+          "a contiguous run merges into one exact range, computed by the "
+          "engine rather than added up by the caller");
+
+    const McpToolCallOutcome gapOutcome =
+        callShort(R"({"segments":[{"span_id":"S1","end_span_id":"S3"}]})");
+    Check(!gapOutcome.ok &&
+              gapOutcome.message.find("breath") != std::string::npos,
+          "a run spanning a real silence is refused, not stitched over");
+
+    Check(!callShort(R"({"segments":[{"span_id":"S9"}]})").ok,
+          "an unknown span id is refused");
+
+    // The regression this whole shape exists to prevent.
     Check(
-        shortOutcome.ok && captured &&
-            std::holds_alternative<CreateProjectTimelineFromSegmentsOperation>(
-                *captured) &&
-            std::get<CreateProjectTimelineFromSegmentsOperation>(*captured)
-                    .segments[0]
-                    .source_in == RationalTime{100, 25},
-        "create_interview_short forwards exact transcript ranges as one "
-        "project operation");
+        !callShort(
+             R"({"segments":[{"source_id":"01K30000000000000000000001","source_in":{"value":103,"rate":25},"duration":{"value":10,"rate":25}}]})")
+             .ok,
+        "a raw source range is refused: the model never states a time");
+
+    // ---- clean_disfluencies: one intention, one reversible operation ----
+    // The clip covers source frames [100, 110) at 25/s, so every word below
+    // sits inside it and the "euh" is the only filler.
+    Transcript transcript;
+    transcript.media_id = "01K30000000000000000000001";
+    transcript.whisper_model = "large-v3";
+    transcript.verbatim = true;
+    transcript.source_rate = {25, 1};
+    transcript.words = {
+        {"Le", {100, 25}, {102, 25}},
+        {"euh", {102, 25}, {104, 25}},
+        {"montage", {104, 25}, {107, 25}},
+        {"avance", {107, 25}, {110, 25}},
+    };
+
+    InMemoryBackend cleanBackend(fixture);
+    cleanBackend.SetSourceTranscript(transcript);
+    McpToolRegistry cleanRegistry;
+    const std::string beforeClean =
+        cleanBackend.CurrentDocument().SaveToString();
+    mcp_json::Value cleanArguments;
+    std::string cleanParseError;
+    Check(mcp_json::Value::Parse(R"({"clip_id":"01K30000000000000000000003"})",
+                                 cleanArguments, cleanParseError),
+          "clean_disfluencies arguments parse: " + cleanParseError);
+    const McpToolCallOutcome cleanOutcome =
+        cleanRegistry.Call(cleanBackend, "clean_disfluencies", cleanArguments);
+    Check(cleanOutcome.ok,
+          "clean_disfluencies applies: " + cleanOutcome.message);
+    Check(cleanOutcome.result_json.find("\"removed_count\":1") !=
+                  std::string::npos &&
+              cleanOutcome.result_json.find("euh") != std::string::npos,
+          "clean_disfluencies reports the filler it cut, by text");
+    Check(
+        cleanOutcome.result_json.find("\"verbatim\":true") != std::string::npos,
+        "clean_disfluencies reports which decoding the transcript came "
+        "from, because a standard one would say nothing about the take");
+    Check(cleanBackend.CurrentDocument().SaveToString() != beforeClean,
+          "clean_disfluencies actually changed the document");
+
+    // One tool call is one operation, so one undo restores the document
+    // byte for byte -- the property that makes this safe to point at an
+    // agent in the first place.
+    std::string cleanUndoErrorName;
+    std::string cleanUndoMessage;
+    std::string cleanUndoResult;
+    Check(cleanBackend.Undo(cleanUndoResult, cleanUndoErrorName,
+                            cleanUndoMessage),
+          "the cleanup undoes: " + cleanUndoMessage);
+    Check(cleanBackend.CurrentDocument().SaveToString() == beforeClean,
+          "undoing one clean_disfluencies call restores the exact prior "
+          "bytes, so the whole cleanup is a single reversible step");
+
+    // Cleaning a clip with nothing to cut is an honoured request, not an
+    // error, and must not touch the document.
+    Transcript clean;
+    clean.media_id = "01K30000000000000000000001";
+    clean.whisper_model = "large-v3";
+    clean.verbatim = true;
+    clean.source_rate = {25, 1};
+    clean.words = {{"Le", {100, 25}, {104, 25}},
+                   {"montage", {104, 25}, {110, 25}}};
+    InMemoryBackend tidyBackend(fixture);
+    tidyBackend.SetSourceTranscript(clean);
+    const std::string beforeTidy = tidyBackend.CurrentDocument().SaveToString();
+    const McpToolCallOutcome tidyOutcome =
+        cleanRegistry.Call(tidyBackend, "clean_disfluencies", cleanArguments);
+    Check(tidyOutcome.ok && tidyOutcome.result_json.find("\"applied\":false") !=
+                                std::string::npos,
+          "cleaning an already clean clip succeeds without applying anything");
+    Check(tidyBackend.CurrentDocument().SaveToString() == beforeTidy,
+          "a no-op cleanup leaves the document untouched");
+
+    // An A/V pair is resolved by the tool, not by the caller: naming the
+    // audio clip must take its linked picture with it, in one operation.
+    Document avFixture;
+    avFixture.sources = {
+        {"01K30000000000000000000001", "folder/A.MP4", {25, 1}, {1000, 25}}};
+    const auto linkedTrack = [](const Ulid& trackId, const std::string& kind,
+                                int32_t index, const Ulid& clipId) {
+        DocumentTrack track;
+        track.id = trackId;
+        track.kind = kind;
+        track.index = index;
+        DocumentClip clip{
+            clipId, "01K30000000000000000000001", {100, 25}, {10, 25}, {0, 25}};
+        clip.link_group_id = "01K30000000000000000000050";
+        track.clips = {clip};
+        return track;
+    };
+    avFixture.sequence.tracks = {
+        linkedTrack("01K30000000000000000000051", "video", 0,
+                    "01K30000000000000000000052"),
+        linkedTrack("01K30000000000000000000053", "audio", 1,
+                    "01K30000000000000000000054"),
+    };
+
+    InMemoryBackend avBackend(avFixture);
+    avBackend.SetSourceTranscript(transcript);
+    mcp_json::Value avArguments;
+    std::string avParseError;
+    Check(mcp_json::Value::Parse(R"({"clip_id":"01K30000000000000000000054"})",
+                                 avArguments, avParseError),
+          "A/V cleanup arguments parse: " + avParseError);
+    const std::string beforeAv = avBackend.CurrentDocument().SaveToString();
+    const McpToolCallOutcome avOutcome =
+        cleanRegistry.Call(avBackend, "clean_disfluencies", avArguments);
+    Check(avOutcome.ok,
+          "clean_disfluencies applies to a pair: " + avOutcome.message);
+    Check(avOutcome.result_json.find("01K30000000000000000000052") !=
+              std::string::npos,
+          "the result names the linked picture it also cut, so the caller "
+          "can see it happened");
+    const DocumentTrack& avVideo =
+        avBackend.CurrentDocument().sequence.tracks[0];
+    const DocumentTrack& avAudio =
+        avBackend.CurrentDocument().sequence.tracks[1];
+    Check(avVideo.clips.size() == avAudio.clips.size(),
+          "picture and sound end up with the same number of fragments");
+    bool alignedPair = avVideo.clips.size() == avAudio.clips.size();
+    for (size_t index = 0; index < avVideo.clips.size() && alignedPair; ++index)
+        alignedPair =
+            avVideo.clips[index].timeline_in ==
+                avAudio.clips[index].timeline_in &&
+            avVideo.clips[index].duration == avAudio.clips[index].duration;
+    Check(alignedPair,
+          "and they stay frame-aligned: cleaning the sound did not slide it "
+          "out from under the picture");
+
+    std::string avUndoResult;
+    std::string avUndoErrorName;
+    std::string avUndoMessage;
+    Check(avBackend.Undo(avUndoResult, avUndoErrorName, avUndoMessage) &&
+              avBackend.CurrentDocument().SaveToString() == beforeAv,
+          "one undo restores both tracks: the pair cut is a single step");
+
+    // ---- list_shot_quality: measured, never judged --------------------
+    // Forty samples at 4/s. The take is sharp and still except at samples
+    // 32 and 33, which is where the timeline's second clip sits.
+    ShotQualityReport quality;
+    quality.media_id = "01K30000000000000000000001";
+    quality.samples_per_second = 4;
+    quality.analysis_width = 384;
+    quality.analysis_height = 216;
+    std::vector<int64_t> allSharpness;
+    for (int index = 0; index < 40; ++index) {
+        const bool ruined = index == 32 || index == 33;
+        ShotQualitySample sample;
+        sample.time = RationalTime{index, 4};
+        sample.sharpness = ruined ? 900 : 4000;
+        sample.motion = ruined ? 130000 : 2000;
+        allSharpness.push_back(sample.sharpness);
+        quality.samples.push_back(sample);
+    }
+    quality.median_sharpness = ShotQualityPercentile(allSharpness, 50);
+
+    InMemoryBackend qualityBackend(fixture);
+    qualityBackend.SetSourceShotQuality(quality);
+    McpToolRegistry qualityRegistry;
+    const McpToolCallOutcome qualityOutcome = qualityRegistry.Call(
+        qualityBackend, "list_shot_quality", mcp_json::Value::MakeObject());
+    Check(qualityOutcome.ok,
+          "list_shot_quality reports: " + qualityOutcome.message);
+    mcp_json::Value qualityView;
+    std::string qualityParseError;
+    Check(mcp_json::Value::Parse(qualityOutcome.result_json, qualityView,
+                                 qualityParseError),
+          "shot quality view parses: " + qualityParseError);
+    const mcp_json::Value* qualityClips = qualityView.Find("clips");
+    Check(qualityClips && qualityClips->IsArray() &&
+              qualityClips->AsArray().size() == 2,
+          "both video clips are graded");
+    bool sawClean = false;
+    bool sawRuined = false;
+    if (qualityClips && qualityClips->IsArray()) {
+        for (const mcp_json::Value& entry : qualityClips->AsArray()) {
+            const mcp_json::Value* sharpness = entry.Find("sharpness");
+            const mcp_json::Value* steadiness = entry.Find("steadiness");
+            const mcp_json::Value* isClean = entry.Find("clean");
+            if (!sharpness || !steadiness || !isClean) continue;
+            if (isClean->AsBool() && sharpness->AsString() == "Sharp" &&
+                steadiness->AsString() == "Steady")
+                sawClean = true;
+            if (!isClean->AsBool() && sharpness->AsString() == "Blurry" &&
+                steadiness->AsString() == "Shaky")
+                sawRuined = true;
+        }
+    }
+    Check(sawClean, "the usable clip grades Sharp and Steady");
+    Check(sawRuined,
+          "the clip sitting over the ruined samples grades Blurry and Shaky");
+
+    // Occlusion: a clip covered end to end by a higher video track is not a
+    // defect to fix, because nobody sees it. The grade must still say it
+    // measured badly -- what changes is whether it needs acting on.
+    Document coveredFixture = fixture;
+    DocumentTrack cover;
+    cover.id = "01K30000000000000000000060";
+    cover.kind = "video";
+    cover.index = 5;  // above track 0, so composited over it
+    // Covers the second clip's whole span (timeline 20..30 at 25/s) and only
+    // the first half of the first clip's (5..10 of 5..15).
+    cover.clips = {{"01K30000000000000000000061",
+                    "01K30000000000000000000001",
+                    {0, 25},
+                    {10, 25},
+                    {20, 25}},
+                   {"01K30000000000000000000062",
+                    "01K30000000000000000000001",
+                    {0, 25},
+                    {5, 25},
+                    {5, 25}}};
+    coveredFixture.sequence.tracks.push_back(cover);
+
+    InMemoryBackend coveredBackend(coveredFixture);
+    // Soft only where the two clips actually read -- source seconds 4.0 and
+    // 8.0, i.e. samples 16-17 and 32-33 on the 4/s grid. Making the whole
+    // source soft instead would move its own median down onto the soft value
+    // and grade everything Sharp, which is the documented cost of a
+    // source-relative grade, not the thing under test here.
+    ShotQualityReport poor;
+    poor.media_id = "01K30000000000000000000001";
+    poor.samples_per_second = 4;
+    poor.analysis_width = 384;
+    poor.analysis_height = 216;
+    std::vector<int64_t> poorSharpness;
+    for (int index = 0; index < 40; ++index) {
+        ShotQualitySample sample;
+        sample.time = RationalTime{index, 4};
+        const bool insideAClip =
+            index == 16 || index == 17 || index == 32 || index == 33;
+        sample.sharpness = insideAClip ? 800 : 4000;
+        sample.motion = 2000;
+        poorSharpness.push_back(sample.sharpness);
+        poor.samples.push_back(sample);
+    }
+    poor.median_sharpness = ShotQualityPercentile(poorSharpness, 50);
+    poor.median_motion = 2000;
+    coveredBackend.SetSourceShotQuality(poor);
+
+    const McpToolCallOutcome coveredOutcome = qualityRegistry.Call(
+        coveredBackend, "list_shot_quality", mcp_json::Value::MakeObject());
+    mcp_json::Value coveredView;
+    std::string coveredParseError;
+    Check(coveredOutcome.ok &&
+              mcp_json::Value::Parse(coveredOutcome.result_json, coveredView,
+                                     coveredParseError),
+          "the covered timeline reports: " + coveredParseError);
+    int fullyCovered = 0;
+    int needsAttention = 0;
+    int gradedBad = 0;
+    const mcp_json::Value* coveredClips = coveredView.Find("clips");
+    if (coveredClips && coveredClips->IsArray()) {
+        for (const mcp_json::Value& entry : coveredClips->AsArray()) {
+            const mcp_json::Value* isClean = entry.Find("clean");
+            const mcp_json::Value* covered = entry.Find("fully_covered");
+            const mcp_json::Value* attention = entry.Find("needs_attention");
+            if (!isClean || !covered || !attention) continue;
+            if (!isClean->AsBool()) ++gradedBad;
+            if (covered->AsBool()) ++fullyCovered;
+            if (attention->AsBool()) ++needsAttention;
+        }
+    }
+    Check(gradedBad >= 2,
+          "both clips of the covered fixture still measure badly");
+    Check(fullyCovered == 1,
+          "exactly the clip covered end to end reports fully_covered");
+    Check(needsAttention == gradedBad - 1,
+          "the covered one drops out of needs_attention while the partly "
+          "visible one stays: occlusion changes what to act on, never the "
+          "grade");
+
+    // A source that was never analysed must read as unknown, never as a
+    // pass: a caller filtering on `clean` would otherwise cut with it.
+    InMemoryBackend blindBackend(fixture);
+    const McpToolCallOutcome blindOutcome = qualityRegistry.Call(
+        blindBackend, "list_shot_quality", mcp_json::Value::MakeObject());
+    mcp_json::Value blindView;
+    std::string blindParseError;
+    Check(blindOutcome.ok && mcp_json::Value::Parse(blindOutcome.result_json,
+                                                    blindView, blindParseError),
+          "an unanalysed timeline still reports: " + blindParseError);
+    const mcp_json::Value* blindClips = blindView.Find("clips");
+    const mcp_json::Value* blindUnknown = blindView.Find("unanalyzed");
+    Check(blindClips && blindClips->IsArray() && blindClips->AsArray().empty(),
+          "nothing is graded without an analysis");
+    Check(blindUnknown && blindUnknown->IsArray() &&
+              blindUnknown->AsArray().size() == 2,
+          "every unmeasured clip is named as unmeasured rather than omitted");
+
     McpServer server(backend);
     std::string startError;
     Check(server.Start(0, startError),

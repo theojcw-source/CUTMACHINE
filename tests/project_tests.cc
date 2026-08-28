@@ -55,6 +55,52 @@ int main() {
               verticalId,
           "serialized project operation retains enriched IDs");
 
+    // QC-2026-08 -- switching the active timeline is an operation like any
+    // other, so an agent can navigate a project instead of being stuck on
+    // whatever the app last left active.
+    Check(project.active_timeline_id == firstId,
+          "adding a timeline does not steal focus from the active one");
+    const std::string beforeActivate = project.SaveToString();
+    Check(projectLog.Apply(
+              project,
+              ProjectOperation{SetActiveProjectTimelineOperation{verticalId}},
+              editError, error),
+          "activate timeline operation: " + error);
+    Check(project.active_timeline_id == verticalId &&
+              project.ActiveTimeline() == project.FindTimeline(verticalId),
+          "the named timeline becomes active");
+    const std::string afterActivate = project.SaveToString();
+    Check(projectLog.Undo(project, editError, error),
+          "undo activate: " + error);
+    Check(project.SaveToString() == beforeActivate &&
+              project.active_timeline_id == firstId,
+          "undoing an activation restores byte-identical JSON");
+    Check(projectLog.Redo(project, editError, error),
+          "redo activate: " + error);
+    Check(project.SaveToString() == afterActivate,
+          "redoing an activation is byte-identical too");
+    ProjectOperation decodedActivate;
+    Check(DeserializeProjectOperation(
+              SerializeProjectOperation(projectLog.AppliedEntries().back().op),
+              decodedActivate, editError, error) &&
+              std::get<SetActiveProjectTimelineOperation>(decodedActivate)
+                      .timeline_id == verticalId,
+          "activation round-trips through canonical JSON: " + error);
+    const std::string beforeUnknown = project.SaveToString();
+    Check(!projectLog.Apply(project,
+                            ProjectOperation{SetActiveProjectTimelineOperation{
+                                "01K30000000000000000000099"}},
+                            editError, error) &&
+              editError == EditError::UnknownSequence,
+          "activating a timeline the project does not hold is refused by name");
+    Check(project.SaveToString() == beforeUnknown,
+          "and the refusal leaves the project untouched");
+    Check(projectLog.Apply(
+              project,
+              ProjectOperation{SetActiveProjectTimelineOperation{firstId}},
+              editError, error),
+          "restore the original active timeline: " + error);
+
     const std::string beforeSessionSelection = project.SaveToString();
     Document edit = project.MakeDocument(verticalId);
     Check(project.SaveToString() == beforeSessionSelection,

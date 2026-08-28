@@ -60,6 +60,103 @@ int main() {
               sourceIn == 50 && span.Find("text") &&
               span.Find("text")->AsString() == "Une accroche.",
           "span exposes source-exact boundaries and readable text");
+
+    // ---- span ids resolve to exact ranges; the caller never adds times ----
+    std::vector<TimelineTranscriptSpan> built;
+    Check(BuildTimelineTranscriptSpans(document, directory, built, error),
+          "spans build: " + error);
+    Check(built.size() == 1 && built[0].span_id == "S1",
+          "spans are numbered in timeline order");
+
+    // Two contiguous spans of one source, and a third after a gap: the
+    // shape that separates a legitimate merge from one that would swallow
+    // a silence nobody asked to cut.
+    const std::vector<TimelineTranscriptSpan> run = {
+        {"S1", sourceId, {50, 25}, {25, 25}, {25, 25}, "Une accroche."},
+        {"S2", sourceId, {75, 25}, {30, 25}, {50, 25}, "Puis la suite."},
+        {"S3", sourceId, {200, 25}, {20, 25}, {80, 25}, "Et la chute."},
+        {"S4",
+         "01K50000000000000000000009",
+         {0, 25},
+         {10, 25},
+         {100, 25},
+         "Autre source."},
+    };
+    Ulid resolvedSource;
+    RationalTime resolvedIn;
+    RationalTime resolvedDuration;
+
+    Check(ResolveTranscriptSpanRange(run, "S1", "", resolvedSource, resolvedIn,
+                                     resolvedDuration, error),
+          "a single span resolves: " + error);
+    Check(resolvedSource == sourceId && resolvedIn.compare({50, 25}) == 0 &&
+              resolvedDuration.compare({25, 25}) == 0,
+          "one span resolves to its own exact range");
+
+    Check(ResolveTranscriptSpanRange(run, "S1", "S2", resolvedSource,
+                                     resolvedIn, resolvedDuration, error),
+          "a contiguous run resolves: " + error);
+    Check(resolvedIn.compare({50, 25}) == 0 &&
+              resolvedDuration.compare({55, 25}) == 0,
+          "a contiguous run merges into one range spanning both spans");
+
+    Check(!ResolveTranscriptSpanRange(run, "S2", "S3", resolvedSource,
+                                      resolvedIn, resolvedDuration, error),
+          "a run across a real editorial gap is refused");
+    Check(error.find("breath") != std::string::npos,
+          "the refusal names the reason and suggests separate segments");
+
+    // A cue breaks on a pause between words, and that pause belongs to
+    // neither cue. Refusing those made ordinary sentences unselectable: on a
+    // real interview, three of eight editorial beats were rejected over gaps
+    // of one and two frames. Anything under the cue segmenter's own maximum
+    // gap is one continuous utterance and merges, breath included.
+    const std::vector<TimelineTranscriptSpan> breathing = {
+        {"S1", sourceId, {50, 25}, {25, 25}, {25, 25}, "Une accroche"},
+        // Two frames of silence, well under kSubtitleCueMaximumGap.
+        {"S2", sourceId, {77, 25}, {30, 25}, {52, 25}, "puis la suite."},
+    };
+    Check(ResolveTranscriptSpanRange(breathing, "S1", "S2", resolvedSource,
+                                     resolvedIn, resolvedDuration, error),
+          "a two-frame breath between cues still merges: " + error);
+    Check(resolvedIn.compare({50, 25}) == 0 &&
+              resolvedDuration.compare({57, 25}) == 0,
+          "and the merged range keeps the breath rather than dropping it");
+
+    // The boundary itself: exactly the cue segmenter's maximum gap is a real
+    // break, not a breath, so it is refused.
+    const std::vector<TimelineTranscriptSpan> atLimit = {
+        {"S1", sourceId, {0, 25}, {25, 25}, {0, 25}, "Avant"},
+        {"S2", sourceId, {25, 25}, {25, 25}, {25, 25}, "après"},
+    };
+    std::vector<TimelineTranscriptSpan> justOver = atLimit;
+    // 0.7 s at 25 fps is 17.5 frames, so 18 frames is over the line.
+    justOver[1].source_in = {25 + 18, 25};
+    Check(!ResolveTranscriptSpanRange(justOver, "S1", "S2", resolvedSource,
+                                      resolvedIn, resolvedDuration, error),
+          "a gap past the cue segmenter's own limit is refused");
+
+    Check(!ResolveTranscriptSpanRange(run, "S3", "S4", resolvedSource,
+                                      resolvedIn, resolvedDuration, error),
+          "a run across two sources is refused");
+    Check(!ResolveTranscriptSpanRange(run, "S2", "S1", resolvedSource,
+                                      resolvedIn, resolvedDuration, error),
+          "a backwards run is refused rather than silently reordered");
+    Check(!ResolveTranscriptSpanRange(run, "S9", "", resolvedSource, resolvedIn,
+                                      resolvedDuration, error),
+          "an unknown span id is refused");
+
+    // The rendered view and the structured spans must stay the same thing:
+    // a backend that can only hand out JSON still answers span lookups.
+    std::vector<TimelineTranscriptSpan> reparsed;
+    Check(ParseTimelineTranscriptSpans(
+              SerializeTimelineTranscriptSpans(document, run), reparsed, error),
+          "the rendered view parses back to spans: " + error);
+    Check(reparsed.size() == run.size() && reparsed[1].span_id == "S2" &&
+              reparsed[1].source_in.compare(run[1].source_in) == 0 &&
+              reparsed[1].duration.compare(run[1].duration) == 0,
+          "a span survives the view round trip with its exact times");
+
     std::filesystem::remove_all(directory);
     std::cout << "interview short tests passed\n";
     return 0;

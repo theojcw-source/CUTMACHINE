@@ -530,6 +530,67 @@ int main() {
         std::cerr << failures << " assertion(s) failed\n";
         return 1;
     }
+    // QC-2026-08 -- a tool result carrying a picture must reach Anthropic as
+    // an image block, not as a description of one. Without this the whole
+    // read_frame path is a no-op the model never sees.
+    {
+        chat::ChatLlmConfig imageConfig;
+        imageConfig.provider = chat::ChatLlmProvider::AnthropicMessages;
+        imageConfig.model = "claude-sonnet-4-5";
+        imageConfig.api_key = "test-key";
+        imageConfig.base_url = "https://api.anthropic.test";
+        std::string captured;
+        chat::ChatLlmClient imageClient(
+            imageConfig, [&captured](const ChatHttpRequest& request,
+                                     ChatHttpResponse& response, std::string&) {
+                captured = request.body;
+                response.status_code = 200;
+                response.body = R"({"content":[{"type":"text","text":"vu"}]})";
+                return true;
+            });
+        chat::ChatMessage message;
+        message.role = "user";
+        message.content.push_back(chat::ChatContentBlock::MakeToolResult(
+            "toolu_1", "{\"source_id\":\"M1\"}", false, "read_frame",
+            "Zm9vYmFy", "image/jpeg"));
+        std::vector<McpTool> noTools;
+        const chat::ChatSendResult result =
+            imageClient.SendMessages({message}, "system", noTools);
+        Check(result.ok, "the image-carrying turn is sent: " + result.error);
+        Check(captured.find("\"type\":\"image\"") != std::string::npos,
+              "the request carries an image block");
+        Check(
+            captured.find("\"media_type\":\"image/jpeg\"") != std::string::npos,
+            "with its MIME type");
+        Check(captured.find("\"data\":\"Zm9vYmFy\"") != std::string::npos,
+              "and the base64 payload itself");
+        Check(captured.find("\"type\":\"text\",\"text\":\"{") !=
+                  std::string::npos,
+              "the tool's own text stays alongside the picture");
+
+        // Every other tool result must keep the plain string form, so adding
+        // pictures changed nothing about the traffic that already worked.
+        std::string plainBody;
+        chat::ChatLlmClient plainClient(
+            imageConfig,
+            [&plainBody](const ChatHttpRequest& request,
+                         ChatHttpResponse& response, std::string&) {
+                plainBody = request.body;
+                response.status_code = 200;
+                response.body = R"({"content":[{"type":"text","text":"ok"}]})";
+                return true;
+            });
+        chat::ChatMessage plain;
+        plain.role = "user";
+        plain.content.push_back(chat::ChatContentBlock::MakeToolResult(
+            "toolu_2", "{\"ok\":true}", false, "describe"));
+        Check(plainClient.SendMessages({plain}, "system", noTools).ok,
+              "a textual tool result still sends");
+        Check(plainBody.find("\"type\":\"image\"") == std::string::npos &&
+                  plainBody.find("\"content\":\"{") != std::string::npos,
+              "a textual tool result keeps the plain string content form");
+    }
+
     std::cout << "All chat LLM client tests passed\n";
     return 0;
 }

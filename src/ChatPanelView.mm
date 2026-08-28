@@ -187,6 +187,48 @@ public:
         return ok;
     }
 
+    // Forwarded like everything else. Leaving these to McpBackend's
+    // "this backend has no project cache" defaults silently disabled every
+    // transcript- and picture-driven tool from the chat panel while the same
+    // tools worked over MCP -- the exact kind of surface-specific behaviour
+    // PHILOSOPHY.md principle 3 rules out.
+    bool ReadSourceTranscript(const Ulid& sourceId, Transcript& transcript,
+                              std::string& message) override {
+        __block bool ok = false;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          ok = live_.ReadSourceTranscript(sourceId, transcript, message);
+        });
+        return ok;
+    }
+
+    bool ReadSourceShotQuality(const Ulid& sourceId, ShotQualityReport& report,
+                               std::string& message) override {
+        __block bool ok = false;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          ok = live_.ReadSourceShotQuality(sourceId, report, message);
+        });
+        return ok;
+    }
+
+    bool AnalyzeSourceShotQuality(const Ulid& sourceId, std::string& resultJson,
+                                  std::string& message) override {
+        __block bool ok = false;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          ok = live_.AnalyzeSourceShotQuality(sourceId, resultJson, message);
+        });
+        return ok;
+    }
+
+    bool CaptureSourceFrame(const Ulid& sourceId, const RationalTime& time,
+                            std::string& jpegBytes,
+                            std::string& message) override {
+        __block bool ok = false;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          ok = live_.CaptureSourceFrame(sourceId, time, jpegBytes, message);
+        });
+        return ok;
+    }
+
     bool Undo(std::string& resultJson, std::string& errorName,
               std::string& message) override {
         __block bool ok = false;

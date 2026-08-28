@@ -29,6 +29,8 @@ const char* MediaTaskKindName(MediaTaskKind kind) {
             return "Beat";
         case MediaTaskKind::Transcription:
             return "Transcription";
+        case MediaTaskKind::ShotQuality:
+            return "ShotQuality";
     }
     return "Probe";
 }

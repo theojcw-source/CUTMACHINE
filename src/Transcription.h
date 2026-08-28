@@ -39,6 +39,10 @@ struct Transcript {
     // silently reused as if it were this one -- e.g. a project migrated to a
     // larger local model should re-transcribe, not read stale words.
     std::string whisper_model;
+    // Verbatim decoding deliberately biases Whisper toward audible fillers,
+    // repetitions and false starts. Keep it in the cache identity so a
+    // standard transcript is never silently substituted for one.
+    bool verbatim = false;
     // The exact timebase TranscriptWord::start/end are expressed in. This is
     // normally the source media's own MediaRate (DocumentSource::rate), so a
     // word's RationalTime is already frame-exact in the domain
@@ -56,6 +60,7 @@ struct WhisperSettings {
     std::string ffmpeg_path = "ffmpeg";
     // ISO 639-1 code, or "auto" to let whisper.cpp detect the language.
     std::string language = "auto";
+    bool verbatim = false;
 };
 
 // Decodes `inputPath`'s audio locally via FFmpeg (mirrors Waveform.cc's
@@ -84,6 +89,48 @@ struct WordRange {
     size_t start_word_index;
     size_t end_word_index;
 };
+
+// What kind of thing a detected stretch of words is. The two are kept apart
+// because they do not carry the same risk: a filler syllable is never a word
+// a speaker meant to say, while an immediately repeated word can be
+// deliberate emphasis ("tres tres bien"). A caller that cleans automatically
+// should act on Filler and put Repetition in front of a human.
+enum class DisfluencyKind {
+    Filler,
+    Repetition,
+};
+
+struct Disfluency {
+    WordRange range;
+    DisfluencyKind kind;
+    // The transcript text the range covers, so a proposed cut can be
+    // reviewed without reading the transcript back.
+    std::string text;
+};
+
+// F1.4 -- deterministic detection of French disfluencies over an already
+// frame-exact transcript. No model is involved, on purpose: what can be
+// proven from the words is decided here, and what needs judgement ("is this
+// 'donc' a tic or the argument?") is deliberately left out rather than
+// guessed. The result is sorted and non-overlapping, which is exactly
+// ResolveWordRemoval's precondition, so cleaning up a clip is a straight
+// hand-off from this function to that one -- and stays one reversible
+// RemoveWordsOperation.
+//
+// Only a transcript generated with WhisperSettings::verbatim carries these
+// words at all: Whisper's default decoding silently drops them (measured on
+// a 7 min 35 interview -- 3 tics kept out of 20 actually spoken).
+std::vector<Disfluency> FindDisfluencies(
+    const std::vector<TranscriptWord>& words);
+
+// The same detection, restricted to the words `clip` actually plays. A clip
+// in a montage exposes a few seconds of a media that may run for minutes, and
+// ApplyOperation refuses any range outside the clip's own source span -- so
+// proposing one would only ever produce an error a caller has to guess its
+// way out of. Word indices stay those of the full transcript, because that is
+// what ResolveWordRemoval resolves against.
+std::vector<Disfluency> FindDisfluenciesInClip(const DocumentClip& clip,
+                                               const Transcript& transcript);
 
 // The single explicit rounding rule this file uses to place a transcribed
 // word boundary onto the exact frame grid of `frameRate` (PHILOSOPHY.md

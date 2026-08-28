@@ -6,12 +6,20 @@
 McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
                                std::function<void()> onApplied,
                                ProjectApplyCallback applyProject,
-                               TranscriptCallback readTranscript)
+                               TranscriptCallback readTranscript,
+                               SourceTranscriptCallback readSourceTranscript,
+                               SourceShotQualityCallback readSourceShotQuality,
+                               AnalyzeShotQualityCallback analyzeShotQuality,
+                               CaptureFrameCallback captureFrame)
     : document_(document),
       edit_log_(editLog),
       on_applied_(std::move(onApplied)),
       apply_project_(std::move(applyProject)),
-      read_transcript_(std::move(readTranscript)) {}
+      read_transcript_(std::move(readTranscript)),
+      read_source_transcript_(std::move(readSourceTranscript)),
+      read_source_shot_quality_(std::move(readSourceShotQuality)),
+      analyze_shot_quality_(std::move(analyzeShotQuality)),
+      capture_frame_(std::move(captureFrame)) {}
 
 bool McpLiveBackend::SnapshotDocument(Document& document, std::string&) {
     document = document_;
@@ -51,6 +59,47 @@ bool McpLiveBackend::ReadTimelineTranscript(std::string& json,
         return false;
     }
     return read_transcript_(json, message);
+}
+
+bool McpLiveBackend::ReadSourceTranscript(const Ulid& sourceId,
+                                          Transcript& transcript,
+                                          std::string& message) {
+    if (!read_source_transcript_) {
+        message = "the live backend has no transcript reader";
+        return false;
+    }
+    return read_source_transcript_(sourceId, transcript, message);
+}
+
+bool McpLiveBackend::ReadSourceShotQuality(const Ulid& sourceId,
+                                           ShotQualityReport& report,
+                                           std::string& message) {
+    if (!read_source_shot_quality_) {
+        message = "the live backend has no shot quality reader";
+        return false;
+    }
+    return read_source_shot_quality_(sourceId, report, message);
+}
+
+bool McpLiveBackend::AnalyzeSourceShotQuality(const Ulid& sourceId,
+                                              std::string& resultJson,
+                                              std::string& message) {
+    if (!analyze_shot_quality_) {
+        message = "the live backend cannot run a shot quality analysis";
+        return false;
+    }
+    return analyze_shot_quality_(sourceId, resultJson, message);
+}
+
+bool McpLiveBackend::CaptureSourceFrame(const Ulid& sourceId,
+                                        const RationalTime& time,
+                                        std::string& jpegBytes,
+                                        std::string& message) {
+    if (!capture_frame_) {
+        message = "the live backend cannot render a frame";
+        return false;
+    }
+    return capture_frame_(sourceId, time, jpegBytes, message);
 }
 
 bool McpLiveBackend::Undo(std::string& resultJson, std::string& errorName,

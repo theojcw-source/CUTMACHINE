@@ -1,6 +1,7 @@
 #include "McpProjectBackend.h"
 
 #include "Cli.h"
+#include "FrameCapture.h"
 #include "InterviewShort.h"
 #include "Json.h"
 #include "Project.h"
@@ -82,6 +83,62 @@ bool McpProjectBackend::ReadTimelineTranscript(std::string& json,
         project.MakeActiveDocument(),
         projectPath.parent_path() / ".cutmachine" / "transcripts", json,
         message);
+}
+
+bool McpProjectBackend::ReadSourceTranscript(const Ulid& sourceId,
+                                             Transcript& transcript,
+                                             std::string& message) {
+    const std::filesystem::path projectPath =
+        std::filesystem::absolute(project_path_);
+    const std::filesystem::path path = projectPath.parent_path() /
+                                       ".cutmachine" / "transcripts" /
+                                       (sourceId + ".json");
+    return LoadAudioTranscript(path.string(), transcript, message);
+}
+
+bool McpProjectBackend::ReadSourceShotQuality(const Ulid& sourceId,
+                                              ShotQualityReport& report,
+                                              std::string& message) {
+    const std::filesystem::path projectPath =
+        std::filesystem::absolute(project_path_);
+    const std::filesystem::path path = projectPath.parent_path() /
+                                       ".cutmachine" / "shotquality" /
+                                       (sourceId + ".json");
+    return LoadShotQuality(path.string(), report, message);
+}
+
+bool McpProjectBackend::AnalyzeSourceShotQuality(const Ulid& sourceId,
+                                                 std::string& resultJson,
+                                                 std::string& message) {
+    // Same command `--shot-quality` runs, for the same reason ApplyOperation
+    // reuses ApplyOperationCommand: one analysis path, not two.
+    std::string output;
+    const int result =
+        AnalyzeShotQualityCommand(project_path_, sourceId, output);
+    std::string errorName;
+    return ParseCommandResult(output, result == 0, resultJson, errorName,
+                              message);
+}
+
+bool McpProjectBackend::CaptureSourceFrame(const Ulid& sourceId,
+                                           const RationalTime& time,
+                                           std::string& jpegBytes,
+                                           std::string& message) {
+    Project project;
+    if (!LoadStoredProject(project_path_, project, message)) return false;
+    const auto media = std::find_if(
+        project.rushes.begin(), project.rushes.end(),
+        [&](const LibraryMedia& item) { return item.id == sourceId; });
+    if (media == project.rushes.end()) {
+        message = "unknown media_id '" + sourceId + "'";
+        return false;
+    }
+    std::filesystem::path path(media->path);
+    if (path.is_relative()) {
+        path = std::filesystem::absolute(project_path_).parent_path() / path;
+    }
+    return ::CaptureSourceFrame(path.lexically_normal().string(), time,
+                                FrameCaptureSettings{}, jpegBytes, message);
 }
 
 bool McpProjectBackend::Undo(std::string& resultJson, std::string& errorName,

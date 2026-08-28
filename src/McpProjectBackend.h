@@ -21,6 +21,15 @@ public:
     bool ApplyProjectEdit(ProjectOperation operation, std::string& resultJson,
                           std::string& errorName,
                           std::string& message) override;
+    bool ReadSourceTranscript(const Ulid& sourceId, Transcript& transcript,
+                              std::string& message) override;
+    bool ReadSourceShotQuality(const Ulid& sourceId, ShotQualityReport& report,
+                               std::string& message) override;
+    bool AnalyzeSourceShotQuality(const Ulid& sourceId, std::string& resultJson,
+                                  std::string& message) override;
+    bool CaptureSourceFrame(const Ulid& sourceId, const RationalTime& time,
+                            std::string& jpegBytes,
+                            std::string& message) override;
     bool ReadTimelineTranscript(std::string& json,
                                 std::string& message) override;
     bool Undo(std::string& resultJson, std::string& errorName,

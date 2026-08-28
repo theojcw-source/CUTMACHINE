@@ -124,7 +124,7 @@ une fois F0 mergé.
 | Ticket | Statut |
 |---|---|
 | F0.1–F0.4 | fait |
-| F1.1–F1.2 | fait (serveur MCP natif + 39 tools) |
+| F1.1–F1.2 | fait (serveur MCP natif ; 55 tools au 28/08/2026) |
 | F1.3 | fait (grading couleur, rendu Metal non vérifiable hors macOS) |
 | F1.4 | fait (transcription whisper.cpp + coupe par mot) |
 | F1.5 | fait (multicam) |
@@ -134,6 +134,53 @@ une fois F0 mergé.
 | F2.3 | fait (panneau média Média/Audio/Légendes, AppKit non vérifiable hors macOS) |
 | F2.4 | fait (chat branché sur le même dispatcher McpTools que le serveur MCP, BYOK) |
 | F2.5 | fait (transport : lecture/pause, scrub bar, timecode) |
+
+## Suite d'audit — QC-2026-08
+
+Chantiers issus de l'audit externe du 28 août 2026, sur l'axe « interview
+dynamique, sans plan flou ni bougé, sans hésitations ».
+
+| Ticket | Statut |
+|---|---|
+| Q1 — Module `ShotQuality` : netteté (variance du laplacien) et bougé mesurés par FFmpeg, cache `.cutmachine/shotquality/`, cœur pur testé sans FFmpeg | fait |
+| Q2 — `--shot-quality`, `--shot-quality-report`, outil MCP `list_shot_quality` | fait |
+| Q3 — `create_interview_short` n'accepte plus que des `span_id`, avec fusion d'un intervalle contigu (`end_span_id`) résolue par le moteur | fait |
+| Q4 — `clean_disfluencies` : une intention, une opération réversible, aucune énumération par le modèle | fait |
+| Q4b — `RemoveWordsOperation.linked_clip_ids` : une paire A/V liée est coupée des deux côtés dans une seule opération réversible (avant, nettoyer le son laissait l'image et désynchronisait) | fait |
+| Q5 — `MainThreadBackend` transmet enfin `ReadSourceTranscript` : le nettoyage par mot était injoignable depuis le panneau chat alors qu'il marchait en MCP | fait |
+
+## Suite d'audit — parité des surfaces (QC-2026-08b)
+
+Déclenché par un constat : sur le montage « Le dixième titan », l'essentiel du
+travail utile était hors du catalogue d'outils, donc hors de portée de l'agent
+intégré. Ces tickets ramènent ces capacités dans le moteur.
+
+| Ticket | Statut |
+|---|---|
+| P1 — `read_frame` : l'agent peut **regarder** une image (JPEG via MCP et jusque dans le `tool_result` Anthropic). Corrige la classe d'erreur qu'aucune mesure n'attrape — un plan net et stable qui montre quelqu'un en train de parler | fait |
+| P2 — `analyze_shot_quality` : l'agent peut produire l'analyse qu'il ne pouvait que lire | fait |
+| P3 — `list_shot_quality` tient compte du recouvrement (`visible`, `fully_covered`, `needs_attention`) au lieu de réclamer la correction de plans invisibles | fait |
+| P4 — `SetActiveProjectTimelineOperation` + outil `set_active_timeline` : changer de timeline n'était possible qu'à la souris | fait |
+| P5 — Notation du bougé rendue relative à la source ; les seuils absolus condamnaient 67 % d'une interview à la main | fait |
+| P6 — Contiguïté des spans adossée à `kSubtitleCueMaximumGap` : les respirations inter-mots ne sont plus des refus | fait |
+
+Restent ouverts sur cet axe :
+
+- **La transcription n'est toujours pas déclenchable par l'agent** (`--transcribe` en CLI, action de menu dans l'app). Elle demande un chemin de modèle Whisper, qui est une préférence utilisateur — à traiter comme telle avant d'exposer l'outil.
+- **Aucun verrou partagé entre `--mcp-serve` et l'app.** Seule l'app prend `ProjectSessionLock` ; deux surfaces sur le même projet divergent en silence.
+- **Vérification du rendu** (comparer l'export à ce que le document décrit) reste un travail manuel.
+
+Restent ouverts et non traités ici, par ordre de gravité (voir l'audit) :
+
+- **`Export.cc` ne lit jamais `clip.effects`.** L'étalonnage est visible au
+  moniteur et absent du fichier livré. C'est un défaut de correction, et le
+  premier ticket à prendre.
+- **`Test copilot/` n'est pas branché** : trois suites de tests et le job CI
+  `ctest.yml` sont écrits et non référencés dans `CMakeLists.txt`.
+- **Aucune sortie interopérable** (OTIO/FCPXML/EDL).
+- **Pas de marqueur de tour dans `EditLog`** : impossible d'annuler une
+  intervention d'agent en un geste.
+- **La langue n'entre pas dans l'identité du cache de transcription.**
 
 Toutes les phases (0, 1, 2) sont closes. Reste hors roadmap : validation
 visuelle réelle sur macOS (AppKit/Metal non compilables dans ce

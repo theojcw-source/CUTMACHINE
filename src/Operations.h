@@ -488,8 +488,15 @@ struct RemoveWordsOperation {
     // or tail edge (see ApplyRemoveWords) -- there is no fragment on the
     // other side of those cuts to pad against.
     RationalTime gap_padding{0, 1};
+    // Other clips cut by the exact same source ranges, each ripple-closed on
+    // its own track, inside this one operation. This is how an A/V pair is
+    // cleaned: picture and sound must lose the same frames or they drift,
+    // and doing it as two operations would turn one editorial gesture into
+    // two undo steps. Every named clip must contain every range in its own
+    // source span, which is checked here rather than trusted.
+    std::vector<Ulid> linked_clip_ids;
     // Other tracks ripple-shifted by this clip's same total delta, beyond
-    // its own track. Mirrors RippleTrimOperation::sync_track_ids.
+    // the tracks cut above. Mirrors RippleTrimOperation::sync_track_ids.
     std::vector<Ulid> sync_track_ids;
     std::vector<ExactTrackState> exact_track_result;
 };
@@ -601,17 +608,26 @@ struct ProjectRelinkItem {
     std::string stored_path;
 };
 
+// QC-2026-08 -- Switching which timeline is active was reachable only from
+// the app's own timeline list, so an agent could create a timeline and then
+// not navigate to one. That is the "moteur d'abord" rule broken in the
+// direction the rule exists to prevent (PHILOSOPHY.md principle 3): a
+// capability the mouse had and no other surface did.
+struct SetActiveProjectTimelineOperation {
+    Ulid timeline_id;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
 struct RelinkProjectMediaOperation {
     std::vector<ProjectRelinkItem> replacements;
     std::optional<ExactProjectState> exact_project_result;
 };
 
-using ProjectOperation =
-    std::variant<AddProjectTimelineOperation,
-                 CreateProjectTimelineFromSegmentsOperation,
-                 RemoveProjectTimelineOperation, SetProjectBinMetadataOperation,
-                 SetProjectTimelineBinOperation, RenameProjectItemOperation,
-                 RelinkProjectMediaOperation>;
+using ProjectOperation = std::variant<
+    AddProjectTimelineOperation, CreateProjectTimelineFromSegmentsOperation,
+    RemoveProjectTimelineOperation, SetProjectBinMetadataOperation,
+    SetProjectTimelineBinOperation, RenameProjectItemOperation,
+    SetActiveProjectTimelineOperation, RelinkProjectMediaOperation>;
 
 // On success, operation is enriched with generated IDs and exact redo state.
 // Both document and operation remain unchanged on failure.

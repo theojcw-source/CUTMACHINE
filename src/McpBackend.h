@@ -26,9 +26,14 @@
 // one shape without a reverse enum<->string mapping.
 
 #include "Document.h"
+#include "FrameCapture.h"
+#include "InterviewShort.h"
 #include "Operations.h"
+#include "ShotQuality.h"
+#include "Transcription.h"
 
 #include <string>
+#include <vector>
 
 class McpBackend {
 public:
@@ -60,6 +65,61 @@ public:
     // cache directory belongs to the open project, not the Document JSON.
     virtual bool ReadTimelineTranscript(std::string&, std::string& message) {
         message = "this backend has no project transcript cache";
+        return false;
+    }
+
+    // One mounted source's cached transcript, keyed on the media identity
+    // DocumentSource::id and LibraryMedia::id share. Separate from
+    // ReadTimelineTranscript because word-level editing addresses a single
+    // clip's own source, not the flattened view of the audible timeline.
+    virtual bool ReadSourceTranscript(const Ulid&, Transcript&,
+                                      std::string& message) {
+        message = "this backend has no project transcript cache";
+        return false;
+    }
+
+    // The same view, structured. Editorial selection addresses spans by id
+    // and never by time, so the tool that builds a short needs the spans as
+    // objects rather than as the rendered JSON a model reads. The default
+    // goes through ReadTimelineTranscript and parses its own output, so a
+    // backend that can only produce the rendered view still answers this
+    // correctly instead of having to grow a second cache path.
+    virtual bool ReadTimelineTranscriptSpans(
+        std::vector<TimelineTranscriptSpan>& spans, std::string& message) {
+        std::string json;
+        if (!ReadTimelineTranscript(json, message)) return false;
+        return ParseTimelineTranscriptSpans(json, spans, message);
+    }
+
+    // Renders one frame of a mounted source, as JPEG bytes, at an exact
+    // position in that source's own time domain. Behind the backend because
+    // resolving a media id to a file on disk is the open project's job.
+    // See FrameCapture.h for why looking is a capability at all.
+    virtual bool CaptureSourceFrame(const Ulid&, const RationalTime&,
+                                    std::string&, std::string& message) {
+        message = "this backend cannot render a frame";
+        return false;
+    }
+
+    // Produces the picture-quality analysis this backend can otherwise only
+    // read. Without it the tool catalog could report grades and never make
+    // one, so an agent depended on a human running the CLI first -- the
+    // engine-first rule broken at the last step (PHILOSOPHY.md principle 3).
+    // Long-running by nature: it decodes the whole source.
+    virtual bool AnalyzeSourceShotQuality(const Ulid&, std::string&,
+                                          std::string& message) {
+        message = "this backend cannot run a shot quality analysis";
+        return false;
+    }
+
+    // Read-only cached picture-quality report for one mounted source, keyed
+    // on the same media identity DocumentSource::id and LibraryMedia::id
+    // share. Kept behind the backend for the same reason the transcript
+    // readers are: the analysis is a cache artifact belonging to the open
+    // project, never document state.
+    virtual bool ReadSourceShotQuality(const Ulid&, ShotQualityReport&,
+                                       std::string& message) {
+        message = "this backend has no project shot quality cache";
         return false;
     }
 

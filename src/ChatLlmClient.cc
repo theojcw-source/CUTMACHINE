@@ -90,11 +90,25 @@ std::string DumpContentBlock(const ChatContentBlock& block) {
             return "{\"type\":\"tool_use\",\"id\":\"" + Esc(block.tool_use_id) +
                    "\",\"name\":\"" + Esc(block.tool_name) +
                    "\",\"input\":" + block.tool_input.Dump() + "}";
-        case ChatBlockType::ToolResult:
+        case ChatBlockType::ToolResult: {
+            // A tool result carrying a picture becomes an array of blocks --
+            // the text the tool returned, then the image. Anthropic accepts
+            // an image inside a tool_result; the plain-string form stays for
+            // every other tool so nothing about the existing traffic
+            // changes.
+            const std::string body =
+                block.tool_image_base64.empty() || block.tool_image_mime.empty()
+                    ? "\"" + Esc(block.text) + "\""
+                    : "[{\"type\":\"text\",\"text\":\"" + Esc(block.text) +
+                          "\"},{\"type\":\"image\",\"source\":{\"type\":"
+                          "\"base64\",\"media_type\":\"" +
+                          Esc(block.tool_image_mime) + "\",\"data\":\"" +
+                          Esc(block.tool_image_base64) + "\"}}]";
             return "{\"type\":\"tool_result\",\"tool_use_id\":\"" +
-                   Esc(block.tool_use_id) + "\",\"content\":\"" +
-                   Esc(block.text) + "\",\"is_error\":" +
-                   (block.tool_is_error ? "true" : "false") + "}";
+                   Esc(block.tool_use_id) + "\",\"content\":" + body +
+                   ",\"is_error\":" + (block.tool_is_error ? "true" : "false") +
+                   "}";
+        }
     }
     return "{}";
 }
@@ -474,16 +488,17 @@ ChatContentBlock ChatContentBlock::MakeToolUse(std::string id, std::string name,
     return block;
 }
 
-ChatContentBlock ChatContentBlock::MakeToolResult(std::string toolUseId,
-                                                  std::string text,
-                                                  bool isError,
-                                                  std::string toolName) {
+ChatContentBlock ChatContentBlock::MakeToolResult(
+    std::string toolUseId, std::string text, bool isError, std::string toolName,
+    std::string imageBase64, std::string imageMime) {
     ChatContentBlock block;
     block.type = ChatBlockType::ToolResult;
     block.tool_use_id = std::move(toolUseId);
     block.text = std::move(text);
     block.tool_name = std::move(toolName);
     block.tool_is_error = isError;
+    block.tool_image_base64 = std::move(imageBase64);
+    block.tool_image_mime = std::move(imageMime);
     return block;
 }
 

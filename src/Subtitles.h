@@ -15,6 +15,13 @@ struct SubtitleCue {
     std::string text;
 };
 
+// The silence that ends one cue and starts the next. SubtitleCuesForClip
+// breaks a cue when words are further apart than this, so two consecutive
+// cues are separated either by nothing, or by a pause shorter than this that
+// simply falls outside both of them. Exposed because InterviewShort.cc has
+// to tell those two apart from a real editorial gap.
+inline constexpr RationalTime kSubtitleCueMaximumGap{7, 10};
+
 bool ParseSrt(const std::string& contents, std::vector<SubtitleCue>& cues,
               std::string& error);
 bool LoadSrt(const std::string& path, std::vector<SubtitleCue>& cues,

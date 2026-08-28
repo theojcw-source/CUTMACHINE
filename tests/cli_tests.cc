@@ -67,6 +67,34 @@ int main() {
         (GenerateUlid() + "-cli-tests");
     std::filesystem::create_directory(directory);
     std::string error;
+    std::string createdOutput;
+    const std::filesystem::path createdPackage =
+        directory / "Created.cutmachine-project";
+    Check(CreateProjectCommand(createdPackage.string(), "Mission IA",
+                               createdOutput) == 0,
+          "headless project creation succeeds: " + createdOutput);
+    const std::filesystem::path createdPath =
+        createdPackage / "project.cutmachine.json";
+    Project createdProject;
+    Check(Project::Load(createdPath.string(), createdProject, error) &&
+              createdProject.name == "Mission IA" &&
+              createdProject.timelines.size() == 1,
+          "headless project creation writes a valid package: " + error);
+    const std::string createdBytes = Read(createdPath);
+    Check(CreateProjectCommand(createdPackage.string(), "Replacement",
+                               createdOutput) == 1,
+          "headless project creation refuses an existing destination");
+    Check(Read(createdPath) == createdBytes,
+          "refused project creation preserves the existing package");
+    Check(TranscribeMediaCommand(createdPath.string(),
+                                 "01K39999999999999999999999", "missing.bin",
+                                 "fr", true, createdOutput) == 1 &&
+              createdOutput.find("\"error\":\"UnknownMedia\"") !=
+                  std::string::npos,
+          "headless transcription rejects an unknown media identity");
+    Check(Read(createdPath) == createdBytes,
+          "refused transcription leaves the project byte-identical");
+
     Project fixtureProject = Project::FromDocument(Fixture(), "CLI fixture");
     std::string fixturePath;
     Check(CreatePortableProject(

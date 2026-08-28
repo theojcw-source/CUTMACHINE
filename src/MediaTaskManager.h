@@ -20,7 +20,8 @@ enum class MediaTaskKind {
     Proxy,
     Relink,
     Beat,
-    Transcription
+    Transcription,
+    ShotQuality
 };
 enum class MediaTaskState { Queued, Running, Succeeded, Failed, Cancelled };
 

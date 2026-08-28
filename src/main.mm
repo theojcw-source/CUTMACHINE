@@ -4162,6 +4162,83 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 strongSelf.state->document,
                 projectPath.parent_path() / ".cutmachine" / "transcripts", json,
                 message);
+        },
+        [weakSelf](const Ulid& sourceId, Transcript& transcript,
+                   std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            return LoadAudioTranscript(
+                (projectPath.parent_path() / ".cutmachine" / "transcripts" /
+                 (sourceId + ".json"))
+                    .string(),
+                transcript, message);
+        },
+        [weakSelf](const Ulid& sourceId, ShotQualityReport& report,
+                   std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            return LoadShotQuality((projectPath.parent_path() / ".cutmachine" /
+                                    "shotquality" / (sourceId + ".json"))
+                                       .string(),
+                                   report, message);
+        },
+        [weakSelf](const Ulid& sourceId, std::string& resultJson,
+                   std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            // Same command the CLI runs, so a grade produced from the chat
+            // panel is the same artifact `--shot-quality` writes.
+            std::string output;
+            const int result = AnalyzeShotQualityCommand(
+                strongSelf.documentPath.UTF8String ?: "", sourceId, output);
+            if (result != 0) {
+                message = output;
+                return false;
+            }
+            resultJson = output;
+            return true;
+        },
+        [weakSelf](const Ulid& sourceId, const RationalTime& time,
+                   std::string& jpegBytes, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const LibraryMedia* media = nullptr;
+            for (const LibraryMedia& item : strongSelf.state->project.rushes) {
+                if (item.id == sourceId) {
+                    media = &item;
+                    break;
+                }
+            }
+            if (media == nullptr) {
+                message = "unknown media_id '" + sourceId + "'";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            std::filesystem::path path(media->path);
+            if (path.is_relative()) path = projectPath.parent_path() / path;
+            return ::CaptureSourceFrame(path.lexically_normal().string(), time,
+                                        FrameCaptureSettings{}, jpegBytes,
+                                        message);
         });
     self.chatPanelView = [[CMChatPanelView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];
@@ -6839,7 +6916,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         std::string cacheError;
         if (LoadAudioTranscript(cachedPath.string(), cached, cacheError) &&
             cached.media_id == mediaId &&
-            cached.whisper_model == expectedModel) {
+            cached.whisper_model == expectedModel && !cached.verbatim) {
             batch.transcript_paths.emplace(mediaId, cachedPath);
             continue;
         }
@@ -12483,6 +12560,57 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if (argc == 4 && std::string(argv[1]) == "--create-project") {
+        std::string output;
+        const int result = CreateProjectCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc >= 5 && argc <= 7 && std::string(argv[1]) == "--transcribe") {
+        std::string language = "auto";
+        bool verbatim = false;
+        for (int index = 5; index < argc; ++index) {
+            if (std::string(argv[index]) == "--verbatim") {
+                verbatim = true;
+            } else if (language == "auto") {
+                language = argv[index];
+            } else {
+                std::fprintf(stderr, "Unexpected transcription argument: %s\n",
+                             argv[index]);
+                return 2;
+            }
+        }
+        std::string output;
+        const int result = TranscribeMediaCommand(argv[2], argv[3], argv[4],
+                                                  language, verbatim, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 4 && std::string(argv[1]) == "--shot-quality") {
+        std::string output;
+        const int result = AnalyzeShotQualityCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--shot-quality-report") {
+        std::string output;
+        const int result = ShotQualityReportCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 4 && std::string(argv[1]) == "--disfluencies") {
+        std::string output;
+        const int result = ListDisfluenciesCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--remove-words") {
+        std::string output;
+        const int result =
+            RemoveWordsCommand(argv[2], argv[3], argv[4], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
     if (argc == 4 && std::string(argv[1]) == "--apply-op") {
         std::string output;
         const int result = ApplyOperationCommand(argv[2], argv[3], output);
@@ -12595,6 +12723,18 @@ int main(int argc, char* argv[]) {
         std::fprintf(
             stderr,
             "Usage: %s [/path/to/project.cutmachine.json]\n"
+            "       %s --create-project /path/to/Film.cutmachine-project "
+            "'<name>'\n"
+            "       %s --transcribe /path/to/project.cutmachine.json "
+            "'<media-id>' /path/to/ggml-model.bin [language] [--verbatim]\n"
+            "       %s --shot-quality /path/to/project.cutmachine.json "
+            "'<media-id>'\n"
+            "       %s --shot-quality-report "
+            "/path/to/project.cutmachine.json\n"
+            "       %s --disfluencies /path/to/project.cutmachine.json "
+            "'<clip-id>'\n"
+            "       %s --remove-words /path/to/project.cutmachine.json "
+            "'<clip-id>' '<[{\"start_word_index\":0,\"end_word_index\":0}]>'\n"
             "       %s --describe /path/to/project.cutmachine.json\n"
             "       %s --apply-op /path/to/project.cutmachine.json "
             "'<op.json>'\n"
@@ -12610,7 +12750,8 @@ int main(int argc, char* argv[]) {
             "       %s --export /path/to/project.cutmachine.json output.mp4 "
             "[--software] [--overwrite]\n",
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-            argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
+            argv[0]);
         return 2;
     }
 

@@ -70,13 +70,22 @@ struct ChatContentBlock {
     std::string tool_name;    // ToolUse only
     mcp_json::Value tool_input;  // ToolUse only -- the tool call's arguments
     bool tool_is_error = false;  // ToolResult only
+    // ToolResult only: a picture the tool returned alongside its text, as
+    // base64 with its MIME type. Empty for every tool but read_frame.
+    // Serialised only for providers whose API accepts an image inside a tool
+    // result -- see SendMessages; elsewhere the text still goes through and
+    // the picture is dropped rather than faked into a description.
+    std::string tool_image_base64;
+    std::string tool_image_mime;
 
     static ChatContentBlock MakeText(std::string text);
     static ChatContentBlock MakeToolUse(std::string id, std::string name,
                                         mcp_json::Value input);
     static ChatContentBlock MakeToolResult(std::string toolUseId,
                                            std::string text, bool isError,
-                                           std::string toolName = {});
+                                           std::string toolName = {},
+                                           std::string imageBase64 = {},
+                                           std::string imageMime = {});
 };
 
 // One turn of the conversation. `role` is "user" or "assistant", matching

@@ -139,6 +139,7 @@ add_library(cutmachine_model
     src/MediaTaskManager.cc
     src/EditLog.cc
     src/Export.cc
+    src/FrameCapture.cc
     src/Keyframes.cc
     src/McpLiveBackend.cc
     src/McpProjectBackend.cc
@@ -151,6 +152,7 @@ add_library(cutmachine_model
     src/ProjectStorage.cc
     src/Proxy.cc
     src/Relink.cc
+    src/ShotQuality.cc
     src/Subtitles.cc
     src/Thumbnail.cc
     src/Timeline.cc
@@ -416,6 +418,20 @@ if(BUILD_TESTING)
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
     add_test(NAME cutmachine_transcription_tests
              COMMAND cutmachine_transcription_tests)
+
+    add_executable(cutmachine_frame_capture_tests tests/frame_capture_tests.cc)
+    target_link_libraries(cutmachine_frame_capture_tests PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_frame_capture_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_frame_capture_tests
+             COMMAND cutmachine_frame_capture_tests)
+
+    add_executable(cutmachine_shot_quality_tests tests/shot_quality_tests.cc)
+    target_link_libraries(cutmachine_shot_quality_tests PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_shot_quality_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_shot_quality_tests
+             COMMAND cutmachine_shot_quality_tests)
 
     add_executable(cutmachine_subtitle_tests tests/subtitle_tests.cc)
     target_link_libraries(cutmachine_subtitle_tests PRIVATE cutmachine_model)

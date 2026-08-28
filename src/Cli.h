@@ -14,6 +14,32 @@ class Project;
 
 // Headless command entry points. These functions depend only on the model
 // library and never initialize AppKit, Metal, media decoding, or rendering.
+int CreateProjectCommand(const std::string& packagePath,
+                         const std::string& projectName, std::string& output);
+// ALPHA-2026-08 -- automation must be able to produce the same local
+// transcript cache the AppKit action consumes; otherwise an agent can read a
+// transcript but cannot complete the workflow that creates it.
+int TranscribeMediaCommand(const std::string& projectPath,
+                           const std::string& mediaId,
+                           const std::string& whisperModelPath,
+                           const std::string& language, bool verbatim,
+                           std::string& output);
+// ALPHA-2026-08 -- the reason these take word indices and never a timecode
+// is PHILOSOPHY.md principle 7: the caller (agent or human) names *which
+// words*, CUTMACHINE resolves *which frames*. A caller that could pass a
+// time would be a caller that could invent one.
+// QC-2026-08 -- picture quality is measured, never judged, so the analysis
+// has to be reachable without the app: an agent that can read a grade but
+// cannot produce one has half a workflow. Mirrors TranscribeMediaCommand.
+int AnalyzeShotQualityCommand(const std::string& projectPath,
+                              const std::string& mediaId, std::string& output);
+int ShotQualityReportCommand(const std::string& projectPath,
+                             std::string& output);
+int ListDisfluenciesCommand(const std::string& projectPath,
+                            const std::string& clipId, std::string& output);
+int RemoveWordsCommand(const std::string& projectPath,
+                       const std::string& clipId, const std::string& rangesJson,
+                       std::string& output);
 int DescribeCommand(const std::string& documentPath, std::string& output);
 
 // The same JSON view DescribeCommand produces (sequence/tracks/library/bins/

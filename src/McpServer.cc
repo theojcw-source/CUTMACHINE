@@ -45,8 +45,17 @@ std::string ToolCallResultJson(const McpToolCallOutcome& outcome) {
     const std::string text =
         outcome.ok ? outcome.result_json
                    : (outcome.error_name + ": " + outcome.message);
-    return "{\"content\":[{\"type\":\"text\",\"text\":\"" + Esc(text) +
-           "\"}],\"isError\":" + (outcome.ok ? "false" : "true") + "}";
+    std::string content = "{\"type\":\"text\",\"text\":\"" + Esc(text) + "\"}";
+    // A tool that returned a picture contributes a second content block, in
+    // the shape the MCP specification gives image results. The text block
+    // stays first so a client that ignores images still gets the answer.
+    if (!outcome.image_base64.empty() && !outcome.image_mime.empty()) {
+        content += ",{\"type\":\"image\",\"data\":\"" +
+                   Esc(outcome.image_base64) + "\",\"mimeType\":\"" +
+                   Esc(outcome.image_mime) + "\"}";
+    }
+    return "{\"content\":[" + content +
+           "],\"isError\":" + (outcome.ok ? "false" : "true") + "}";
 }
 
 }  // namespace

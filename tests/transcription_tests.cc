@@ -199,7 +199,8 @@ int main() {
             const std::filesystem::path good = root / "good.transcript";
             std::ofstream(good)
                 << "{\"version\":1,\"media_id\":\"01K300000000000000000000AA\","
-                   "\"whisper_model\":\"ggml-base.en.bin\",\"source_rate\":{"
+                   "\"whisper_model\":\"ggml-base.en.bin\","
+                   "\"verbatim\":true,\"source_rate\":{"
                    "\"num\":25,\"den\":1},\"words\":["
                    "{\"text\":\"hi\",\"start\":{\"value\":0,\"rate\":25},"
                    "\"end\":{\"value\":10,\"rate\":25}},"
@@ -211,7 +212,7 @@ int main() {
                 LoadAudioTranscript(good.string(), parsed, error);
             Check(loadedGood, "loads a well-formed transcript cache: " + error);
             Check(parsed.words.size() == 2 && parsed.words[0].text == "hi" &&
-                      parsed.source_rate.num == 25,
+                      parsed.source_rate.num == 25 && parsed.verbatim,
                   "parsed transcript matches the cache contents exactly");
 
             const std::filesystem::path rounded =
@@ -228,7 +229,7 @@ int main() {
                    "\"end\":{\"value\":5,\"rate\":25}}]}\n";
             Transcript normalized;
             Check(LoadAudioTranscript(rounded.string(), normalized, error) &&
-                      normalized.words.size() == 2 &&
+                      normalized.words.size() == 2 && !normalized.verbatim &&
                       normalized.words[0].end == RationalTime{3, 25} &&
                       normalized.words[1].start == RationalTime{3, 25} &&
                       normalized.words[1].text == "tiny next",
@@ -250,6 +251,141 @@ int main() {
                   "rejects a cache whose words are not in chronological order");
 
             std::filesystem::remove_all(root);
+        });
+
+    Test("RemoveWordsOperation cuts a linked A/V pair in one reversible step",
+         [] {
+             // The shape a real interview has: one source, its picture on a
+             // video track and its detached sound on an audio track, linked,
+             // covering the same span, each followed by another clip.
+             const Ulid sourceId = "01K30000000000000000000020";
+             const Ulid linkGroup = "01K30000000000000000000021";
+             Document document;
+             document.sources = {{sourceId, "A.MP4", {25, 1}, {10000, 25}}};
+             const auto pair = [&](const Ulid& trackId, const std::string& kind,
+                                   int32_t index, const Ulid& firstId,
+                                   const Ulid& secondId) {
+                 DocumentTrack track;
+                 track.id = trackId;
+                 track.kind = kind;
+                 track.index = index;
+                 DocumentClip first{
+                     firstId, sourceId, {0, 25}, {100, 25}, {0, 25}};
+                 first.link_group_id = linkGroup;
+                 DocumentClip second{
+                     secondId, sourceId, {0, 25}, {50, 25}, {100, 25}};
+                 track.clips = {first, second};
+                 return track;
+             };
+             document.sequence.tracks = {
+                 pair("01K30000000000000000000022", "video", 0,
+                      "01K30000000000000000000023",
+                      "01K30000000000000000000024"),
+                 pair("01K30000000000000000000025", "audio", 1,
+                      "01K30000000000000000000026",
+                      "01K30000000000000000000027"),
+             };
+             const std::string before = document.SaveToString();
+
+             EditLog log;
+             RemoveWordsOperation remove{
+                 "01K30000000000000000000026",  // aim at the sound
+                 {{{20, 25}, {60, 25}}},
+                 {0, 1},
+                 {"01K30000000000000000000023"},  // take the picture with it
+                 {},
+                 {}};
+             Check(Apply(log, document, remove, "clean a linked pair"),
+                   "RemoveWords applies across a linked A/V pair");
+
+             const DocumentTrack& video = document.sequence.tracks[0];
+             const DocumentTrack& audio = document.sequence.tracks[1];
+             Check(video.clips.size() == 3 && audio.clips.size() == 3,
+                   "both tracks split into two fragments plus their next clip");
+             // The whole point: picture and sound must still line up. Cutting
+             // only the clip named would have left the video 40 frames longer
+             // and every later frame out of sync with its own sound.
+             for (size_t index = 0; index < 3; ++index) {
+                 Check(video.clips[index].timeline_in ==
+                           audio.clips[index].timeline_in,
+                       "fragment " + std::to_string(index) +
+                           " starts at the same timeline position on both "
+                           "tracks");
+                 Check(
+                     video.clips[index].duration == audio.clips[index].duration,
+                     "fragment " + std::to_string(index) +
+                         " has the same duration on both tracks");
+             }
+             Check(video.clips[2].timeline_in == (RationalTime{60, 25}),
+                   "downstream material closes up by the 40 removed frames on "
+                   "both tracks at once");
+
+             const std::string serialized =
+                 SerializeOperation(log.AppliedEntries().back().op);
+             Check(serialized.find("linked_clip_ids") != std::string::npos,
+                   "the linked clips are part of the serialized operation");
+             Operation parsedOperation = RemoveClipOperation{};
+             EditError error = EditError::None;
+             std::string message;
+             Check(DeserializeOperation(serialized, parsedOperation, error,
+                                        message) &&
+                       SerializeOperation(parsedOperation) == serialized,
+                   "a linked RemoveWords JSON round-trips exactly");
+
+             Check(
+                 log.Undo(document, error, message) &&
+                     document.SaveToString() == before,
+                 "undoing the pair cut restores both tracks byte-identically");
+             Check(log.Redo(document, error, message),
+                   "and it redoes from the recorded snapshot");
+         });
+
+    Test(
+        "RemoveWordsOperation refuses a linked clip that does not cover the "
+        "cut, instead of cutting part of the pair",
+        [] {
+            const Ulid sourceId = "01K30000000000000000000030";
+            Document document;
+            document.sources = {{sourceId, "A.MP4", {25, 1}, {10000, 25}}};
+            DocumentTrack video;
+            video.id = "01K30000000000000000000031";
+            video.kind = "video";
+            video.index = 0;
+            // Deliberately reads a different part of the source, so the ranges
+            // resolved against the audio clip fall outside it.
+            video.clips = {{"01K30000000000000000000032",
+                            sourceId,
+                            {500, 25},
+                            {100, 25},
+                            {0, 25}}};
+            DocumentTrack audio;
+            audio.id = "01K30000000000000000000033";
+            audio.kind = "audio";
+            audio.index = 1;
+            audio.clips = {{"01K30000000000000000000034",
+                            sourceId,
+                            {0, 25},
+                            {100, 25},
+                            {0, 25}}};
+            document.sequence.tracks = {video, audio};
+            const std::string before = document.SaveToString();
+
+            EditLog log;
+            RemoveWordsOperation remove{"01K30000000000000000000034",
+                                        {{{20, 25}, {60, 25}}},
+                                        {0, 1},
+                                        {"01K30000000000000000000032"},
+                                        {},
+                                        {}};
+            EditError error = EditError::None;
+            std::string message;
+            Check(!log.Apply(document, remove, error, message),
+                  "a linked clip outside the ranges is refused");
+            Check(error == EditError::SourceOutOfBounds,
+                  "and it is refused by name, not by a generic failure");
+            Check(document.SaveToString() == before,
+                  "the refusal leaves both tracks untouched: no half-applied "
+                  "cut");
         });
 
     Test(
@@ -474,6 +610,118 @@ int main() {
         std::cout << "SKIP: GenerateAudioTranscript FFmpeg smoke test (no "
                      "FFmpeg executable configured for this build)\n";
     }
+
+    Test("FindDisfluencies isolates fillers and stutters", [] {
+        const auto word = [](const std::string& text, int64_t start,
+                             int64_t end) {
+            return TranscriptWord{text, RationalTime{start, 25},
+                                  RationalTime{end, 25}};
+        };
+        const std::vector<TranscriptWord> words = {
+            word("Donc", 0, 1),    word("euuuh", 1, 2),
+            word("je", 2, 3),      word("je", 3, 4),
+            word("voulais", 4, 5), word("m'inspirer", 5, 6),
+            word("de", 6, 7),      word("l'Attaque", 7, 8),
+        };
+        const std::vector<Disfluency> found = FindDisfluencies(words);
+        Check(found.size() == 2,
+              "one filler and one stutter are found, and nothing else");
+        if (found.size() == 2) {
+            Check(found[0].kind == DisfluencyKind::Filler &&
+                      found[0].range.start_word_index == 1 &&
+                      found[0].range.end_word_index == 1,
+                  "'euuuh' is folded onto 'euh' and reported as a filler");
+            // The second "je" is the one that runs into "voulais", so the cut
+            // has to land on the first.
+            Check(found[1].kind == DisfluencyKind::Repetition &&
+                      found[1].range.start_word_index == 2 &&
+                      found[1].range.end_word_index == 2,
+                  "a doubled word drops its first occurrence, not its last");
+        }
+        // Sorted and non-overlapping is ResolveWordRemoval's precondition,
+        // so the detector owes it directly rather than by convention.
+        for (size_t index = 1; index < found.size(); ++index)
+            Check(found[index].range.start_word_index >
+                      found[index - 1].range.end_word_index,
+                  "detected ranges are sorted and non-overlapping");
+    });
+
+    Test("FindDisfluenciesInClip only names words the clip plays", [] {
+        Transcript transcript;
+        transcript.media_id = "01K300000000000000000000AA";
+        transcript.source_rate = {25, 1};
+        transcript.words = {
+            {"euh", RationalTime{0, 25}, RationalTime{5, 25}},
+            {"bonjour", RationalTime{5, 25}, RationalTime{25, 25}},
+            {"euh", RationalTime{50, 25}, RationalTime{55, 25}},
+        };
+        DocumentClip clip;
+        clip.id = "01K300000000000000000000AB";
+        clip.source_id = transcript.media_id;
+        clip.source_in = RationalTime{0, 25};
+        clip.duration = RationalTime{30, 25};
+
+        const std::vector<Disfluency> found =
+            FindDisfluenciesInClip(clip, transcript);
+        // The second "euh" is real, but it lives past this clip's out point:
+        // ApplyOperation would refuse it, so proposing it would only produce
+        // an error the caller has to guess its way out of.
+        Check(found.size() == 1 && found[0].range.start_word_index == 0,
+              "a disfluency outside the clip's source span is not proposed");
+
+        // Indices stay those of the whole transcript -- that is the domain
+        // ResolveWordRemoval looks them up in.
+        RemoveWordsOperation operation;
+        std::string error;
+        Check(ResolveWordRemoval(clip, transcript, {found[0].range},
+                                 RationalTime{0, 1}, {}, operation, error),
+              "the proposed range resolves against the full transcript: " +
+                  error);
+    });
+
+    Test("FindDisfluencies keeps real words that look like fillers", [] {
+        const auto word = [](const std::string& text) {
+            return TranscriptWord{text, RationalTime{0, 25},
+                                  RationalTime{1, 25}};
+        };
+        // "eu" is what collapsing "euu" lands on, but it is also the past
+        // participle of "avoir"; "bien" starts like "ben". Cutting either
+        // would remove meaning, which is the failure this detector must not
+        // have.
+        const std::vector<TranscriptWord> words = {
+            word("j'ai"), word("eu"), word("bien"), word("des"), word("des"),
+        };
+        const std::vector<Disfluency> found = FindDisfluencies(words);
+        Check(found.size() == 1 &&
+                  found[0].kind == DisfluencyKind::Repetition &&
+                  found[0].range.start_word_index == 3,
+              "only the doubled 'des' is reported; 'eu' and 'bien' survive");
+    });
+
+    Test("FindDisfluencies ignores punctuation glued to words", [] {
+        const auto word = [](const std::string& text) {
+            return TranscriptWord{text, RationalTime{0, 25},
+                                  RationalTime{1, 25}};
+        };
+        // Whisper attaches punctuation to the preceding word and sometimes
+        // emits two words in one token, so folding has to see through both.
+        const std::vector<TranscriptWord> words = {
+            word("partiel,"), word("Euh..."), word("c'\u00e9tait"),
+            word("? Donc"),   word("donc"),   word("voil\u00e0"),
+        };
+        const std::vector<Disfluency> found = FindDisfluencies(words);
+        Check(found.size() == 2,
+              "punctuation does not hide a filler or a "
+              "repetition");
+        if (found.size() == 2) {
+            Check(found[0].kind == DisfluencyKind::Filler &&
+                      found[0].range.start_word_index == 1,
+                  "'Euh...' is recognised through its trailing punctuation");
+            Check(found[1].kind == DisfluencyKind::Repetition &&
+                      found[1].range.start_word_index == 3,
+                  "'? Donc' and 'donc' are seen as the same repeated word");
+        }
+    });
 
     if (failures > 0) {
         std::cerr << failures << " failure(s)\n";
