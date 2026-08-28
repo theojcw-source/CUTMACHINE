@@ -442,6 +442,84 @@ décodage média :
 ./build/cutmachine --export ./Film.cutmachine-project/project.cutmachine.json ./film.mp4
 ```
 
+## Import depuis DaVinci Resolve
+
+Un chutier Resolve n'est pas un fichier : il vit dans la base du projet, et un
+`.drp` est une archive opaque. Il n'y a donc rien à analyser — la seule entrée
+honnête est de faire parler Resolve.
+
+### Depuis Resolve, en un clic
+
+```sh
+tools/resolve-plugin/install.sh
+```
+
+Puis dans Resolve : `Workspace → Scripts → Utility → CUTMACHINE`. La fenêtre
+importe les chutiers du projet ouvert et sait interroger le moteur
+(`--describe`) pour montrer ce que verra l'agent. Voir
+[`tools/resolve-plugin/README.md`](tools/resolve-plugin/README.md).
+
+C'est le chemin recommandé : le script tourne **dans** Resolve, donc il ne
+réclame pas le scripting externe réservé à Resolve Studio, et n'a besoin
+d'aucun interpréteur Python.
+
+### Depuis un terminal
+
+```sh
+# 1. Resolve Studio est lancé, le projet ouvert. Le pont lit le Media Pool.
+python3 -m sidecar.resolve_bridge -o manifest.json
+
+# 2. CUTMACHINE reproduit l'arborescence et ingère les rushes.
+./build/cutmachine --import-resolve \
+  ./Film.cutmachine-project/project.cutmachine.json ./manifest.json
+```
+
+Cette voie-là exige **DaVinci Resolve Studio** : la version gratuite n'exécute
+des scripts que depuis l'application. En échange, elle s'automatise.
+
+Les deux producteurs écrivent le même schéma de manifeste et passent par le
+même importeur — vérifié sur un projet de 408 rushes, où les deux manifestes
+sont équivalents. Ni l'un ni l'autre ne modifie le projet Resolve : ils lisent
+le Media Pool.
+
+Le manifeste ne transporte **que l'identité et l'organisation** — chemin, nom,
+chutier. Aucune métadonnée technique : Resolve renvoie sa cadence en flottant,
+et un flottant ne devient jamais un `RationalTime`. C'est la sonde FFmpeg de
+`--ingest` qui fait autorité sur la cadence et la durée, si bien qu'un rush
+importé depuis Resolve est identique au même rush ingéré depuis un dossier.
+
+Les chutiers sont créés par `AddBinOperation` et les rushes classés par
+`SetMediaBinOperation` : l'import complet s'annule par `Cmd+Z`, chutier par
+chutier. Réimporter le même manifeste ne duplique rien — les chutiers sont
+appariés par nom et par parent, les rushes par chemin absolu résolu. Un Media
+Pool qui grossit se réimporte donc en n'ajoutant que le nouveau. Attention :
+un rush déjà présent est reclassé dans son chutier Resolve, donc un
+réimport écrase le classement fait à la main dans CUTMACHINE.
+
+Les entrées sans fichier — timelines, clips composés, générateurs — sont
+écartées par le pont et rapportées dans son `skipped`. Côté import, tout rush
+refusé est **nommé avec son motif** dans le tableau `errors`, comme pour
+`--ingest` : sur un Media Pool de plusieurs centaines de rushes, un simple
+compteur obligerait à comparer le chutier à la main. Un rush déjà présent dans
+la médiathèque compte dans `skipped` sans figurer dans `errors` — c'est le
+résultat attendu d'un réimport, pas un échec.
+
+```json
+{"ok":true,"added":405,"skipped":3,"bins_created":22,"bins_reused":0,
+ "errors":[{"file":"Ian Post - Electricity.wav","reason":"no video stream"}]}
+```
+
+Deux motifs de refus reviennent souvent. Le média hors ligne : le volume doit
+être monté au moment de l'import. Et le **fichier audio seul** — musique,
+ambiance, son stock — que la sonde refuse faute de flux vidéo. C'est une limite
+de `ProbeMediaMetadata`, partagée avec `--ingest`, pas de l'import Resolve.
+
+Ce qui reste hors périmètre : les timelines Resolve elles-mêmes (seuls les
+rushes traversent), les mots-clés, drapeaux et commentaires de clip, le
+timecode de départ — `LibraryMedia` n'a pas de champ pour l'accueillir — et le
+trajet retour vers Resolve, qui demande une sortie interopérable (voir
+`ROADMAP.md`).
+
 ## Transcription verbatim et nettoyage des hésitations
 
 `--transcribe` accepte une langue explicite et un mode `--verbatim`.

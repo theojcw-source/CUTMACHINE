@@ -587,4 +587,25 @@ if(BUILD_TESTING)
     set_tests_properties(cutmachine_sidecar_tests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
+
+    # The Resolve plugin's pure core is Lua, so its tests run under fuscript,
+    # the Lua 5.1 interpreter DaVinci Resolve ships. Registered only where
+    # Resolve is installed: this is a tool test, not a reason to fail a build
+    # on a machine without it.
+    #
+    # fuscript ALWAYS exits 0 -- on os.exit(1) and on an uncaught Lua error
+    # alike -- so the verdict has to come from its output. Without
+    # PASS_REGULAR_EXPRESSION this test would pass while asserting nothing.
+    set(RESOLVE_FUSCRIPT "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fuscript")
+    if(EXISTS "${RESOLVE_FUSCRIPT}")
+        add_test(
+            NAME cutmachine_resolve_plugin_tests
+            COMMAND "${RESOLVE_FUSCRIPT}" -l lua
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/resolve-plugin/tests/test_cutmachine_lua.lua"
+        )
+        set_tests_properties(cutmachine_resolve_plugin_tests PROPERTIES
+            PASS_REGULAR_EXPRESSION "plugin resolve : tests passés"
+            TIMEOUT 30
+        )
+    endif()
 endif()
