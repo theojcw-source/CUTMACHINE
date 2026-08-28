@@ -12567,9 +12567,13 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
-    if (argc >= 5 && argc <= 7 && std::string(argv[1]) == "--transcribe") {
+    // ALPHA-2026-08 -- the model path became optional the day it became a
+    // local setting (Transcription.h). Omitting it entirely, or passing it
+    // empty to reach the arguments behind it, resolves the configured model.
+    if (argc >= 4 && argc <= 7 && std::string(argv[1]) == "--transcribe") {
         std::string language = "auto";
         bool verbatim = false;
+        const std::string modelPath = argc >= 5 ? argv[4] : "";
         for (int index = 5; index < argc; ++index) {
             if (std::string(argv[index]) == "--verbatim") {
                 verbatim = true;
@@ -12582,8 +12586,8 @@ int main(int argc, char* argv[]) {
             }
         }
         std::string output;
-        const int result = TranscribeMediaCommand(argv[2], argv[3], argv[4],
-                                                  language, verbatim, output);
+        const int result = TranscribeMediaCommand(
+            argv[2], argv[3], modelPath, language, verbatim, output);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
@@ -12733,7 +12737,8 @@ int main(int argc, char* argv[]) {
             "       %s --create-project /path/to/Film.cutmachine-project "
             "'<name>'\n"
             "       %s --transcribe /path/to/project.cutmachine.json "
-            "'<media-id>' /path/to/ggml-model.bin [language] [--verbatim]\n"
+            "'<media-id>' [/path/to/ggml-model.bin] [language] "
+            "[--verbatim]\n"
             "       %s --shot-quality /path/to/project.cutmachine.json "
             "'<media-id>'\n"
             "       %s --shot-quality-report "

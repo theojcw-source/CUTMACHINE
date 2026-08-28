@@ -1,5 +1,6 @@
 #include "Transcription.h"
 
+#include "LocalEnv.h"
 #include "whisper.h"
 
 #include <poll.h>
@@ -936,5 +937,26 @@ bool ResolveWordRemoval(const DocumentClip& clip, const Transcript& transcript,
     // which fills it from the clip's link group).
     operation = RemoveWordsOperation{clip.id, std::move(ranges), gapPadding,
                                      {},      syncTrackIds,      {}};
+    return true;
+}
+
+bool ResolveConfiguredWhisperModel(std::string& path, std::string& reason) {
+    const std::string configured =
+        local_env::Value("CUTMACHINE_WHISPER_MODEL");
+    const std::string file = local_env::LocalEnvFilePath();
+    if (configured.empty()) {
+        reason = "no Whisper model configured: set CUTMACHINE_WHISPER_MODEL "
+                 "to a local ggml model file, either in the environment or in "
+                 "'" +
+                 file + "'";
+        return false;
+    }
+    if (!std::filesystem::is_regular_file(configured)) {
+        reason = "CUTMACHINE_WHISPER_MODEL does not name a regular file: '" +
+                 configured + "' (configured in '" + file + "')";
+        return false;
+    }
+    path = configured;
+    reason.clear();
     return true;
 }

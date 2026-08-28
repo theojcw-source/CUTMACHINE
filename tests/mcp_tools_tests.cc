@@ -104,6 +104,30 @@ public:
         return true;
     }
 
+    // Records what the tool asked for, so the test can check the arguments
+    // reach the engine rather than being swallowed by the dispatcher.
+    struct TranscriptionRequest {
+        Ulid media_id;
+        std::string language;
+        bool verbatim = false;
+        bool seen = false;
+    };
+    TranscriptionRequest transcription_request;
+
+    bool TranscribeSource(const Ulid& mediaId, const std::string& language,
+                          bool verbatim, std::string& resultJson,
+                          std::string& message) override {
+        transcription_request = {mediaId, language, verbatim, true};
+        if (transcription_fails_) {
+            message = "no Whisper model configured";
+            return false;
+        }
+        resultJson = "{\"ok\":true}";
+        return true;
+    }
+
+    void FailTranscription() { transcription_fails_ = true; }
+
     bool ReadSourceShotQuality(const Ulid&, ShotQualityReport& report,
                                std::string& message) override {
         if (shot_quality_.samples.empty()) {
@@ -189,6 +213,7 @@ public:
     }
 
 private:
+    bool transcription_fails_ = false;
     Document document_;
     EditLog log_;
     std::optional<ProjectOperation> project_operation_;
@@ -979,6 +1004,84 @@ int main() {
 
     server.Stop();
     Check(!server.IsRunning(), "server reports stopped after Stop()");
+
+    // ALPHA-2026-08 -- transcribe_media. The tool the catalog lacked while
+    // every word-level tool in it needed a transcript to exist.
+    {
+        McpToolRegistry registry;
+        InMemoryBackend backend(fixture);
+        const auto call = [&](const std::string& argumentsJson) {
+            mcp_json::Value arguments;
+            std::string parseFailure;
+            Check(mcp_json::Value::Parse(argumentsJson, arguments,
+                                         parseFailure),
+                  "transcribe_media arguments parse: " + parseFailure);
+            return registry.Call(backend, "transcribe_media", arguments);
+        };
+
+        const McpToolCallOutcome outcome = call(
+            R"({"media_id":"01K30000000000000000000001","language":"fr","verbatim":true})");
+        Check(outcome.ok, "transcribe_media succeeds: " + outcome.message);
+        Check(backend.transcription_request.seen &&
+                  backend.transcription_request.media_id ==
+                      "01K30000000000000000000001" &&
+                  backend.transcription_request.language == "fr" &&
+                  backend.transcription_request.verbatim,
+              "media, language and verbatim reach the engine unchanged");
+
+        backend.transcription_request = {};
+        Check(call(R"({"media_id":"01K30000000000000000000001"})").ok,
+              "language and verbatim are optional");
+        Check(backend.transcription_request.language == "auto" &&
+                  !backend.transcription_request.verbatim,
+              "the defaults are automatic detection and non-verbatim");
+
+        Check(!call(R"({"media_id":"01K30000000000000000000001","langauge":"fr"})")
+                   .ok,
+              "a misspelled argument is refused rather than ignored");
+        Check(!call(R"({})").ok, "media_id is required");
+        Check(!call(R"({"media_id":"01K39999999999999999999999"})").ok,
+              "an unknown media is refused");
+
+        // The message a user must act on: the model is a local setting, and
+        // a failure that does not say so leaves them with nothing to do.
+        InMemoryBackend unconfigured(fixture);
+        unconfigured.FailTranscription();
+        mcp_json::Value arguments;
+        std::string parseFailure;
+        mcp_json::Value::Parse(R"({"media_id":"01K30000000000000000000001"})",
+                               arguments, parseFailure);
+        const McpToolCallOutcome failure =
+            registry.Call(unconfigured, "transcribe_media", arguments);
+        Check(!failure.ok &&
+                  failure.message.find("Whisper model") != std::string::npos,
+              "an unconfigured model surfaces as a named reason");
+    }
+
+    // A backend that never implements it must say so rather than pretend.
+    {
+        class BareBackend : public InMemoryBackend {
+        public:
+            using InMemoryBackend::InMemoryBackend;
+            bool TranscribeSource(const Ulid&, const std::string&, bool,
+                                  std::string&,
+                                  std::string& message) override {
+                return McpBackend::TranscribeSource(Ulid(), std::string(),
+                                                    false, message, message);
+            }
+        };
+        McpToolRegistry registry;
+        BareBackend bare(fixture);
+        mcp_json::Value arguments;
+        std::string parseFailure;
+        mcp_json::Value::Parse(R"({"media_id":"01K30000000000000000000001"})",
+                               arguments, parseFailure);
+        const McpToolCallOutcome outcome =
+            registry.Call(bare, "transcribe_media", arguments);
+        Check(!outcome.ok && outcome.message.find("cannot run a transcription")
+                                 != std::string::npos,
+              "a backend without transcription reports the gap explicitly");
+    }
 
     if (failures != 0) {
         std::cerr << failures << " assertion(s) failed\n";

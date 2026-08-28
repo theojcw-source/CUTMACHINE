@@ -136,6 +136,7 @@ add_library(cutmachine_model
     src/Ingest.cc
     src/InterviewShort.cc
     src/Json.cc
+    src/LocalEnv.cc
     src/MediaTaskManager.cc
     src/EditLog.cc
     src/Export.cc

@@ -844,10 +844,20 @@ int TranscribeMediaCommand(const std::string& projectPath,
             ErrorJson(EditError::InvalidOperation, "media has no audio stream");
         return 1;
     }
-    if (!std::filesystem::is_regular_file(whisperModelPath)) {
-        output = ErrorJson(
-            EditError::IoError,
-            "Whisper model is not a regular file: '" + whisperModelPath + "'");
+    // An empty path means "use the configured model" -- the only form the
+    // agent can use, since it has no way to know where a human keeps a ggml
+    // file. An explicit path still wins, so the CLI stays scriptable.
+    std::string modelPath = whisperModelPath;
+    if (modelPath.empty() &&
+        !ResolveConfiguredWhisperModel(modelPath, error)) {
+        output = ErrorJson(EditError::IoError, error);
+        return 1;
+    }
+    if (!std::filesystem::is_regular_file(modelPath)) {
+        output =
+            ErrorJson(EditError::IoError,
+                      "Whisper model is not a regular file: '" + modelPath +
+                          "'");
         return 1;
     }
 
@@ -859,7 +869,7 @@ int TranscribeMediaCommand(const std::string& projectPath,
     const std::filesystem::path transcriptPath =
         base / ".cutmachine" / "transcripts" / (mediaId + ".json");
     WhisperSettings settings;
-    settings.whisper_model_path = whisperModelPath;
+    settings.whisper_model_path = modelPath;
     settings.language = language.empty() ? "auto" : language;
     settings.verbatim = verbatim;
     MediaTaskManager tasks(1);

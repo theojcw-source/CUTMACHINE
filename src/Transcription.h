@@ -63,6 +63,18 @@ struct WhisperSettings {
     bool verbatim = false;
 };
 
+// ALPHA-2026-08 -- the model path is the one thing standing between the
+// agent and a transcript it can produce rather than only read. It cannot be a
+// tool argument (an agent has no way to know where a human keeps a ggml file,
+// and a wrong guess is a silent failure) and it cannot live in the project
+// (it is machine-local; see LocalEnv.h). So it is a local setting, resolved
+// here once for every surface: the CLI, the MCP tool and the app all fail the
+// same way, with a message naming the variable and the file to edit.
+//
+// Returns false with a user-facing reason when nothing is configured or the
+// configured path is not a file. Never downloads anything.
+bool ResolveConfiguredWhisperModel(std::string& path, std::string& reason);
+
 // Decodes `inputPath`'s audio locally via FFmpeg (mirrors Waveform.cc's
 // decode pipeline), runs local whisper.cpp inference against the PCM
 // samples, and writes the resulting transcript as JSON to `outputPath`

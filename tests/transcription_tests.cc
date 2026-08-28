@@ -4,6 +4,7 @@
 #include "Operations.h"
 #include "Transcription.h"
 
+#include <unistd.h>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -721,6 +722,67 @@ int main() {
                       found[1].range.start_word_index == 3,
                   "'? Donc' and 'donc' are seen as the same repeated word");
         }
+    });
+
+    Test("the configured Whisper model resolves from the local settings", [] {
+        const std::filesystem::path root =
+            std::filesystem::temp_directory_path() /
+            ("cutmachine-whisper-" + std::to_string(::getpid()));
+        std::filesystem::create_directories(root);
+        const std::filesystem::path envFile = root / ".env";
+        const std::filesystem::path model = root / "ggml-test.bin";
+        {
+            std::ofstream(model) << "not a real model, but a real file";
+        }
+        ::setenv("CUTMACHINE_ENV_FILE", envFile.string().c_str(), 1);
+        ::unsetenv("CUTMACHINE_WHISPER_MODEL");
+
+        // Nothing configured at all: the message has to name both the
+        // variable and the file, or the user is told "no" with nowhere to go.
+        std::string path;
+        std::string reason;
+        Check(!ResolveConfiguredWhisperModel(path, reason),
+              "an unconfigured model is refused");
+        Check(reason.find("CUTMACHINE_WHISPER_MODEL") != std::string::npos &&
+                  reason.find(envFile.string()) != std::string::npos,
+              "the refusal names the setting and the file to edit: " + reason);
+
+        // Configured through the file.
+        {
+            std::ofstream(envFile)
+                << "# commentaire\nCUTMACHINE_WHISPER_MODEL=" << model.string()
+                << "\n";
+        }
+        path.clear();
+        Check(ResolveConfiguredWhisperModel(path, reason) &&
+                  path == model.string(),
+              "a model configured in the local .env resolves: " + reason);
+
+        // The real environment wins over the file, so a one-off override in
+        // front of a command works without editing anything.
+        const std::filesystem::path other = root / "ggml-other.bin";
+        {
+            std::ofstream(other) << "another real file";
+        }
+        ::setenv("CUTMACHINE_WHISPER_MODEL", other.string().c_str(), 1);
+        path.clear();
+        Check(ResolveConfiguredWhisperModel(path, reason) &&
+                  path == other.string(),
+              "an exported variable overrides the file");
+
+        // Configured but wrong: refused before any inference is attempted.
+        ::setenv("CUTMACHINE_WHISPER_MODEL",
+                 (root / "absent.bin").string().c_str(), 1);
+        path.clear();
+        Check(!ResolveConfiguredWhisperModel(path, reason),
+              "a configured path that is not a file is refused");
+        Check(reason.find("absent.bin") != std::string::npos,
+              "the refusal names the offending path: " + reason);
+
+        ::unsetenv("CUTMACHINE_WHISPER_MODEL");
+        ::unsetenv("CUTMACHINE_ENV_FILE");
+        std::error_code cleanup;
+        std::filesystem::remove_all(root, cleanup);
     });
 
     if (failures > 0) {

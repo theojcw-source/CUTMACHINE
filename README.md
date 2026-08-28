@@ -522,7 +522,38 @@ trajet retour vers Resolve, qui demande une sortie interopérable (voir
 
 ## Transcription verbatim et nettoyage des hésitations
 
-`--transcribe` accepte une langue explicite et un mode `--verbatim`.
+### Configurer le modèle
+
+Le chemin du modèle Whisper est un **réglage local de la machine**, jamais une
+donnée de projet : un chemin enregistré dans le projet n'existerait pas sur un
+autre Mac, et le même montage doit s'ouvrir partout. Il se pose une fois, dans
+`~/.config/cutmachine/.env` — le même fichier que la clé API du panneau chat :
+
+```sh
+echo 'CUTMACHINE_WHISPER_MODEL=/chemin/vers/ggml-large-v3.bin' \
+  >> ~/.config/cutmachine/.env
+```
+
+La variable d'environnement l'emporte sur le fichier, donc un essai ponctuel
+se fait en la préfixant à la commande, sans rien modifier.
+
+Une fois posé, le réglage sert les trois surfaces à l'identique : `--transcribe`
+sans chemin explicite, l'outil MCP `transcribe_media`, et l'application. Tant
+qu'il n'est pas posé, les trois refusent de la même façon, en nommant la
+variable et le fichier à éditer.
+
+`transcribe_media` est ce qui rend le travail sur les mots atteignable par un
+agent : `list_disfluencies`, `remove_words` et le montage d'interview lisent
+tous un transcript, et aucun d'eux ne pouvait le faire exister. Il faut
+`verbatim: true` pour pouvoir retirer les hésitations ensuite — le décodage par
+défaut les supprime silencieusement, donc elles ne sont plus là pour être
+coupées.
+
+### Le reste
+
+`--transcribe` accepte une langue explicite et un mode `--verbatim`. Le chemin
+du modèle y reste facultatif : donné, il l'emporte ; omis, c'est le réglage
+local qui s'applique.
 
 L'auto-détection de langue se trompe sur un rush long et majoritairement non
 parlé (mesuré : gallois détecté sur une interview française). Nomme la langue.

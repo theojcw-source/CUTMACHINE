@@ -112,6 +112,22 @@ public:
         return false;
     }
 
+    // Produces the transcript this backend can otherwise only read. Same
+    // asymmetry AnalyzeSourceShotQuality closed for picture quality, and the
+    // more costly one: every word-level tool in this catalog
+    // (list_disfluencies, remove_words, the interview short) needs a
+    // transcript, so without this the agent's whole editorial path depended
+    // on a human running `--transcribe` first. The Whisper model is not an
+    // argument -- it is a local setting the engine resolves
+    // (Transcription.h) -- because an agent has no way to know where a human
+    // keeps a ggml file. Long-running by nature: it decodes and infers over
+    // the whole audio.
+    virtual bool TranscribeSource(const Ulid&, const std::string&, bool,
+                                  std::string&, std::string& message) {
+        message = "this backend cannot run a transcription";
+        return false;
+    }
+
     // Read-only cached picture-quality report for one mounted source, keyed
     // on the same media identity DocumentSource::id and LibraryMedia::id
     // share. Kept behind the backend for the same reason the transcript

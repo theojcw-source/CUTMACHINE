@@ -163,10 +163,10 @@ intégré. Ces tickets ramènent ces capacités dans le moteur.
 | P4 — `SetActiveProjectTimelineOperation` + outil `set_active_timeline` : changer de timeline n'était possible qu'à la souris | fait |
 | P5 — Notation du bougé rendue relative à la source ; les seuils absolus condamnaient 67 % d'une interview à la main | fait |
 | P6 — Contiguïté des spans adossée à `kSubtitleCueMaximumGap` : les respirations inter-mots ne sont plus des refus | fait |
+| P7 — `transcribe_media` : l'agent peut **produire** le transcript dont dépendait tout son travail sur les mots. Le chemin du modèle Whisper devient un réglage local (`LocalEnv.h`), donc résolu identiquement par la CLI, le serveur MCP et l'app | fait |
 
 Restent ouverts sur cet axe :
 
-- **La transcription n'est toujours pas déclenchable par l'agent** (`--transcribe` en CLI, action de menu dans l'app). Elle demande un chemin de modèle Whisper, qui est une préférence utilisateur — à traiter comme telle avant d'exposer l'outil.
 - **Aucun verrou partagé entre `--mcp-serve` et l'app.** Seule l'app prend `ProjectSessionLock` ; deux surfaces sur le même projet divergent en silence.
 - **Vérification du rendu** (comparer l'export à ce que le document décrit) reste un travail manuel.
 

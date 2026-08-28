@@ -1,5 +1,7 @@
 #include "ChatLlmClient.h"
 
+#include "LocalEnv.h"
+
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -13,60 +15,6 @@ using mcp_json::Value;
 
 std::string Esc(const std::string& text) {
     return mcp_json::EscapeJsonString(text);
-}
-
-// ---------------------------------------------------------------------
-// Local dotenv loading -- mirrors sidecar/planner.py's _load_project_env:
-// blank lines and '#' comments are skipped, an optional leading "export "
-// is stripped, the first '=' splits key from value, and a value wrapped in
-// matching quotes has them stripped. Every key is set with overwrite=0, so
-// a variable already exported in the real environment always wins.
-// ---------------------------------------------------------------------
-
-std::string Trim(const std::string& text) {
-    size_t begin = 0;
-    size_t end = text.size();
-    while (begin < end && std::isspace(static_cast<unsigned char>(text[begin])))
-        ++begin;
-    while (end > begin &&
-           std::isspace(static_cast<unsigned char>(text[end - 1])))
-        --end;
-    return text.substr(begin, end - begin);
-}
-
-void LoadDotEnvFile(const std::string& path) {
-    std::ifstream input(path);
-    if (!input.is_open()) return;
-    std::string line;
-    while (std::getline(input, line)) {
-        std::string trimmed = Trim(line);
-        if (trimmed.empty() || trimmed[0] == '#') continue;
-        if (trimmed.rfind("export ", 0) == 0) trimmed = Trim(trimmed.substr(7));
-        const size_t equals = trimmed.find('=');
-        if (equals == std::string::npos) continue;
-        std::string key = Trim(trimmed.substr(0, equals));
-        std::string value = Trim(trimmed.substr(equals + 1));
-        if (key.empty()) continue;
-        if (value.size() >= 2 && value.front() == value.back() &&
-            (value.front() == '\'' || value.front() == '"')) {
-            value = value.substr(1, value.size() - 2);
-        }
-        ::setenv(key.c_str(), value.c_str(), /*overwrite=*/0);
-    }
-}
-
-// $CUTMACHINE_ENV_FILE if set, else ~/.config/cutmachine/.env -- see
-// ChatLlmConfig::FromEnvironment's doc comment for why this is not the
-// sidecar's project-root .env.
-void LoadLocalEnvFileIfPresent() {
-    if (const char* explicitPath = std::getenv("CUTMACHINE_ENV_FILE");
-        explicitPath && *explicitPath) {
-        LoadDotEnvFile(explicitPath);
-        return;
-    }
-    const char* home = std::getenv("HOME");
-    if (home && *home)
-        LoadDotEnvFile(std::string(home) + "/.config/cutmachine/.env");
 }
 
 std::string EnvString(const char* name) {
@@ -503,7 +451,7 @@ ChatContentBlock ChatContentBlock::MakeToolResult(
 }
 
 ChatLlmConfig ChatLlmConfig::FromEnvironment(std::string* missingKeyError) {
-    LoadLocalEnvFileIfPresent();
+    local_env::LoadLocalEnvFileIfPresent();
 
     ChatLlmConfig config;
     const std::string explicitModel = EnvString("CUTMACHINE_ANTHROPIC_MODEL");

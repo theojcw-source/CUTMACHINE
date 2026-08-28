@@ -19,6 +19,9 @@ int CreateProjectCommand(const std::string& packagePath,
 // ALPHA-2026-08 -- automation must be able to produce the same local
 // transcript cache the AppKit action consumes; otherwise an agent can read a
 // transcript but cannot complete the workflow that creates it.
+// An empty `whisperModelPath` resolves the model configured locally
+// (Transcription.h's ResolveConfiguredWhisperModel), which is how every
+// caller that is not a human typing a path reaches this.
 int TranscribeMediaCommand(const std::string& projectPath,
                            const std::string& mediaId,
                            const std::string& whisperModelPath,

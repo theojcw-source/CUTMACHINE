@@ -1975,6 +1975,31 @@ bool DispatchAnalyzeShotQuality(McpBackend& backend, const IdResolver& resolver,
                : Fail(errorName, message, message);
 }
 
+bool DispatchTranscribeMedia(McpBackend& backend, const IdResolver& resolver,
+                             const Value& args, std::string& resultJson,
+                             std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"media_id", "language",
+                                                      "verbatim"};
+    if (!CheckKnownKeys(args, kAllowed, "transcribe_media", message))
+        return Fail(errorName, message, message);
+    Ulid mediaId;
+    if (!ReadId(args, "media_id", "transcribe_media", resolver, true, mediaId,
+                message))
+        return Fail(errorName, message, message);
+    std::string language;
+    if (!ReadString(args, "language", "transcribe_media", false, "auto",
+                    language, message))
+        return Fail(errorName, message, message);
+    bool verbatim = false;
+    if (!ReadBool(args, "verbatim", "transcribe_media", false, verbatim,
+                  message))
+        return Fail(errorName, message, message);
+    return backend.TranscribeSource(mediaId, language, verbatim, resultJson,
+                                    message)
+               ? true
+               : Fail(errorName, message, message);
+}
+
 bool DispatchSetActiveTimeline(McpBackend& backend, const IdResolver& resolver,
                                const Value& args, std::string& resultJson,
                                std::string& errorName, std::string& message) {
@@ -2768,6 +2793,30 @@ McpToolRegistry::McpToolRegistry() {
             .Field("media_id", IdSchema("Media to analyse."), true)
             .Build("analyze_shot_quality arguments"),
         DispatchAnalyzeShotQuality);
+
+    add("transcribe_media",
+        "Transcribe a source's audio locally and cache the transcript, so the "
+        "word-level tools have something to read. Every editorial tool that "
+        "names words rather than times -- list_disfluencies, remove_words, "
+        "build_interview_short -- needs this to have run once on the media. "
+        "Decodes and infers over the whole audio, so it takes from seconds to "
+        "several minutes depending on length; the result is cached and only "
+        "needs redoing when the media changes. Runs a local model with no "
+        "network access. Set verbatim when you intend to remove hesitations: "
+        "the default decoding silently drops them, so they cannot be edited "
+        "out of a transcript made without it.",
+        SchemaBuilder()
+            .Field("media_id", IdSchema("Media to transcribe."), true)
+            .Field("language",
+                   StringSchema("ISO 639-1 code such as \"fr\", or \"auto\" "
+                                "to detect it. Defaults to \"auto\"."),
+                   false)
+            .Field("verbatim",
+                   BoolSchema("Keep hesitations and filler words. Required if "
+                              "they are to be removable afterwards."),
+                   false)
+            .Build("transcribe_media arguments"),
+        DispatchTranscribeMedia);
 
     add("set_active_timeline",
         "Switch which timeline the other tools act on. Every editing tool "
