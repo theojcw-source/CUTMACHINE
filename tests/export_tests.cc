@@ -141,6 +141,16 @@ int main() {
     Check(plan.filter_graph.find("overlay=") != std::string::npos &&
               plan.filter_graph.find("amix=inputs=1") != std::string::npos,
           "plan contains video composition and audio mixing");
+    Check(plan.filter_graph.find(
+              "alimiter=limit=0.668344:level=0:latency=1") !=
+              std::string::npos,
+          "AAC export keeps codec headroom without automatic makeup gain");
+    Check(plan.filter_graph.find("eof_action=repeat:repeatlast=1") !=
+                  std::string::npos &&
+              plan.filter_graph.find("enable=gte(t\\,") != std::string::npos &&
+              plan.filter_graph.find(")*lt(t\\,") != std::string::npos,
+          "video clips hold their final decoded frame only inside their "
+          "half-open timeline range");
     Check(plan.filter_graph.find("setpts=PTS-STARTPTS+(5/25)/TB") !=
               std::string::npos,
           "clip placement remains rational in the filter graph");
@@ -301,6 +311,33 @@ int main() {
               commandOutput.find("\"error\":\"InvalidExport\"") !=
                   std::string::npos,
           "headless export returns a structured validation error");
+
+    const std::filesystem::path sequenceDestination =
+        directory / "sequence-size.mp4";
+    ExportSettings sequenceSettings =
+        Exporter::HevcMain10SoftwarePreset(sequenceDestination.string());
+    sequenceSettings.ffmpeg_path = FFMPEG_EXECUTABLE;
+    Check(ExportCommand(headlessProjectPath, sequenceSettings, {}, nullptr,
+                        commandOutput) == 0,
+          "headless high-quality preset follows the sequence format: " +
+              commandOutput);
+    AVFormatContext* sequenceFormat = nullptr;
+    Check(avformat_open_input(&sequenceFormat, sequenceDestination.c_str(),
+                              nullptr, nullptr) >= 0 &&
+              avformat_find_stream_info(sequenceFormat, nullptr) >= 0,
+          "sequence-sized headless export can be probed");
+    if (sequenceFormat) {
+        const AVCodecParameters* video = nullptr;
+        for (unsigned int index = 0; index < sequenceFormat->nb_streams;
+             ++index)
+            if (sequenceFormat->streams[index]->codecpar->codec_type ==
+                AVMEDIA_TYPE_VIDEO)
+                video = sequenceFormat->streams[index]->codecpar;
+        Check(video && video->width == document.sequence.width &&
+                  video->height == document.sequence.height,
+              "headless export dimensions match the active sequence");
+        avformat_close_input(&sequenceFormat);
+    }
 
     std::filesystem::remove_all(directory);
     if (failures != 0) {

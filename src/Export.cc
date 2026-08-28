@@ -165,8 +165,15 @@ ExportSettings Exporter::SettingsForPreset(ExportPresetId preset,
 }
 
 ExportSettings Exporter::HevcMain10Preset(const std::string& outputPath) {
-    return SettingsForPreset(ExportPresetId::HevcHighQuality, outputPath, 1920,
-                             1080, {25, 1});
+    ExportSettings settings = SettingsForPreset(
+        ExportPresetId::HevcHighQuality, outputPath, 1920, 1080, {25, 1});
+    // The headless preset has no document at construction time. Zero is a
+    // deliberate deferred value resolved by ExportCommand from the active
+    // sequence, matching the UI's "Format de séquence" preset.
+    settings.width = 0;
+    settings.height = 0;
+    settings.frame_rate = {0, 1};
+    return settings;
 }
 
 ExportSettings Exporter::HevcMain10SoftwarePreset(
@@ -402,9 +409,9 @@ bool Exporter::BuildPlan(const Document& document,
                   << ":alpha=1";
         graph << ",setpts=PTS-STARTPTS+" << position << "/TB[v" << videoOrdinal
               << "];" << "[base" << videoOrdinal << "][v" << videoOrdinal
-              << "]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=pass:repeatlast=0:"
-                 "shortest=0:enable=between(t\\,"
-              << position << "\\," << position << '+' << clipDuration
+              << "]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=repeat:repeatlast=1:"
+                 "shortest=0:enable=gte(t\\,"
+              << position << ")*lt(t\\," << position << '+' << clipDuration
               << ")[base" << (videoOrdinal + 1) << "];";
         ++videoOrdinal;
     }
@@ -486,7 +493,8 @@ bool Exporter::BuildPlan(const Document& document,
         for (size_t index = 0; index < audioOrdinal; ++index)
             graph << "[a" << index << ']';
         graph << "amix=inputs=" << audioOrdinal
-              << ":duration=longest:normalize=0,alimiter=limit=1:latency=1,"
+              << ":duration=longest:normalize=0,"
+                 "alimiter=limit=0.668344:level=0:latency=1,"
                  "apad,atrim="
               << "duration=" << Decimal(duration) << "[audio]";
     }

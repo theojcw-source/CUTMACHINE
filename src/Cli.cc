@@ -764,8 +764,19 @@ int ExportCommand(const std::string& documentPath,
         return 1;
     }
     Document document = project.MakeActiveDocument();
+    ExportSettings resolvedSettings = settings;
+    if (settings.width == 0 && settings.height == 0) {
+        resolvedSettings = Exporter::SettingsForPreset(
+            ExportPresetId::HevcHighQuality, settings.output_path,
+            document.sequence.width, document.sequence.height,
+            document.sequence.frame_rate);
+        resolvedSettings.encoder = settings.encoder;
+        resolvedSettings.overwrite = settings.overwrite;
+        resolvedSettings.ffmpeg_path = settings.ffmpeg_path;
+    }
     ExportPlan plan;
-    if (!Exporter::BuildPlan(document, documentPath, settings, plan, error)) {
+    if (!Exporter::BuildPlan(document, documentPath, resolvedSettings, plan,
+                             error)) {
         output = "{\"ok\":false,\"error\":\"InvalidExport\",\"detail\":\"" +
                  EscapeJson(error) + "\"}\n";
         return 1;
