@@ -3,6 +3,7 @@
 #include "Document.h"
 #include "EditLog.h"
 #include "RationalTime.h"
+#include "SequenceFormat.h"
 #include "Subtitles.h"
 #include "Ulid.h"
 
@@ -1975,6 +1976,57 @@ bool DispatchAnalyzeShotQuality(McpBackend& backend, const IdResolver& resolver,
                : Fail(errorName, message, message);
 }
 
+bool DispatchConformSequence(McpBackend& backend, const IdResolver&,
+                             const Value& args, std::string& resultJson,
+                             std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"preview"};
+    if (!CheckKnownKeys(args, kAllowed, "conform_sequence", message))
+        return Fail(errorName, message, message);
+    bool preview = false;
+    if (!ReadBool(args, "preview", "conform_sequence", false, preview, message))
+        return Fail(errorName, message, message);
+
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    SequenceFormatProposal proposal;
+    if (!ResolveSequenceFormat(document.library, proposal, message))
+        return Fail(errorName, message, message);
+
+    const DocumentSequence& current = document.sequence;
+    const bool alreadyConformed =
+        current.width == proposal.chosen.width &&
+        current.height == proposal.chosen.height &&
+        current.frame_rate.num == proposal.chosen.frame_rate.num &&
+        current.frame_rate.den == proposal.chosen.frame_rate.den;
+
+    // Applying a no-op would still push an entry onto the undo stack, so a
+    // sequence that already matches is reported rather than rewritten.
+    if (preview || alreadyConformed) {
+        resultJson = SequenceFormatProposalJson(
+            proposal, std::string(",\"applied\":false,\"already_conformed\":") +
+                          (alreadyConformed ? "true" : "false"));
+        return true;
+    }
+
+    UpdateSequenceOperation operation;
+    operation.sequence_id = current.id;
+    operation.name = current.name;
+    operation.width = proposal.chosen.width;
+    operation.height = proposal.chosen.height;
+    operation.frame_rate = proposal.chosen.frame_rate;
+    std::string applied;
+    if (!backend.ApplyOperation(operation, applied, errorName, message))
+        return false;
+    // The proposal, not the bare {"ok":true} the apply path returns: the
+    // caller has to see which format was chosen and what it passed over.
+    resultJson = SequenceFormatProposalJson(
+        proposal, ",\"applied\":true,\"already_conformed\":false");
+    return true;
+}
+
 bool DispatchTranscribeMedia(McpBackend& backend, const IdResolver& resolver,
                              const Value& args, std::string& resultJson,
                              std::string& errorName, std::string& message) {
@@ -2793,6 +2845,23 @@ McpToolRegistry::McpToolRegistry() {
             .Field("media_id", IdSchema("Media to analyse."), true)
             .Build("analyze_shot_quality arguments"),
         DispatchAnalyzeShotQuality);
+
+    add("conform_sequence",
+        "Set the sequence's resolution and frame rate to the format the "
+        "project's own rushes are in, and report what it chose. Use this "
+        "rather than update_sequence whenever the intent is \"make the "
+        "sequence match the footage\": the numbers are computed from the "
+        "media, never guessed, and rotated rushes are accounted for -- a "
+        "vertical shoot is stored landscape with a rotation flag, so its "
+        "sequence is portrait even though every file reads 3840x2160. When "
+        "the rushes disagree, the most common format wins and the others are "
+        "reported in \"candidates\" for you to raise with the user. Set "
+        "preview to see the proposal without changing anything.",
+        SchemaBuilder()
+            .Field("preview",
+                   BoolSchema("Report the format without applying it."), false)
+            .Build("conform_sequence arguments"),
+        DispatchConformSequence);
 
     add("transcribe_media",
         "Transcribe a source's audio locally and cache the transcript, so the "

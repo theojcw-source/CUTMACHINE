@@ -154,6 +154,7 @@ add_library(cutmachine_model
     src/Proxy.cc
     src/Relink.cc
     src/ResolveImport.cc
+    src/SequenceFormat.cc
     src/ShotQuality.cc
     src/Subtitles.cc
     src/Thumbnail.cc
@@ -373,6 +374,13 @@ if(BUILD_TESTING)
                           PRIVATE cutmachine_model)
     add_test(NAME cutmachine_project_storage_tests
              COMMAND cutmachine_project_storage_tests)
+
+    add_executable(cutmachine_sequence_format_tests
+        tests/sequence_format_tests.cc)
+    target_link_libraries(cutmachine_sequence_format_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_sequence_format_tests
+             COMMAND cutmachine_sequence_format_tests)
 
     add_executable(cutmachine_project_bin_tests tests/project_bin_tests.cc)
     target_link_libraries(cutmachine_project_bin_tests PRIVATE cutmachine_model)

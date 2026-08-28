@@ -7,6 +7,7 @@
 #include "Operations.h"
 #include "Project.h"
 #include "ProjectStorage.h"
+#include "SequenceFormat.h"
 #include "ShotQuality.h"
 #include "Timeline.h"
 #include "Transcription.h"
@@ -1148,6 +1149,23 @@ int DescribeCommand(const std::string& documentPath, std::string& output) {
         output = ErrorJson(EditError::ArithmeticError, exception.what());
         return 1;
     }
+}
+
+int ProposeSequenceCommand(const std::string& projectPath,
+                           std::string& output) {
+    Project project;
+    std::string error;
+    if (!LoadStoredProject(projectPath, project, error)) {
+        output = ErrorJson(EditError::ParseError, error);
+        return 1;
+    }
+    SequenceFormatProposal proposal;
+    if (!ResolveSequenceFormat(project.rushes, proposal, error)) {
+        output = ErrorJson(EditError::InvalidOperation, error);
+        return 1;
+    }
+    output = SequenceFormatProposalJson(proposal) + "\n";
+    return 0;
 }
 
 int ApplyOperationCommand(const std::string& documentPath,

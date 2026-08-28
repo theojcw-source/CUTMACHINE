@@ -1005,6 +1005,115 @@ int main() {
     server.Stop();
     Check(!server.IsRunning(), "server reports stopped after Stop()");
 
+    // SEQ-2026-08 -- conform_sequence. The agent names the intent; the
+    // engine computes the pixels, rotation included.
+    {
+        Document rotated = fixture;
+        rotated.sequence.width = 1920;
+        rotated.sequence.height = 1080;
+        rotated.sequence.frame_rate = {25, 1};
+        rotated.library.clear();
+        // Document::Validate requires a path and a filename on every library
+        // entry, so the fixture carries them: the operation is applied for
+        // real, not against a document the engine would reject anyway.
+        const auto rush = [](int32_t rateNum, const std::string& name) {
+            LibraryMedia media;
+            media.id = GenerateUlid();
+            media.path = "rushes/" + name;
+            media.filename = name;
+            media.codec = "h264";
+            media.width = 3840;
+            media.height = 2160;
+            media.rotation_degrees = 90;
+            media.orientation = "portrait";
+            media.rate = {rateNum, 1};
+            media.duration = {100, rateNum};
+            return media;
+        };
+        rotated.library.push_back(rush(25, "A.MP4"));
+        rotated.library.push_back(rush(25, "B.MP4"));
+        rotated.library.push_back(rush(25, "C.MP4"));
+        rotated.library.push_back(rush(50, "D.MP4"));
+
+        McpToolRegistry registry;
+        InMemoryBackend backend(rotated);
+        const auto call = [&](const std::string& argumentsJson) {
+            mcp_json::Value arguments;
+            std::string parseFailure;
+            Check(mcp_json::Value::Parse(argumentsJson, arguments,
+                                         parseFailure),
+                  "conform_sequence arguments parse: " + parseFailure);
+            return registry.Call(backend, "conform_sequence", arguments);
+        };
+
+        const McpToolCallOutcome preview = call(R"({"preview":true})");
+        Check(preview.ok, "conform_sequence previews: " + preview.message);
+        Check(preview.result_json.find("\"width\":2160") != std::string::npos &&
+                  preview.result_json.find("\"height\":3840") !=
+                      std::string::npos,
+              "the proposal is the displayed frame, not the stored one: " +
+                  preview.result_json);
+        Check(preview.result_json.find("\"applied\":false") !=
+                  std::string::npos,
+              "a preview reports that it changed nothing");
+        Document afterPreview;
+        std::string snapshotMessage;
+        backend.SnapshotDocument(afterPreview, snapshotMessage);
+        Check(afterPreview.sequence.width == 1920,
+              "a preview really does leave the sequence alone");
+        Check(preview.result_json.find("\"media_count\":3") !=
+                      std::string::npos &&
+                  preview.result_json.find("\"media_count\":1") !=
+                      std::string::npos,
+              "both formats are reported with their counts: " +
+                  preview.result_json);
+
+        const McpToolCallOutcome applied = call(R"({})");
+        Check(applied.ok, "conform_sequence applies: " + applied.error_name + " " + applied.message);
+        Check(applied.result_json.find("\"applied\":true") !=
+                  std::string::npos,
+              "applying says so: " + applied.result_json);
+        Document conformed;
+        backend.SnapshotDocument(conformed, snapshotMessage);
+        Check(conformed.sequence.width == 2160 &&
+                  conformed.sequence.height == 3840 &&
+                  conformed.sequence.frame_rate.num == 25 &&
+                  conformed.sequence.frame_rate.den == 1,
+              "the sequence now matches the rushes exactly");
+        Check(conformed.sequence.name == fixture.sequence.name,
+              "conforming the format does not rename the sequence");
+
+        // A second call must not push a no-op onto the undo stack.
+        const McpToolCallOutcome again = call(R"({})");
+        Check(again.ok && again.result_json.find(
+                              "\"already_conformed\":true") !=
+                              std::string::npos &&
+                  again.result_json.find("\"applied\":false") !=
+                      std::string::npos,
+              "a sequence already matching is reported, not rewritten: " +
+                  again.result_json);
+        Check(registry.Call(backend, "undo", mcp_json::Value::MakeObject()).ok,
+              "one undo is enough to take the format back");
+        Document undone;
+        backend.SnapshotDocument(undone, snapshotMessage);
+        Check(undone.sequence.width == 1920 && undone.sequence.height == 1080,
+              "undo restores the previous format exactly");
+
+        Check(!call(R"({"previw":true})").ok,
+              "a misspelled argument is refused rather than ignored");
+
+        // A project with nothing to derive a format from must say so.
+        Document soundOnly = fixture;
+        soundOnly.library.clear();
+        InMemoryBackend silent(soundOnly);
+        const McpToolCallOutcome nothing =
+            registry.Call(silent, "conform_sequence",
+                          mcp_json::Value::MakeObject());
+        Check(!nothing.ok &&
+                  nothing.message.find("picture format") != std::string::npos,
+              "an empty library refuses with a reason: " + nothing.message);
+    }
+
     // ALPHA-2026-08 -- transcribe_media. The tool the catalog lacked while
     // every word-level tool in it needed a transcript to exist.
     {

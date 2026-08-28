@@ -12685,6 +12685,12 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if (argc == 3 && std::string(argv[1]) == "--propose-sequence") {
+        std::string output;
+        const int result = ProposeSequenceCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
     if (argc == 4 && std::string(argv[1]) == "--import-resolve") {
         std::string output;
         const int result = ImportResolveCommand(argv[2], argv[3], output);
@@ -12761,11 +12767,13 @@ int main(int argc, char* argv[]) {
             "[--recursive]\n"
             "       %s --import-resolve /path/to/project.cutmachine.json "
             "/path/to/manifest.json\n"
+            "       %s --propose-sequence "
+            "/path/to/project.cutmachine.json\n"
             "       %s --export /path/to/project.cutmachine.json output.mp4 "
             "[--software] [--overwrite]\n",
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-            argv[0], argv[0]);
+            argv[0], argv[0], argv[0]);
         return 2;
     }
 

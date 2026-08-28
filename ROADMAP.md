@@ -164,6 +164,7 @@ intégré. Ces tickets ramènent ces capacités dans le moteur.
 | P5 — Notation du bougé rendue relative à la source ; les seuils absolus condamnaient 67 % d'une interview à la main | fait |
 | P6 — Contiguïté des spans adossée à `kSubtitleCueMaximumGap` : les respirations inter-mots ne sont plus des refus | fait |
 | P7 — `transcribe_media` : l'agent peut **produire** le transcript dont dépendait tout son travail sur les mots. Le chemin du modèle Whisper devient un réglage local (`LocalEnv.h`), donc résolu identiquement par la CLI, le serveur MCP et l'app | fait |
+| P8 — `conform_sequence` : le format de séquence se **déduit** des rushes (`SequenceFormat.h`) au lieu d'être deviné. Un tournage vertical est stocké en paysage avec un drapeau de rotation ; choisir la taille stockée donnait une séquence couchée | fait |
 
 Restent ouverts sur cet axe :
 

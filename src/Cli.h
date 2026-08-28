@@ -44,6 +44,11 @@ int RemoveWordsCommand(const std::string& projectPath,
                        const std::string& clipId, const std::string& rangesJson,
                        std::string& output);
 int DescribeCommand(const std::string& documentPath, std::string& output);
+// SEQ-2026-08 -- read-only: reports the sequence format the project's rushes
+// imply, without touching the document. Conforming to it is a separate,
+// journalized UpdateSequenceOperation.
+int ProposeSequenceCommand(const std::string& projectPath,
+                           std::string& output);
 
 // The same JSON view DescribeCommand produces (sequence/tracks/library/bins/
 // markers, with the A1/A2.../K1... aliases the MCP tool catalog's ID
