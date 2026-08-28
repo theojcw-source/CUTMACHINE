@@ -488,9 +488,17 @@ bool CommitStoredProjectAndLogs(
     std::vector<std::string> removals;
     for (fs::directory_iterator item(timelines, directoryError), end;
          !directoryError && item != end; item.increment(directoryError)) {
+        // A stale timeline is a file this code itself could have written, so
+        // it is named <ULID>.json and nothing else. Requiring a valid ULID
+        // rather than merely a .json extension keeps the transaction off
+        // files it does not own -- notably the AppleDouble "._<name>"
+        // sidecars macOS creates for every file on exFAT and FAT volumes,
+        // which cannot be renamed on their own and made every save to a
+        // project stored on such a drive fail.
+        const std::string stem = item->path().stem().string();
         if (item->is_regular_file(directoryError) &&
-            item->path().extension() == ".json" &&
-            !activeTimelineIds.count(item->path().stem().string()))
+            item->path().extension() == ".json" && IsValidUlid(stem) &&
+            !activeTimelineIds.count(stem))
             removals.push_back(item->path().string());
         directoryError.clear();
     }
