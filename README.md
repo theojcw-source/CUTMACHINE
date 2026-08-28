@@ -438,6 +438,7 @@ décodage média :
 ./build/cutmachine --undo-project-op ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --redo-project-op ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --ingest ./Film.cutmachine-project/project.cutmachine.json ./rushes --recursive
+./build/cutmachine --import-resolve ./Film.cutmachine-project/project.cutmachine.json ./manifest.json
 ./build/cutmachine --export ./Film.cutmachine-project/project.cutmachine.json ./film.mp4
 ```
 

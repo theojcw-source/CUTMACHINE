@@ -50,6 +50,7 @@ extern "C" {
 #include "Proxy.h"
 #include "Relink.h"
 #include "Renderer.h"
+#include "ResolveImport.h"
 #include "Subtitles.h"
 #include "Thumbnail.h"
 #include "Timecode.h"
@@ -12680,6 +12681,12 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if (argc == 4 && std::string(argv[1]) == "--import-resolve") {
+        std::string output;
+        const int result = ImportResolveCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
     if (argc >= 4 && argc <= 6 && std::string(argv[1]) == "--export") {
         ExportSettings settings = Exporter::HevcMain10Preset(argv[3]);
         for (int index = 4; index < argc; ++index) {
@@ -12747,11 +12754,13 @@ int main(int argc, char* argv[]) {
             "       %s --ingest /path/to/project.cutmachine.json "
             "/path/to/media "
             "[--recursive]\n"
+            "       %s --import-resolve /path/to/project.cutmachine.json "
+            "/path/to/manifest.json\n"
             "       %s --export /path/to/project.cutmachine.json output.mp4 "
             "[--software] [--overwrite]\n",
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-            argv[0]);
+            argv[0], argv[0]);
         return 2;
     }
 

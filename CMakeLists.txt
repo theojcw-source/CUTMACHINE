@@ -152,6 +152,7 @@ add_library(cutmachine_model
     src/ProjectStorage.cc
     src/Proxy.cc
     src/Relink.cc
+    src/ResolveImport.cc
     src/ShotQuality.cc
     src/Subtitles.cc
     src/Thumbnail.cc
@@ -391,6 +392,17 @@ if(BUILD_TESTING)
     target_compile_definitions(cutmachine_ingest_tests PRIVATE
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
     add_test(NAME cutmachine_ingest_tests COMMAND cutmachine_ingest_tests)
+
+    add_executable(cutmachine_resolve_import_tests
+        tests/resolve_import_tests.cc
+        src/MediaSource.mm
+    )
+    target_link_libraries(cutmachine_resolve_import_tests
+                          PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_resolve_import_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_resolve_import_tests
+             COMMAND cutmachine_resolve_import_tests)
 
     add_executable(cutmachine_media_task_manager_tests
         tests/media_task_manager_tests.cc

@@ -177,7 +177,10 @@ Restent ouverts et non traités ici, par ordre de gravité (voir l'audit) :
   premier ticket à prendre.
 - **`Test copilot/` n'est pas branché** : trois suites de tests et le job CI
   `ctest.yml` sont écrits et non référencés dans `CMakeLists.txt`.
-- **Aucune sortie interopérable** (OTIO/FCPXML/EDL).
+- **Aucune sortie interopérable** (OTIO/FCPXML/EDL). L'entrée existe désormais
+  pour DaVinci Resolve Studio (`sidecar/resolve_bridge.py` + `--import-resolve`,
+  chutiers et rushes seulement) ; rien ne repart de CUTMACHINE vers un autre
+  logiciel de montage.
 - **Pas de marqueur de tour dans `EditLog`** : impossible d'annuler une
   intervention d'agent en un geste.
 - **La langue n'entre pas dans l'identité du cache de transcription.**

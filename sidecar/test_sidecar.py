@@ -17,6 +17,7 @@ from sidecar.planner import (
     PlannerError,
 )
 from sidecar.repl import run_turn
+from sidecar.resolve_bridge import SCHEMA, collect
 from sidecar.schema import PLANNER_RESPONSE_SCHEMA
 
 
@@ -519,6 +520,105 @@ class EvaluationTests(unittest.TestCase):
                     f"invalid oracle for case {index + 1}: "
                     f"{result.error}: {result.detail}",
                 )
+
+
+class FakeResolveClip:
+    """Duck type of a Resolve MediaPoolItem, property bag included."""
+
+    def __init__(self, **properties: Any) -> None:
+        self.properties = properties
+
+    def GetClipProperty(self) -> dict[str, Any]:
+        return self.properties
+
+    def GetUniqueId(self) -> str:
+        return self.properties.get("uid", "")
+
+
+class FakeResolveFolder:
+    def __init__(self, name: str, clips=None, folders=None) -> None:
+        self.name = name
+        self.clips = clips or []
+        self.folders = folders or []
+
+    def GetName(self) -> str:
+        return self.name
+
+    def GetClipList(self):
+        return self.clips
+
+    def GetSubFolderList(self):
+        return self.folders
+
+
+class ResolveBridgeTests(unittest.TestCase):
+    def media_pool(self) -> FakeResolveFolder:
+        rush = FakeResolveClip(**{
+            "File Path": "/rushes/C8015.MP4",
+            "Clip Name": "C8015.MP4",
+            "uid": "5d45",
+        })
+        loose = FakeResolveClip(**{
+            "File Path": "/rushes/C8035.MP4",
+            "File Name": "C8035.MP4",
+        })
+        timeline = FakeResolveClip(**{
+            "File Path": "",
+            "Clip Name": "DERUSH",
+            "Type": "Timeline",
+        })
+        rosie = FakeResolveFolder("Rosie", clips=[rush])
+        rushes = FakeResolveFolder("1_RUSHES", folders=[rosie])
+        tl = FakeResolveFolder("TL", clips=[timeline])
+        return FakeResolveFolder("Master", clips=[loose],
+                                 folders=[rushes, tl])
+
+    def test_walks_the_tree_into_flat_lists(self) -> None:
+        collected = collect(self.media_pool())
+        names = {b["name"]: b for b in collected["bins"]}
+        self.assertEqual(set(names), {"1_RUSHES", "Rosie", "TL"})
+        self.assertEqual(names["1_RUSHES"]["parent_key"], "")
+        self.assertEqual(names["Rosie"]["parent_key"],
+                         names["1_RUSHES"]["key"])
+        self.assertEqual(len(set(b["key"] for b in collected["bins"])), 3)
+
+    def test_root_clips_carry_the_empty_bin_key(self) -> None:
+        collected = collect(self.media_pool())
+        loose = [c for c in collected["clips"] if c["name"] == "C8035.MP4"]
+        self.assertEqual(len(loose), 1)
+        self.assertEqual(loose[0]["bin_key"], "")
+        self.assertNotIn("resolve_uid", loose[0])
+
+    def test_nested_clip_keeps_its_bin_and_identity(self) -> None:
+        collected = collect(self.media_pool())
+        names = {b["name"]: b for b in collected["bins"]}
+        nested = [c for c in collected["clips"] if c["name"] == "C8015.MP4"]
+        self.assertEqual(len(nested), 1)
+        self.assertEqual(nested[0]["bin_key"], names["Rosie"]["key"])
+        self.assertEqual(nested[0]["resolve_uid"], "5d45")
+        self.assertEqual(nested[0]["path"], "/rushes/C8015.MP4")
+
+    def test_entries_without_a_file_are_reported_not_dropped(self) -> None:
+        collected = collect(self.media_pool())
+        self.assertEqual([c["name"] for c in collected["clips"]].count(
+            "DERUSH"), 0)
+        skipped = collected["skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["name"], "DERUSH")
+        self.assertEqual(skipped[0]["reason"], "Timeline")
+
+    def test_sibling_bins_sharing_a_name_get_distinct_keys(self) -> None:
+        pool = FakeResolveFolder("Master", folders=[
+            FakeResolveFolder("Jour 01"), FakeResolveFolder("Jour 01")])
+        collected = collect(pool)
+        keys = [b["key"] for b in collected["bins"]]
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(len(set(keys)), 2)
+
+    def test_schema_matches_the_importer(self) -> None:
+        header = (ROOT / "src" / "ResolveImport.h").read_text(
+            encoding="utf-8")
+        self.assertIn(f'"{SCHEMA}"', header)
 
 
 if __name__ == "__main__":
