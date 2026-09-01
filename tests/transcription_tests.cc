@@ -731,9 +731,7 @@ int main() {
         std::filesystem::create_directories(root);
         const std::filesystem::path envFile = root / ".env";
         const std::filesystem::path model = root / "ggml-test.bin";
-        {
-            std::ofstream(model) << "not a real model, but a real file";
-        }
+        { std::ofstream(model) << "not a real model, but a real file"; }
         ::setenv("CUTMACHINE_ENV_FILE", envFile.string().c_str(), 1);
         ::unsetenv("CUTMACHINE_WHISPER_MODEL");
 
@@ -761,9 +759,7 @@ int main() {
         // The real environment wins over the file, so a one-off override in
         // front of a command works without editing anything.
         const std::filesystem::path other = root / "ggml-other.bin";
-        {
-            std::ofstream(other) << "another real file";
-        }
+        { std::ofstream(other) << "another real file"; }
         ::setenv("CUTMACHINE_WHISPER_MODEL", other.string().c_str(), 1);
         path.clear();
         Check(ResolveConfiguredWhisperModel(path, reason) &&

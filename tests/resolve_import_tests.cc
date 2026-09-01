@@ -171,9 +171,8 @@ int main() {
             << R"({"key":"b1","name":"1_RUSHES","parent_key":""},)"
             << R"({"key":"b2","name":"Rosie","parent_key":"b1"}],)"
             << R"("clips":[{"path":")" << first.string()
-            << R"(","name":"C8015.MP4","bin_key":"b2"},)"
-            << R"({"path":")" << second.string()
-            << R"(","name":"C8035.MP4","bin_key":"b1"}]})";
+            << R"(","name":"C8015.MP4","bin_key":"b2"},)" << R"({"path":")"
+            << second.string() << R"(","name":"C8035.MP4","bin_key":"b1"}]})";
     }
 
     std::string output;
