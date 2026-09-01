@@ -17,8 +17,8 @@ bool RateEqual(const MediaRate& left, const MediaRate& right) {
            static_cast<int64_t>(right.num) * left.den;
 }
 
-bool SameFormat(const SequenceFormatCandidate& candidate,
-                int32_t width, int32_t height, const MediaRate& rate) {
+bool SameFormat(const SequenceFormatCandidate& candidate, int32_t width,
+                int32_t height, const MediaRate& rate) {
     return candidate.width == width && candidate.height == height &&
            candidate.frame_rate.num == rate.num &&
            candidate.frame_rate.den == rate.den;

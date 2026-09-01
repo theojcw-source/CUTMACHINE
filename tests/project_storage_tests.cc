@@ -185,9 +185,8 @@ int main() {
     // exFAT or FAT volume -- the format of most shared media drives. Those
     // sidecars cannot be renamed on their own, so treating one as an obsolete
     // timeline made every save to a project stored on such a drive fail.
-    const fs::path sidecar =
-        destination / "Timelines" /
-        ("._" + collected.timelines.front().id + ".json");
+    const fs::path sidecar = destination / "Timelines" /
+                             ("._" + collected.timelines.front().id + ".json");
     const fs::path stranger = destination / "Timelines" / "notes.json";
     Write(sidecar, "apple-double");
     Write(stranger, "{}");

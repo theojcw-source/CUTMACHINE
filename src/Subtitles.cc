@@ -177,17 +177,9 @@ AddTrackOperation BuildSubtitleTrackEdit(const std::vector<SubtitleCue>& cues,
     return operation;
 }
 
-bool SaveSrt(const Document& document, const std::string& path,
-             std::string& error) {
+bool WriteSrt(const std::vector<SubtitleCue>& cues, const std::string& path,
+              std::string& error) {
     error.clear();
-    std::vector<const DocumentClip*> cues;
-    for (const DocumentTrack& track : document.sequence.tracks)
-        if (track.kind == "caption" && track.visible)
-            for (const DocumentClip& clip : track.clips) cues.push_back(&clip);
-    std::stable_sort(cues.begin(), cues.end(),
-                     [](const DocumentClip* left, const DocumentClip* right) {
-                         return left->timeline_in < right->timeline_in;
-                     });
     if (cues.empty()) {
         error = "timeline contains no visible subtitles";
         return false;
@@ -200,11 +192,11 @@ bool SaveSrt(const Document& document, const std::string& path,
         }
         for (size_t index = 0; index < cues.size(); ++index) {
             output << index + 1 << '\n'
-                   << FormatTimestamp(cues[index]->timeline_in) << " --> "
+                   << FormatTimestamp(cues[index].timeline_in) << " --> "
                    << FormatTimestamp(
-                          cues[index]->timeline_in.add(cues[index]->duration))
+                          cues[index].timeline_in.add(cues[index].duration))
                    << '\n'
-                   << cues[index]->caption_text << "\n\n";
+                   << cues[index].text << "\n\n";
         }
         if (!output) {
             error = "unable to write SRT file";
@@ -217,6 +209,25 @@ bool SaveSrt(const Document& document, const std::string& path,
         return false;
     }
     return true;
+}
+
+bool SaveSrt(const Document& document, const std::string& path,
+             std::string& error) {
+    error.clear();
+    std::vector<const DocumentClip*> ordered;
+    for (const DocumentTrack& track : document.sequence.tracks)
+        if (track.kind == "caption" && track.visible)
+            for (const DocumentClip& clip : track.clips)
+                ordered.push_back(&clip);
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const DocumentClip* left, const DocumentClip* right) {
+                         return left->timeline_in < right->timeline_in;
+                     });
+    std::vector<SubtitleCue> cues;
+    cues.reserve(ordered.size());
+    for (const DocumentClip* clip : ordered)
+        cues.push_back({clip->timeline_in, clip->duration, clip->caption_text});
+    return WriteSrt(cues, path, error);
 }
 
 std::vector<const DocumentClip*> ActiveSubtitles(const Document& document,

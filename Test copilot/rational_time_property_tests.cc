@@ -52,25 +52,39 @@ void Test(const std::string& name, Function function) {
 
 // Rates représentatifs du monde réel + cas limites
 const std::vector<int32_t> kRates = {
-    1, 24, 25, 30, 48, 50, 60,
+    1,
+    24,
+    25,
+    30,
+    48,
+    50,
+    60,
     // NTSC drop-frame stocké comme {value * 1001, 30000}
     // mais on teste les rates directement ici
-    1001, 30000,
+    1001,
+    30000,
     // audio
-    44100, 48000,
+    44100,
+    48000,
     // sous-frames (timecode SMPTE)
     2997,
 };
 
 // Valeurs représentatives pour value (incluant 0, négatif, grands)
 const std::vector<int64_t> kValues = {
-    -3600LL * 48000,   // -1h en samples 48kHz
-    -1, 0, 1,
-    24, 25, 30, 48, 100,
+    -3600LL * 48000,  // -1h en samples 48kHz
+    -1,
+    0,
+    1,
+    24,
+    25,
+    30,
+    48,
+    100,
     1001,
     30000,
-    static_cast<int64_t>(3600) * 48000,  // 1h en samples
-    static_cast<int64_t>(24) * 3600 * 25 // 24h en frames 25fps
+    static_cast<int64_t>(3600) * 48000,   // 1h en samples
+    static_cast<int64_t>(24) * 3600 * 25  // 24h en frames 25fps
 };
 
 // Rescale exact uniquement si value * newRate divisible par rate
@@ -99,12 +113,11 @@ int main() {
                     try {
                         const RationalTime ab = a.add(b);
                         const RationalTime ba = b.add(a);
-                        Check(ab == ba,
-                              "add non commutatif pour {" +
-                                  std::to_string(vA) + "/" +
-                                  std::to_string(rA) + "} + {" +
-                                  std::to_string(vB) + "/" +
-                                  std::to_string(rB) + "}");
+                        Check(ab == ba, "add non commutatif pour {" +
+                                            std::to_string(vA) + "/" +
+                                            std::to_string(rA) + "} + {" +
+                                            std::to_string(vB) + "/" +
+                                            std::to_string(rB) + "}");
                     } catch (const std::overflow_error&) {
                         // Overflow légal : LCM > int32_t ou value > int64_t
                     }
@@ -127,10 +140,10 @@ int main() {
                         try {
                             const RationalTime lhs = ta.add(tb).add(tc);
                             const RationalTime rhs = ta.add(tb.add(tc));
-                            Check(lhs == rhs,
-                                  "(a+b)+c != a+(b+c) pour rate=" +
-                                      std::to_string(r));
-                        } catch (const std::overflow_error&) {}
+                            Check(lhs == rhs, "(a+b)+c != a+(b+c) pour rate=" +
+                                                  std::to_string(r));
+                        } catch (const std::overflow_error&) {
+                        }
                     }
                 }
             }
@@ -150,12 +163,13 @@ int main() {
                     const RationalTime b{vB, rB};
                     try {
                         const RationalTime result = a.add(b).sub(b);
-                        Check(result == a,
-                              "(a+b)-b != a pour a={" + std::to_string(vA) +
-                                  "/" + std::to_string(rA) + "} b={" +
-                                  std::to_string(vB) + "/" +
-                                  std::to_string(rB) + "}");
-                    } catch (const std::overflow_error&) {}
+                        Check(result == a, "(a+b)-b != a pour a={" +
+                                               std::to_string(vA) + "/" +
+                                               std::to_string(rA) + "} b={" +
+                                               std::to_string(vB) + "/" +
+                                               std::to_string(rB) + "}");
+                    } catch (const std::overflow_error&) {
+                    }
                 }
             }
         }
@@ -175,14 +189,15 @@ int main() {
                     const RationalTime middle = t.rescale(rB);
                     if (!CanRescaleExact(middle, rA)) continue;
                     const RationalTime back = middle.rescale(rA);
-                    Check(back == t,
-                          "rescale aller-retour échoue pour {" +
-                              std::to_string(v) + "/" + std::to_string(rA) +
-                              "} -> " + std::to_string(rB) + " -> " +
-                              std::to_string(rA));
+                    Check(back == t, "rescale aller-retour échoue pour {" +
+                                         std::to_string(v) + "/" +
+                                         std::to_string(rA) + "} -> " +
+                                         std::to_string(rB) + " -> " +
+                                         std::to_string(rA));
                 } catch (const std::invalid_argument&) {
                     // Rescale non exact : attendu, ignoré ici
-                } catch (const std::overflow_error&) {}
+                } catch (const std::overflow_error&) {
+                }
             }
         }
     });
@@ -201,7 +216,8 @@ int main() {
         } catch (const std::overflow_error&) {
             threw = true;  // acceptable
         }
-        Check(threw, "rescale non exact doit lancer une exception, pas tronquer");
+        Check(threw,
+              "rescale non exact doit lancer une exception, pas tronquer");
     });
 
     // ------------------------------------------------------------------
@@ -209,7 +225,7 @@ int main() {
     // ------------------------------------------------------------------
     Test("compare est antisymétrique", [] {
         const std::vector<RationalTime> samples = {
-            {0, 1}, {1, 25}, {2, 25}, {1, 50},
+            {0, 1},   {1, 25},        {2, 25},     {1, 50},
             {-1, 25}, {30000, 30000}, {1001, 1001}};
         for (const auto& a : samples) {
             for (const auto& b : samples) {
@@ -226,8 +242,7 @@ int main() {
     // ------------------------------------------------------------------
     Test("compare est transitif : a<=b et b<=c => a<=c", [] {
         const std::vector<RationalTime> samples = {
-            {0, 25}, {1, 25}, {2, 25}, {1, 50},
-            {100, 48000}, {200, 48000}};
+            {0, 25}, {1, 25}, {2, 25}, {1, 50}, {100, 48000}, {200, 48000}};
         for (const auto& a : samples) {
             for (const auto& b : samples) {
                 for (const auto& c : samples) {
@@ -243,7 +258,10 @@ int main() {
     // P8 : to_frames floor : frame*den/num <= t < (frame+1)*den/num
     // ------------------------------------------------------------------
     Test("to_frames est un floor correct", [] {
-        struct Rate { int32_t num; int32_t den; };
+        struct Rate {
+            int32_t num;
+            int32_t den;
+        };
         const std::vector<Rate> frameRates = {
             {25, 1}, {24, 1}, {30, 1}, {30000, 1001}, {60, 1}};
         for (auto [num, den] : frameRates) {
@@ -255,13 +273,18 @@ int main() {
                     // Si f valide dans int64, construire le RationalTime
                     // et vérifier sans overflow
                     try {
-                        const RationalTime floor{f * static_cast<int64_t>(den), num};
-                        const RationalTime ceil{(f + 1) * static_cast<int64_t>(den), num};
+                        const RationalTime floor{f * static_cast<int64_t>(den),
+                                                 num};
+                        const RationalTime ceil{
+                            (f + 1) * static_cast<int64_t>(den), num};
                         Check(t >= floor,
-                              "to_frames : t < floor(t) -- floor division incorrecte");
+                              "to_frames : t < floor(t) -- floor division "
+                              "incorrecte");
                         Check(t < ceil,
-                              "to_frames : t >= ceil(t) -- pas vraiment un floor");
-                    } catch (const std::overflow_error&) {}
+                              "to_frames : t >= ceil(t) -- pas vraiment un "
+                              "floor");
+                    } catch (const std::overflow_error&) {
+                    }
                 }
             }
         }
@@ -278,7 +301,8 @@ int main() {
                 try {
                     Check(t.add(zero) == t, "t + 0 != t");
                     Check(zero.add(t) == t, "0 + t != t");
-                } catch (const std::overflow_error&) {}
+                } catch (const std::overflow_error&) {
+                }
             }
         }
     });
@@ -289,12 +313,13 @@ int main() {
     Test("même valeur sémantique == true entre rates différents", [] {
         // 1 seconde exprimée de plusieurs façons
         const std::vector<RationalTime> one_second = {
-            {1, 1}, {25, 25}, {30, 30}, {48000, 48000},
-            {30000, 30000}, {24, 24}};
+            {1, 1},         {25, 25},       {30, 30},
+            {48000, 48000}, {30000, 30000}, {24, 24}};
         for (const auto& a : one_second) {
             for (const auto& b : one_second) {
                 Check(a == b,
-                      "1 seconde exprimée en rates différents devrait être égale");
+                      "1 seconde exprimée en rates différents devrait être "
+                      "égale");
             }
         }
         // Demi-seconde : 12/24 == 1/2 == 25/50
@@ -302,7 +327,8 @@ int main() {
             {1, 2}, {12, 24}, {25, 50}, {24000, 48000}};
         for (const auto& a : half_second) {
             for (const auto& b : half_second) {
-                Check(a == b, "0.5s exprimée en rates différents devrait être égale");
+                Check(a == b,
+                      "0.5s exprimée en rates différents devrait être égale");
             }
         }
     });
@@ -335,8 +361,7 @@ int main() {
     // ------------------------------------------------------------------
     Test("overflow est détecté et lève std::overflow_error", [] {
         // Deux heures de samples à 48kHz au rate le plus élevé
-        const RationalTime huge{
-            std::numeric_limits<int64_t>::max() / 2, 48000};
+        const RationalTime huge{std::numeric_limits<int64_t>::max() / 2, 48000};
         bool threw = false;
         try {
             huge.add(huge);

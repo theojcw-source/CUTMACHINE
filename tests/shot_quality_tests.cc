@@ -69,9 +69,27 @@ std::vector<uint8_t> Blurred(const std::vector<uint8_t>& frame, int passes) {
     return current;
 }
 
+// The same frame moved sideways, wrapping around so nothing enters or
+// leaves it. Every pixel changes value, but the set of values in the frame
+// is untouched: this is what a pan looks like to the two change metrics, and
+// the whole reason a detected cut has to clear both of them.
+std::vector<uint8_t> ShiftedLeft(const std::vector<uint8_t>& frame,
+                                 int32_t columns) {
+    std::vector<uint8_t> shifted = frame;
+    for (int32_t y = 0; y < kHeight; ++y) {
+        for (int32_t x = 0; x < kWidth; ++x) {
+            const int32_t from = (x + columns) % kWidth;
+            shifted[static_cast<size_t>(y) * kWidth + x] =
+                frame[static_cast<size_t>(y) * kWidth + from];
+        }
+    }
+    return shifted;
+}
+
 ShotQualityReport ReportFrom(const std::string& mediaId, uint32_t rate,
                              const std::vector<int64_t>& sharpness,
-                             const std::vector<int64_t>& motion) {
+                             const std::vector<int64_t>& motion,
+                             const std::vector<int64_t>& histogram = {}) {
     ShotQualityReport report;
     report.media_id = mediaId;
     report.samples_per_second = rate;
@@ -83,12 +101,21 @@ ShotQualityReport ReportFrom(const std::string& mediaId, uint32_t rate,
                                    static_cast<int32_t>(rate)};
         sample.sharpness = sharpness[index];
         sample.motion = index < motion.size() ? motion[index] : 0;
+        sample.histogram_distance =
+            index < histogram.size() ? histogram[index] : 0;
         report.samples.push_back(sample);
     }
     report.median_sharpness = ShotQualityPercentile(sharpness, 50);
+    // Sample 0's change metrics are zero by construction, not by
+    // measurement, so they are left out of the medians exactly as
+    // GenerateShotQuality leaves them out.
     std::vector<int64_t> motionAfterFirst(
         motion.begin() + (motion.empty() ? 0 : 1), motion.end());
     report.median_motion = ShotQualityPercentile(motionAfterFirst, 50);
+    std::vector<int64_t> histogramAfterFirst(
+        histogram.begin() + (histogram.empty() ? 0 : 1), histogram.end());
+    report.median_histogram_distance =
+        ShotQualityPercentile(histogramAfterFirst, 50);
     return report;
 }
 
@@ -162,6 +189,54 @@ int main() {
     Check(partial > 0 && partial < kShotQualityMetricScale,
           "a partial change measures between still and full scale");
 
+    // ---- Histogram distance, and what it sees that motion does not -------
+    Check(FrameHistogramDistanceMetric(busy.data(), busy.data(), kWidth,
+                                       kHeight) == 0,
+          "a frame compared against itself has no histogram distance");
+    Check(FrameHistogramDistanceMetric(black.data(), white.data(), kWidth,
+                                       kHeight) == kShotQualityMetricScale,
+          "two planes sharing no luma bin are a full-scale distance apart");
+    Check(FrameHistogramDistanceMetric(white.data(), black.data(), kWidth,
+                                       kHeight) ==
+              FrameHistogramDistanceMetric(black.data(), white.data(), kWidth,
+                                           kHeight),
+          "histogram distance is symmetric");
+    Check(FrameHistogramDistanceMetric(nullptr, white.data(), kWidth,
+                                       kHeight) == 0,
+          "a null plane measures zero histogram distance");
+
+    // The bins are 8 luma levels wide, so a change smaller than one bin is
+    // deliberately invisible here. That is the point: sensor noise on a
+    // locked-off tripod must not read as the scene changing.
+    Check(
+        FrameHistogramDistanceMetric(
+            FlatFrame(128).data(), FlatFrame(130).data(), kWidth, kHeight) == 0,
+        "a change too small to cross a bin edge does not register");
+
+    // The case the whole metric exists for. Shifting the bar pattern by half
+    // its period flips every pixel between the two values, so motion is
+    // near full scale -- and the frame still holds exactly the same values
+    // in the same quantities, so the histogram has not moved at all.
+    const std::vector<uint8_t> panned = ShiftedLeft(busy, 2);
+    const int64_t panMotion =
+        FrameMotionMetric(busy.data(), panned.data(), kWidth, kHeight);
+    const int64_t panHistogram = FrameHistogramDistanceMetric(
+        busy.data(), panned.data(), kWidth, kHeight);
+    Check(panMotion > kShotQualityMetricScale / 2,
+          "a pan moves most of the picture, got " + std::to_string(panMotion));
+    Check(panHistogram == 0,
+          "but it does not change which values the picture is made of, got " +
+              std::to_string(panHistogram));
+
+    // A cut, by contrast, moves both readings at once.
+    const int64_t cutMotion =
+        FrameMotionMetric(busy.data(), grey.data(), kWidth, kHeight);
+    const int64_t cutHistogram =
+        FrameHistogramDistanceMetric(busy.data(), grey.data(), kWidth, kHeight);
+    Check(cutMotion > kShotQualityMetricScale / 4 &&
+              cutHistogram == kShotQualityMetricScale,
+          "replacing the scene moves motion and histogram together");
+
     // ---- Percentiles -------------------------------------------------------
     const std::vector<int64_t> ramp = {10, 20, 30, 40, 50};
     Check(ShotQualityPercentile(ramp, 0) == 10, "p0 is the minimum");
@@ -187,7 +262,9 @@ int main() {
         sourceId, 4,
         {4000, 4200, 3900, 4100, 4000, 3950, 4050, 3900, 950, 900, 1000, 880},
         {0, 2000, 1500, 1800, 2200, 1900, 1700, 2100, 120000, 130000, 118000,
-         125000});
+         125000},
+        {0, 1200, 900, 1100, 1300, 1000, 950, 1250, 40000, 45000, 38000,
+         42000});
 
     ShotQualityThresholds thresholds;
     ClipShotQuality summary;
@@ -306,6 +383,206 @@ int main() {
           "a fourfold jump in sensor noise is still a still frame, because "
           "the absolute floor outranks the ratio");
 
+    // ---- Shot segmentation -------------------------------------------------
+    // Sixteen samples at 4/s: two takes of two seconds each, joined by a
+    // hard cut at sample 8. Everything outside that sample is ordinary
+    // within-take variation, so exactly one boundary is the right answer.
+    const std::vector<int64_t> twoTakeSharpness = {
+        4000, 4300, 4300, 4100, 4000, 3900, 4050, 3950,
+        3000, 3100, 3200, 3600, 3400, 3300, 3250, 3150};
+    const std::vector<int64_t> quietMotion = {
+        0,    2000, 1800, 2200, 1900, 2100, 2000, 1950,
+        2050, 2050, 1900, 2000, 2150, 1850, 2000, 1900};
+    const std::vector<int64_t> quietHistogram = {
+        0,    1500, 1200, 1800, 1400, 1600, 1300, 1700,
+        1450, 1500, 1400, 1600, 1200, 1800, 1500, 1300};
+
+    std::vector<int64_t> cutMotionSeries = quietMotion;
+    std::vector<int64_t> cutHistogramSeries = quietHistogram;
+    cutMotionSeries[8] = 900000;
+    cutHistogramSeries[8] = 800000;
+
+    const ShotSegmentationSettings segmentation;
+    const ShotQualityReport twoTakes = ReportFrom(
+        sourceId, 4, twoTakeSharpness, cutMotionSeries, cutHistogramSeries);
+    const std::vector<SourceShot> twoShots =
+        DetectSourceShots(twoTakes, segmentation);
+    Check(twoShots.size() == 2,
+          "a source with one cut in it segments into two shots, got " +
+              std::to_string(twoShots.size()));
+    if (twoShots.size() == 2) {
+        Check(twoShots[0].first_sample == 0 && twoShots[0].sample_count == 8,
+              "the first shot runs from the start to the cut");
+        Check(twoShots[1].first_sample == 8 && twoShots[1].sample_count == 8,
+              "the second shot runs from the cut to the end");
+        // Times land in the source's own domain on the analysis grid, so
+        // they can be used as a clip's source_in without conversion.
+        Check(twoShots[1].start.compare({8, 4}) == 0 &&
+                  twoShots[1].end.compare({16, 4}) == 0,
+              "shot times are exact on the analysis grid");
+        // The sharpest sample, with the earliest of a tie -- samples 1 and 2
+        // both measure 4300.
+        Check(twoShots[0].keyframe_sample == 1,
+              "the keyframe is the sharpest sample, earliest of a tie, got " +
+                  std::to_string(twoShots[0].keyframe_sample));
+        Check(twoShots[0].keyframe.compare({1, 4}) == 0,
+              "and it carries its own timestamp");
+        Check(twoShots[1].keyframe_sample == 11,
+              "each shot picks its own keyframe, got " +
+                  std::to_string(twoShots[1].keyframe_sample));
+        // The cut's own spike belongs to neither take. Counting it would put
+        // 900000 into the second shot's motion and report a still take as
+        // moving.
+        Check(twoShots[1].median_motion < 60000,
+              "a shot's motion excludes the cut that opened it, got " +
+                  std::to_string(twoShots[1].median_motion));
+        // Coverage: every sample belongs to exactly one shot.
+        Check(twoShots[0].end.compare(twoShots[1].start) == 0,
+              "shots meet with no gap and no overlap");
+    }
+
+    // The discrimination the second metric buys, in both directions.
+    // A whip pan moves the picture without changing what it is made of.
+    std::vector<int64_t> panMotionSeries = quietMotion;
+    panMotionSeries[8] = 900000;
+    const ShotQualityReport pan = ReportFrom(sourceId, 4, twoTakeSharpness,
+                                             panMotionSeries, quietHistogram);
+    Check(DetectSourceShots(pan, segmentation).size() == 1,
+          "a whip pan is movement inside one shot, not a cut");
+
+    // A light being switched on changes what the picture is made of without
+    // moving it.
+    std::vector<int64_t> rampHistogramSeries = quietHistogram;
+    rampHistogramSeries[8] = 800000;
+    const ShotQualityReport lightingRamp = ReportFrom(
+        sourceId, 4, twoTakeSharpness, quietMotion, rampHistogramSeries);
+    Check(DetectSourceShots(lightingRamp, segmentation).size() == 1,
+          "a lighting change is not a cut either");
+
+    // A second boundary inside the minimum shot length is dropped, not
+    // allowed to carve a one-sample shot out of the take.
+    std::vector<int64_t> flashMotion = cutMotionSeries;
+    std::vector<int64_t> flashHistogram = cutHistogramSeries;
+    flashMotion[10] = 900000;
+    flashHistogram[10] = 800000;
+    const std::vector<SourceShot> flash = DetectSourceShots(
+        ReportFrom(sourceId, 4, twoTakeSharpness, flashMotion, flashHistogram),
+        segmentation);
+    Check(flash.size() == 2,
+          "a second boundary inside the minimum shot length is dropped, got " +
+              std::to_string(flash.size()));
+    Check(flash.size() != 2 || flash[1].first_sample == 8,
+          "and it is the earlier boundary that survives");
+
+    // The same minimum applies to the tail, which would otherwise be the one
+    // place a stub shot could appear.
+    std::vector<int64_t> lateMotion = quietMotion;
+    std::vector<int64_t> lateHistogram = quietHistogram;
+    lateMotion[14] = 900000;
+    lateHistogram[14] = 800000;
+    Check(DetectSourceShots(ReportFrom(sourceId, 4, twoTakeSharpness,
+                                       lateMotion, lateHistogram),
+                            segmentation)
+                  .size() == 1,
+          "a cut too close to the end leaves no stub shot behind");
+
+    // A source with no cut in it is one shot. That is the answer, not a
+    // failure to find anything.
+    const std::vector<SourceShot> single = DetectSourceShots(
+        ReportFrom(sourceId, 4, twoTakeSharpness, quietMotion, quietHistogram),
+        segmentation);
+    Check(single.size() == 1 && single[0].first_sample == 0 &&
+              single[0].sample_count == 16,
+          "an uncut source is one shot covering all of it");
+
+    Check(DetectSourceShots(ShotQualityReport{}, segmentation).empty(),
+          "a report with no samples yields no shots");
+
+    // ---- The calibration, on samples that were actually measured ---------
+    // Everything above uses invented numbers chosen to isolate one rule at a
+    // time. These two series are not invented: they are what
+    // GenerateShotQuality produced from a real handheld rush (C8022.MP4,
+    // 6.7 s at 4 samples/s, 384x216 analysis), and from the same footage
+    // with a cut spliced into it. They are here because the thresholds in
+    // ShotSegmentationSettings were set from them, and a threshold whose
+    // evidence lives only in a comment is a threshold nobody can re-check.
+    //
+    // The rush ends with the camera leaving its subject: three samples
+    // reaching motion 67 624 / 70 433 / 55 683 and histogram distance
+    // 56 544 / 292 944 / 237 027. Every one of them clears both absolute
+    // conditions. They are not cuts, and nothing but the local ratio says
+    // so.
+    //
+    // The samples below are exactly the measured ones; only their order is
+    // arranged. In the rush the move falls in the last three samples, where
+    // the minimum-length rule drops it for a reason that has nothing to do
+    // with the calibration under test -- so the quiet opening is repeated
+    // after the move to put it in the middle of a source. Without that, this
+    // fixture passes even with the local ratio switched off, and proves
+    // nothing.
+    const std::vector<int64_t> measuredQuietMotion = {
+        35331, 34977, 28892, 26325, 19251, 12399, 7906,  9711,
+        5139,  8684,  22290, 27707, 34233, 24504, 12646, 5414,
+        15965, 7292,  12136, 6950,  16828, 36323, 33525};
+    const std::vector<int64_t> measuredQuietHistogram = {
+        14913, 17843, 11019, 7113, 8138,  5582,  7414, 4231,
+        6703,  5123,  6956,  4545, 18313, 14937, 4340, 5172,
+        7294,  5762,  2664,  3122, 6426,  30502, 18940};
+    const std::vector<int64_t> measuredMoveMotion = {67624, 70433, 55683};
+    const std::vector<int64_t> measuredMoveHistogram = {56544, 292944, 237027};
+
+    // Leading zero: sample 0 has no predecessor to differ from.
+    std::vector<int64_t> rushMotion = {0};
+    std::vector<int64_t> rushHistogram = {0};
+    for (const std::vector<int64_t>* part :
+         {&measuredQuietMotion, &measuredMoveMotion, &measuredQuietMotion})
+        rushMotion.insert(rushMotion.end(), part->begin(), part->end());
+    for (const std::vector<int64_t>* part :
+         {&measuredQuietHistogram, &measuredMoveHistogram,
+          &measuredQuietHistogram})
+        rushHistogram.insert(rushHistogram.end(), part->begin(), part->end());
+    const std::vector<int64_t> measuredSharpness(rushMotion.size(), 4287);
+    const ShotQualityReport handheldRush =
+        ReportFrom(sourceId, 4, measuredSharpness, rushMotion, rushHistogram);
+
+    int clearedBothFloors = 0;
+    for (size_t index = 1; index < handheldRush.samples.size(); ++index)
+        if (handheldRush.samples[index].motion >=
+                segmentation.cut_motion_floor &&
+            handheldRush.samples[index].histogram_distance >=
+                std::max(segmentation.cut_histogram_floor,
+                         handheldRush.median_histogram_distance *
+                             segmentation.cut_histogram_ratio_percent / 100))
+            ++clearedBothFloors;
+    Check(clearedBothFloors == 3,
+          "the camera move clears every absolute condition, so nothing but "
+          "the local ratio can reject it -- samples that cleared: " +
+              std::to_string(clearedBothFloors));
+    Check(DetectSourceShots(handheldRush, segmentation).size() == 1,
+          "a real handheld rush with no cut in it is one shot");
+
+    // The same footage with a real cut at sample 8, which measures *lower*
+    // than the camera move on both metrics: motion 48 489 against 70 321,
+    // histogram distance 30 900 against 295 476. That inversion is why the
+    // rule cannot be a pair of thresholds on the values themselves. What
+    // separates them is that the cut stands alone (408% of its
+    // neighbourhood) while the move is spread over several samples (210%).
+    const std::vector<int64_t> jumpSharpness(18, 4159);
+    const ShotQualityReport withJumpCut = ReportFrom(
+        sourceId, 4, jumpSharpness,
+        {0, 35131, 34792, 28930, 26263, 19178, 12306, 7732, 48489, 15926, 7163,
+         11874, 6837, 16767, 36219, 33510, 67393, 70321},
+        {0, 14527, 13201, 13925, 8969, 4279, 5027, 3990, 30900, 7342, 4472,
+         2495, 4050, 4714, 28440, 16143, 55808, 295476});
+    const std::vector<SourceShot> jumpShots =
+        DetectSourceShots(withJumpCut, segmentation);
+    Check(jumpShots.size() == 2,
+          "the cut is found even though it measures smaller than the camera "
+          "move in the same source, got " +
+              std::to_string(jumpShots.size()) + " shot(s)");
+    Check(jumpShots.size() != 2 || jumpShots[1].first_sample == 8,
+          "and it is found at the sample the cut is actually on");
+
     // ---- Cache round-trip --------------------------------------------------
     const std::string json = SerializeShotQuality(report);
     Check(json.find('.') == std::string::npos,
@@ -318,7 +595,10 @@ int main() {
     Check(reloaded.samples.size() == report.samples.size() &&
               reloaded.media_id == report.media_id &&
               reloaded.samples_per_second == report.samples_per_second &&
-              reloaded.median_sharpness == report.median_sharpness,
+              reloaded.median_sharpness == report.median_sharpness &&
+              reloaded.median_motion == report.median_motion &&
+              reloaded.median_histogram_distance ==
+                  report.median_histogram_distance,
           "the reloaded report carries the same header");
     bool sameSamples = true;
     for (size_t index = 0; index < report.samples.size(); ++index) {
@@ -327,17 +607,19 @@ int main() {
             reloaded.samples[index].sharpness ==
                 report.samples[index].sharpness &&
             reloaded.samples[index].motion == report.samples[index].motion &&
+            reloaded.samples[index].histogram_distance ==
+                report.samples[index].histogram_distance &&
             reloaded.samples[index].time.compare(report.samples[index].time) ==
                 0;
     }
     Check(sameSamples, "every sample survives the round trip exactly");
 
     ShotQualityReport rejected;
-    Check(!DeserializeShotQuality("{\"version\":3}", rejected, error),
+    Check(!DeserializeShotQuality("{\"version\":4}", rejected, error),
           "a future cache version is refused rather than guessed at");
-    // The version that graded motion against an absolute threshold is
-    // refused by name, so a stale cache is re-analysed instead of silently
-    // producing grades from a rule that measurement disproved.
+    // Both older versions are missing a metric that was never measured, so
+    // both are refused by name and told to re-analyse rather than having the
+    // gap filled in with an invented value.
     Check(!DeserializeShotQuality(
               "{\"version\":1,\"media_id\":\"x\",\"samples_per_second\":4,"
               "\"analysis_width\":8,\"analysis_height\":8,"
@@ -349,9 +631,27 @@ int main() {
               "{\"version\":2,\"media_id\":\"x\",\"samples_per_second\":4,"
               "\"analysis_width\":8,\"analysis_height\":8,"
               "\"median_sharpness\":1,\"median_motion\":1,"
-              "\"sharpness\":[1,2],\"motion\":[1]}",
+              "\"sharpness\":[1],\"motion\":[0]}",
+              rejected, error) &&
+              error.find("re-run") != std::string::npos,
+          "a pre-segmentation cache is refused and says to re-run");
+    Check(!DeserializeShotQuality(
+              "{\"version\":3,\"media_id\":\"x\",\"samples_per_second\":4,"
+              "\"analysis_width\":8,\"analysis_height\":8,"
+              "\"median_sharpness\":1,\"median_motion\":1,"
+              "\"median_histogram_distance\":1,"
+              "\"sharpness\":[1,2],\"motion\":[1],\"histogram\":[1]}",
               rejected, error),
           "mismatched metric arrays are refused");
+    // A cache carrying the two older metrics but not the new one is refused
+    // too: the arrays match, so only the explicit check catches it.
+    Check(!DeserializeShotQuality(
+              "{\"version\":3,\"media_id\":\"x\",\"samples_per_second\":4,"
+              "\"analysis_width\":8,\"analysis_height\":8,"
+              "\"median_sharpness\":1,\"median_motion\":1,"
+              "\"sharpness\":[1],\"motion\":[0]}",
+              rejected, error),
+          "a cache with no histogram array is refused");
 
     // ---- End to end, through FFmpeg on real decoded frames ---------------
     // Everything above works on synthetic planes. This section proves the
@@ -486,6 +786,117 @@ int main() {
               " against source median " +
               std::to_string(softSummary.source_median_sharpness) + ")");
     Check(!softSummary.clean, "and it is reported as not clean");
+
+    // ---- Segmentation, on a real cut in real decoded frames --------------
+    // Two flat takes of three seconds joined by a hard cut. Flat on purpose:
+    // it puts the whole burden on the decode path and the boundary rule,
+    // with nothing in the content that could accidentally produce the right
+    // answer. Everything about *which* candidates get rejected is settled
+    // above on synthetic samples, where the numbers are exact.
+    const std::filesystem::path cut = root / "cut.mp4";
+    const std::filesystem::path cutReportPath = root / "cache" / "cut.json";
+    const std::string makeCut =
+        Quote(FFMPEG_EXECUTABLE) +
+        " -hide_banner -loglevel error"
+        " -f lavfi -i 'color=c=black:size=320x240:rate=25:duration=3'"
+        " -f lavfi -i 'color=c=white:size=320x240:rate=25:duration=3'"
+        " -filter_complex '[0:v][1:v]concat=n=2:v=1:a=0'"
+        " -c:v libx264 -pix_fmt yuv420p -y " +
+        Quote(cut);
+    if (std::system(makeCut.c_str()) != 0) {
+        std::cerr << "FAIL: unable to generate the shot segmentation "
+                     "fixture\n";
+        std::filesystem::remove_all(root);
+        return 1;
+    }
+    const std::string cutId = "01KQ00000000000000000000CT";
+    MediaTaskManager cutTasks;
+    cutTasks.Enqueue(MediaTaskKind::ShotQuality, "cut",
+                     [&](MediaTaskContext& context, std::string& taskError) {
+                         return GenerateShotQuality(
+                             cut.string(), cutReportPath.string(), cutId,
+                             {6, 1}, settings, context, taskError);
+                     });
+    if (!cutTasks.WaitForIdle(120000)) {
+        std::cerr << "FAIL: shot segmentation analysis timed out\n";
+        std::filesystem::remove_all(root);
+        return 1;
+    }
+    ShotQualityReport cutMeasured;
+    Check(LoadShotQuality(cutReportPath.string(), cutMeasured, error),
+          "the cut fixture analyses: " + error);
+    const std::vector<SourceShot> detected =
+        DetectSourceShots(cutMeasured, segmentation);
+    Check(detected.size() == 2,
+          "one hard cut in six seconds of real footage segments into two "
+          "shots, got " +
+              std::to_string(detected.size()));
+    if (detected.size() == 2) {
+        // The cut sits at t=3, which is sample 12 at 4/s. One sample of
+        // slack for where the encoder puts the transition frame.
+        Check(detected[1].first_sample >= 11 && detected[1].first_sample <= 13,
+              "the boundary lands on the cut, at sample " +
+                  std::to_string(detected[1].first_sample) + " of " +
+                  std::to_string(cutMeasured.samples.size()));
+        Check(detected[0].start.compare({0, 4}) == 0 &&
+                  detected[0].end.compare(detected[1].start) == 0 &&
+                  detected[1].end.value ==
+                      static_cast<int64_t>(cutMeasured.samples.size()),
+              "the two shots cover the whole source with no gap");
+    }
+    // A sustained camera move on real decoded frames. It holds motion and
+    // histogram distance above both absolute floors from end to end and is
+    // still one shot -- here it is the histogram's ratio against the source
+    // median that rejects it, because a source that is *nothing but* a pan
+    // has a high median of its own. The other half of the rule, where the
+    // move is a brief part of an otherwise still take and only the local
+    // ratio can reject it, is pinned on measured samples further down.
+    const std::filesystem::path panFixture = root / "pan.mp4";
+    const std::filesystem::path panReportPath = root / "cache" / "pan.json";
+    const std::string makePan =
+        Quote(FFMPEG_EXECUTABLE) +
+        " -hide_banner -loglevel error -f lavfi -i "
+        "'smptebars=size=1280x240:rate=25:duration=4' -vf " +
+        Quote("crop=320:240:x='min(960,t*240)':y=0") +
+        " -c:v libx264 -pix_fmt yuv420p -y " + Quote(panFixture);
+    if (std::system(makePan.c_str()) != 0) {
+        std::cerr << "FAIL: unable to generate the camera pan fixture\n";
+        std::filesystem::remove_all(root);
+        return 1;
+    }
+    const std::string panId = "01KQ00000000000000000000PN";
+    MediaTaskManager panTasks;
+    panTasks.Enqueue(MediaTaskKind::ShotQuality, "pan",
+                     [&](MediaTaskContext& context, std::string& taskError) {
+                         return GenerateShotQuality(
+                             panFixture.string(), panReportPath.string(), panId,
+                             {4, 1}, settings, context, taskError);
+                     });
+    if (!panTasks.WaitForIdle(120000)) {
+        std::cerr << "FAIL: camera pan analysis timed out\n";
+        std::filesystem::remove_all(root);
+        return 1;
+    }
+    ShotQualityReport panMeasured;
+    Check(LoadShotQuality(panReportPath.string(), panMeasured, error),
+          "the pan fixture analyses: " + error);
+    // First assert the fixture is still the hard case it was chosen for: a
+    // pan that failed to clear the floors would make the check below pass
+    // for the wrong reason.
+    int aboveBothFloors = 0;
+    for (size_t index = 1; index < panMeasured.samples.size(); ++index)
+        if (panMeasured.samples[index].motion >=
+                segmentation.cut_motion_floor &&
+            panMeasured.samples[index].histogram_distance >=
+                segmentation.cut_histogram_floor)
+            ++aboveBothFloors;
+    Check(aboveBothFloors >= 8,
+          "the pan clears both absolute thresholds throughout, so a rule of "
+          "floors alone would cut it to pieces -- samples above both: " +
+              std::to_string(aboveBothFloors) + " of " +
+              std::to_string(panMeasured.samples.size()));
+    Check(DetectSourceShots(panMeasured, segmentation).size() == 1,
+          "a sustained camera move is one shot, not a string of cuts");
 
     // The cache is reproducible: the same media analysed twice must produce
     // the same bytes, which is what makes a stored grade trustworthy.

@@ -11,9 +11,9 @@
 #include <fstream>
 #include <set>
 #include <sstream>
-#include <vector>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -143,8 +143,8 @@ bool LoadOptionalLogs(const std::string& projectPath, const Project& project,
             !EditLog::Load(path, log, editError, error))
             return false;
         if (existsError) {
-            error = "historique de timeline illisible : " +
-                    existsError.message();
+            error =
+                "historique de timeline illisible : " + existsError.message();
             return false;
         }
         timelineLogs.emplace(timeline.id, std::move(log));
@@ -212,9 +212,8 @@ bool ParseResolveManifest(const std::string& json, ResolveManifest& manifest,
             const mcp_json::Value* key =
                 RequiredString(entry, "key", "chutier", error);
             if (key == nullptr) return false;
-            const mcp_json::Value* name =
-                RequiredString(entry, "name", "chutier " + key->AsString(),
-                               error);
+            const mcp_json::Value* name = RequiredString(
+                entry, "name", "chutier " + key->AsString(), error);
             if (name == nullptr) return false;
             if (name->AsString().empty()) {
                 error = "chutier " + key->AsString() + " : nom vide";
@@ -271,8 +270,8 @@ bool ParseResolveManifest(const std::string& json, ResolveManifest& manifest,
 }
 
 bool PlanResolveImport(const Document& document,
-                       const ResolveManifest& manifest,
-                       ResolveImportPlan& plan, std::string& error) {
+                       const ResolveManifest& manifest, ResolveImportPlan& plan,
+                       std::string& error) {
     std::vector<size_t> order;
     if (!OrderBins(manifest.bins, order, error)) return false;
 
@@ -310,8 +309,7 @@ bool PlanResolveImport(const Document& document,
 }
 
 int ImportResolveCommand(const std::string& projectPath,
-                         const std::string& manifestPath,
-                         std::string& output) {
+                         const std::string& manifestPath, std::string& output) {
     std::string reason;
     std::string manifestText;
     const std::vector<SkippedClip> none;
@@ -350,8 +348,7 @@ int ImportResolveCommand(const std::string& projectPath,
     EditError error = EditError::None;
     for (const AddBinOperation& operation : plan.new_bins) {
         if (!log.Apply(document, operation, error, reason)) {
-            output = ResultJson(false, 0, 0, 0, plan.reused_bins, reason,
-                                none);
+            output = ResultJson(false, 0, 0, 0, plan.reused_bins, reason, none);
             return 1;
         }
     }
@@ -389,10 +386,9 @@ int ImportResolveCommand(const std::string& projectPath,
             filing.bin_id = binId;
             if (document.library[known->second].bin_id != binId &&
                 !log.Apply(document, filing, error, reason)) {
-                output =
-                    ResultJson(false, added, alreadyPresent,
-                               plan.new_bins.size(), plan.reused_bins, reason,
-                               skipped);
+                output = ResultJson(false, added, alreadyPresent,
+                                    plan.new_bins.size(), plan.reused_bins,
+                                    reason, skipped);
                 return 1;
             }
             continue;
@@ -401,10 +397,10 @@ int ImportResolveCommand(const std::string& projectPath,
         media.id = GenerateUlid();
         media.filename = absolute.filename().string();
         std::error_code relativeError;
-        media.path = std::filesystem::relative(absolute, projectRoot,
-                                               relativeError)
-                         .lexically_normal()
-                         .string();
+        media.path =
+            std::filesystem::relative(absolute, projectRoot, relativeError)
+                .lexically_normal()
+                .string();
         if (relativeError || media.path.empty()) media.path = absolute.string();
         if (!ProbeMediaMetadata(absolute.string(), media, reason)) {
             skipped.push_back({media.filename, reason});
@@ -422,10 +418,9 @@ int ImportResolveCommand(const std::string& projectPath,
             filing.media_id = media.id;
             filing.bin_id = binId;
             if (!log.Apply(document, filing, error, reason)) {
-                output =
-                    ResultJson(false, added, alreadyPresent,
-                               plan.new_bins.size(), plan.reused_bins, reason,
-                               skipped);
+                output = ResultJson(false, added, alreadyPresent,
+                                    plan.new_bins.size(), plan.reused_bins,
+                                    reason, skipped);
                 return 1;
             }
         }

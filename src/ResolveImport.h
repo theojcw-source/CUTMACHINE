@@ -73,8 +73,8 @@ struct ResolveImportPlan {
 // Matches manifest bins onto the document's existing bins by (name, parent)
 // so a second import of a growing Media Pool is additive, not duplicating.
 bool PlanResolveImport(const Document& document,
-                       const ResolveManifest& manifest,
-                       ResolveImportPlan& plan, std::string& error);
+                       const ResolveManifest& manifest, ResolveImportPlan& plan,
+                       std::string& error);
 
 // Headless entry point: creates the bins through AddBinOperation, ingests each
 // clip through the shared FFmpeg probe, files it with SetMediaBinOperation,

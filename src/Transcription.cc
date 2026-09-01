@@ -941,14 +941,14 @@ bool ResolveWordRemoval(const DocumentClip& clip, const Transcript& transcript,
 }
 
 bool ResolveConfiguredWhisperModel(std::string& path, std::string& reason) {
-    const std::string configured =
-        local_env::Value("CUTMACHINE_WHISPER_MODEL");
+    const std::string configured = local_env::Value("CUTMACHINE_WHISPER_MODEL");
     const std::string file = local_env::LocalEnvFilePath();
     if (configured.empty()) {
-        reason = "no Whisper model configured: set CUTMACHINE_WHISPER_MODEL "
-                 "to a local ggml model file, either in the environment or in "
-                 "'" +
-                 file + "'";
+        reason =
+            "no Whisper model configured: set CUTMACHINE_WHISPER_MODEL "
+            "to a local ggml model file, either in the environment or in "
+            "'" +
+            file + "'";
         return false;
     }
     if (!std::filesystem::is_regular_file(configured)) {

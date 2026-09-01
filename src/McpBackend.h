@@ -30,6 +30,7 @@
 #include "InterviewShort.h"
 #include "Operations.h"
 #include "ShotQuality.h"
+#include "SpeechOnset.h"
 #include "Transcription.h"
 
 #include <string>
@@ -136,6 +137,24 @@ public:
     virtual bool ReadSourceShotQuality(const Ulid&, ShotQualityReport&,
                                        std::string& message) {
         message = "this backend has no project shot quality cache";
+        return false;
+    }
+
+    // ONSET-2026-08 -- the same pair for the speech envelope. It exists
+    // because the transcript is not a reliable answer to "where does this
+    // clip start speaking": Whisper puts the first words of a segment on
+    // silence, so an agent trusting them opens clips on dead air. Reading a
+    // measurement it cannot produce would leave the same half-workflow
+    // AnalyzeSourceShotQuality was added to close.
+    virtual bool ReadSourceSpeechOnset(const Ulid&, SpeechOnsetReport&,
+                                       std::string& message) {
+        message = "this backend has no project speech onset cache";
+        return false;
+    }
+
+    virtual bool AnalyzeSourceSpeechOnset(const Ulid&, std::string&,
+                                          std::string& message) {
+        message = "this backend cannot run a speech onset analysis";
         return false;
     }
 

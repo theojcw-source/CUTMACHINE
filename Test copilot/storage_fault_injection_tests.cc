@@ -13,8 +13,8 @@
 //     invariants de haut niveau sur ProjectStorage (via les fonctions
 //     publiques) en inspectant l'état du disque après chaque panne simulée.
 //
-// Note : comme ProjectStorage écrit directement avec std::ofstream / fs::rename,
-// on injecte les pannes au niveau des wrappers qu'on contrôle ici,
+// Note : comme ProjectStorage écrit directement avec std::ofstream /
+// fs::rename, on injecte les pannes au niveau des wrappers qu'on contrôle ici,
 // en testant les comportements observables sur le vrai filesystem avec
 // des répertoires temporaires -- même approche que project_recovery_tests.cc.
 //
@@ -154,9 +154,9 @@ int main() {
         // Tentative d'autosave avec un projet invalide
         Project invalid = MakeProject("Invalid");
         invalid.width = 0;  // invalide selon Project::Validate
-        Check(
-            !ProjectRecovery::WriteAutosave(projectPath.string(), invalid, error),
-            "autosave invalide doit échouer");
+        Check(!ProjectRecovery::WriteAutosave(projectPath.string(), invalid,
+                                              error),
+              "autosave invalide doit échouer");
 
         // L'autosave précédent doit être inchangé
         const std::string afterFail =
@@ -203,7 +203,7 @@ int main() {
             Project reloaded;
             std::string loadError;
             Check(Project::LoadFromString(ReadFile(projectPath), reloaded,
-                                         loadError),
+                                          loadError),
                   "fichier projet illisible après Save : " + loadError);
         }
     });
@@ -217,8 +217,7 @@ int main() {
 
         Project p = MakeProject("Clean");
         std::string error;
-        Check(p.Save(projectPath.string(), error),
-              "save project : " + error);
+        Check(p.Save(projectPath.string(), error), "save project : " + error);
 
         // Sauvegarder plusieurs fois de suite
         for (int i = 0; i < 5; ++i) {
@@ -259,10 +258,9 @@ int main() {
 
         ProjectEditLog projectLog;
 
-        Check(
-            ProjectRecovery::WriteAutosave(projectPath.string(), working,
-                                           timelineLogs, projectLog, error),
-            "write recovery envelope : " + error);
+        Check(ProjectRecovery::WriteAutosave(projectPath.string(), working,
+                                             timelineLogs, projectLog, error),
+              "write recovery envelope : " + error);
 
         // S'assurer que l'autosave est plus récent
         const fs::path autosavePath =
@@ -282,11 +280,10 @@ int main() {
         Project recovered;
         std::map<std::string, EditLog> recoveredLogs;
         ProjectEditLog recoveredProjectLog;
-        Check(
-            ProjectRecovery::LoadAutosave(projectPath.string(), recovered,
-                                          recoveredLogs, recoveredProjectLog,
-                                          error),
-            "LoadAutosave envelope : " + error);
+        Check(ProjectRecovery::LoadAutosave(projectPath.string(), recovered,
+                                            recoveredLogs, recoveredProjectLog,
+                                            error),
+              "LoadAutosave envelope : " + error);
 
         Check(recovered.name == working.name,
               "nom du projet récupéré incorrect");
@@ -360,10 +357,8 @@ int main() {
               "Project Save/Load non idempotent (différence de bytes)");
 
         // Vérifier l'intégrité après rechargement
-        Check(loaded.Validate(error),
-              "projet rechargé invalide : " + error);
-        Check(loaded.name == p.name,
-              "nom perdu après rechargement");
+        Check(loaded.Validate(error), "projet rechargé invalide : " + error);
+        Check(loaded.name == p.name, "nom perdu après rechargement");
         Check(loaded.timelines.size() == p.timelines.size(),
               "nombre de timelines perdu après rechargement");
     });
@@ -386,14 +381,14 @@ int main() {
         Check(ProjectRecovery::WriteAutosave(projectPath.string(), p, logs,
                                              projectLog, error),
               "first autosave : " + error);
-        const std::string first = ReadFile(
-            ProjectRecovery::AutosavePath(projectPath.string()));
+        const std::string first =
+            ReadFile(ProjectRecovery::AutosavePath(projectPath.string()));
 
         Check(ProjectRecovery::WriteAutosave(projectPath.string(), p, logs,
                                              projectLog, error),
               "second autosave : " + error);
-        const std::string second = ReadFile(
-            ProjectRecovery::AutosavePath(projectPath.string()));
+        const std::string second =
+            ReadFile(ProjectRecovery::AutosavePath(projectPath.string()));
 
         Check(first == second,
               "deux autosaves identiques produisent des bytes différents "
@@ -421,12 +416,13 @@ int main() {
 
         // Logs complets
         std::map<std::string, EditLog> completeLogs;
-        for (const auto& tl : p.timelines) completeLogs.emplace(tl.id, EditLog{});
+        for (const auto& tl : p.timelines)
+            completeLogs.emplace(tl.id, EditLog{});
         Check(ProjectRecovery::WriteAutosave(projectPath.string(), p,
                                              completeLogs, plog, error),
               "write complet : " + error);
-        const std::string validAutosave = ReadFile(
-            ProjectRecovery::AutosavePath(projectPath.string()));
+        const std::string validAutosave =
+            ReadFile(ProjectRecovery::AutosavePath(projectPath.string()));
 
         // Logs incomplets (une timeline manquante)
         std::map<std::string, EditLog> incompleteLogs;
@@ -434,15 +430,13 @@ int main() {
         if (!p.timelines.empty())
             incompleteLogs.emplace(p.timelines.front().id, EditLog{});
 
-        const bool rejected =
-            !ProjectRecovery::WriteAutosave(projectPath.string(), p,
-                                            incompleteLogs, plog, error);
-        Check(rejected,
-              "autosave avec historique incomplet doit être rejeté");
+        const bool rejected = !ProjectRecovery::WriteAutosave(
+            projectPath.string(), p, incompleteLogs, plog, error);
+        Check(rejected, "autosave avec historique incomplet doit être rejeté");
 
         if (rejected) {
-            const std::string afterReject = ReadFile(
-                ProjectRecovery::AutosavePath(projectPath.string()));
+            const std::string afterReject =
+                ReadFile(ProjectRecovery::AutosavePath(projectPath.string()));
             Check(afterReject == validAutosave,
                   "autosave précédent détruit par le rejet");
         }

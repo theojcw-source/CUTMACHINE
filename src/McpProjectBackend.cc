@@ -107,6 +107,28 @@ bool McpProjectBackend::ReadSourceShotQuality(const Ulid& sourceId,
     return LoadShotQuality(path.string(), report, message);
 }
 
+bool McpProjectBackend::ReadSourceSpeechOnset(const Ulid& sourceId,
+                                              SpeechOnsetReport& report,
+                                              std::string& message) {
+    const std::filesystem::path projectPath =
+        std::filesystem::absolute(project_path_);
+    const std::filesystem::path path = projectPath.parent_path() /
+                                       ".cutmachine" / "speechonset" /
+                                       (sourceId + ".json");
+    return LoadSpeechOnset(path.string(), report, message);
+}
+
+bool McpProjectBackend::AnalyzeSourceSpeechOnset(const Ulid& sourceId,
+                                                 std::string& resultJson,
+                                                 std::string& message) {
+    std::string output;
+    const int result =
+        AnalyzeSpeechOnsetCommand(project_path_, sourceId, output);
+    std::string errorName;
+    return ParseCommandResult(output, result == 0, resultJson, errorName,
+                              message);
+}
+
 bool McpProjectBackend::AnalyzeSourceShotQuality(const Ulid& sourceId,
                                                  std::string& resultJson,
                                                  std::string& message) {
@@ -121,10 +143,9 @@ bool McpProjectBackend::AnalyzeSourceShotQuality(const Ulid& sourceId,
 }
 
 bool McpProjectBackend::TranscribeSource(const Ulid& sourceId,
-                                        const std::string& language,
-                                        bool verbatim,
-                                        std::string& resultJson,
-                                        std::string& message) {
+                                         const std::string& language,
+                                         bool verbatim, std::string& resultJson,
+                                         std::string& message) {
     // Same command `--transcribe` runs. The empty model path is deliberate:
     // it resolves the locally configured model, which is the only form a
     // caller that is not a human typing a path can use.

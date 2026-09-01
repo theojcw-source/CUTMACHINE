@@ -80,17 +80,21 @@ int main() {
         {"key":"b1","name":"A"},{"key":"b1","name":"B"}]})",
                   "clé dupliquée");
     CheckRejected(R"({"schema":"cutmachine.resolve-manifest.v1","bins":[
-        {"key":"b1","name":"A","parent_key":"absent"}]})", "parent inconnu");
+        {"key":"b1","name":"A","parent_key":"absent"}]})",
+                  "parent inconnu");
     CheckRejected(R"({"schema":"cutmachine.resolve-manifest.v1","bins":[
         {"key":"b1","name":"A","parent_key":"b2"},
-        {"key":"b2","name":"B","parent_key":"b1"}]})", "cycle de chutiers");
+        {"key":"b2","name":"B","parent_key":"b1"}]})",
+                  "cycle de chutiers");
     CheckRejected(R"({"schema":"cutmachine.resolve-manifest.v1","clips":[
         {"path":"/a.mp4","bin_key":"absent"}]})",
                   "rush dans un chutier absent");
     CheckRejected(R"({"schema":"cutmachine.resolve-manifest.v1","clips":[
-        {"path":""}]})", "rush sans chemin");
+        {"path":""}]})",
+                  "rush sans chemin");
     CheckRejected(R"({"schema":"cutmachine.resolve-manifest.v1","bins":[
-        {"key":"","name":"A"}]})", "clé vide");
+        {"key":"","name":"A"}]})",
+                  "clé vide");
 
     // --- Planning ----------------------------------------------------------
     Document document;
@@ -111,8 +115,8 @@ int main() {
     // Applying the plan then re-planning must create nothing: a second import
     // of a Media Pool that grew adds only what is new.
     for (const AddBinOperation& operation : plan.new_bins)
-        document.bins.push_back({operation.bin_id, operation.name,
-                                 operation.parent_id});
+        document.bins.push_back(
+            {operation.bin_id, operation.name, operation.parent_id});
     ResolveImportPlan replan;
     Check(PlanResolveImport(document, manifest, replan, error),
           "un second passage se planifie : " + error);

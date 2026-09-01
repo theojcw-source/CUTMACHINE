@@ -120,6 +120,29 @@ int main() {
     std::error_code ignored;
     std::filesystem::remove(output, ignored);
 
+    // WriteSrt sert le même sérialiseur à un appelant qui tient déjà ses
+    // cues : --export-srt les tire des transcriptions en cache, sans poser
+    // de piste de sous-titres dans le document juste pour obtenir un fichier.
+    const std::filesystem::path direct =
+        std::filesystem::temp_directory_path() /
+        ("cutmachine-subtitles-" + GenerateUlid() + ".srt");
+    Check(WriteSrt(generated, direct.string(), error),
+          "des cues s'écrivent en SRT sans passer par le document : " + error);
+    std::vector<SubtitleCue> roundTrip;
+    Check(LoadSrt(direct.string(), roundTrip, error) &&
+              roundTrip.size() == generated.size() &&
+              roundTrip[0].timeline_in == generated[0].timeline_in &&
+              roundTrip[0].text == generated[0].text &&
+              roundTrip[1].text == generated[1].text,
+          "l'aller-retour garde le minutage et le texte : " + error);
+    std::filesystem::remove(direct, ignored);
+
+    std::vector<SubtitleCue> nothing;
+    Check(!WriteSrt(nothing, direct.string(), error),
+          "une liste vide se refuse au lieu d'écrire un fichier vide");
+    Check(!std::filesystem::exists(direct, ignored),
+          "et rien n'est créé sur le disque");
+
     Check(log.Undo(document, editError, message) &&
               document.SaveToString() == before,
           "one undo removes the imported track byte-identically");

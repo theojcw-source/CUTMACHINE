@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import unicodedata
 from typing import Any
 
 
@@ -129,13 +130,144 @@ def build_manifest(resolve: Any) -> dict[str, Any]:
     return manifest
 
 
+TIMELINE_SCHEMA = "cutmachine.resolve-timeline.v2"
+
+
+def normalized(path: str) -> str:
+    """macOS hands the same path back in either Unicode normalization.
+
+    CUTMACHINE resolves media paths through the filesystem, which yields NFD
+    ("Anthropoce" + combining grave); Resolve reports what it stored, usually
+    NFC. Comparing the raw strings silently fails on every accented folder
+    name, so both sides are folded before matching.
+    """
+    return unicodedata.normalize("NFC", path)
+
+
+def index_media_pool(root: Any) -> dict[str, Any]:
+    """Maps every clip in the Media Pool by absolute path, then by filename."""
+    by_path: dict[str, Any] = {}
+    by_name: dict[str, Any] = {}
+
+    def walk(folder: Any) -> None:
+        for clip in folder.GetClipList() or []:
+            path = (clip.GetClipProperty("File Path") or "").strip()
+            if path:
+                by_path.setdefault(normalized(path), clip)
+                name = (clip.GetClipProperty("File Name") or "").strip()
+                if name:
+                    by_name.setdefault(normalized(name), clip)
+        for child in folder.GetSubFolderList() or []:
+            walk(child)
+
+    walk(root)
+    # The filename fallback only helps when it is unambiguous, which the
+    # setdefault above does not guarantee; callers treat it as a hint.
+    return {"by_path": by_path, "by_name": by_name}
+
+
+def send_timeline(resolve: Any, timeline: dict[str, Any],
+                  name: str | None = None) -> str:
+    """Rebuilds a CUTMACHINE cut as a new Resolve timeline.
+
+    `name` overrides the montage's own name. Resolve refuses a duplicate
+    timeline name, so without an override a cut can only ever be sent once:
+    every later revision of the same montage would be rejected. This is where
+    the operator says where it lands, not what it contains.
+    """
+    if timeline.get("schema") != TIMELINE_SCHEMA:
+        raise ResolveBridgeError(
+            f"schéma inattendu : {timeline.get('schema')} "
+            f"(attendu {TIMELINE_SCHEMA})")
+    project = resolve.GetProjectManager().GetCurrentProject()
+    if project is None:
+        raise ResolveBridgeError("Aucun projet ouvert dans Resolve.")
+    media_pool = project.GetMediaPool()
+    index = index_media_pool(media_pool.GetRootFolder())
+
+    pending = []
+    missing = []
+    layers = 1
+    for clip in timeline.get("clips", []):
+        item = index["by_path"].get(normalized(clip["path"]))
+        if item is None:
+            item = index["by_name"].get(normalized(clip.get("filename", "")))
+        if item is None:
+            missing.append(clip.get("filename") or clip["path"])
+            continue
+        layer = int(clip.get("video_layer", 0))
+        layers = max(layers, layer + 1)
+        info = {
+            "mediaPoolItem": item,
+            "startFrame": int(clip["start_frame"]),
+            "endFrame": int(clip["end_frame"]),
+            "trackIndex": layer + 1,
+        }
+        if not clip.get("with_audio", False):
+            # mediaType 1 = image seule. Sans ça, Resolve rapporte le son du
+            # plan de coupe et le pose sous l'interview qu'il recouvre.
+            info["mediaType"] = 1
+        pending.append((info, int(clip.get("record_frame", 0))))
+    if missing:
+        raise ResolveBridgeError(
+            "Rushes absents du Media Pool : " + ", ".join(sorted(set(missing))))
+    if not pending:
+        raise ResolveBridgeError("Aucun plan à envoyer.")
+
+    name = name or timeline.get("name") or "CUTMACHINE"
+    created = media_pool.CreateEmptyTimeline(name)
+    if not created:
+        raise ResolveBridgeError(
+            f"Resolve a refusé de créer la timeline « {name} » "
+            "(un nom identique existe peut-être déjà).")
+    # Une timeline neuve n'a qu'une piste vidéo : chaque couche de recouvrement
+    # a besoin de la sienne avant qu'AppendToTimeline puisse l'adresser.
+    while int(created.GetTrackCount("video")) < layers:
+        if not created.AddTrack("video"):
+            raise ResolveBridgeError(
+                "Resolve a refusé d'ajouter une piste vidéo.")
+    # Resolve compte les images depuis le timecode de départ de la séquence
+    # (90000 pour 01:00:00:00 à 25 i/s) ; CUTMACHINE compte depuis zéro. Sans
+    # ce décalage, les plans repartiraient bout à bout au lieu de se poser où
+    # le montage les place.
+    start = int(created.GetStartFrame())
+    infos = []
+    for info, record_frame in pending:
+        info["recordFrame"] = start + record_frame
+        infos.append(info)
+    if not media_pool.AppendToTimeline(infos):
+        raise ResolveBridgeError("AppendToTimeline a échoué.")
+    couches = "" if layers == 1 else f", sur {layers} pistes vidéo"
+    return f"{len(infos)} plan(s) → timeline « {name} » dans Resolve{couches}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Exporte les chutiers du projet Resolve ouvert en "
                     "manifeste d'import CUTMACHINE.")
     parser.add_argument("--output", "-o", default="-",
                         help="Fichier de sortie ('-' pour la sortie standard)")
+    parser.add_argument("--send", metavar="TIMELINE.json",
+                        help="Renvoie dans Resolve une timeline exportée par "
+                             "`cutmachine --export-resolve-timeline`")
+    parser.add_argument("--name", metavar="NOM",
+                        help="Nom de la timeline créée dans Resolve "
+                             "(par défaut celui du montage). Resolve refuse "
+                             "un nom déjà pris : sans ça, on ne peut pas "
+                             "renvoyer une révision du même montage.")
     arguments = parser.parse_args(argv)
+
+    if arguments.send:
+        try:
+            with open(arguments.send, encoding="utf-8") as handle:
+                timeline = json.load(handle)
+            print(send_timeline(connect(), timeline, arguments.name),
+                  file=sys.stderr)
+        except ResolveBridgeError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        return 0
+
     try:
         manifest = build_manifest(connect())
     except ResolveBridgeError as error:

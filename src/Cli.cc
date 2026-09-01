@@ -1,15 +1,20 @@
 #include "Cli.h"
 
 #include "Document.h"
+#include "DocumentDelta.h"
 #include "EditLog.h"
 #include "Export.h"
+#include "InterviewShort.h"
 #include "Json.h"
 #include "Operations.h"
 #include "Project.h"
 #include "ProjectStorage.h"
 #include "SequenceFormat.h"
 #include "ShotQuality.h"
+#include "SpeechOnset.h"
+#include "Subtitles.h"
 #include "Timeline.h"
+#include "TranscriptAlignment.h"
 #include "Transcription.h"
 #include "Ulid.h"
 
@@ -757,6 +762,43 @@ bool CommitTextArtifactsAndRemove(
     return CommitArtifacts(std::move(prepared), message);
 }
 
+int ExportSrtCommand(const std::string& projectPath,
+                     const std::string& outputPath, std::string& output) {
+    Project project;
+    std::string error;
+    if (!LoadStoredProject(projectPath, project, error)) {
+        output = "{\"ok\":false,\"error\":\"InvalidDocument\",\"detail\":\"" +
+                 EscapeJson(error) + "\"}\n";
+        return 1;
+    }
+    Document document = project.MakeActiveDocument();
+    const std::filesystem::path transcriptDirectory =
+        std::filesystem::absolute(projectPath).parent_path() / ".cutmachine" /
+        "transcripts";
+    std::vector<TimelineTranscriptSpan> spans;
+    if (!BuildTimelineTranscriptSpans(document, transcriptDirectory, spans,
+                                      error)) {
+        output = "{\"ok\":false,\"error\":\"InvalidTranscript\",\"detail\":\"" +
+                 EscapeJson(error) + "\"}\n";
+        return 1;
+    }
+    // The spans are already the readable groupings SubtitleCuesForClip cuts
+    // -- about 42 characters, a sentence end, or a pause -- and they already
+    // carry timeline positions, so nothing here recomputes a boundary.
+    std::vector<SubtitleCue> cues;
+    cues.reserve(spans.size());
+    for (const TimelineTranscriptSpan& span : spans)
+        cues.push_back({span.timeline_in, span.duration, span.text});
+    if (!WriteSrt(cues, outputPath, error)) {
+        output = "{\"ok\":false,\"error\":\"InvalidSubtitles\",\"detail\":\"" +
+                 EscapeJson(error) + "\"}\n";
+        return 1;
+    }
+    output = "{\"ok\":true,\"cues\":" + std::to_string(cues.size()) +
+             ",\"path\":\"" + EscapeJson(outputPath) + "\"}\n";
+    return 0;
+}
+
 int ExportCommand(const std::string& documentPath,
                   const ExportSettings& settings,
                   const ExportProgressCallback& progress,
@@ -849,16 +891,14 @@ int TranscribeMediaCommand(const std::string& projectPath,
     // agent can use, since it has no way to know where a human keeps a ggml
     // file. An explicit path still wins, so the CLI stays scriptable.
     std::string modelPath = whisperModelPath;
-    if (modelPath.empty() &&
-        !ResolveConfiguredWhisperModel(modelPath, error)) {
+    if (modelPath.empty() && !ResolveConfiguredWhisperModel(modelPath, error)) {
         output = ErrorJson(EditError::IoError, error);
         return 1;
     }
     if (!std::filesystem::is_regular_file(modelPath)) {
-        output =
-            ErrorJson(EditError::IoError,
-                      "Whisper model is not a regular file: '" + modelPath +
-                          "'");
+        output = ErrorJson(
+            EditError::IoError,
+            "Whisper model is not a regular file: '" + modelPath + "'");
         return 1;
     }
 
@@ -996,8 +1036,152 @@ int ShotQualityReportCommand(const std::string& projectPath,
                 reports.emplace(clip.source_id, std::move(report));
         }
     }
-    output = DescribeShotQualityForAgent(document, reports,
-                                         ShotQualityThresholds{}) +
+    output =
+        DescribeShotQualityForAgent(document, reports, ShotQualityThresholds{},
+                                    ShotSegmentationSettings{}) +
+        "\n";
+    return 0;
+}
+
+int AlignTranscriptsCommand(const std::string& projectPath,
+                            std::string& output) {
+    Project project;
+    std::string error;
+    if (!LoadStoredProject(projectPath, project, error)) {
+        output = ErrorJson(EditError::ParseError, error);
+        return 1;
+    }
+    const std::filesystem::path base =
+        std::filesystem::absolute(projectPath).parent_path();
+    std::ostringstream out;
+    out << "{\"ok\":true,\"sources\":[";
+    bool first = true;
+    for (const LibraryMedia& media : project.rushes) {
+        Transcript transcript;
+        SpeechOnsetReport envelope;
+        std::string message;
+        const std::filesystem::path transcriptPath =
+            base / ".cutmachine" / "transcripts" / (media.id + ".json");
+        const std::filesystem::path envelopePath =
+            base / ".cutmachine" / "speechonset" / (media.id + ".json");
+        if (!LoadAudioTranscript(transcriptPath.string(), transcript, message))
+            continue;
+        if (!LoadSpeechOnset(envelopePath.string(), envelope, message))
+            continue;
+        Transcript aligned;
+        TranscriptAlignmentReport report;
+        if (!AlignTranscriptToSpeech(transcript, envelope,
+                                     TranscriptAlignmentSettings{}, aligned,
+                                     report, message))
+            continue;
+        if (!first) out << ',';
+        first = false;
+        out << "{\"media_id\":\"" << EscapeJson(media.id)
+            << "\",\"filename\":\"" << EscapeJson(media.filename)
+            << "\",\"report\":" << SerializeTranscriptAlignmentReport(report)
+            << "}";
+    }
+    out << "]}\n";
+    output = out.str();
+    return 0;
+}
+
+int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
+                              const std::string& mediaId, std::string& output) {
+    Project project;
+    std::string error;
+    if (!LoadStoredProject(projectPath, project, error)) {
+        output = ErrorJson(EditError::ParseError, error);
+        return 1;
+    }
+    const auto media = std::find_if(
+        project.rushes.begin(), project.rushes.end(),
+        [&](const LibraryMedia& item) { return item.id == mediaId; });
+    if (media == project.rushes.end()) {
+        output = ErrorJson(EditError::UnknownMedia,
+                           "unknown media_id '" + mediaId + "'");
+        return 1;
+    }
+    if (!media->has_audio) {
+        output = ErrorJson(EditError::ValidationFailed,
+                           "media '" + media->filename + "' has no audio");
+        return 1;
+    }
+    const std::filesystem::path base =
+        std::filesystem::absolute(projectPath).parent_path();
+    std::filesystem::path input(media->path);
+    if (input.is_relative()) input = base / input;
+    input = input.lexically_normal();
+    const std::filesystem::path reportPath =
+        base / ".cutmachine" / "speechonset" / (mediaId + ".json");
+    MediaTaskManager tasks(1);
+    const Ulid taskId = tasks.Enqueue(
+        MediaTaskKind::SpeechOnset, "Analyse parole " + media->filename,
+        [input, reportPath, mediaId](MediaTaskContext& context,
+                                     std::string& taskError) {
+            return GenerateSpeechOnset(input.string(), reportPath.string(),
+                                       mediaId, SpeechOnsetSettings{}, context,
+                                       taskError);
+        });
+    if (!tasks.WaitForIdle(24 * 60 * 60 * 1000)) {
+        tasks.Cancel(taskId);
+        output =
+            ErrorJson(EditError::IoError, "speech onset analysis timed out");
+        return 1;
+    }
+    const std::vector<MediaTaskSnapshot> snapshots = tasks.Snapshot();
+    const auto snapshot = std::find_if(
+        snapshots.begin(), snapshots.end(),
+        [&](const MediaTaskSnapshot& item) { return item.id == taskId; });
+    if (snapshot == snapshots.end() ||
+        snapshot->state != MediaTaskState::Succeeded) {
+        const std::string detail = snapshot == snapshots.end()
+                                       ? "speech onset task disappeared"
+                                       : snapshot->error;
+        output = ErrorJson(EditError::IoError, detail);
+        return 1;
+    }
+    SpeechOnsetReport report;
+    std::string loadError;
+    if (!LoadSpeechOnset(reportPath.string(), report, loadError)) {
+        output = ErrorJson(EditError::IoError, loadError);
+        return 1;
+    }
+    output = "{\"ok\":true,\"media_id\":\"" + EscapeJson(mediaId) +
+             "\",\"path\":\"" + EscapeJson(reportPath.string()) +
+             "\",\"windows\":" + std::to_string(report.levels.size()) +
+             ",\"speech_level\":" + std::to_string(report.speech_level) +
+             ",\"noise_floor\":" + std::to_string(report.noise_floor) + "}\n";
+    return 0;
+}
+
+int SpeechOnsetReportCommand(const std::string& projectPath,
+                             std::string& output) {
+    Project project;
+    std::string error;
+    if (!LoadStoredProject(projectPath, project, error)) {
+        output = ErrorJson(EditError::ParseError, error);
+        return 1;
+    }
+    const Document document = project.MakeActiveDocument();
+    const std::filesystem::path base =
+        std::filesystem::absolute(projectPath).parent_path();
+    std::map<Ulid, SpeechOnsetReport> reports;
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        if (track.kind != "audio") continue;
+        for (const DocumentClip& clip : track.clips) {
+            if (reports.count(clip.source_id)) continue;
+            SpeechOnsetReport report;
+            std::string loadError;
+            const std::filesystem::path path = base / ".cutmachine" /
+                                               "speechonset" /
+                                               (clip.source_id + ".json");
+            if (LoadSpeechOnset(path.string(), report, loadError))
+                reports.emplace(clip.source_id, std::move(report));
+        }
+    }
+    output = DescribeSpeechOnsetForAgent(document, reports,
+                                         SpeechOnsetThresholds{}) +
              "\n";
     return 0;
 }
@@ -1185,6 +1369,10 @@ int ApplyOperationCommand(const std::string& documentPath,
         return 1;
     }
     Document document = project.MakeActiveDocument();
+    // DELTA-2026-08 -- the state the caller already knows about. Kept so the
+    // result can say what changed instead of making the caller re-read the
+    // whole timeline to find out.
+    const Document before = document;
 
     EditLog log;
     const std::string timelineLogPath =
@@ -1225,8 +1413,10 @@ int ApplyOperationCommand(const std::string& documentPath,
         output = ErrorJson(EditError::IoError, message);
         return 1;
     }
+    DocumentDelta delta;
+    ComputeDocumentDelta(before, document, delta);
     output = "{\"ok\":true,\"doc_hash\":\"" + CanonicalHash(updatedDocument) +
-             "\"}\n";
+             "\",\"delta\":" + SerializeDocumentDelta(delta) + "}\n";
     return 0;
 }
 
@@ -1358,6 +1548,9 @@ int MutateTimelineLogCommand(const std::string& documentPath, bool redo,
         return 1;
     }
     Document document = project.MakeActiveDocument();
+    // Undo needs the delta more than anything else does: the caller has no
+    // way to guess what a reversal put back.
+    const Document before = document;
 
     EditLog log;
     if (!LoadOptionalTimelineLog(documentPath, project.active_timeline_id, log,
@@ -1383,8 +1576,10 @@ int MutateTimelineLogCommand(const std::string& documentPath, bool redo,
         output = ErrorJson(EditError::IoError, message);
         return 1;
     }
+    DocumentDelta delta;
+    ComputeDocumentDelta(before, document, delta);
     output = "{\"ok\":true,\"doc_hash\":\"" + CanonicalHash(updatedDocument) +
-             "\"}\n";
+             "\",\"delta\":" + SerializeDocumentDelta(delta) + "}\n";
     return 0;
 }
 

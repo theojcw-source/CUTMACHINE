@@ -70,7 +70,8 @@ struct Lcg {
     }
     int64_t NextInt64(int64_t lo, int64_t hi) {
         if (lo >= hi) return lo;
-        return lo + static_cast<int64_t>(Next() % static_cast<uint64_t>(hi - lo));
+        return lo +
+               static_cast<int64_t>(Next() % static_cast<uint64_t>(hi - lo));
     }
     bool NextBool() { return Next() % 2 == 0; }
     size_t NextIndex(size_t size) {
@@ -119,7 +120,8 @@ void CheckInvariants(const Document& doc, const std::string& context) {
     std::string error;
     Check(doc.Validate(error), context + " : Validate() : " + error);
     Check(AllIdsUnique(doc, error), context + " : IDs uniques : " + error);
-    Check(NoDegenerateClip(doc, error), context + " : clips valides : " + error);
+    Check(NoDegenerateClip(doc, error),
+          context + " : clips valides : " + error);
 }
 
 // -----------------------------------------------------------------------
@@ -197,8 +199,7 @@ GeneratedOp GenRemoveClip(const Document& doc, Lcg& rng) {
     // Collecter tous les clips
     std::vector<std::string> clipIds;
     for (const auto& track : doc.sequence.tracks)
-        for (const auto& clip : track.clips)
-            clipIds.push_back(clip.id);
+        for (const auto& clip : track.clips) clipIds.push_back(clip.id);
     if (clipIds.empty()) return {false, {}};
     const std::string id = clipIds[rng.NextIndex(clipIds.size())];
     RemoveClipOperation op;
@@ -219,12 +220,18 @@ GeneratedOp GenRemoveMarker(const Document& doc, Lcg& rng) {
 GeneratedOp PickOperation(const Document& doc, Lcg& rng) {
     const int choice = static_cast<int>(rng.Next() % 5);
     switch (choice) {
-        case 0: return GenAddTrack(rng);
-        case 1: return GenAddClip(doc, rng);
-        case 2: return GenAddMarker(doc, rng);
-        case 3: return GenRemoveClip(doc, rng);
-        case 4: return GenRemoveMarker(doc, rng);
-        default: return {false, {}};
+        case 0:
+            return GenAddTrack(rng);
+        case 1:
+            return GenAddClip(doc, rng);
+        case 2:
+            return GenAddMarker(doc, rng);
+        case 3:
+            return GenRemoveClip(doc, rng);
+        case 4:
+            return GenRemoveMarker(doc, rng);
+        default:
+            return {false, {}};
     }
 }
 
@@ -272,8 +279,8 @@ int main() {
             }
         }
         // On doit avoir au moins appliqué quelques opérations
-        Check(applied >= 5, "trop peu d'opérations applicables : " +
-                                 std::to_string(applied));
+        Check(applied >= 5,
+              "trop peu d'opérations applicables : " + std::to_string(applied));
     });
 
     // ------------------------------------------------------------------
@@ -287,7 +294,8 @@ int main() {
         // Construire un document de base
         for (int i = 0; i < 2; ++i) {
             auto g = GenAddTrack(rng);
-            EditError e = EditError::None; std::string m;
+            EditError e = EditError::None;
+            std::string m;
             log.Apply(doc, g.op, e, m);
         }
 
@@ -330,7 +338,8 @@ int main() {
 
         for (int i = 0; i < 2; ++i) {
             auto g = GenAddTrack(rng);
-            EditError e = EditError::None; std::string m;
+            EditError e = EditError::None;
+            std::string m;
             log.Apply(doc, g.op, e, m);
         }
 
@@ -345,11 +354,13 @@ int main() {
             const std::string stateAfterApply = doc.SaveToString();
 
             // Undo
-            EditError undoErr = EditError::None; std::string undoMsg;
+            EditError undoErr = EditError::None;
+            std::string undoMsg;
             if (!log.Undo(doc, undoErr, undoMsg)) continue;
 
             // Redo
-            EditError redoErr = EditError::None; std::string redoMsg;
+            EditError redoErr = EditError::None;
+            std::string redoMsg;
             const bool redoOk = log.Redo(doc, redoErr, redoMsg);
             Check(redoOk, "Redo a échoué : " + redoMsg);
             if (redoOk) {
@@ -370,14 +381,16 @@ int main() {
 
         for (int i = 0; i < 2; ++i) {
             auto g = GenAddTrack(rng);
-            EditError e = EditError::None; std::string m;
+            EditError e = EditError::None;
+            std::string m;
             log.Apply(doc, g.op, e, m);
         }
 
         for (int step = 0; step < 80; ++step) {
             auto g = PickOperation(doc, rng);
             if (!g.applicable) continue;
-            EditError err = EditError::None; std::string msg;
+            EditError err = EditError::None;
+            std::string msg;
             if (!log.Apply(doc, g.op, err, msg)) continue;
 
             // Sérialisation du log
@@ -385,7 +398,8 @@ int main() {
             EditLog reloaded;
             EditError loadErr = EditError::None;
             std::string loadMsg;
-            const bool loaded = EditLog::Deserialize(s1, reloaded, loadErr, loadMsg);
+            const bool loaded =
+                EditLog::Deserialize(s1, reloaded, loadErr, loadMsg);
             Check(loaded, "Deserialize a échoué step " + std::to_string(step) +
                               " : " + loadMsg);
             if (loaded) {
@@ -407,13 +421,15 @@ int main() {
         // Construire un document non trivial
         for (int i = 0; i < 3; ++i) {
             auto g = GenAddTrack(rng);
-            EditError e = EditError::None; std::string m;
+            EditError e = EditError::None;
+            std::string m;
             log.Apply(doc, g.op, e, m);
         }
         for (int i = 0; i < 5; ++i) {
             auto g = GenAddClip(doc, rng);
             if (!g.applicable) continue;
-            EditError e = EditError::None; std::string m;
+            EditError e = EditError::None;
+            std::string m;
             log.Apply(doc, g.op, e, m);
         }
 
@@ -428,7 +444,8 @@ int main() {
         for (int step = 0; step < 60 && extraApplied < 30; ++step) {
             auto g = PickOperation(doc, rng);
             if (!g.applicable) continue;
-            EditError err = EditError::None; std::string msg;
+            EditError err = EditError::None;
+            std::string msg;
             if (!log.Apply(doc, g.op, err, msg)) continue;
             ++extraApplied;
             states.push_back(doc.SaveToString());
@@ -436,7 +453,8 @@ int main() {
 
         // Undo de tout ce qui a été appliqué en plus
         for (int i = extraApplied - 1; i >= 0; --i) {
-            EditError err = EditError::None; std::string msg;
+            EditError err = EditError::None;
+            std::string msg;
             const bool ok = log.Undo(doc, err, msg);
             Check(ok, "Undo #" + std::to_string(i) + " a échoué : " + msg);
             if (ok) {
@@ -462,12 +480,13 @@ int main() {
 
         {
             auto g = GenAddTrack(rng);
-            EditError e = EditError::None; std::string m;
+            EditError e = EditError::None;
+            std::string m;
             log.Apply(doc, g.op, e, m);
         }
 
         size_t applied = log.AppliedCount();
-        size_t undone  = log.UndoneCount();
+        size_t undone = log.UndoneCount();
 
         Check(applied + undone == log.AppliedCount() + log.UndoneCount(),
               "invariant compteurs initial");
@@ -477,29 +496,32 @@ int main() {
             const bool doRedo = !doUndo && rng.NextBool() && undone > 0;
 
             if (doUndo) {
-                EditError e = EditError::None; std::string m;
+                EditError e = EditError::None;
+                std::string m;
                 if (log.Undo(doc, e, m)) {
                     Check(log.AppliedCount() == applied - 1,
                           "AppliedCount incorrect après Undo");
                     Check(log.UndoneCount() == undone + 1,
                           "UndoneCount incorrect après Undo");
                     applied = log.AppliedCount();
-                    undone  = log.UndoneCount();
+                    undone = log.UndoneCount();
                 }
             } else if (doRedo) {
-                EditError e = EditError::None; std::string m;
+                EditError e = EditError::None;
+                std::string m;
                 if (log.Redo(doc, e, m)) {
                     Check(log.AppliedCount() == applied + 1,
                           "AppliedCount incorrect après Redo");
                     Check(log.UndoneCount() == undone - 1,
                           "UndoneCount incorrect après Redo");
                     applied = log.AppliedCount();
-                    undone  = log.UndoneCount();
+                    undone = log.UndoneCount();
                 }
             } else {
                 auto g = PickOperation(doc, rng);
                 if (!g.applicable) continue;
-                EditError e = EditError::None; std::string m;
+                EditError e = EditError::None;
+                std::string m;
                 if (log.Apply(doc, g.op, e, m)) {
                     Check(log.AppliedCount() == applied + 1,
                           "AppliedCount incorrect après Apply");
@@ -507,7 +529,7 @@ int main() {
                     Check(log.UndoneCount() == 0,
                           "UndoneCount doit être 0 après Apply");
                     applied = log.AppliedCount();
-                    undone  = log.UndoneCount();
+                    undone = log.UndoneCount();
                 }
             }
         }
@@ -523,14 +545,16 @@ int main() {
 
         for (int i = 0; i < 2; ++i) {
             auto g = GenAddTrack(rng);
-            EditError e = EditError::None; std::string m;
+            EditError e = EditError::None;
+            std::string m;
             log.Apply(doc, g.op, e, m);
         }
 
         for (int step = 0; step < 40; ++step) {
             auto g = PickOperation(doc, rng);
             if (!g.applicable) continue;
-            EditError err = EditError::None; std::string msg;
+            EditError err = EditError::None;
+            std::string msg;
             log.Apply(doc, g.op, err, msg);
         }
 
@@ -551,7 +575,8 @@ int main() {
     });
 
     if (failures != 0) {
-        std::cerr << failures << " test(s) de séquences d'opérations échoué(s)\n";
+        std::cerr << failures
+                  << " test(s) de séquences d'opérations échoué(s)\n";
         return 1;
     }
     std::cout << "Tous les tests de séquences d'opérations passent\n";

@@ -29,6 +29,13 @@ bool LoadSrt(const std::string& path, std::vector<SubtitleCue>& cues,
 bool SaveSrt(const Document& document, const std::string& path,
              std::string& error);
 
+// SRT-2026-08 -- the serializer SaveSrt is built on, taking cues directly.
+// A caller that already holds them from somewhere other than a caption track
+// -- the timeline's cached transcripts, say -- can write a file without first
+// mutating the document to park them on a track it does not otherwise want.
+bool WriteSrt(const std::vector<SubtitleCue>& cues, const std::string& path,
+              std::string& error);
+
 AddTrackOperation BuildSubtitleTrackEdit(const std::vector<SubtitleCue>& cues,
                                          int32_t trackIndex,
                                          const Ulid& trackId = {});

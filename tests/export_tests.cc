@@ -141,8 +141,7 @@ int main() {
     Check(plan.filter_graph.find("overlay=") != std::string::npos &&
               plan.filter_graph.find("amix=inputs=1") != std::string::npos,
           "plan contains video composition and audio mixing");
-    Check(plan.filter_graph.find(
-              "alimiter=limit=0.668344:level=0:latency=1") !=
+    Check(plan.filter_graph.find("alimiter=limit=0.668344:level=0:latency=1") !=
               std::string::npos,
           "AAC export keeps codec headroom without automatic makeup gain");
     Check(plan.filter_graph.find("eof_action=repeat:repeatlast=1") !=

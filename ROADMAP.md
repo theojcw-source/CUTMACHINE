@@ -148,6 +148,7 @@ dynamique, sans plan flou ni bougé, sans hésitations ».
 | Q4 — `clean_disfluencies` : une intention, une opération réversible, aucune énumération par le modèle | fait |
 | Q4b — `RemoveWordsOperation.linked_clip_ids` : une paire A/V liée est coupée des deux côtés dans une seule opération réversible (avant, nettoyer le son laissait l'image et désynchronisait) | fait |
 | Q5 — `MainThreadBackend` transmet enfin `ReadSourceTranscript` : le nettoyage par mot était injoignable depuis le panneau chat alors qu'il marchait en MCP | fait |
+| Q6 — Segmentation d'un rush en plans : distance d'histogramme de luma par échantillon (cache v3), `DetectSourceShots`, plans exposés par source dans `--shot-quality-report` et `list_shot_quality` | fait |
 
 ## Suite d'audit — parité des surfaces (QC-2026-08b)
 

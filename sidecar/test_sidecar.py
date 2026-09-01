@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,15 @@ from sidecar.planner import (
     PlannerError,
 )
 from sidecar.repl import run_turn
-from sidecar.resolve_bridge import SCHEMA, collect
+from sidecar.resolve_bridge import (
+    SCHEMA,
+    TIMELINE_SCHEMA,
+    ResolveBridgeError,
+    collect,
+    index_media_pool,
+    normalized,
+    send_timeline,
+)
 from sidecar.schema import PLANNER_RESPONSE_SCHEMA
 
 
@@ -528,8 +537,13 @@ class FakeResolveClip:
     def __init__(self, **properties: Any) -> None:
         self.properties = properties
 
-    def GetClipProperty(self) -> dict[str, Any]:
-        return self.properties
+    def GetClipProperty(self, key: str | None = None):
+        # The real API answers the whole property bag with no argument and a
+        # single value with a key. collect() uses the first form, the send
+        # path the second, so the fake has to do both.
+        if key is None:
+            return self.properties
+        return self.properties.get(key, "")
 
     def GetUniqueId(self) -> str:
         return self.properties.get("uid", "")
@@ -619,6 +633,193 @@ class ResolveBridgeTests(unittest.TestCase):
         header = (ROOT / "src" / "ResolveImport.h").read_text(
             encoding="utf-8")
         self.assertIn(f'"{SCHEMA}"', header)
+
+
+class FakeResolveTimeline:
+    """Resolve compte les images depuis le timecode de départ de la séquence.
+
+    90000 = 01:00:00:00 à 25 i/s, ce que renvoie un vrai projet. Le pont doit
+    décaler chaque `recordFrame` d'autant, sinon les plans repartent à zéro et
+    se réempilent bout à bout -- exactement le défaut que le schéma v2 corrige.
+    """
+
+    def __init__(self, name: str, start_frame: int = 90000) -> None:
+        self.name = name
+        self.start_frame = start_frame
+        self.video_tracks = 1
+
+    def GetTrackCount(self, kind: str) -> int:
+        return self.video_tracks if kind == "video" else 1
+
+    def AddTrack(self, kind: str) -> bool:
+        if kind != "video":
+            return False
+        self.video_tracks += 1
+        return True
+
+    def GetStartFrame(self) -> int:
+        return self.start_frame
+
+
+class FakeMediaPool:
+    def __init__(self, root, timelines=None) -> None:
+        self.root = root
+        self.created = None
+        self.timeline = None
+        self.appended = None
+
+    def GetRootFolder(self):
+        return self.root
+
+    def CreateEmptyTimeline(self, name):
+        self.created = name
+        self.timeline = FakeResolveTimeline(name)
+        return self.timeline
+
+    def AppendToTimeline(self, infos):
+        self.appended = infos
+        return True
+
+
+class FakeResolveProject:
+    def __init__(self, pool) -> None:
+        self.pool = pool
+
+    def GetMediaPool(self):
+        return self.pool
+
+    def GetName(self):
+        return "projet"
+
+
+class FakeResolveApp:
+    def __init__(self, project) -> None:
+        self.project = project
+
+    def GetProjectManager(self):
+        return self
+
+    def GetCurrentProject(self):
+        return self.project
+
+    def GetVersionString(self):
+        return "20.3.1.6"
+
+
+class ResolveSendTests(unittest.TestCase):
+    ACCENTED = "/Volumes/LaCie/Anthropoc\u00e8ne/C7429.MP4"
+
+    def app(self, stored_path: str) -> tuple[FakeResolveApp, FakeMediaPool]:
+        clip = FakeResolveClip(**{
+            "File Path": stored_path, "File Name": "C7429.MP4"})
+        pool = FakeMediaPool(FakeResolveFolder("Master", clips=[clip]))
+        return FakeResolveApp(FakeResolveProject(pool)), pool
+
+    def timeline(self, path: str) -> dict[str, Any]:
+        return {"schema": TIMELINE_SCHEMA, "name": "MONTAGE",
+                "clips": [{"path": path, "filename": "C7429.MP4",
+                           "start_frame": 0, "end_frame": 100,
+                           "video_layer": 0, "record_frame": 0,
+                           "with_audio": True}]}
+
+    def overlay(self, path: str) -> dict[str, Any]:
+        """Un plan de coupe posé par-dessus le plan parlant."""
+        timeline = self.timeline(path)
+        timeline["clips"].append({
+            "path": path, "filename": "C7429.MP4",
+            "start_frame": 300, "end_frame": 350,
+            "video_layer": 1, "record_frame": 40, "with_audio": False})
+        return timeline
+
+    def test_rebuilds_the_cut_in_resolve(self) -> None:
+        app, pool = self.app(self.ACCENTED)
+        message = send_timeline(app, self.timeline(self.ACCENTED))
+        self.assertEqual(pool.created, "MONTAGE")
+        self.assertEqual(len(pool.appended), 1)
+        self.assertEqual(pool.appended[0]["startFrame"], 0)
+        self.assertEqual(pool.appended[0]["endFrame"], 100)
+        self.assertIn("1 plan", message)
+
+    def test_positions_each_plan_from_the_timeline_start(self) -> None:
+        # Sans le décalage, recordFrame vaudrait 0 et Resolve replacerait le
+        # plan au tout début au lieu de l'endroit que le montage lui donne.
+        app, pool = self.app(self.ACCENTED)
+        send_timeline(app, self.overlay(self.ACCENTED))
+        self.assertEqual(pool.appended[0]["recordFrame"], 90000)
+        self.assertEqual(pool.appended[1]["recordFrame"], 90040)
+
+    def test_creates_a_track_per_layer_and_addresses_it(self) -> None:
+        app, pool = self.app(self.ACCENTED)
+        message = send_timeline(app, self.overlay(self.ACCENTED))
+        self.assertEqual(pool.timeline.video_tracks, 2)
+        self.assertEqual(pool.appended[0]["trackIndex"], 1)
+        self.assertEqual(pool.appended[1]["trackIndex"], 2)
+        self.assertIn("2 pistes", message)
+
+    def test_an_overlay_travels_without_its_sound(self) -> None:
+        # Resolve rapporte le son de chaque plan : laisser passer celui d'un
+        # plan de coupe poserait son ambiance sous l'interview recouverte.
+        app, pool = self.app(self.ACCENTED)
+        send_timeline(app, self.overlay(self.ACCENTED))
+        self.assertNotIn("mediaType", pool.appended[0])
+        self.assertEqual(pool.appended[1]["mediaType"], 1)
+
+    def test_an_explicit_name_overrides_the_montage_name(self) -> None:
+        # Resolve refuse un nom déjà pris : sans surcharge, une révision du
+        # même montage ne pourrait jamais être renvoyée.
+        app, pool = self.app(self.ACCENTED)
+        send_timeline(app, self.timeline(self.ACCENTED), "MONTAGE v3")
+        self.assertEqual(pool.created, "MONTAGE v3")
+
+    def test_without_an_override_the_montage_name_is_kept(self) -> None:
+        app, pool = self.app(self.ACCENTED)
+        send_timeline(app, self.timeline(self.ACCENTED), None)
+        self.assertEqual(pool.created, "MONTAGE")
+
+    def test_matches_across_unicode_normalizations(self) -> None:
+        # CUTMACHINE resolves paths through the filesystem and gets NFD;
+        # Resolve reports what it stored. Raw string comparison would fail on
+        # every accented folder name.
+        decomposed = unicodedata.normalize("NFD", self.ACCENTED)
+        self.assertNotEqual(decomposed, self.ACCENTED)
+        app, pool = self.app(self.ACCENTED)
+        send_timeline(app, self.timeline(decomposed))
+        self.assertEqual(len(pool.appended), 1)
+
+    def test_falls_back_to_the_filename(self) -> None:
+        app, pool = self.app("/ailleurs/C7429.MP4")
+        send_timeline(app, self.timeline("/Volumes/autre/C7429.MP4"))
+        self.assertEqual(len(pool.appended), 1)
+
+    def test_refuses_a_rush_absent_from_the_media_pool(self) -> None:
+        app, pool = self.app(self.ACCENTED)
+        timeline = self.timeline(self.ACCENTED)
+        timeline["clips"][0]["filename"] = "INCONNU.MP4"
+        timeline["clips"][0]["path"] = "/ailleurs/INCONNU.MP4"
+        with self.assertRaises(ResolveBridgeError) as raised:
+            send_timeline(app, timeline)
+        self.assertIn("INCONNU.MP4", str(raised.exception))
+        self.assertIsNone(pool.appended)
+
+    def test_refuses_an_unexpected_schema(self) -> None:
+        app, _ = self.app(self.ACCENTED)
+        timeline = self.timeline(self.ACCENTED)
+        timeline["schema"] = "autre.v1"
+        with self.assertRaises(ResolveBridgeError):
+            send_timeline(app, timeline)
+
+    def test_indexes_every_nested_folder(self) -> None:
+        clip = FakeResolveClip(**{"File Path": "/a/B.MP4",
+                                  "File Name": "B.MP4"})
+        nested = FakeResolveFolder("Master", folders=[
+            FakeResolveFolder("1_RUSHES", clips=[clip])])
+        index = index_media_pool(nested)
+        self.assertIn(normalized("/a/B.MP4"), index["by_path"])
+
+    def test_timeline_schema_matches_the_exporter(self) -> None:
+        header = (ROOT / "src" / "ResolveExport.cc").read_text(
+            encoding="utf-8")
+        self.assertIn(TIMELINE_SCHEMA, header)
 
 
 if __name__ == "__main__":

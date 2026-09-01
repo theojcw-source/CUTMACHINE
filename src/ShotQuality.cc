@@ -124,6 +124,35 @@ int64_t FrameMotionMetric(const uint8_t* previous, const uint8_t* current,
     return ScaleToMetric(total, static_cast<__int128>(count) * 255);
 }
 
+int64_t FrameHistogramDistanceMetric(const uint8_t* previous,
+                                     const uint8_t* current, int32_t width,
+                                     int32_t height) {
+    if (previous == nullptr || current == nullptr || width < 1 || height < 1)
+        return 0;
+    const int64_t count =
+        static_cast<int64_t>(width) * static_cast<int64_t>(height);
+    // 256 / kShotQualityHistogramBins is exact, so every byte maps into
+    // range and the compiler turns the division into a shift.
+    constexpr int32_t kBinWidth = 256 / kShotQualityHistogramBins;
+    int64_t previousBins[kShotQualityHistogramBins] = {};
+    int64_t currentBins[kShotQualityHistogramBins] = {};
+    for (int64_t index = 0; index < count; ++index) {
+        ++previousBins[previous[index] / kBinWidth];
+        ++currentBins[current[index] / kBinWidth];
+    }
+    __int128 total = 0;
+    for (int32_t bin = 0; bin < kShotQualityHistogramBins; ++bin) {
+        const int64_t difference = currentBins[bin] - previousBins[bin];
+        total += difference < 0 ? -difference : difference;
+    }
+    // Both histograms hold exactly `count` entries, so what one bin gains
+    // another loses and the absolute differences sum to twice the number of
+    // pixels that moved. Dividing by 2*count therefore reads directly as
+    // "the fraction of pixels that changed luma bin", and reaches full scale
+    // only when the two planes share no bin at all.
+    return ScaleToMetric(total, static_cast<__int128>(count) * 2);
+}
+
 int64_t ShotQualityPercentile(std::vector<int64_t> values, int percent) {
     if (values.empty()) return 0;
     if (percent < 0) percent = 0;
@@ -205,23 +234,127 @@ bool SummarizeClipShotQuality(const DocumentClip& clip,
     return true;
 }
 
+std::vector<SourceShot> DetectSourceShots(
+    const ShotQualityReport& report, const ShotSegmentationSettings& settings) {
+    std::vector<SourceShot> shots;
+    if (report.samples.empty() || report.samples_per_second == 0) return shots;
+    const int32_t rate = static_cast<int32_t>(report.samples_per_second);
+
+    // The two absolute conditions. They do not separate a cut from a camera
+    // move -- see ShotSegmentationSettings, where the measurements are --
+    // they only stop the local ratio below from firing on a neighbourhood
+    // that barely moved at all.
+    const int64_t histogramAt =
+        std::max(settings.cut_histogram_floor,
+                 report.median_histogram_distance *
+                     settings.cut_histogram_ratio_percent / 100);
+    const int64_t window =
+        std::max<int64_t>(1, settings.cut_local_window_samples);
+
+    // Sample 0 always opens a shot: the source starts somewhere, and its
+    // two change metrics are zero by construction rather than by
+    // measurement, so it can never be a detected boundary itself. For the
+    // same reason it is left out of every neighbourhood below.
+    std::vector<size_t> starts = {0};
+    std::vector<int64_t> neighbourhood;
+    for (size_t index = 1; index < report.samples.size(); ++index) {
+        const ShotQualitySample& sample = report.samples[index];
+        if (sample.motion < settings.cut_motion_floor) continue;
+        if (sample.histogram_distance < histogramAt) continue;
+
+        // The condition that does the actual work: a cut is instantaneous,
+        // so it stands alone; a camera move has inertia, so its neighbours
+        // moved nearly as much as it did.
+        const size_t reach = static_cast<size_t>(window);
+        const size_t first = index > reach ? index - reach : 1;
+        const size_t limit = std::min(report.samples.size(), index + reach + 1);
+        neighbourhood.clear();
+        for (size_t other = first; other < limit; ++other)
+            if (other != index)
+                neighbourhood.push_back(report.samples[other].motion);
+        // A median of zero means nothing around this sample moved at all,
+        // and no multiple of zero is reachable. That is not a reason to
+        // reject: a spike in a perfectly still neighbourhood is the clearest
+        // boundary there is, so the ratio passes rather than dividing.
+        const int64_t baseline = ShotQualityPercentile(neighbourhood, 50);
+        if (baseline > 0 && static_cast<__int128>(sample.motion) * 100 <
+                                static_cast<__int128>(baseline) *
+                                    settings.cut_motion_local_percent)
+            continue;
+        // Too close to the previous boundary: dropped, not merged into it.
+        // Keeping the earlier one is what makes the pass single-sweep and
+        // its output independent of how many candidates cluster inside the
+        // window -- a flash frame produces one dropped candidate whether it
+        // lasted one sample or three.
+        if (static_cast<int64_t>(index - starts.back()) <
+            settings.minimum_samples)
+            continue;
+        starts.push_back(index);
+    }
+    // The tail gets the same minimum as everything else. Without this a cut
+    // near the very end of a source leaves a stub shot that no rule
+    // upstream would have allowed anywhere else in it.
+    if (starts.size() > 1 &&
+        static_cast<int64_t>(report.samples.size() - starts.back()) <
+            settings.minimum_samples)
+        starts.pop_back();
+
+    shots.reserve(starts.size());
+    for (size_t shotIndex = 0; shotIndex < starts.size(); ++shotIndex) {
+        const size_t first = starts[shotIndex];
+        const size_t limit = shotIndex + 1 < starts.size()
+                                 ? starts[shotIndex + 1]
+                                 : report.samples.size();
+        SourceShot shot;
+        shot.first_sample = static_cast<int32_t>(first);
+        shot.sample_count = static_cast<int32_t>(limit - first);
+        shot.start = RationalTime{static_cast<int64_t>(first), rate};
+        shot.end = RationalTime{static_cast<int64_t>(limit), rate};
+
+        std::vector<int64_t> sharpness;
+        std::vector<int64_t> motion;
+        sharpness.reserve(limit - first);
+        size_t keyframe = first;
+        for (size_t index = first; index < limit; ++index) {
+            sharpness.push_back(report.samples[index].sharpness);
+            // A shot's first sample measures its change against the *last
+            // sample of the previous shot*, which for a detected boundary is
+            // the cut itself. Counting it would put the cut's own spike into
+            // the shot's motion median and report every shot as moving.
+            if (index > first) motion.push_back(report.samples[index].motion);
+            // Strictly greater, so a tie keeps the earliest sample and two
+            // runs over the same media pick the same frame.
+            if (report.samples[index].sharpness >
+                report.samples[keyframe].sharpness)
+                keyframe = index;
+        }
+        shot.keyframe_sample = static_cast<int32_t>(keyframe);
+        shot.keyframe = RationalTime{static_cast<int64_t>(keyframe), rate};
+        shot.median_sharpness = ShotQualityPercentile(std::move(sharpness), 50);
+        shot.median_motion = ShotQualityPercentile(std::move(motion), 50);
+        shots.push_back(shot);
+    }
+    return shots;
+}
+
 // Cache layout, written strictly and read tolerantly (the same split
 // Transcription.cc uses). Sample k's time is {k, samples_per_second} by
-// construction, so the index is the timestamp and only the two metrics are
-// stored -- two parallel integer arrays rather than an array of objects,
+// construction, so the index is the timestamp and only the three metrics
+// are stored -- parallel integer arrays rather than an array of objects,
 // which keeps a one-hour rush's cache in the low hundreds of kilobytes and
 // still reads plainly in a text editor. There is no float literal anywhere
 // in the file.
 std::string SerializeShotQuality(const ShotQualityReport& report) {
     std::ostringstream output;
-    output << "{\"version\":2,\"media_id\":\""
+    output << "{\"version\":3,\"media_id\":\""
            << mcp_json::EscapeJsonString(report.media_id)
            << "\",\"samples_per_second\":" << report.samples_per_second
            << ",\"analysis_width\":" << report.analysis_width
            << ",\"analysis_height\":" << report.analysis_height
            << ",\"median_sharpness\":" << report.median_sharpness
            << ",\"median_motion\":" << report.median_motion
-           << ",\"sharpness\":[";
+           << ",\"median_histogram_distance\":"
+           << report.median_histogram_distance << ",\"sharpness\":[";
     for (size_t index = 0; index < report.samples.size(); ++index) {
         if (index) output << ',';
         output << report.samples[index].sharpness;
@@ -230,6 +363,11 @@ std::string SerializeShotQuality(const ShotQualityReport& report) {
     for (size_t index = 0; index < report.samples.size(); ++index) {
         if (index) output << ',';
         output << report.samples[index].motion;
+    }
+    output << "],\"histogram\":[";
+    for (size_t index = 0; index < report.samples.size(); ++index) {
+        if (index) output << ',';
+        output << report.samples[index].histogram_distance;
     }
     output << "]}";
     return output.str();
@@ -245,15 +383,19 @@ bool DeserializeShotQuality(const std::string& json, ShotQualityReport& report,
         return false;
     }
     int64_t version = 0;
-    // Version 1 stored no median_motion, because motion was graded against
-    // an absolute threshold that measurement later showed to be wrong. It is
-    // refused rather than migrated: a cache is cheap to rebuild (ten seconds
-    // for a seven-minute rush) and inventing the missing median would be the
-    // silent fallback this project refuses everywhere else.
-    if (!ReadInt64Field(root, "version", version) || version != 2) {
-        error = version == 1
-                    ? "shot quality cache predates source-relative motion "
-                      "grading; re-run the analysis"
+    // Older caches are refused rather than migrated, and the reason has not
+    // changed between the two bumps: a cache is cheap to rebuild (ten
+    // seconds for a seven-minute rush), while inventing a metric that was
+    // never measured would be the silent fallback this project refuses
+    // everywhere else. Version 1 stored no median_motion, because motion was
+    // graded against an absolute threshold measurement later showed to be
+    // wrong. Version 2 stored no histogram distance, so DetectSourceShots
+    // could not tell one of its two conditions from the other and would have
+    // had to call every whip pan a cut.
+    if (!ReadInt64Field(root, "version", version) || version != 3) {
+        error = (version == 1 || version == 2)
+                    ? "shot quality cache predates shot segmentation; "
+                      "re-run the analysis"
                     : "unsupported shot quality cache version";
         return false;
     }
@@ -282,15 +424,22 @@ bool DeserializeShotQuality(const std::string& json, ShotQualityReport& report,
     if (!ReadInt64Field(root, "median_sharpness", parsed.median_sharpness) ||
         parsed.median_sharpness < 0 ||
         !ReadInt64Field(root, "median_motion", parsed.median_motion) ||
-        parsed.median_motion < 0) {
-        error = "shot quality cache has no median sharpness or motion";
+        parsed.median_motion < 0 ||
+        !ReadInt64Field(root, "median_histogram_distance",
+                        parsed.median_histogram_distance) ||
+        parsed.median_histogram_distance < 0) {
+        error =
+            "shot quality cache has no median sharpness, motion or "
+            "histogram distance";
         return false;
     }
     const Value* sharpness = root.Find("sharpness");
     const Value* motion = root.Find("motion");
+    const Value* histogram = root.Find("histogram");
     if (sharpness == nullptr || !sharpness->IsArray() || motion == nullptr ||
-        !motion->IsArray() ||
-        sharpness->AsArray().size() != motion->AsArray().size()) {
+        !motion->IsArray() || histogram == nullptr || !histogram->IsArray() ||
+        sharpness->AsArray().size() != motion->AsArray().size() ||
+        sharpness->AsArray().size() != histogram->AsArray().size()) {
         error = "shot quality cache metric arrays are missing or mismatched";
         return false;
     }
@@ -299,7 +448,9 @@ bool DeserializeShotQuality(const std::string& json, ShotQualityReport& report,
         ShotQualitySample sample;
         if (!sharpness->AsArray()[index].AsInt64(sample.sharpness) ||
             !motion->AsArray()[index].AsInt64(sample.motion) ||
-            sample.sharpness < 0 || sample.motion < 0) {
+            !histogram->AsArray()[index].AsInt64(sample.histogram_distance) ||
+            sample.sharpness < 0 || sample.motion < 0 ||
+            sample.histogram_distance < 0) {
             error = "shot quality cache contains an invalid metric";
             return false;
         }
@@ -484,6 +635,12 @@ bool GenerateShotQuality(const std::string& inputPath,
                             : FrameMotionMetric(previousFrame.data(), frame,
                                                 settings.analysis_width,
                                                 settings.analysis_height);
+                    sample.histogram_distance =
+                        previousFrame.empty() ? 0
+                                              : FrameHistogramDistanceMetric(
+                                                    previousFrame.data(), frame,
+                                                    settings.analysis_width,
+                                                    settings.analysis_height);
                     report.samples.push_back(sample);
                     previousFrame.assign(frame, frame + frameBytes);
                     offset += frameBytes;
@@ -529,18 +686,25 @@ bool GenerateShotQuality(const std::string& inputPath,
     }
     std::vector<int64_t> allSharpness;
     std::vector<int64_t> allMotion;
+    std::vector<int64_t> allHistogram;
     allSharpness.reserve(report.samples.size());
     allMotion.reserve(report.samples.size());
+    allHistogram.reserve(report.samples.size());
     for (size_t index = 0; index < report.samples.size(); ++index) {
         allSharpness.push_back(report.samples[index].sharpness);
         // The first sample has no predecessor, so its zero is an absence of
         // measurement rather than a still frame; counting it would drag the
-        // median down on a short source.
-        if (index > 0) allMotion.push_back(report.samples[index].motion);
+        // median down on a short source. Both change metrics share that.
+        if (index > 0) {
+            allMotion.push_back(report.samples[index].motion);
+            allHistogram.push_back(report.samples[index].histogram_distance);
+        }
     }
     report.median_sharpness =
         ShotQualityPercentile(std::move(allSharpness), 50);
     report.median_motion = ShotQualityPercentile(std::move(allMotion), 50);
+    report.median_histogram_distance =
+        ShotQualityPercentile(std::move(allHistogram), 50);
 
     // Written through a neighbouring temporary and renamed, so a cancelled
     // or crashed run never leaves a half-parsed cache behind for the next
@@ -622,7 +786,8 @@ RationalTime VisibleDuration(const Document& document,
 
 std::string DescribeShotQualityForAgent(
     const Document& document, const std::map<Ulid, ShotQualityReport>& reports,
-    const ShotQualityThresholds& thresholds) {
+    const ShotQualityThresholds& thresholds,
+    const ShotSegmentationSettings& segmentation) {
     Value graded = Value::MakeArray();
     Value ungraded = Value::MakeArray();
     for (const DocumentTrack& track : document.sequence.tracks) {
@@ -682,6 +847,41 @@ std::string DescribeShotQualityForAgent(
         }
     }
 
+    // What the rushes hold, as opposed to what the timeline already uses.
+    // Keyed by source rather than by clip because a shot is a property of
+    // the media: two clips cut from the same take share these, and a caller
+    // looking for an unused shot has no clip to hang the question on.
+    Value sources = Value::MakeArray();
+    for (const auto& entry : reports) {
+        const ShotQualityReport& report = entry.second;
+        Value item = Value::MakeObject();
+        item.Set("source_id", Value::MakeString(entry.first));
+        item.Set("samples_per_second",
+                 Value::MakeInt(report.samples_per_second));
+        item.Set("median_sharpness", Value::MakeInt(report.median_sharpness));
+        item.Set("median_motion", Value::MakeInt(report.median_motion));
+        item.Set("median_histogram_distance",
+                 Value::MakeInt(report.median_histogram_distance));
+        Value shotList = Value::MakeArray();
+        for (const SourceShot& shot : DetectSourceShots(report, segmentation)) {
+            Value described = Value::MakeObject();
+            // Source-domain times, so these can be used as a clip's
+            // source_in and duration without conversion.
+            described.Set("start", TimeValue(shot.start));
+            described.Set("end", TimeValue(shot.end));
+            described.Set("duration", TimeValue(shot.end.sub(shot.start)));
+            // The frame to pull when one still has to stand for the shot.
+            described.Set("keyframe", TimeValue(shot.keyframe));
+            described.Set("samples", Value::MakeInt(shot.sample_count));
+            described.Set("median_sharpness",
+                          Value::MakeInt(shot.median_sharpness));
+            described.Set("median_motion", Value::MakeInt(shot.median_motion));
+            shotList.Push(std::move(described));
+        }
+        item.Set("shots", std::move(shotList));
+        sources.Push(std::move(item));
+    }
+
     Value limits = Value::MakeObject();
     limits.Set("blurry_ratio_percent",
                Value::MakeInt(thresholds.blurry_ratio_percent));
@@ -693,12 +893,26 @@ std::string DescribeShotQualityForAgent(
                Value::MakeInt(thresholds.shaky_ratio_percent));
     limits.Set("motion_floor", Value::MakeInt(thresholds.motion_floor));
 
+    Value cuts = Value::MakeObject();
+    cuts.Set("cut_motion_floor", Value::MakeInt(segmentation.cut_motion_floor));
+    cuts.Set("cut_histogram_floor",
+             Value::MakeInt(segmentation.cut_histogram_floor));
+    cuts.Set("cut_histogram_ratio_percent",
+             Value::MakeInt(segmentation.cut_histogram_ratio_percent));
+    cuts.Set("cut_motion_local_percent",
+             Value::MakeInt(segmentation.cut_motion_local_percent));
+    cuts.Set("cut_local_window_samples",
+             Value::MakeInt(segmentation.cut_local_window_samples));
+    cuts.Set("minimum_samples", Value::MakeInt(segmentation.minimum_samples));
+
     Value root = Value::MakeObject();
     root.Set("timeline_id", Value::MakeString(document.sequence.id));
     root.Set("timeline_name", Value::MakeString(document.sequence.name));
     root.Set("metric_scale", Value::MakeInt(kShotQualityMetricScale));
     root.Set("thresholds", std::move(limits));
+    root.Set("segmentation", std::move(cuts));
     root.Set("clips", std::move(graded));
     root.Set("unanalyzed", std::move(ungraded));
+    root.Set("sources", std::move(sources));
     return root.Dump();
 }

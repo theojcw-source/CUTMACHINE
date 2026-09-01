@@ -21,7 +21,8 @@ enum class MediaTaskKind {
     Relink,
     Beat,
     Transcription,
-    ShotQuality
+    ShotQuality,
+    SpeechOnset
 };
 enum class MediaTaskState { Queued, Running, Succeeded, Failed, Cancelled };
 

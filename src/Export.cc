@@ -708,7 +708,31 @@ bool Exporter::Run(const ExportPlan& plan,
         // siblings, so the hard-link commit cannot cross filesystems.
         if (link(plan.temporary_output_path.c_str(),
                  plan.settings.output_path.c_str()) != 0) {
-            renameError = std::error_code(errno, std::generic_category());
+            // exFAT has no hard links at all, and an external delivery drive
+            // is routinely formatted that way -- the same constraint that
+            // shaped ProjectStorage's exFAT support. Without this fallback a
+            // fully rendered export is destroyed by removeTemporaryFiles at
+            // the very last step, which is the worst possible moment to fail.
+            // Checking then renaming cannot be atomic, so it stays a fallback
+            // and never the first choice: the race it opens is narrower than
+            // the cost of discarding a finished render.
+            const int linkErrno = errno;
+            if (linkErrno == ENOTSUP || linkErrno == EPERM ||
+                linkErrno == EXDEV) {
+                std::error_code existsError;
+                if (std::filesystem::exists(plan.settings.output_path,
+                                            existsError) ||
+                    existsError) {
+                    renameError = std::make_error_code(std::errc::file_exists);
+                } else {
+                    std::filesystem::rename(plan.temporary_output_path,
+                                            plan.settings.output_path,
+                                            renameError);
+                }
+            } else {
+                renameError =
+                    std::error_code(linkErrno, std::generic_category());
+            }
         } else {
             std::error_code ignored;
             std::filesystem::remove(plan.temporary_output_path, ignored);

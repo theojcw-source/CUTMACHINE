@@ -31,6 +31,8 @@ const char* MediaTaskKindName(MediaTaskKind kind) {
             return "Transcription";
         case MediaTaskKind::ShotQuality:
             return "ShotQuality";
+        case MediaTaskKind::SpeechOnset:
+            return "SpeechOnset";
     }
     return "Probe";
 }

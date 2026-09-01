@@ -21,8 +21,8 @@ find_package(Threads REQUIRED)
 # F1.4 -- local transcription. Fetched, not vendored, following this
 # project's general preference for build-time dependencies over committed
 # third-party source. whisper.cpp is MIT licensed (compatible with this
-# project's Apache-2.0) and runs entirely on-device: pulling it in does not
-# touch PHILOSOPHY.md's "pas de service central" guard-rail, since inference
+# project's AGPL-3.0-or-later) and runs entirely on-device: pulling it in does
+# not touch PHILOSOPHY.md's "pas de service central" guard-rail, since inference
 # still happens against a local model file the caller supplies, never a
 # network call. Examples/tests/server and the GPU backends this project's
 # target platform (macOS/Apple Silicon) does not use are disabled; GGML_METAL
@@ -153,9 +153,13 @@ add_library(cutmachine_model
     src/ProjectStorage.cc
     src/Proxy.cc
     src/Relink.cc
+    src/ResolveExport.cc
     src/ResolveImport.cc
     src/SequenceFormat.cc
+    src/DocumentDelta.cc
     src/ShotQuality.cc
+    src/TranscriptAlignment.cc
+    src/SpeechOnset.cc
     src/Subtitles.cc
     src/Thumbnail.cc
     src/Timeline.cc
@@ -402,6 +406,13 @@ if(BUILD_TESTING)
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
     add_test(NAME cutmachine_ingest_tests COMMAND cutmachine_ingest_tests)
 
+    add_executable(cutmachine_resolve_export_tests
+        tests/resolve_export_tests.cc)
+    target_link_libraries(cutmachine_resolve_export_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_resolve_export_tests
+             COMMAND cutmachine_resolve_export_tests)
+
     add_executable(cutmachine_resolve_import_tests
         tests/resolve_import_tests.cc
         src/MediaSource.mm
@@ -453,6 +464,27 @@ if(BUILD_TESTING)
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
     add_test(NAME cutmachine_shot_quality_tests
              COMMAND cutmachine_shot_quality_tests)
+
+    add_executable(cutmachine_document_delta_tests
+        tests/document_delta_tests.cc)
+    target_link_libraries(cutmachine_document_delta_tests
+        PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_document_delta_tests
+             COMMAND cutmachine_document_delta_tests)
+
+    add_executable(cutmachine_transcript_alignment_tests
+        tests/transcript_alignment_tests.cc)
+    target_link_libraries(cutmachine_transcript_alignment_tests
+        PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_transcript_alignment_tests
+             COMMAND cutmachine_transcript_alignment_tests)
+
+    add_executable(cutmachine_speech_onset_tests tests/speech_onset_tests.cc)
+    target_link_libraries(cutmachine_speech_onset_tests PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_speech_onset_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_speech_onset_tests
+             COMMAND cutmachine_speech_onset_tests)
 
     add_executable(cutmachine_subtitle_tests tests/subtitle_tests.cc)
     target_link_libraries(cutmachine_subtitle_tests PRIVATE cutmachine_model)

@@ -1040,9 +1040,9 @@ int main() {
         const auto call = [&](const std::string& argumentsJson) {
             mcp_json::Value arguments;
             std::string parseFailure;
-            Check(mcp_json::Value::Parse(argumentsJson, arguments,
-                                         parseFailure),
-                  "conform_sequence arguments parse: " + parseFailure);
+            Check(
+                mcp_json::Value::Parse(argumentsJson, arguments, parseFailure),
+                "conform_sequence arguments parse: " + parseFailure);
             return registry.Call(backend, "conform_sequence", arguments);
         };
 
@@ -1053,9 +1053,9 @@ int main() {
                       std::string::npos,
               "the proposal is the displayed frame, not the stored one: " +
                   preview.result_json);
-        Check(preview.result_json.find("\"applied\":false") !=
-                  std::string::npos,
-              "a preview reports that it changed nothing");
+        Check(
+            preview.result_json.find("\"applied\":false") != std::string::npos,
+            "a preview reports that it changed nothing");
         Document afterPreview;
         std::string snapshotMessage;
         backend.SnapshotDocument(afterPreview, snapshotMessage);
@@ -1069,9 +1069,9 @@ int main() {
                   preview.result_json);
 
         const McpToolCallOutcome applied = call(R"({})");
-        Check(applied.ok, "conform_sequence applies: " + applied.error_name + " " + applied.message);
-        Check(applied.result_json.find("\"applied\":true") !=
-                  std::string::npos,
+        Check(applied.ok, "conform_sequence applies: " + applied.error_name +
+                              " " + applied.message);
+        Check(applied.result_json.find("\"applied\":true") != std::string::npos,
               "applying says so: " + applied.result_json);
         Document conformed;
         backend.SnapshotDocument(conformed, snapshotMessage);
@@ -1085,9 +1085,9 @@ int main() {
 
         // A second call must not push a no-op onto the undo stack.
         const McpToolCallOutcome again = call(R"({})");
-        Check(again.ok && again.result_json.find(
-                              "\"already_conformed\":true") !=
-                              std::string::npos &&
+        Check(again.ok &&
+                  again.result_json.find("\"already_conformed\":true") !=
+                      std::string::npos &&
                   again.result_json.find("\"applied\":false") !=
                       std::string::npos,
               "a sequence already matching is reported, not rewritten: " +
@@ -1106,9 +1106,8 @@ int main() {
         Document soundOnly = fixture;
         soundOnly.library.clear();
         InMemoryBackend silent(soundOnly);
-        const McpToolCallOutcome nothing =
-            registry.Call(silent, "conform_sequence",
-                          mcp_json::Value::MakeObject());
+        const McpToolCallOutcome nothing = registry.Call(
+            silent, "conform_sequence", mcp_json::Value::MakeObject());
         Check(!nothing.ok &&
                   nothing.message.find("picture format") != std::string::npos,
               "an empty library refuses with a reason: " + nothing.message);
@@ -1122,9 +1121,9 @@ int main() {
         const auto call = [&](const std::string& argumentsJson) {
             mcp_json::Value arguments;
             std::string parseFailure;
-            Check(mcp_json::Value::Parse(argumentsJson, arguments,
-                                         parseFailure),
-                  "transcribe_media arguments parse: " + parseFailure);
+            Check(
+                mcp_json::Value::Parse(argumentsJson, arguments, parseFailure),
+                "transcribe_media arguments parse: " + parseFailure);
             return registry.Call(backend, "transcribe_media", arguments);
         };
 
@@ -1145,9 +1144,11 @@ int main() {
                   !backend.transcription_request.verbatim,
               "the defaults are automatic detection and non-verbatim");
 
-        Check(!call(R"({"media_id":"01K30000000000000000000001","langauge":"fr"})")
-                   .ok,
-              "a misspelled argument is refused rather than ignored");
+        Check(
+            !call(
+                 R"({"media_id":"01K30000000000000000000001","langauge":"fr"})")
+                 .ok,
+            "a misspelled argument is refused rather than ignored");
         Check(!call(R"({})").ok, "media_id is required");
         Check(!call(R"({"media_id":"01K39999999999999999999999"})").ok,
               "an unknown media is refused");
@@ -1173,8 +1174,7 @@ int main() {
         public:
             using InMemoryBackend::InMemoryBackend;
             bool TranscribeSource(const Ulid&, const std::string&, bool,
-                                  std::string&,
-                                  std::string& message) override {
+                                  std::string&, std::string& message) override {
                 return McpBackend::TranscribeSource(Ulid(), std::string(),
                                                     false, message, message);
             }
@@ -1187,9 +1187,10 @@ int main() {
                                arguments, parseFailure);
         const McpToolCallOutcome outcome =
             registry.Call(bare, "transcribe_media", arguments);
-        Check(!outcome.ok && outcome.message.find("cannot run a transcription")
-                                 != std::string::npos,
-              "a backend without transcription reports the gap explicitly");
+        Check(
+            !outcome.ok && outcome.message.find("cannot run a transcription") !=
+                               std::string::npos,
+            "a backend without transcription reports the gap explicitly");
     }
 
     if (failures != 0) {

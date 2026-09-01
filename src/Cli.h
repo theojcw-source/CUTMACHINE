@@ -38,17 +38,39 @@ int AnalyzeShotQualityCommand(const std::string& projectPath,
                               const std::string& mediaId, std::string& output);
 int ShotQualityReportCommand(const std::string& projectPath,
                              std::string& output);
+// ONSET-2026-08 -- same shape, and for the same reason: where the voice
+// starts is a measurement, so it has to be reachable without the app. The
+// report publishes the trim in whole frames precisely so a caller never
+// computes one (PHILOSOPHY.md principle 7).
+int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
+                              const std::string& mediaId, std::string& output);
+int SpeechOnsetReportCommand(const std::string& projectPath,
+                             std::string& output);
+// ALIGN-2026-08 -- read-only. Reports which cached word boundaries the speech
+// envelope contradicts, and where each one belongs. Nothing is written: a
+// transcript is a cache artifact several tools read, and rewriting it under
+// them is a decision for the caller, not for a report.
+int AlignTranscriptsCommand(const std::string& projectPath,
+                            std::string& output);
 int ListDisfluenciesCommand(const std::string& projectPath,
                             const std::string& clipId, std::string& output);
 int RemoveWordsCommand(const std::string& projectPath,
                        const std::string& clipId, const std::string& rangesJson,
                        std::string& output);
 int DescribeCommand(const std::string& documentPath, std::string& output);
+// SRT-2026-08 -- read-only. Subtitles were reachable only from the app: the
+// cue builder and SaveSrt both had their single caller in main.mm, so a
+// headless montage could be transcribed but never subtitled, against
+// AGENTS.md's rule that what only the mouse can reach does not exist. Cues
+// come from the audible audio tracks, because subtitles follow what is
+// heard, not what is on screen -- an overlay laid over someone else's words
+// must not caption itself.
+int ExportSrtCommand(const std::string& projectPath,
+                     const std::string& outputPath, std::string& output);
 // SEQ-2026-08 -- read-only: reports the sequence format the project's rushes
 // imply, without touching the document. Conforming to it is a separate,
 // journalized UpdateSequenceOperation.
-int ProposeSequenceCommand(const std::string& projectPath,
-                           std::string& output);
+int ProposeSequenceCommand(const std::string& projectPath, std::string& output);
 
 // The same JSON view DescribeCommand produces (sequence/tracks/library/bins/
 // markers, with the A1/A2.../K1... aliases the MCP tool catalog's ID

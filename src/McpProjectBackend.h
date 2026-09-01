@@ -27,6 +27,10 @@ public:
                                std::string& message) override;
     bool AnalyzeSourceShotQuality(const Ulid& sourceId, std::string& resultJson,
                                   std::string& message) override;
+    bool ReadSourceSpeechOnset(const Ulid& sourceId, SpeechOnsetReport& report,
+                               std::string& message) override;
+    bool AnalyzeSourceSpeechOnset(const Ulid& sourceId, std::string& resultJson,
+                                  std::string& message) override;
     bool TranscribeSource(const Ulid& sourceId, const std::string& language,
                           bool verbatim, std::string& resultJson,
                           std::string& message) override;

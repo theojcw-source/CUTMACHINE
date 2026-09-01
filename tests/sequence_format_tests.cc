@@ -107,10 +107,10 @@ int main() {
     audioOnly.has_audio = true;
     audioOnly.rate = {0, 1};
     SequenceFormatProposal mixed;
-    Check(ResolveSequenceFormat(
-              {Media(1920, 1080, 25), audioOnly, Media(0, 0, 25)}, mixed,
-              error),
-          "une médiathèque partiellement inutilisable se résout : " + error);
+    Check(
+        ResolveSequenceFormat(
+            {Media(1920, 1080, 25), audioOnly, Media(0, 0, 25)}, mixed, error),
+        "une médiathèque partiellement inutilisable se résout : " + error);
     Check(mixed.media_considered == 1 && mixed.media_ignored == 2 &&
               mixed.unanimous,
           "les médias sans format sont comptés à part, jamais rattachés");

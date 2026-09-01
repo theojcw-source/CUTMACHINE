@@ -685,6 +685,49 @@ durée encore visible (`visible`, ce que dit le document) et `needs_attention`,
 qui est la conjonction des deux. Sans ça, la vue réclamait de recouper des
 plans invisibles.
 
+### Découper un rush en plans
+
+Noter ce qui est déjà monté est une chose ; savoir ce que les rushes
+contiennent en est une autre. Un fichier sorti de la caméra en une seule prise
+peut tenir six prises, et tant qu'elles ne sont pas nommées il n'y a rien à
+sélectionner, à noter ou à décrire d'autre que le fichier entier.
+
+`--shot-quality-report` publie donc, à côté de la liste des clips, un tableau
+`sources` : pour chaque média analysé, les plans détectés à l'intérieur, avec
+leur début, leur fin et l'échantillon le plus net — l'image à extraire quand
+une seule doit représenter le plan. Les temps sont dans le domaine temporel de
+la source, donc utilisables tels quels comme `source_in`.
+
+Reste une mesure, sans modèle : une coupe est une discontinuité de l'image.
+Une troisième grandeur par échantillon s'ajoute aux deux précédentes, la
+**distance d'histogramme de luma** — la fraction des pixels ayant changé de
+casier de luminance. Le cache passe en version 3 ; les anciens sont refusés et
+réanalysés plutôt que complétés par une valeur jamais mesurée.
+
+L'idée de départ était qu'un panoramique déplace l'image sans changer sa
+distribution, contrairement à une coupe. **Mesurée, cette idée est fausse.**
+Sur la prise réelle ci-dessus, l'instant où la caméra quitte le sujet atteint
+70 433 de bougé et 292 944 de distance d'histogramme ; une vraie coupe montée
+dans la même matière mesure 48 489 et 30 900. Le mouvement de caméra note
+*plus haut que la coupe sur les deux grandeurs*. Aucun couple de seuils
+absolus ne les sépare.
+
+Ce qui les sépare n'est pas l'amplitude du changement mais sa forme. Une
+caméra a de l'inertie : un mouvement s'étale sur plusieurs échantillons. Une
+coupe est instantanée : elle tombe sur un seul. Rapportés à la médiane de leur
+voisinage, les mêmes événements se rangent — les mouvements de caméra montent
+à 153 %, 194 %, 201 %, 202 %, 210 %, 232 % et 299 %, les deux coupes réelles à
+408 % et 3 956 %. Le seuil est à 350 %, à égale distance des deux, et 162 des
+combinaisons balayées autour de ce point donnent le même résultat sur les
+quatre fixtures : la règle est sur un plateau, pas sur une arête.
+
+Les limites sont connues et énoncées : un fondu enchaîné n'est pas trouvé,
+puisqu'il n'a aucun échantillon isolé sur lequel piquer ; une coupe entre deux
+plans réellement semblables peut passer sous les planchers absolus ; et
+l'étalonnage repose sur quatre fixtures dont une seule est de la vraie matière.
+Élargir ce corpus est ce qui ferait cesser d'être provisoires les nombres
+ci-dessus.
+
 ## Regarder un plan
 
 Mesurer ne suffit pas, et le manque s'est constaté sur un vrai montage : un
@@ -909,3 +952,13 @@ python3 -m sidecar.eval --backend all
 
 Le rapport affiche chaque comparaison et le taux de réussite séparément pour
 chaque backend. Une évaluation parfaite retourne 0 ; toute divergence retourne 1.
+
+## Licence
+
+CUTMACHINE est distribué sous la GNU Affero General Public License, version 3
+ou toute version ultérieure (`AGPL-3.0-or-later`). Consultez [LICENSE](LICENSE)
+pour les conditions complètes.
+
+Cette licence s'applique à compter de la version qui contient ce changement.
+Les versions antérieures publiées sous Apache License 2.0 restent disponibles
+selon les droits déjà accordés par cette licence.

@@ -50,6 +50,7 @@ extern "C" {
 #include "Proxy.h"
 #include "Relink.h"
 #include "Renderer.h"
+#include "ResolveExport.h"
 #include "ResolveImport.h"
 #include "Subtitles.h"
 #include "Thumbnail.h"
@@ -5371,7 +5372,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     if (![self applyAndPersistTimelineOperation:Operation {
-            AddCaptionStyleOperation { CaptionStyle{}, -1 }
+            AddCaptionStyleOperation{CaptionStyle{}, -1}
         }
                                           error:error
                                         message:message]) {
@@ -7140,7 +7141,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     if (![self applyAndPersistTimelineOperation:Operation {
-            RemoveBinOperation { binId, "", "" }
+            RemoveBinOperation{binId, "", ""}
         }
                                           error:error
                                         message:message]) {
@@ -7205,9 +7206,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     std::string message;
     if (bin) {
         if (![self applyAndPersistTimelineOperation:Operation {
-                RenameBinOperation {
-                    identifier.UTF8String ?: "", name.UTF8String ?: ""
-                }
+                RenameBinOperation{identifier.UTF8String ?: "",
+                                   name.UTF8String ?: ""}
             }
                                               error:error
                                             message:message]) {
@@ -12586,8 +12586,8 @@ int main(int argc, char* argv[]) {
             }
         }
         std::string output;
-        const int result = TranscribeMediaCommand(
-            argv[2], argv[3], modelPath, language, verbatim, output);
+        const int result = TranscribeMediaCommand(argv[2], argv[3], modelPath,
+                                                  language, verbatim, output);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
@@ -12685,6 +12685,36 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if (argc == 4 && std::string(argv[1]) == "--speech-onset") {
+        std::string output;
+        const int result = AnalyzeSpeechOnsetCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--align-transcripts") {
+        std::string output;
+        const int result = AlignTranscriptsCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--speech-onset-report") {
+        std::string output;
+        const int result = SpeechOnsetReportCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 4 && std::string(argv[1]) == "--export-srt") {
+        std::string output;
+        const int result = ExportSrtCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--export-resolve-timeline") {
+        std::string output;
+        const int result = ExportResolveTimelineCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
     if (argc == 3 && std::string(argv[1]) == "--propose-sequence") {
         std::string output;
         const int result = ProposeSequenceCommand(argv[2], output);
@@ -12749,6 +12779,10 @@ int main(int argc, char* argv[]) {
             "'<media-id>'\n"
             "       %s --shot-quality-report "
             "/path/to/project.cutmachine.json\n"
+            "       %s --speech-onset /path/to/project.cutmachine.json "
+            "'<media-id>'\n"
+            "       %s --speech-onset-report "
+            "/path/to/project.cutmachine.json\n"
             "       %s --disfluencies /path/to/project.cutmachine.json "
             "'<clip-id>'\n"
             "       %s --remove-words /path/to/project.cutmachine.json "
@@ -12770,10 +12804,12 @@ int main(int argc, char* argv[]) {
             "       %s --propose-sequence "
             "/path/to/project.cutmachine.json\n"
             "       %s --export /path/to/project.cutmachine.json output.mp4 "
-            "[--software] [--overwrite]\n",
+            "[--software] [--overwrite]\n"
+            "       %s --export-srt /path/to/project.cutmachine.json "
+            "output.srt\n",
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-            argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 

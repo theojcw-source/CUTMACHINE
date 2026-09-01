@@ -1871,8 +1871,8 @@ bool DispatchListShotQuality(McpBackend& backend, const IdResolver&,
                 reports.emplace(clip.source_id, std::move(report));
         }
     }
-    resultJson =
-        DescribeShotQualityForAgent(document, reports, ShotQualityThresholds{});
+    resultJson = DescribeShotQualityForAgent(
+        document, reports, ShotQualityThresholds{}, ShotSegmentationSettings{});
     return true;
 }
 
@@ -1959,6 +1959,46 @@ bool DispatchReadFrame(McpBackend& backend, const IdResolver& resolver,
     envelope.Set(kMcpImageTextKey, Value::MakeString(described.Dump()));
     resultJson = envelope.Dump();
     return true;
+}
+
+bool DispatchListSpeechOnsets(McpBackend& backend, const IdResolver&,
+                              const Value& args, std::string& resultJson,
+                              std::string& errorName, std::string& message) {
+    if (!CheckKnownKeys(args, {}, "list_speech_onsets", message))
+        return Fail(errorName, message, message);
+    Document document;
+    if (!backend.SnapshotDocument(document, message))
+        return Fail(errorName, message, message);
+    std::map<Ulid, SpeechOnsetReport> reports;
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        if (track.kind != "audio") continue;
+        for (const DocumentClip& clip : track.clips) {
+            if (reports.count(clip.source_id)) continue;
+            SpeechOnsetReport report;
+            std::string readError;
+            if (backend.ReadSourceSpeechOnset(clip.source_id, report,
+                                              readError))
+                reports.emplace(clip.source_id, std::move(report));
+        }
+    }
+    resultJson =
+        DescribeSpeechOnsetForAgent(document, reports, SpeechOnsetThresholds{});
+    return true;
+}
+
+bool DispatchAnalyzeSpeechOnset(McpBackend& backend, const IdResolver& resolver,
+                                const Value& args, std::string& resultJson,
+                                std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"media_id"};
+    if (!CheckKnownKeys(args, kAllowed, "analyze_speech_onset", message))
+        return Fail(errorName, message, message);
+    Ulid mediaId;
+    if (!ReadId(args, "media_id", "analyze_speech_onset", resolver, true,
+                mediaId, message))
+        return Fail(errorName, message, message);
+    return backend.AnalyzeSourceSpeechOnset(mediaId, resultJson, message)
+               ? true
+               : Fail(errorName, message, message);
 }
 
 bool DispatchAnalyzeShotQuality(McpBackend& backend, const IdResolver& resolver,
@@ -2772,9 +2812,37 @@ McpToolRegistry::McpToolRegistry() {
         "from the pictures themselves, never judged by a model. Use it to "
         "keep soft or unsteady shots out of a cut. Clips whose source has "
         "not been analysed are listed under \"unanalyzed\" and are not a "
-        "pass: they are unknown.",
+        "pass: they are unknown. \"sources\" lists, per analysed source, the "
+        "shots detected inside it with their source-domain start, end and "
+        "sharpest keyframe -- what the rushes hold, including takes the "
+        "timeline never used.",
         SchemaBuilder().Build("list_shot_quality takes no arguments"),
         DispatchListShotQuality);
+
+    add("list_speech_onsets",
+        "Report where the voice actually starts inside every audible clip, "
+        "measured from the audio itself. Use it before trusting a cut's in "
+        "point: the transcript is not an answer here, because Whisper places "
+        "the first words of a segment on silence, and an edit built on those "
+        "timestamps opens clips on up to a second of dead air that listeners "
+        "hear as hesitation -- which list_disfluencies cannot see, since "
+        "those pauses contain no word to remove. Each entry publishes "
+        "`suggested_trim` in whole sequence frames, pre-roll already "
+        "deducted: pass it straight to ripple_trim rather than computing one, "
+        "and use `link_group_id` to trim the picture and sound together. "
+        "Clips whose source has not been analysed are listed under "
+        "\"unanalyzed\" and are not a pass: they are unknown.",
+        SchemaBuilder().Build("list_speech_onsets takes no arguments"),
+        DispatchListSpeechOnsets);
+
+    add("analyze_speech_onset",
+        "Measure one source's speech envelope and cache it, so "
+        "list_speech_onsets has something to read. Decodes the whole audio; "
+        "long-running.",
+        SchemaBuilder()
+            .Field("media_id", IdSchema("Source media to analyse."), true)
+            .Build("analyze_speech_onset arguments"),
+        DispatchAnalyzeSpeechOnset);
 
     add("list_disfluencies",
         "List the fillers (euh, heu, hum, ben) and stuttered repetitions "
