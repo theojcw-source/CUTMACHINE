@@ -20,6 +20,7 @@
 #include "McpTools.h"
 #include "Operations.h"
 #include "ShotQuality.h"
+#include "SpeechOnset.h"
 #include "Transcription.h"
 #include "Ulid.h"
 
@@ -93,6 +94,19 @@ public:
     void SetSourceShotQuality(ShotQualityReport report) {
         shot_quality_ = std::move(report);
     }
+    void SetSourceSpeechOnset(SpeechOnsetReport report) {
+        speech_onset_ = std::move(report);
+    }
+
+    bool ReadSourceSpeechOnset(const Ulid&, SpeechOnsetReport& report,
+                               std::string& message) override {
+        if (speech_onset_.levels.empty()) {
+            message = "no speech envelope in this fixture";
+            return false;
+        }
+        report = speech_onset_;
+        return true;
+    }
 
     bool ReadSourceTranscript(const Ulid&, Transcript& transcript,
                               std::string& message) override {
@@ -107,17 +121,20 @@ public:
     // Records what the tool asked for, so the test can check the arguments
     // reach the engine rather than being swallowed by the dispatcher.
     struct TranscriptionRequest {
-        Ulid media_id;
+        std::vector<Ulid> media_ids;
         std::string language;
         bool verbatim = false;
+        bool include_silent = false;
         bool seen = false;
     };
     TranscriptionRequest transcription_request;
 
-    bool TranscribeSource(const Ulid& mediaId, const std::string& language,
-                          bool verbatim, std::string& resultJson,
-                          std::string& message) override {
-        transcription_request = {mediaId, language, verbatim, true};
+    bool TranscribeSources(const std::vector<Ulid>& mediaIds,
+                           const std::string& language, bool verbatim,
+                           bool includeSilent, std::string& resultJson,
+                           std::string& message) override {
+        transcription_request = {mediaIds, language, verbatim, includeSilent,
+                                 true};
         if (transcription_fails_) {
             message = "no Whisper model configured";
             return false;
@@ -127,6 +144,24 @@ public:
     }
 
     void FailTranscription() { transcription_fails_ = true; }
+
+    // QC-2026-09 (A1) -- records whether the alignment pass was asked to
+    // write, because that boolean is the whole difference between a report
+    // and a transcript the word-level tools can be trusted on.
+    struct AlignmentRequest {
+        bool apply = false;
+        bool seen = false;
+    };
+    AlignmentRequest alignment_request;
+
+    bool AlignSourceTranscripts(bool apply, std::string& resultJson,
+                                std::string&) override {
+        alignment_request = {apply, true};
+        resultJson = "{\"ok\":true,\"applied\":";
+        resultJson += apply ? "true" : "false";
+        resultJson += ",\"sources\":[]}";
+        return true;
+    }
 
     bool ReadSourceShotQuality(const Ulid&, ShotQualityReport& report,
                                std::string& message) override {
@@ -219,6 +254,7 @@ private:
     std::optional<ProjectOperation> project_operation_;
     Transcript transcript_;
     ShotQualityReport shot_quality_;
+    SpeechOnsetReport speech_onset_;
 };
 
 // Minimal blocking HTTP client: sends one POST and reads the response until
@@ -1131,11 +1167,30 @@ int main() {
             R"({"media_id":"01K30000000000000000000001","language":"fr","verbatim":true})");
         Check(outcome.ok, "transcribe_media succeeds: " + outcome.message);
         Check(backend.transcription_request.seen &&
-                  backend.transcription_request.media_id ==
+                  backend.transcription_request.media_ids.size() == 1 &&
+                  backend.transcription_request.media_ids[0] ==
                       "01K30000000000000000000001" &&
                   backend.transcription_request.language == "fr" &&
                   backend.transcription_request.verbatim,
               "media, language and verbatim reach the engine unchanged");
+
+        // QC-2026-09 A3 -- the batch form is the whole point of the ticket:
+        // one model load for the rushes instead of one per rush.
+        backend.transcription_request = {};
+        Check(call(R"({"media_ids":["01K30000000000000000000001"]})").ok,
+              "a list of media is accepted");
+        Check(backend.transcription_request.media_ids.size() == 1,
+              "and reaches the engine as a batch");
+        Check(!call(R"({"media_id":"01K30000000000000000000001",)"
+                    R"("media_ids":["01K30000000000000000000001"]})")
+                   .ok,
+              "naming both forms is refused rather than resolved arbitrarily");
+        backend.transcription_request = {};
+        Check(call(R"({"media_id":"01K30000000000000000000001",)"
+                   R"("include_silent":true})")
+                      .ok &&
+                  backend.transcription_request.include_silent,
+              "the override for media measured as mute reaches the engine");
 
         backend.transcription_request = {};
         Check(call(R"({"media_id":"01K30000000000000000000001"})").ok,
@@ -1149,7 +1204,7 @@ int main() {
                  R"({"media_id":"01K30000000000000000000001","langauge":"fr"})")
                  .ok,
             "a misspelled argument is refused rather than ignored");
-        Check(!call(R"({})").ok, "media_id is required");
+        Check(!call(R"({})").ok, "a media to transcribe is required");
         Check(!call(R"({"media_id":"01K39999999999999999999999"})").ok,
               "an unknown media is refused");
 
@@ -1168,15 +1223,265 @@ int main() {
               "an unconfigured model surfaces as a named reason");
     }
 
+    // QC-2026-09 A4 -- addressing by source frame. The fixture's clip A1
+    // plays source frames 100..109 at timeline 5..14, so a caller naming a
+    // rush frame must land on the position the engine computes and never on
+    // the frame number itself.
+    {
+        McpToolRegistry registry;
+        InMemoryBackend backend(fixture);
+        const auto call = [&](const std::string& tool,
+                              const std::string& argumentsJson) {
+            mcp_json::Value arguments;
+            std::string parseFailure;
+            Check(
+                mcp_json::Value::Parse(argumentsJson, arguments, parseFailure),
+                tool + " arguments parse: " + parseFailure);
+            return registry.Call(backend, tool, arguments);
+        };
+
+        const McpToolCallOutcome located = call(
+            "locate_source_frame",
+            R"({"media_id":"01K30000000000000000000001","source_frame":105})");
+        Check(located.ok, "locate_source_frame succeeds: " + located.message);
+        mcp_json::Value view;
+        std::string viewError;
+        Check(mcp_json::Value::Parse(located.result_json, view, viewError),
+              "its result is JSON: " + viewError);
+        const mcp_json::Value* matches = view.Find("matches");
+        Check(matches != nullptr && matches->IsArray() &&
+                  matches->AsArray().size() == 1,
+              "one clip of the fixture plays that frame");
+        if (matches != nullptr && matches->AsArray().size() == 1) {
+            const mcp_json::Value* position =
+                matches->AsArray()[0].Find("timeline_position");
+            const mcp_json::Value* value =
+                position ? position->Find("value") : nullptr;
+            int64_t frames = 0;
+            Check(value != nullptr && value->AsInt64(frames) && frames == 10,
+                  "source frame 105 is at timeline frame 10, not at 105");
+        }
+        Check(call("locate_source_frame",
+                   R"({"media_id":"01K30000000000000000000001",)"
+                   R"("source_frame":4000})")
+                  .ok,
+              "a frame that is not on the timeline is a fact, not an error");
+
+        // The cut takes it too, and lands where locate_source_frame said.
+        Check(call("split_clip", R"({"clip_id":"01K30000000000000000000003",)"
+                                 R"("source_frame":105})")
+                  .ok,
+              "split_clip cuts on a source frame");
+        const DocumentTrack* track =
+            backend.CurrentDocument().FindTrack("01K30000000000000000000002");
+        Check(track != nullptr && track->clips.size() == 3,
+              "the clip is actually split in two");
+        if (track != nullptr && track->clips.size() == 3) {
+            Check(track->clips[1].timeline_in == RationalTime{10, 25} &&
+                      track->clips[1].source_in == RationalTime{105, 25},
+                  "the cut lands on the frame that was named, in both "
+                  "domains");
+        }
+        EditError undoError = EditError::None;
+        std::string undoMessage;
+        backend.Log().Undo(const_cast<Document&>(backend.CurrentDocument()),
+                           undoError, undoMessage);
+
+        Check(!call("split_clip", R"({"clip_id":"01K30000000000000000000003",)"
+                                  R"("source_frame":105,"timeline_position":)"
+                                  R"({"value":10,"rate":25}})")
+                   .ok,
+              "naming both a source frame and a timeline position is refused "
+              "rather than resolved by precedence");
+        Check(!call("split_clip", R"({"clip_id":"01K30000000000000000000003"})")
+                   .ok,
+              "and naming neither is refused too");
+        Check(!call("split_clip", R"({"clip_id":"01K30000000000000000000003",)"
+                                  R"("source_frame":4000})")
+                   .ok,
+              "a frame the clip does not play is refused with a reason");
+
+        // A trim reads the same address, with the tail inclusive.
+        Check(call("trim_clip", R"({"clip_id":"01K30000000000000000000003",)"
+                                R"("edge":"Head","source_frame":103})")
+                  .ok,
+              "trim_clip enters on a source frame");
+        const DocumentClip* trimmed =
+            backend.CurrentDocument().FindClip("01K30000000000000000000003");
+        Check(trimmed != nullptr && trimmed->source_in == RationalTime{103, 25},
+              "and the clip starts on exactly that frame");
+        Check(
+            !call("trim_clip", R"({"clip_id":"01K30000000000000000000003",)"
+                               R"("edge":"Head","delta":{"value":1,"rate":25},)"
+                               R"("source_frame":103})")
+                 .ok,
+            "a delta and a source frame together are refused");
+    }
+
+    // QC-2026-09 A2 -- tighten_pauses. What matters at this layer is that the
+    // clip's linked sound is carried by the same cut and that the whole thing
+    // is one undoable event: the arithmetic itself is pinned in
+    // tests/pause_tightening_tests.cc.
+    {
+        Document pauses;
+        pauses.sources = {
+            {"01K30000000000000000000001", "rush.MP4", {25, 1}, {1000, 25}}};
+        DocumentClip picture;
+        picture.id = "01K30000000000000000000010";
+        picture.source_id = "01K30000000000000000000001";
+        picture.source_in = {0, 25};
+        picture.duration = {75, 25};
+        picture.timeline_in = {0, 25};
+        picture.link_group_id = "01K30000000000000000000012";
+        DocumentClip sound = picture;
+        sound.id = "01K30000000000000000000011";
+        pauses.sequence.tracks = {
+            {"01K30000000000000000000013", "video", 0, {picture}},
+            {"01K30000000000000000000014", "audio", 1, {sound}},
+        };
+
+        // Une seconde de parole, une de silence, une de parole.
+        SpeechOnsetReport envelope;
+        envelope.media_id = "01K30000000000000000000001";
+        envelope.windows_per_second = 50;
+        envelope.decode_sample_rate = 16000;
+        for (int index = 0; index < 150; ++index)
+            envelope.levels.push_back(index >= 50 && index < 100 ? 20000
+                                                                 : 200000);
+        envelope.speech_level = SpeechLevelPercentile(envelope.levels, 90);
+        envelope.noise_floor = SpeechLevelPercentile(envelope.levels, 5);
+
+        McpToolRegistry registry;
+        InMemoryBackend backend(pauses);
+        backend.SetSourceSpeechOnset(envelope);
+        const auto call = [&](const std::string& argumentsJson) {
+            mcp_json::Value arguments;
+            std::string parseFailure;
+            Check(
+                mcp_json::Value::Parse(argumentsJson, arguments, parseFailure),
+                "tighten_pauses arguments parse: " + parseFailure);
+            return registry.Call(backend, "tighten_pauses", arguments);
+        };
+
+        const McpToolCallOutcome outcome =
+            call(R"({"clip_id":"01K30000000000000000000010"})");
+        Check(outcome.ok, "tighten_pauses succeeds: " + outcome.message);
+        mcp_json::Value result;
+        std::string resultError;
+        Check(mcp_json::Value::Parse(outcome.result_json, result, resultError),
+              "its result is JSON: " + resultError);
+        const mcp_json::Value* applied = result.Find("applied");
+        Check(applied != nullptr && applied->IsBool() && applied->AsBool(),
+              "a clip with a one-second hole is actually tightened");
+        const mcp_json::Value* alsoCut = result.Find("also_cut");
+        Check(alsoCut != nullptr && alsoCut->IsArray() &&
+                  alsoCut->AsArray().size() == 1 &&
+                  alsoCut->AsArray()[0].AsString() ==
+                      "01K30000000000000000000011",
+              "the linked sound is cut by the same operation, not left behind");
+        const DocumentTrack* video =
+            backend.CurrentDocument().FindTrack("01K30000000000000000000013");
+        const DocumentTrack* audio =
+            backend.CurrentDocument().FindTrack("01K30000000000000000000014");
+        Check(video != nullptr && audio != nullptr &&
+                  video->clips.size() == 2 && audio->clips.size() == 2,
+              "both tracks are split into the fragments that remain");
+
+        EditError undoError = EditError::None;
+        std::string undoMessage;
+        Check(
+            backend.Log().Undo(const_cast<Document&>(backend.CurrentDocument()),
+                               undoError, undoMessage),
+            "one gesture is one undo step: " + undoMessage);
+
+        // Nothing to close is a success, and says so rather than failing.
+        SpeechOnsetReport unbroken;
+        unbroken.media_id = "01K30000000000000000000001";
+        unbroken.windows_per_second = 50;
+        unbroken.decode_sample_rate = 16000;
+        unbroken.levels.assign(150, 200000);
+        unbroken.speech_level = SpeechLevelPercentile(unbroken.levels, 90);
+        unbroken.noise_floor = SpeechLevelPercentile(unbroken.levels, 5);
+        InMemoryBackend tight(pauses);
+        tight.SetSourceSpeechOnset(unbroken);
+        mcp_json::Value arguments;
+        std::string parseFailure;
+        mcp_json::Value::Parse(R"({"clip_id":"01K30000000000000000000010"})",
+                               arguments, parseFailure);
+        const McpToolCallOutcome nothing =
+            registry.Call(tight, "tighten_pauses", arguments);
+        Check(nothing.ok, "an already tight clip is not an error");
+        mcp_json::Value nothingResult;
+        mcp_json::Value::Parse(nothing.result_json, nothingResult, resultError);
+        const mcp_json::Value* nothingApplied = nothingResult.Find("applied");
+        Check(nothingApplied != nullptr && !nothingApplied->AsBool(),
+              "and reports that it changed nothing");
+
+        Check(!call(R"({"clip_id":"01K30000000000000000000010","keep":6})").ok,
+              "a misspelled argument is refused rather than ignored");
+
+        InMemoryBackend blind(pauses);
+        const McpToolCallOutcome missing =
+            registry.Call(blind, "tighten_pauses", arguments);
+        Check(!missing.ok &&
+                  missing.message.find("speech envelope") != std::string::npos,
+              "a source with no envelope reports what is missing");
+    }
+
+    // QC-2026-09 (A1) -- align_transcript. The correction only reaches the
+    // tools that cut on words when `apply` does, so what this pins is that
+    // the flag survives the dispatcher rather than defaulting either way by
+    // accident.
+    {
+        McpToolRegistry registry;
+        InMemoryBackend backend(fixture);
+        const auto call = [&](const std::string& argumentsJson) {
+            mcp_json::Value arguments;
+            std::string parseFailure;
+            Check(
+                mcp_json::Value::Parse(argumentsJson, arguments, parseFailure),
+                "align_transcript arguments parse: " + parseFailure);
+            return registry.Call(backend, "align_transcript", arguments);
+        };
+
+        Check(call(R"({})").ok, "align_transcript takes no required argument");
+        Check(
+            backend.alignment_request.seen && !backend.alignment_request.apply,
+            "reading what the signal contradicts writes nothing by default");
+        Check(call(R"({"apply":true})").ok, "the write form succeeds");
+        Check(backend.alignment_request.apply,
+              "apply reaches the engine rather than being swallowed");
+        Check(!call(R"({"aply":true})").ok,
+              "a misspelled argument is refused rather than ignored");
+
+        class BareBackend : public InMemoryBackend {
+        public:
+            using InMemoryBackend::InMemoryBackend;
+            bool AlignSourceTranscripts(bool, std::string&,
+                                        std::string& message) override {
+                return McpBackend::AlignSourceTranscripts(false, message,
+                                                          message);
+            }
+        };
+        BareBackend bare(fixture);
+        mcp_json::Value empty = mcp_json::Value::MakeObject();
+        const McpToolCallOutcome missing =
+            registry.Call(bare, "align_transcript", empty);
+        Check(!missing.ok &&
+                  missing.message.find("transcript cache") != std::string::npos,
+              "a backend without a transcript cache reports the gap");
+    }
+
     // A backend that never implements it must say so rather than pretend.
     {
         class BareBackend : public InMemoryBackend {
         public:
             using InMemoryBackend::InMemoryBackend;
-            bool TranscribeSource(const Ulid&, const std::string&, bool,
-                                  std::string&, std::string& message) override {
-                return McpBackend::TranscribeSource(Ulid(), std::string(),
-                                                    false, message, message);
+            bool TranscribeSources(const std::vector<Ulid>&, const std::string&,
+                                   bool, bool, std::string&,
+                                   std::string& message) override {
+                return McpBackend::TranscribeSources({}, std::string(), false,
+                                                     false, message, message);
             }
         };
         McpToolRegistry registry;

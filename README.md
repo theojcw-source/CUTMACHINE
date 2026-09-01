@@ -419,8 +419,14 @@ décodage média :
 ```sh
 ./build/cutmachine --create-project ./Film.cutmachine-project "Film"
 ./build/cutmachine --transcribe \
-  ./Film.cutmachine-project/project.cutmachine.json '<media-id>' \
+  ./Film.cutmachine-project/project.cutmachine.json '<media-id>[,<media-id>…]' \
   ./models/ggml-large-v3.bin fr --verbatim
+./build/cutmachine --align-transcripts \
+  ./Film.cutmachine-project/project.cutmachine.json --write
+./build/cutmachine --tighten-pauses \
+  ./Film.cutmachine-project/project.cutmachine.json '<clip-id>' 400 6
+./build/cutmachine --locate-source-frame \
+  ./Film.cutmachine-project/project.cutmachine.json '<media-id>' 1412
 ./build/cutmachine --disfluencies \
   ./Film.cutmachine-project/project.cutmachine.json '<clip-id>'
 ./build/cutmachine --remove-words \
@@ -595,6 +601,22 @@ coupées.
 du modèle y reste facultatif : donné, il l'emporte ; omis, c'est le réglage
 local qui s'applique.
 
+Il accepte aussi **plusieurs `media-id` séparés par des virgules** (MCP :
+`media_ids`), et ne charge alors le modèle qu'une fois. Le chargement mesure
+~8 s ; sur les 43 rushes parlés d'un projet réel, c'était près de six minutes
+passées à relire le même fichier, contre 11 min d'inférence utile. Les médias
+dont le document dit qu'ils sont muets sont **sautés et signalés** plutôt que
+transcrits — 29 des 71 rushes du même projet étaient des plans de coupe à
+−74 dBFS, tous passés à Whisper à 11× le temps réel pour ne rien produire.
+`--include-silent` (MCP : `include_silent`) force le passage.
+
+Ce niveau vient de `--ingest`, qui mesure désormais le niveau audio moyen de
+chaque média et l'enregistre dans le document (`audio_level`), au même titre
+que la cadence et la durée. C'est un décodage audio, donc un coût réel :
+mesuré à 0,3 s sur un rush 4K de 268 Mo. Une entrée de bibliothèque écrite
+avant ce champ se relit « non mesurée » — jamais « silencieuse » ; un
+ré-`--ingest` la remplit.
+
 L'auto-détection de langue se trompe sur un rush long et majoritairement non
 parlé (mesuré : gallois détecté sur une interview française). Nomme la langue.
 
@@ -627,6 +649,50 @@ CUTMACHINE détecte, calcule les images et applique **une** opération
 réversible pour tout le plan. Le modèle n'énumère rien. Les répétitions ne
 sont retirées que si `include_repetitions` est demandé — un mot répété peut
 être une insistance voulue, une syllabe d'hésitation jamais.
+
+### Recaler les mots sur le signal, et refermer les silences
+
+Les horodatages de Whisper sont excellents la plupart du temps et
+occasionnellement faux d'une seconde. `--align-transcripts` (MCP :
+`align_transcript`) compare chaque frontière de mot à l'enveloppe d'énergie
+produite par `--speech-onset`, corrige celles qui tombent dans le silence, et
+**refuse** les autres plutôt que de les déplacer au jugé — une frontière
+ambiguë, sans front de parole à portée, ou qui demanderait un déplacement
+au-delà du plafond est signalée et laissée où elle est. Sans `--write`, c'est
+un rapport ; avec, la correction est écrite dans le cache de transcription que
+lisent `remove_words`, `clean_disfluencies` et le montage d'interview. C'est
+ce qui rend une coupe par mot fiable ; sans ça, la seule façon de vérifier une
+borne était d'extraire un fragment et de le retranscrire.
+
+`--tighten-pauses` (MCP : `tighten_pauses`) referme les silences **internes**
+d'un plan sans lire un seul mot : il cherche les creux de l'enveloppe d'au
+moins `min_gap` millisecondes, ramène chacun à `keep` images (réparties entre
+les deux bords, pour que le raccord tombe au plus profond du silence), et
+referme en ripple. Une seule `RemoveWordsOperation`, donc un seul `undo`, et
+la paire A/V liée est emportée avec. L'air de tête et de queue n'est pas
+touché : c'est un rognage, la question de `--speech-onset`, et il est publié
+dans le rapport plutôt que coupé en douce.
+
+### Adresser la timeline par le rush
+
+Une décision de montage se prend dans le rush (« couper juste après le nom »,
+« cette prise commence à 1412 »), mais toutes les opérations prennent une
+position **timeline**. La conversion est une soustraction et une addition —
+c'est-à-dire exactement ce qu'on rate une fois sur dix.
+
+`--locate-source-frame` (MCP : `locate_source_frame`) répond « où joue
+l'image N de ce rush » : quel plan, quelle piste, quelle position. Une même
+image peut être sur la timeline plusieurs fois — l'image et son son détaché,
+ou un rush utilisé deux fois — donc toutes les correspondances sont rendues,
+jamais une choisie.
+
+Et les outils de coupe et de rognage acceptent la même adresse :
+`split_clip`, `trim_clip` et `ripple_trim` prennent `source_frame` **à la
+place** de `timeline_position` ou de `delta` — jamais les deux, refus explicite
+sinon. Sur un rognage, `Head` veut dire « le plan démarre sur cette image » et
+`Tail` « c'est la dernière image jouée » : la borne est inclusive, parce que
+c'est ce qu'un numéro d'image veut dire pour un monteur, et le +1 appartient au
+moteur.
 
 Une paire A/V liée est coupée des deux côtés dans la **même** opération.
 `RemoveWordsOperation` porte un champ `linked_clip_ids` : chaque clip nommé

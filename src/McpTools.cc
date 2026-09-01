@@ -2,8 +2,10 @@
 
 #include "Document.h"
 #include "EditLog.h"
+#include "PauseTightening.h"
 #include "RationalTime.h"
 #include "SequenceFormat.h"
+#include "SourceAddress.h"
 #include "Subtitles.h"
 #include "Ulid.h"
 
@@ -75,6 +77,16 @@ const char kTimeSchemaText[] =
     "positive integer.\",\"properties\":{\"value\":{\"type\":\"integer\"},"
     "\"rate\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"value\","
     "\"rate\"],\"additionalProperties\":false}";
+
+// QC-2026-09 A4 -- the same field on split_clip, trim_clip and ripple_trim:
+// the frame of the rush the caller means, which the engine converts into a
+// timeline position or a delta.
+std::string SourceFrameSchema() {
+    return IntSchema(
+        "Frame of the clip's own source, counted in that source's own frame "
+        "rate. Name this instead of a timeline figure when the decision was "
+        "made from the rush; the engine resolves where that frame sits.");
+}
 
 const char kFractionSchemaText[] =
     "{\"type\":\"object\",\"description\":\"Exact fraction as integer "
@@ -485,19 +497,56 @@ bool DispatchClearClips(McpBackend& backend, const IdResolver& resolver,
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
+// QC-2026-09 A4 -- shared by trim_clip and ripple_trim: read the edge, then
+// either the delta the caller measured or the source frame it wants that
+// edge to land on. Exactly one, never both, and never a precedence rule --
+// two answers to one question is how a montage ends up a frame out with
+// nobody able to say where.
+bool ReadTrimAmount(McpBackend& backend, const Value& args,
+                    const std::string& tool, const Ulid& clipId, TrimEdge edge,
+                    RationalTime& delta, std::string& errorName,
+                    std::string& message) {
+    const bool hasDelta = args.Find("delta") != nullptr;
+    const bool hasSourceFrame = args.Find("source_frame") != nullptr;
+    if (hasDelta == hasSourceFrame) {
+        message = "'" + tool +
+                  "' takes either 'delta' or 'source_frame', and exactly one "
+                  "of them";
+        return Fail(errorName, message, message);
+    }
+    if (hasDelta)
+        return ReadTime(args, "delta", tool, true, delta, message)
+                   ? true
+                   : Fail(errorName, message, message);
+    int64_t sourceFrame = 0;
+    if (!ReadInt64(args, "source_frame", tool, true, 0, sourceFrame, message))
+        return Fail(errorName, message, message);
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    return ResolveClipSourceFrameTrim(document, clipId, sourceFrame, edge,
+                                      delta, message)
+               ? true
+               : Fail(errorName, message, message);
+}
+
 bool DispatchTrimClip(McpBackend& backend, const IdResolver& resolver,
                       const Value& args, std::string& resultJson,
                       std::string& errorName, std::string& message) {
     static const std::vector<std::string> kAllowed = {"clip_id", "edge",
-                                                      "delta"};
+                                                      "delta", "source_frame"};
     if (!CheckKnownKeys(args, kAllowed, "trim_clip", message))
         return Fail(errorName, message, message);
     TrimClipOperation op;
     if (!ReadId(args, "clip_id", "trim_clip", resolver, true, op.clip_id,
                 message) ||
-        !ReadEdge(args, "edge", "trim_clip", op.edge, message) ||
-        !ReadTime(args, "delta", "trim_clip", true, op.delta, message))
+        !ReadEdge(args, "edge", "trim_clip", op.edge, message))
         return Fail(errorName, message, message);
+    if (!ReadTrimAmount(backend, args, "trim_clip", op.clip_id, op.edge,
+                        op.delta, errorName, message))
+        return false;
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
@@ -522,15 +571,41 @@ bool DispatchMoveClip(McpBackend& backend, const IdResolver& resolver,
 bool DispatchSplitClip(McpBackend& backend, const IdResolver& resolver,
                        const Value& args, std::string& resultJson,
                        std::string& errorName, std::string& message) {
-    static const std::vector<std::string> kAllowed = {"clip_id",
-                                                      "timeline_position"};
+    static const std::vector<std::string> kAllowed = {
+        "clip_id", "timeline_position", "source_frame"};
     if (!CheckKnownKeys(args, kAllowed, "split_clip", message))
         return Fail(errorName, message, message);
     SplitClipOperation op;
     if (!ReadId(args, "clip_id", "split_clip", resolver, true, op.clip_id,
-                message) ||
-        !ReadTime(args, "timeline_position", "split_clip", true,
-                  op.timeline_position, message))
+                message))
+        return Fail(errorName, message, message);
+    // QC-2026-09 A4 -- a cut is decided in the rush ("just after he says the
+    // name"), and the timeline position is a conversion. Naming the source
+    // frame lets the engine do it; naming both would be two answers to one
+    // question, so it is refused rather than resolved by precedence.
+    const bool hasPosition = args.Find("timeline_position") != nullptr;
+    const bool hasSourceFrame = args.Find("source_frame") != nullptr;
+    if (hasPosition == hasSourceFrame)
+        return Fail(errorName, message,
+                    "'split_clip' takes either 'timeline_position' or "
+                    "'source_frame', and exactly one of them");
+    if (hasPosition) {
+        if (!ReadTime(args, "timeline_position", "split_clip", true,
+                      op.timeline_position, message))
+            return Fail(errorName, message, message);
+        return backend.ApplyOperation(op, resultJson, errorName, message);
+    }
+    int64_t sourceFrame = 0;
+    if (!ReadInt64(args, "source_frame", "split_clip", true, 0, sourceFrame,
+                   message))
+        return Fail(errorName, message, message);
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    if (!ResolveClipSourceFramePosition(document, op.clip_id, sourceFrame,
+                                        op.timeline_position, message))
         return Fail(errorName, message, message);
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
@@ -798,19 +873,22 @@ bool DispatchRippleTrim(McpBackend& backend, const IdResolver& resolver,
                         const Value& args, std::string& resultJson,
                         std::string& errorName, std::string& message) {
     static const std::vector<std::string> kAllowed = {
-        "clip_id", "edge", "delta", "linked_clip_ids", "sync_track_ids"};
+        "clip_id",         "edge",          "delta", "source_frame",
+        "linked_clip_ids", "sync_track_ids"};
     if (!CheckKnownKeys(args, kAllowed, "ripple_trim", message))
         return Fail(errorName, message, message);
     RippleTrimOperation op;
     if (!ReadId(args, "clip_id", "ripple_trim", resolver, true, op.clip_id,
                 message) ||
         !ReadEdge(args, "edge", "ripple_trim", op.edge, message) ||
-        !ReadTime(args, "delta", "ripple_trim", true, op.delta, message) ||
         !ReadIdArray(args, "linked_clip_ids", "ripple_trim", resolver,
                      op.linked_clip_ids, message) ||
         !ReadIdArray(args, "sync_track_ids", "ripple_trim", resolver,
                      op.sync_track_ids, message))
         return Fail(errorName, message, message);
+    if (!ReadTrimAmount(backend, args, "ripple_trim", op.clip_id, op.edge,
+                        op.delta, errorName, message))
+        return false;
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
@@ -1558,43 +1636,6 @@ bool ResolveClipAndTranscript(McpBackend& backend, const Ulid& clipId,
     return true;
 }
 
-// Other clips sharing this one's A/V link group *and* genuinely covering
-// the same cut. A word-level cut that touched only the clip it was aimed at
-// would shorten the sound and leave the picture, so a detached A/V pair has
-// to be cut together -- and working out which clips those are is a
-// document-shape question the caller should not have to answer
-// (PHILOSOPHY.md principle 7).
-//
-// The containment test is what keeps this an intent-layer decision rather
-// than a guess. A link group can hold a member that reads from another
-// source, or from another part of the same one; cutting it by these ranges
-// would be meaningless, so it is left alone here. RemoveWordsOperation stays
-// strict about whatever it is finally told: naming such a clip explicitly is
-// still an error, it just is not one this resolver produces.
-std::vector<Ulid> LinkedClipIdsFor(
-    const Document& document, const DocumentClip& clip,
-    const std::vector<WordRemovalRange>& ranges) {
-    std::vector<Ulid> linked;
-    if (clip.link_group_id.empty()) return linked;
-    for (const DocumentTrack& track : document.sequence.tracks) {
-        for (const DocumentClip& other : track.clips) {
-            if (other.id == clip.id ||
-                other.link_group_id != clip.link_group_id ||
-                other.source_id != clip.source_id)
-                continue;
-            const RationalTime sourceEnd = other.source_in.add(other.duration);
-            const bool covers = std::all_of(
-                ranges.begin(), ranges.end(),
-                [&](const WordRemovalRange& range) {
-                    return range.source_start.compare(other.source_in) >= 0 &&
-                           range.source_end.compare(sourceEnd) <= 0;
-                });
-            if (covers) linked.push_back(other.id);
-        }
-    }
-    return linked;
-}
-
 bool DispatchListDisfluencies(McpBackend& backend, const IdResolver& resolver,
                               const Value& args, std::string& resultJson,
                               std::string& errorName, std::string& message) {
@@ -1693,7 +1734,7 @@ bool DispatchRemoveWords(McpBackend& backend, const IdResolver& resolver,
     // Cutting only the clip named would leave picture and sound at different
     // lengths, which is not something a caller asked for by naming words.
     operation.linked_clip_ids =
-        LinkedClipIdsFor(document, *clip, operation.ranges);
+        LinkedClipIdsCoveringRanges(document, *clip, operation.ranges);
     return backend.ApplyOperation(operation, resultJson, errorName, message);
 }
 
@@ -1829,7 +1870,7 @@ bool DispatchCleanDisfluencies(McpBackend& backend, const IdResolver& resolver,
                             operation, message))
         return Fail(errorName, message, message);
     operation.linked_clip_ids =
-        LinkedClipIdsFor(document, *clip, operation.ranges);
+        LinkedClipIdsCoveringRanges(document, *clip, operation.ranges);
     Value linkedView = Value::MakeArray();
     for (const Ulid& linkedId : operation.linked_clip_ids)
         linkedView.Push(Value::MakeString(linkedId));
@@ -1848,6 +1889,130 @@ bool DispatchCleanDisfluencies(McpBackend& backend, const IdResolver& resolver,
         if (hash != nullptr) root.Set("doc_hash", *hash);
     }
     resultJson = root.Dump();
+    return true;
+}
+
+// QC-2026-09 A2 -- the pause-closing gesture, from the envelope alone. It
+// sits beside clean_disfluencies rather than inside it because the two ask
+// different questions of different artifacts: that one removes words a
+// speaker said and did not mean, this one removes the time between them, and
+// only the first needs a transcript. Both end as one RemoveWordsOperation,
+// so both are one undo step.
+bool DispatchTightenPauses(McpBackend& backend, const IdResolver& resolver,
+                           const Value& args, std::string& resultJson,
+                           std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {
+        "clip_id", "min_gap_ms", "keep_frames", "sync_track_ids"};
+    if (!CheckKnownKeys(args, kAllowed, "tighten_pauses", message))
+        return Fail(errorName, message, message);
+    Ulid clipId;
+    PauseTighteningSettings settings;
+    std::vector<Ulid> syncTrackIds;
+    if (!ReadId(args, "clip_id", "tighten_pauses", resolver, true, clipId,
+                message) ||
+        !ReadInt64(args, "min_gap_ms", "tighten_pauses", false,
+                   settings.minimum_gap_milliseconds,
+                   settings.minimum_gap_milliseconds, message) ||
+        !ReadInt64(args, "keep_frames", "tighten_pauses", false,
+                   settings.keep_frames, settings.keep_frames, message) ||
+        !ReadIdArray(args, "sync_track_ids", "tighten_pauses", resolver,
+                     syncTrackIds, message))
+        return Fail(errorName, message, message);
+
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    const DocumentClip* clip = document.FindClip(clipId);
+    if (clip == nullptr) {
+        errorName = EditErrorName(EditError::UnknownClip);
+        message = "unknown clip_id '" + clipId + "'";
+        return false;
+    }
+    const DocumentSource* source = document.FindSource(clip->source_id);
+    if (source == nullptr) {
+        errorName = EditErrorName(EditError::UnknownSource);
+        message = "clip '" + clipId + "' reads from an unmounted source";
+        return false;
+    }
+    SpeechOnsetReport envelope;
+    if (!backend.ReadSourceSpeechOnset(clip->source_id, envelope, message)) {
+        errorName = "IoError";
+        message = "no speech envelope for source '" + clip->source_id +
+                  "': " + message;
+        return false;
+    }
+
+    RemoveWordsOperation operation;
+    PauseTighteningReport report;
+    if (!ResolvePauseTightening(*clip, envelope, settings, source->rate,
+                                syncTrackIds, operation, report, message))
+        return Fail(errorName, message, message);
+
+    Value root = Value::MakeObject();
+    root.Set("clip_id", Value::MakeString(clip->id));
+    Value reportView;
+    std::string reportParseError;
+    if (Value::Parse(SerializePauseTighteningReport(report), reportView,
+                     reportParseError))
+        root.Set("report", std::move(reportView));
+    if (operation.ranges.empty()) {
+        // An already tight clip is a success, not a failure: the intent has
+        // been honoured. Applying an empty RemoveWords would only be
+        // refused, and refusing here would make a caller guess why.
+        root.Set("applied", Value::MakeBool(false));
+        resultJson = root.Dump();
+        return true;
+    }
+    operation.linked_clip_ids =
+        LinkedClipIdsCoveringRanges(document, *clip, operation.ranges);
+    Value linkedView = Value::MakeArray();
+    for (const Ulid& linkedId : operation.linked_clip_ids)
+        linkedView.Push(Value::MakeString(linkedId));
+    root.Set("also_cut", std::move(linkedView));
+    std::string operationResult;
+    if (!backend.ApplyOperation(operation, operationResult, errorName, message))
+        return false;
+    root.Set("applied", Value::MakeBool(true));
+    Value applied;
+    std::string appliedParseError;
+    if (Value::Parse(operationResult, applied, appliedParseError) &&
+        applied.IsObject()) {
+        const Value* hash = applied.Find("doc_hash");
+        if (hash != nullptr) root.Set("doc_hash", *hash);
+    }
+    resultJson = root.Dump();
+    return true;
+}
+
+// QC-2026-09 A4 -- the read-only half: which clips play a frame of a rush,
+// and where. Answers the question an editor asks of a transcript or a
+// contact sheet ("where is 1412 in the montage?") without asking them to
+// subtract two times.
+bool DispatchLocateSourceFrame(McpBackend& backend, const IdResolver& resolver,
+                               const Value& args, std::string& resultJson,
+                               std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"media_id",
+                                                      "source_frame"};
+    if (!CheckKnownKeys(args, kAllowed, "locate_source_frame", message))
+        return Fail(errorName, message, message);
+    Ulid mediaId;
+    int64_t sourceFrame = 0;
+    if (!ReadId(args, "media_id", "locate_source_frame", resolver, true,
+                mediaId, message) ||
+        !ReadInt64(args, "source_frame", "locate_source_frame", true, 0,
+                   sourceFrame, message))
+        return Fail(errorName, message, message);
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    std::vector<SourceFrameMatch> matches;
+    if (!ResolveSourceFrame(document, mediaId, sourceFrame, matches, message))
+        return Fail(errorName, message, message);
+    resultJson = DescribeSourceFrameMatches(mediaId, sourceFrame, matches);
     return true;
 }
 
@@ -2001,6 +2166,24 @@ bool DispatchAnalyzeSpeechOnset(McpBackend& backend, const IdResolver& resolver,
                : Fail(errorName, message, message);
 }
 
+// QC-2026-09 (A1) -- the pass the agent used to run by hand, forty probes at
+// a time. `apply` defaults to false so reading what the signal contradicts
+// stays free of consequence; setting it installs the corrected boundaries in
+// the transcript cache every word-level tool in this catalog reads.
+bool DispatchAlignTranscript(McpBackend& backend, const IdResolver&,
+                             const Value& args, std::string& resultJson,
+                             std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"apply"};
+    if (!CheckKnownKeys(args, kAllowed, "align_transcript", message))
+        return Fail(errorName, message, message);
+    bool apply = false;
+    if (!ReadBool(args, "apply", "align_transcript", false, apply, message))
+        return Fail(errorName, message, message);
+    return backend.AlignSourceTranscripts(apply, resultJson, message)
+               ? true
+               : Fail(errorName, message, message);
+}
+
 bool DispatchAnalyzeShotQuality(McpBackend& backend, const IdResolver& resolver,
                                 const Value& args, std::string& resultJson,
                                 std::string& errorName, std::string& message) {
@@ -2070,24 +2253,42 @@ bool DispatchConformSequence(McpBackend& backend, const IdResolver&,
 bool DispatchTranscribeMedia(McpBackend& backend, const IdResolver& resolver,
                              const Value& args, std::string& resultJson,
                              std::string& errorName, std::string& message) {
-    static const std::vector<std::string> kAllowed = {"media_id", "language",
-                                                      "verbatim"};
+    static const std::vector<std::string> kAllowed = {
+        "media_id", "media_ids", "language", "verbatim", "include_silent"};
     if (!CheckKnownKeys(args, kAllowed, "transcribe_media", message))
         return Fail(errorName, message, message);
+    // QC-2026-09 A3 -- one media or a list, never both. The single form stays
+    // because most calls are one media and building an array for it would be
+    // noise; the list form is what makes the model load once instead of once
+    // per rush.
     Ulid mediaId;
-    if (!ReadId(args, "media_id", "transcribe_media", resolver, true, mediaId,
-                message))
+    std::vector<Ulid> mediaIds;
+    if (!ReadId(args, "media_id", "transcribe_media", resolver, false, mediaId,
+                message) ||
+        !ReadIdArray(args, "media_ids", "transcribe_media", resolver, mediaIds,
+                     message))
         return Fail(errorName, message, message);
+    if (!mediaId.empty() && !mediaIds.empty())
+        return Fail(errorName, message,
+                    "'transcribe_media' takes either 'media_id' or "
+                    "'media_ids', not both");
+    if (!mediaId.empty()) mediaIds.push_back(mediaId);
+    if (mediaIds.empty())
+        return Fail(errorName, message,
+                    "'transcribe_media' requires 'media_id' or 'media_ids'");
     std::string language;
     if (!ReadString(args, "language", "transcribe_media", false, "auto",
                     language, message))
         return Fail(errorName, message, message);
     bool verbatim = false;
+    bool includeSilent = false;
     if (!ReadBool(args, "verbatim", "transcribe_media", false, verbatim,
-                  message))
+                  message) ||
+        !ReadBool(args, "include_silent", "transcribe_media", false,
+                  includeSilent, message))
         return Fail(errorName, message, message);
-    return backend.TranscribeSource(mediaId, language, verbatim, resultJson,
-                                    message)
+    return backend.TranscribeSources(mediaIds, language, verbatim,
+                                     includeSilent, resultJson, message)
                ? true
                : Fail(errorName, message, message);
 }
@@ -2175,13 +2376,17 @@ McpToolRegistry::McpToolRegistry() {
         DispatchClearClips);
 
     add("trim_clip",
-        "Trim one edge of a clip by an exact delta, changing only that "
-        "clip's own extent.",
+        "Trim one edge of a clip, changing only that clip's own extent. Say "
+        "either how far to move the edge (delta) or which frame of the rush "
+        "it should land on (source_frame) -- exactly one of the two. With "
+        "source_frame, Head means the clip starts on that frame and Tail "
+        "means it is the last frame played.",
         SchemaBuilder()
             .Field("clip_id", IdSchema("Clip to trim."), true)
             .Field("edge", EnumSchema({"Head", "Tail"}, "Which edge to trim."),
                    true)
-            .Field("delta", kTimeSchemaText, true)
+            .Field("delta", kTimeSchemaText, false)
+            .Field("source_frame", SourceFrameSchema(), false)
             .Build("trim_clip arguments"),
         DispatchTrimClip);
 
@@ -2213,11 +2418,15 @@ McpToolRegistry::McpToolRegistry() {
         DispatchMoveClips);
 
     add("split_clip",
-        "Split one clip into two at an exact timeline position strictly "
-        "inside it.",
+        "Split one clip into two, strictly inside it. Say either where on "
+        "the timeline to cut (timeline_position) or which frame of the rush "
+        "to cut on (source_frame) -- exactly one of the two. Prefer "
+        "source_frame when the cut was decided from the material, and let "
+        "the engine work out the position.",
         SchemaBuilder()
             .Field("clip_id", IdSchema("Clip to split."), true)
-            .Field("timeline_position", kTimeSchemaText, true)
+            .Field("timeline_position", kTimeSchemaText, false)
+            .Field("source_frame", SourceFrameSchema(), false)
             .Build("split_clip arguments"),
         DispatchSplitClip);
 
@@ -2326,12 +2535,15 @@ McpToolRegistry::McpToolRegistry() {
 
     add("ripple_trim",
         "Trim one clip's edge and shift every downstream clip on its track "
-        "(and optionally other synced tracks) by the same amount.",
+        "(and optionally other synced tracks) by the same amount. Say either "
+        "how far to move the edge (delta) or which frame of the rush it "
+        "should land on (source_frame) -- exactly one of the two.",
         SchemaBuilder()
             .Field("clip_id", IdSchema("Clip whose edge is trimmed."), true)
             .Field("edge", EnumSchema({"Head", "Tail"}, "Which edge to trim."),
                    true)
-            .Field("delta", kTimeSchemaText, true)
+            .Field("delta", kTimeSchemaText, false)
+            .Field("source_frame", SourceFrameSchema(), false)
             .Field("linked_clip_ids",
                    IdArraySchema("Other clips in the same link group to trim "
                                  "together with clip_id."),
@@ -2805,6 +3017,49 @@ McpToolRegistry::McpToolRegistry() {
             .Build("clean_disfluencies arguments"),
         DispatchCleanDisfluencies);
 
+    add("locate_source_frame",
+        "Find where a frame of a rush is playing on the active timeline: "
+        "which clip, on which track, and at what timeline position. A frame "
+        "can be on the timeline more than once -- a picture and its detached "
+        "sound, or one rush used twice -- so every match is listed rather "
+        "than one being chosen. Use this rather than computing a timeline "
+        "position from a clip's source_in by hand.",
+        SchemaBuilder()
+            .Field("media_id", IdSchema("Rush the frame belongs to."), true)
+            .Field("source_frame",
+                   IntSchema("Frame index in that media's own frame rate."),
+                   true)
+            .Build("locate_source_frame arguments"),
+        DispatchLocateSourceFrame);
+
+    add("tighten_pauses",
+        "Close the silences inside one clip: find every hollow in its speech "
+        "envelope at least min_gap_ms long, cut each down to keep_frames, "
+        "and ripple the clip closed -- one reversible operation carrying the "
+        "clip's linked A/V pair. Needs no transcript, only a cached speech "
+        "onset analysis for the clip's source. Air at the clip's head or "
+        "tail is reported and left alone; that is a head trim, see "
+        "list_speech_onsets.",
+        SchemaBuilder()
+            .Field("clip_id", IdSchema("Clip to tighten."), true)
+            .Field("min_gap_ms",
+                   IntSchema("Shortest hollow treated as a pause, in "
+                             "milliseconds (default 400). Below it, a hollow "
+                             "is a breath and removing it sounds clipped."),
+                   false)
+            .Field("keep_frames",
+                   IntSchema("Frames of each pause to keep, in the source's "
+                             "own frame rate (default 6). Split between the "
+                             "two ends, so the splice lands in the deepest "
+                             "part of the hollow."),
+                   false)
+            .Field("sync_track_ids",
+                   IdArraySchema("Other tracks to ripple by the same total "
+                                 "delta, beyond the clip's linked pair."),
+                   false)
+            .Build("tighten_pauses arguments"),
+        DispatchTightenPauses);
+
     add("list_shot_quality",
         "Report measured picture quality for every video clip on the active "
         "timeline: whether each is Sharp/Soft/Blurry and Steady/Moving/"
@@ -2903,6 +3158,22 @@ McpToolRegistry::McpToolRegistry() {
             .Build("read_frame arguments"),
         DispatchReadFrame);
 
+    add("align_transcript",
+        "Pull every cached transcript's word boundaries onto the speech "
+        "envelope, and report which ones the signal contradicts. Whisper "
+        "word times are excellent typically and occasionally a second out, "
+        "so a cut placed from the transcript alone can open on room tone. "
+        "Read-only unless apply is true, which installs the corrections in "
+        "the transcript cache the word-level tools read. Requires a cached "
+        "transcript and a cached speech onset analysis per source.",
+        SchemaBuilder()
+            .Field("apply",
+                   BoolSchema("Write the corrected boundaries back to the "
+                              "transcript cache (default false)."),
+                   false)
+            .Build("align_transcript arguments"),
+        DispatchAlignTranscript);
+
     add("analyze_shot_quality",
         "Measure a source's picture quality and cache the result, so "
         "list_shot_quality has something to report. Decodes the whole media, "
@@ -2941,9 +3212,24 @@ McpToolRegistry::McpToolRegistry() {
         "needs redoing when the media changes. Runs a local model with no "
         "network access. Set verbatim when you intend to remove hesitations: "
         "the default decoding silently drops them, so they cannot be edited "
-        "out of a transcript made without it.",
+        "out of a transcript made without it. Name several media at once with "
+        "media_ids: the model is loaded once for the batch instead of once "
+        "per call. Media the document records as mute are skipped and "
+        "reported rather than transcribed.",
         SchemaBuilder()
-            .Field("media_id", IdSchema("Media to transcribe."), true)
+            .Field("media_id",
+                   IdSchema("One media to transcribe. Use media_ids instead "
+                            "for several; naming both is an error."),
+                   false)
+            .Field("media_ids",
+                   IdArraySchema("Several media to transcribe in one batch, "
+                                 "sharing a single model load."),
+                   false)
+            .Field("include_silent",
+                   BoolSchema("Transcribe even media whose measured audio "
+                              "level says they carry no speech (default "
+                              "false)."),
+                   false)
             .Field("language",
                    StringSchema("ISO 639-1 code such as \"fr\", or \"auto\" "
                                 "to detect it. Defaults to \"auto\"."),

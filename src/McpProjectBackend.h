@@ -31,9 +31,12 @@ public:
                                std::string& message) override;
     bool AnalyzeSourceSpeechOnset(const Ulid& sourceId, std::string& resultJson,
                                   std::string& message) override;
-    bool TranscribeSource(const Ulid& sourceId, const std::string& language,
-                          bool verbatim, std::string& resultJson,
-                          std::string& message) override;
+    bool AlignSourceTranscripts(bool apply, std::string& resultJson,
+                                std::string& message) override;
+    bool TranscribeSources(const std::vector<Ulid>& sourceIds,
+                           const std::string& language, bool verbatim,
+                           bool includeSilent, std::string& resultJson,
+                           std::string& message) override;
     bool CaptureSourceFrame(const Ulid& sourceId, const RationalTime& time,
                             std::string& jpegBytes,
                             std::string& message) override;

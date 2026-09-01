@@ -123,8 +123,13 @@ public:
     // (Transcription.h) -- because an agent has no way to know where a human
     // keeps a ggml file. Long-running by nature: it decodes and infers over
     // the whole audio.
-    virtual bool TranscribeSource(const Ulid&, const std::string&, bool,
-                                  std::string&, std::string& message) {
+    //
+    // QC-2026-09 A3 -- takes a list because loading the model costs about 8 s
+    // and used to be paid once per media. `includeSilent` overrides the skip
+    // of media the document records as mute.
+    virtual bool TranscribeSources(const std::vector<Ulid>&, const std::string&,
+                                   bool, bool, std::string&,
+                                   std::string& message) {
         message = "this backend cannot run a transcription";
         return false;
     }
@@ -155,6 +160,18 @@ public:
     virtual bool AnalyzeSourceSpeechOnset(const Ulid&, std::string&,
                                           std::string& message) {
         message = "this backend cannot run a speech onset analysis";
+        return false;
+    }
+
+    // QC-2026-09 (A1) -- pulls every cached transcript's word boundaries onto
+    // the speech envelope, and optionally writes the corrections back. Not a
+    // per-source call like the pair above: the point of the pass is that the
+    // agent stops choosing which rush to doubt, because it cannot tell from
+    // the words alone. Behind the backend because both artifacts are project
+    // cache files, and the write installs one.
+    virtual bool AlignSourceTranscripts(bool, std::string&,
+                                        std::string& message) {
+        message = "this backend has no project transcript cache";
         return false;
     }
 

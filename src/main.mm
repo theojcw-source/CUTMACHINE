@@ -43,6 +43,7 @@ extern "C" {
 #include "MediaPanelModel.h"
 #include "MediaTaskManager.h"
 #include "PanelLayout.h"
+#include "PauseTightening.h"
 #include "PerformanceMetrics.h"
 #include "Project.h"
 #include "ProjectRecovery.h"
@@ -11739,6 +11740,39 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
     // WindowServer, but no Accessibility permission or synthetic global input.
     UiSmokeCheck(self.window != nil && self.state != nullptr,
                  "application launches a real editor window");
+
+    // Becoming key is a round trip through the WindowServer, and the
+    // dispatch_async that got us here only promises the next main-queue turn
+    // -- so applicationDidFinishLaunching's activateIgnoringOtherApps has
+    // usually, but not always, landed. AppKit routes the first click on a
+    // non-key window to activating it rather than to the view under it, so
+    // losing that race made every selection-, rename- and drag-dependent
+    // check below fail *together*, intermittently: measured at 1 run in 6 on
+    // an otherwise idle Mac, and easily mistaken for a real regression by
+    // whoever ran ctest next.
+    //
+    // Waiting is the fix rather than retrying a click: a click that arrives
+    // before the window is key is a different gesture, not a lost one.
+    if (!self.window.isKeyWindow) {
+        [NSApp activateIgnoringOtherApps:YES];
+        [self.window makeKeyAndOrderFront:nil];
+        NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:5.0];
+        while (!self.window.isKeyWindow && deadline.timeIntervalSinceNow > 0) {
+            NSEvent* event = [NSApp
+                nextEventMatchingMask:NSEventMaskAny
+                            untilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]
+                               inMode:NSDefaultRunLoopMode
+                              dequeue:YES];
+            if (event) [NSApp sendEvent:event];
+        }
+    }
+    // Reported rather than assumed: on a machine with no usable WindowServer
+    // session -- a locked screen, a headless runner -- the window never
+    // becomes key, and one honest failure naming that is worth more than
+    // seven that blame the media panel.
+    UiSmokeCheck(self.window.isKeyWindow,
+                 "editor window becomes key before any input check");
+
     NSButton* toggle = self.sourceMonitorToggleButton;
     const NSPoint togglePoint =
         NSMakePoint(NSMidX(toggle.frame), NSMidY(toggle.frame));
@@ -12571,15 +12605,42 @@ int main(int argc, char* argv[]) {
     // ALPHA-2026-08 -- the model path became optional the day it became a
     // local setting (Transcription.h). Omitting it entirely, or passing it
     // empty to reach the arguments behind it, resolves the configured model.
-    if (argc >= 4 && argc <= 7 && std::string(argv[1]) == "--transcribe") {
+    //
+    // QC-2026-09 A3 -- several media ids may be given, comma-separated, so
+    // one call pays the model load once. The grammar is otherwise unchanged:
+    // `--transcribe <projet> <media-ids> [modèle] [langue] [--verbatim]`.
+    if (argc >= 4 && std::string(argv[1]) == "--transcribe") {
+        std::vector<std::string> mediaIds;
+        {
+            const std::string joined(argv[3]);
+            size_t start = 0;
+            while (start <= joined.size()) {
+                const size_t comma = joined.find(',', start);
+                const std::string piece = joined.substr(
+                    start, comma == std::string::npos ? std::string::npos
+                                                      : comma - start);
+                if (!piece.empty()) mediaIds.push_back(piece);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
         std::string language = "auto";
         bool verbatim = false;
-        const std::string modelPath = argc >= 5 ? argv[4] : "";
-        for (int index = 5; index < argc; ++index) {
-            if (std::string(argv[index]) == "--verbatim") {
+        bool includeSilent = false;
+        std::string modelPath;
+        int positional = 0;
+        for (int index = 4; index < argc; ++index) {
+            const std::string option(argv[index]);
+            if (option == "--verbatim") {
                 verbatim = true;
-            } else if (language == "auto") {
-                language = argv[index];
+            } else if (option == "--include-silent") {
+                includeSilent = true;
+            } else if (positional == 0) {
+                modelPath = option;
+                ++positional;
+            } else if (positional == 1) {
+                language = option;
+                ++positional;
             } else {
                 std::fprintf(stderr, "Unexpected transcription argument: %s\n",
                              argv[index]);
@@ -12587,8 +12648,9 @@ int main(int argc, char* argv[]) {
             }
         }
         std::string output;
-        const int result = TranscribeMediaCommand(argv[2], argv[3], modelPath,
-                                                  language, verbatim, output);
+        const int result =
+            TranscribeMediaCommand(argv[2], mediaIds, modelPath, language,
+                                   verbatim, includeSilent, output);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
@@ -12604,9 +12666,34 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if (argc == 5 && std::string(argv[1]) == "--locate-source-frame") {
+        std::string output;
+        const int result = LocateSourceFrameCommand(
+            argv[2], argv[3], std::atoll(argv[4]), output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
     if (argc == 4 && std::string(argv[1]) == "--disfluencies") {
         std::string output;
         const int result = ListDisfluenciesCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    // QC-2026-09 A2 -- min-gap and keep default in the engine, so the short
+    // form is the one an editor types and the long form is the one a script
+    // pins.
+    if ((argc == 4 || argc == 6) &&
+        std::string(argv[1]) == "--tighten-pauses") {
+        PauseTighteningSettings defaults;
+        int64_t minimumGapMs = defaults.minimum_gap_milliseconds;
+        int64_t keepFrames = defaults.keep_frames;
+        if (argc == 6) {
+            minimumGapMs = std::atoll(argv[4]);
+            keepFrames = std::atoll(argv[5]);
+        }
+        std::string output;
+        const int result = TightenPausesCommand(argv[2], argv[3], minimumGapMs,
+                                                keepFrames, output);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
@@ -12692,9 +12779,17 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
-    if (argc == 3 && std::string(argv[1]) == "--align-transcripts") {
+    // QC-2026-09 (A1) -- `--write` is what makes the alignment reach the tools
+    // that cut on words; without it this only reports what it would correct.
+    if ((argc == 3 || argc == 4) &&
+        std::string(argv[1]) == "--align-transcripts") {
+        if (argc == 4 && std::string(argv[3]) != "--write") {
+            std::fprintf(stderr, "Unknown --align-transcripts option: %s\n",
+                         argv[3]);
+            return 2;
+        }
         std::string output;
-        const int result = AlignTranscriptsCommand(argv[2], output);
+        const int result = AlignTranscriptsCommand(argv[2], argc == 4, output);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }

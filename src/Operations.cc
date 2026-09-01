@@ -3626,6 +3626,30 @@ bool ApplyRemoveWords(Document& candidate, RemoveWordsOperation& operation,
 
 }  // namespace
 
+std::vector<Ulid> LinkedClipIdsCoveringRanges(
+    const Document& document, const DocumentClip& clip,
+    const std::vector<WordRemovalRange>& ranges) {
+    std::vector<Ulid> linked;
+    if (clip.link_group_id.empty()) return linked;
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        for (const DocumentClip& other : track.clips) {
+            if (other.id == clip.id ||
+                other.link_group_id != clip.link_group_id ||
+                other.source_id != clip.source_id)
+                continue;
+            const RationalTime sourceEnd = other.source_in.add(other.duration);
+            const bool covers = std::all_of(
+                ranges.begin(), ranges.end(),
+                [&](const WordRemovalRange& range) {
+                    return range.source_start.compare(other.source_in) >= 0 &&
+                           range.source_end.compare(sourceEnd) <= 0;
+                });
+            if (covers) linked.push_back(other.id);
+        }
+    }
+    return linked;
+}
+
 bool ResolveIntervalSplits(const Document& document, const Ulid& clipId,
                            const RationalTime& interval,
                            SplitClipAtPositionsOperation& operation,

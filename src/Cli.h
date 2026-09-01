@@ -22,11 +22,15 @@ int CreateProjectCommand(const std::string& packagePath,
 // An empty `whisperModelPath` resolves the model configured locally
 // (Transcription.h's ResolveConfiguredWhisperModel), which is how every
 // caller that is not a human typing a path reaches this.
+// QC-2026-09 A3 -- takes several media because the Whisper model load costs
+// about 8 s and used to be paid once per call. Media whose measured audio
+// level (Document.h, recorded at ingest) says they are mute are skipped and
+// reported rather than sent to the model; `includeSilent` overrides that.
 int TranscribeMediaCommand(const std::string& projectPath,
-                           const std::string& mediaId,
+                           const std::vector<std::string>& mediaIds,
                            const std::string& whisperModelPath,
                            const std::string& language, bool verbatim,
-                           std::string& output);
+                           bool includeSilent, std::string& output);
 // ALPHA-2026-08 -- the reason these take word indices and never a timecode
 // is PHILOSOPHY.md principle 7: the caller (agent or human) names *which
 // words*, CUTMACHINE resolves *which frames*. A caller that could pass a
@@ -46,17 +50,39 @@ int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
                               const std::string& mediaId, std::string& output);
 int SpeechOnsetReportCommand(const std::string& projectPath,
                              std::string& output);
-// ALIGN-2026-08 -- read-only. Reports which cached word boundaries the speech
-// envelope contradicts, and where each one belongs. Nothing is written: a
+// ALIGN-2026-08 -- reports which cached word boundaries the speech envelope
+// contradicts, and where each one belongs. Read-only unless `apply`: a
 // transcript is a cache artifact several tools read, and rewriting it under
 // them is a decision for the caller, not for a report.
-int AlignTranscriptsCommand(const std::string& projectPath,
+//
+// QC-2026-09 (A1) -- `apply` is that decision. Without it the correction
+// exists only in a report, and every tool that cuts on words keeps cutting on
+// the boundaries the signal contradicts; the measured cost of that was some
+// forty probe round trips in one session. The document is never touched
+// either way -- this rewrites a cache file, which a re-transcription
+// regenerates.
+int AlignTranscriptsCommand(const std::string& projectPath, bool apply,
                             std::string& output);
 int ListDisfluenciesCommand(const std::string& projectPath,
                             const std::string& clipId, std::string& output);
 int RemoveWordsCommand(const std::string& projectPath,
                        const std::string& clipId, const std::string& rangesJson,
                        std::string& output);
+// QC-2026-09 A2 -- closes the silences inside one clip, from the speech
+// envelope alone. Applies one reversible RemoveWordsOperation carrying the
+// clip's A/V pair, and reports which pauses it closed. Needs a cached
+// speech onset analysis for the clip's source; it needs no transcript,
+// which is the point -- tightening a take should not wait on Whisper.
+int TightenPausesCommand(const std::string& projectPath,
+                         const std::string& clipId, int64_t minimumGapMs,
+                         int64_t keepFrames, std::string& output);
+// QC-2026-09 A4 -- read-only. Reports which clips of the active timeline play
+// a given frame of a given rush, and where. The conversion it performs is the
+// one every hand-computed timeline position in a measured session got wrong
+// at least once.
+int LocateSourceFrameCommand(const std::string& projectPath,
+                             const std::string& mediaId, int64_t sourceFrame,
+                             std::string& output);
 int DescribeCommand(const std::string& documentPath, std::string& output);
 // SRT-2026-08 -- read-only. Subtitles were reachable only from the app: the
 // cue builder and SaveSrt both had their single caller in main.mm, so a

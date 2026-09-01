@@ -173,6 +173,10 @@ int main() {
                       true,
                       48000,
                       2,
+                      // audio_level_measured / audio_level (QC-2026-09 A3):
+                      // this fixture is built by hand, never ingested.
+                      false,
+                      0,
                       "",
                       "",
                       true}};

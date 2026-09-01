@@ -147,6 +147,7 @@ add_library(cutmachine_model
     src/McpServer.cc
     src/McpTools.cc
     src/Operations.cc
+    src/PauseTightening.cc
     src/Project.cc
     src/ProjectBin.cc
     src/ProjectRecovery.cc
@@ -156,6 +157,7 @@ add_library(cutmachine_model
     src/ResolveExport.cc
     src/ResolveImport.cc
     src/SequenceFormat.cc
+    src/SourceAddress.cc
     src/DocumentDelta.cc
     src/ShotQuality.cc
     src/TranscriptAlignment.cc
@@ -478,6 +480,20 @@ if(BUILD_TESTING)
         PRIVATE cutmachine_model)
     add_test(NAME cutmachine_transcript_alignment_tests
              COMMAND cutmachine_transcript_alignment_tests)
+
+    add_executable(cutmachine_source_address_tests
+        tests/source_address_tests.cc)
+    target_link_libraries(cutmachine_source_address_tests
+        PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_source_address_tests
+             COMMAND cutmachine_source_address_tests)
+
+    add_executable(cutmachine_pause_tightening_tests
+        tests/pause_tightening_tests.cc)
+    target_link_libraries(cutmachine_pause_tightening_tests
+        PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_pause_tightening_tests
+             COMMAND cutmachine_pause_tightening_tests)
 
     add_executable(cutmachine_speech_onset_tests tests/speech_onset_tests.cc)
     target_link_libraries(cutmachine_speech_onset_tests PRIVATE cutmachine_model)

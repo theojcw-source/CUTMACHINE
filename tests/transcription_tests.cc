@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -253,6 +254,51 @@ int main() {
 
             std::filesystem::remove_all(root);
         });
+
+    // QC-2026-09 (A1) -- the alignment pass writes the transcript cache back,
+    // so the write path and the marker on it have to survive a round trip. An
+    // older cache has no marker and must still load, as unaligned.
+    Test("SaveAudioTranscript round-trips the speech alignment marker", [] {
+        const std::filesystem::path root =
+            std::filesystem::temp_directory_path() /
+            (GenerateUlid() + "-transcript-align");
+        std::filesystem::create_directories(root);
+        const std::filesystem::path path = root / "aligned.transcript";
+
+        Transcript transcript;
+        transcript.media_id = "01K300000000000000000000AA";
+        transcript.whisper_model = "ggml-large-v3.bin";
+        transcript.verbatim = true;
+        transcript.speech_aligned = true;
+        transcript.source_rate = {25, 1};
+        transcript.words = {{"bonjour", {0, 25}, {10, 25}},
+                            {"tout", {10, 25}, {14, 25}}};
+        std::string error;
+        Check(SaveAudioTranscript(path.string(), transcript, error),
+              "the transcript cache is written: " + error);
+        Transcript reloaded;
+        Check(LoadAudioTranscript(path.string(), reloaded, error) &&
+                  reloaded.speech_aligned && reloaded.verbatim &&
+                  reloaded.words.size() == 2 &&
+                  reloaded.words[1].text == "tout",
+              "an aligned transcript reads back aligned: " + error);
+
+        transcript.speech_aligned = false;
+        Check(SaveAudioTranscript(path.string(), transcript, error),
+              "rewriting the same path succeeds: " + error);
+        std::ifstream stored(path);
+        std::ostringstream contents;
+        contents << stored.rdbuf();
+        Check(contents.str().find("speech_aligned") == std::string::npos,
+              "an unaligned transcript keeps the bytes it had before the "
+              "marker existed");
+        Transcript legacy;
+        Check(LoadAudioTranscript(path.string(), legacy, error) &&
+                  !legacy.speech_aligned,
+              "and reads back as not aligned: " + error);
+
+        std::filesystem::remove_all(root);
+    });
 
     Test("RemoveWordsOperation cuts a linked A/V pair in one reversible step",
          [] {

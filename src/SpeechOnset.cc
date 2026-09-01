@@ -49,20 +49,26 @@ int64_t WindowsForMilliseconds(int64_t milliseconds,
 
 }  // namespace
 
-int64_t WindowRmsLevel(const int16_t* samples, size_t count) {
-    if (samples == nullptr || count == 0) return 0;
-    __int128 total = 0;
+void RunningRmsLevel::Add(const int16_t* samples, size_t count) {
+    if (samples == nullptr) return;
     for (size_t index = 0; index < count; ++index) {
-        const __int128 value = samples[index];
-        total += value * value;
+        const unsigned __int128 value = static_cast<unsigned __int128>(
+            static_cast<int64_t>(samples[index]) * samples[index]);
+        total_ += value;
     }
-    const __int128 mean = total / static_cast<__int128>(count);
+    count_ += count;
+}
+
+int64_t RunningRmsLevel::Level() const {
+    if (count_ == 0) return 0;
+    const unsigned __int128 mean =
+        total_ / static_cast<unsigned __int128>(count_);
     // Integer square root of the mean square, then scaled. Both steps stay in
     // __int128 so the same samples always produce the same figure, on any
     // standard library -- std::sqrt on a double would not promise that.
-    __int128 root = 0;
-    __int128 bit = static_cast<__int128>(1) << 30;
-    __int128 remainder = mean;
+    unsigned __int128 root = 0;
+    unsigned __int128 bit = static_cast<unsigned __int128>(1) << 30;
+    unsigned __int128 remainder = mean;
     while (bit > remainder) bit >>= 2;
     while (bit != 0) {
         if (remainder >= root + bit) {
@@ -74,10 +80,17 @@ int64_t WindowRmsLevel(const int16_t* samples, size_t count) {
         bit >>= 2;
     }
     // 32768 is full scale for signed 16-bit input.
-    const __int128 scaled = root * kSpeechLevelScale / 32768;
-    if (scaled > std::numeric_limits<int64_t>::max())
+    const unsigned __int128 scaled = root * kSpeechLevelScale / 32768;
+    if (scaled >
+        static_cast<unsigned __int128>(std::numeric_limits<int64_t>::max()))
         return std::numeric_limits<int64_t>::max();
     return static_cast<int64_t>(scaled);
+}
+
+int64_t WindowRmsLevel(const int16_t* samples, size_t count) {
+    RunningRmsLevel level;
+    level.Add(samples, count);
+    return level.Level();
 }
 
 int64_t SpeechLevelPercentile(std::vector<int64_t> values, int percent) {

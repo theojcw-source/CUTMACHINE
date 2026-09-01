@@ -43,7 +43,13 @@
 // ratio rather than a difference in dB, because a logarithm cannot be taken
 // exactly in integers. The two are the same statement: -18 dB is a factor of
 // 0.126, and `speech_ratio_percent` is that factor.
-constexpr int64_t kSpeechLevelScale = 1000000;
+//
+// Defined as Document.h's kAudioLevelScale rather than repeated: A3 records
+// a mean level on LibraryMedia in exactly this convention, and two copies of
+// the number would be two chances for a reading here and a fact there to
+// stop meaning the same thing. The names stay separate because the two are
+// stored in different places -- one in a cache file, one in the document.
+constexpr int64_t kSpeechLevelScale = kAudioLevelScale;
 
 struct SpeechOnsetReport {
     std::string media_id;
@@ -67,11 +73,21 @@ struct SpeechOnsetThresholds {
     // varies by rush, by mic distance and by how loudly someone talks, so an
     // absolute floor either misses a quiet speaker or accepts a loud room.
     //
-    // 13% is -17.7 dB. Measured on the interview rushes this was calibrated
-    // against, speech sits at -17 to -21 dBFS and room tone at -40 to -48
-    // dBFS, so anything from roughly 5% to 25% separates them identically;
-    // 13% sits in the middle of that plateau rather than on either edge.
-    int64_t speech_ratio_percent = 13;
+    // 25% is -12 dB below the clip's own 90th percentile.
+    //
+    // QC-2026-09 (A1) -- this was 13% (-17.7 dB), chosen in the middle of a
+    // plateau measured on rushes where room tone sat 20 to 30 dB under the
+    // voice. That plateau does not exist on every shoot. On
+    // ADS213_ITW_Findetudefevr26 the room sits about 18 dB under the voice,
+    // so the 13% line falls *into* the noise: room windows cross it often
+    // enough to hold for the sustain, the onset lands on the room rather
+    // than on the word, and the report answers `tight: true` on clips
+    // carrying 1.0 to 1.2 s of dead air -- or `suggested_trim: 3` where the
+    // attack is 27 frames further on. A threshold that reads room tone as
+    // speech is worse than no measurement: it is a wrong answer a caller
+    // trusts. -12 dB clears that floor with margin and still sits well under
+    // any speech worth entering on.
+    int64_t speech_ratio_percent = 25;
     // A window over the threshold is not yet an onset: a lip smack, a chair
     // creak or a single-window transient clears it and is not the voice. The
     // run must hold. 100 ms is shorter than any French syllable and longer
@@ -137,10 +153,30 @@ struct ClipSpeechOnset {
 // Pure core. No FFmpeg, no filesystem -- what tests exercise directly.
 // ---------------------------------------------------------------------
 
+// Root mean square over a stream fed block by block, for a caller that
+// cannot hold every sample at once -- an ingest measuring a whole rush, as
+// against an analysis pass measuring one 20 ms window. The answer is
+// identical to WindowRmsLevel over the concatenation of the blocks: there is
+// one implementation, and this is it.
+//
+// Integer throughout: the squares accumulate exactly and the single division
+// and square root happen at the end, so the same samples always give the
+// same number on any standard library.
+class RunningRmsLevel {
+public:
+    void Add(const int16_t* samples, size_t count);
+    // Zero when nothing has been added, which is also what digital silence
+    // measures -- a caller that needs to tell those apart tracks Samples().
+    int64_t Level() const;
+    uint64_t Samples() const { return count_; }
+
+private:
+    unsigned __int128 total_ = 0;
+    uint64_t count_ = 0;
+};
+
 // Root mean square of a block of interleaved-free 16-bit samples, as a
-// fraction of full scale times kSpeechLevelScale. Integer throughout: the
-// squares accumulate in an __int128 and the single division happens at the
-// end, so the same samples always give the same number.
+// fraction of full scale times kSpeechLevelScale.
 int64_t WindowRmsLevel(const int16_t* samples, size_t count);
 
 // Nearest-rank percentile on a copy of `values`, `percent` in 0..100.

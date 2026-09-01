@@ -187,6 +187,115 @@ Restent ouverts et non traités ici, par ordre de gravité (voir l'audit) :
   intervention d'agent en un geste.
 - **La langue n'entre pas dans l'identité du cache de transcription.**
 
+## Suite d'audit — coût de production (QC-2026-09)
+
+Déclenché par le montage des quatre interviews d'`ADS213_ITW_Findetudefevr26`
+(Zoé, Anis, Raphaël, Soraya) en une seule session. Les quatre films sont
+sortis conformes au style de la maison — 60 à 78 s, 19 à 25 plans visibles par
+minute, 46 à 49 % de plans de coupe — mais le coût de production a été dominé
+par des allers-retours que le moteur peut supprimer. Les chiffres ci-dessous
+sont **mesurés sur ce projet**, pas estimés.
+
+Coûts unitaires relevés :
+
+| opération | coût mesuré |
+|---|---|
+| `--transcribe` | ~8 s de chargement de modèle + 11× temps réel + ~3 s de démux d'un rush 4K |
+| `--speech-onset` | 0,19 s — réutilise le cache audio, donc gratuit |
+| `--shot-quality` | 11 s par rush |
+
+La transcription des 43 rushes parlés a coûté ~11 min de machine : ce n'est pas
+le poste dominant. Le poste dominant a été **une quarantaine de sondes de
+bornes** — extraire un fragment de rush, l'ingérer dans un projet jetable, le
+transcrire, lire le résultat — plus quatre reconstructions complètes de piste
+de coupe et sept validations du son monté. Toutes les sondes ont la même
+cause : **les horodatages de mots ne sont pas fiables**, donc aucune décision
+de coupe ne peut s'appuyer sur le transcript seul. Tout le reste en découle,
+y compris l'inutilisabilité de `remove_words` déjà consignée.
+
+| Ticket | Statut |
+|---|---|
+| A1 — **`align_transcript` : recaler les mots sur le signal.** Fonction pure (liste de mots, enveloppe d'énergie) → mots re-datés, testable sans FFmpeg ; recale chaque frontière sur la transition d'énergie la plus proche dans une fenêtre bornée, et marque celles qui restent douteuses. L'enveloppe existe déjà (cache de `--speech-onset`, gratuit). Supprime la boucle de sondage, rend `remove_words` fiable, et fait disparaître la classe « mot avalé en bordure de plan » | fait (fonction pure, `--align-transcripts [--write]`, outil `align_transcript` ; seuil de `--speech-onset` porté à 25 % — 90ᵉ centile − 12 dB) |
+| A2 — **Opération `tighten_pauses(clip, min_gap, keep)`.** Trouve les creux ≥ `min_gap` dans la plage source du plan, ramène chacun à `keep` images, referme en ripple, le tout en une opération réversible. Doit couvrir la paire A/V liée et les pistes synchronisées, comme Q4b l'a fait pour `remove_words`. Mesuré : deux appels équivalents ont retiré 6,6 s de silences internes sur un seul montage, sans lire un mot | fait (`PauseTightening.h`, `--tighten-pauses`, outil `tighten_pauses` ; résout une `RemoveWordsOperation` portant la paire A/V et les pistes synchronisées) |
+| A3 — **Transcription par lot, médias muets sautés.** `--transcribe` accepte plusieurs `media-id` et ne charge le modèle qu'une fois (~8 s × N économisés). `--ingest` enregistre le niveau audio moyen mesuré par FFmpeg comme fait du document, au même titre que la cadence et la durée. Mesuré : 29 des 71 rushes du projet étaient des plans de coupe muets à −74 dB, passés à whisper avant d'être reconnus | fait (`--transcribe` prend plusieurs `media-id`, un seul chargement de modèle ; `--ingest` mesure et enregistre `audio_level`, schéma document v6) |
+| A4 — **Adressage par image source.** Résolveur `(media_id, source_frame)` → `(clip_id, timeline_position)` sur la timeline active, exposé en outil et utilisé par les découpes et les rognages. Mesuré : chaque position timeline calculée à la main dans cette session a produit au moins une erreur ; le script qui prenait des bornes source et résolvait la position lui-même n'en a produit aucune | fait (`SourceAddress.h`, `--locate-source-frame`, outil `locate_source_frame` ; `split_clip`, `trim_clip` et `ripple_trim` acceptent `source_frame`) |
+| A5 — **`sync_track_ids` sur `split_linked_clips`, `remove_linked_clips` et `remove_clip`.** `ripple_trim` l'accepte déjà, pas les autres. C'est précisément pourquoi retirer un plan a forcé la reconstruction complète d'une piste de coupe : la piste sans membre du groupe lié ne suit pas le décalage | à faire |
+| A6 — **`contact_sheet` et `cut_sheet`, rendus à travers le pipeline couleur.** `read_frame` (P1) donne une image par appel : mauvaise granularité pour juger un montage. Il faut une planche des milieux de plans et une planche des paires d'images encadrant chaque coupe. Et elles doivent passer par la transformation couleur du document — une image tirée d'un rush log est délavée, donc inutilisable pour juger une exposition ou une lisibilité | à faire |
+| A7 — **Gain par clip et fondus audio.** Schéma (comme F0.1), opération, export et rendu. Mesuré : un plan à −27 dB, 10 dB sous le reste du montage, n'a pu être traité qu'en le supprimant — avec la phrase qu'il portait | à faire |
+| A8 — **`timeline_stats` : la densité comptée en plans visibles.** Durée, changements de plan visibles, plans/minute, part de plans de coupe, position de la première coupe. Une coupe de V1 masquée par un plan de coupe sur V2 n'est pas un changement de plan : sur un des quatre montages, 28 clips ne font que 25 plans visibles. `list_shot_quality` sait déjà raisonner sur le recouvrement (P3) ; c'est la même donnée. Sans cet outil, le contrôle arithmétique que la procédure exige se fait à la main, donc mal | à faire |
+| A9 — **Garde-fou sur une transcription aberrante.** Comparer le nombre de mots rendus à la durée de parole mesurée, et signaler l'écart. Mesuré : sur C4774, 32 s de parole à −19 dB, `ggml-large-v3` rend 6 mots — de façon reproductible, sur le rush entier comme sur un proxy — là où `ggml-small` en rend 85, dont le seul détail concret du personnage. Sans ce contrôle, la transcription passe pour vide et le rush est écarté à tort | à faire |
+
+### Constats qui mettent à jour des points existants
+
+- **La sortie vers Resolve existe.** Le point « aucune sortie interopérable »
+  ci-dessus est en partie périmé : `--export-resolve-timeline` plus
+  `sidecar/resolve_bridge.py --send` ont renvoyé les quatre montages dans le
+  projet Resolve ouvert, sur deux pistes vidéo, à la durée exacte au frame
+  près. Il manque toujours OTIO/FCPXML/EDL.
+- **`--speech-onset` sous-estimait l'air mort.** Il annonçait `tight: true`
+  sur des plans portant 1,0 à 1,2 s de silence en tête, et `suggested_trim: 3`
+  là où l'attaque réelle est 27 images plus loin. Son seuil était calé trop
+  près du plancher de bruit ; sur ces rushes celui-ci ne tombe qu'à ~18 dB
+  sous la parole. **Corrigé avec A1** : `speech_ratio_percent` passe de 13 à
+  25 % (90ᵉ centile − 12 dB), et `tests/speech_onset_tests.cc` reproduit les
+  deux comportements — l'ancien seuil prenant une respiration pour l'attaque
+  et proposant les 3 images relevées, le nouveau tombant sur le mot.
+- **Le grading créatif reste absent du fichier livré, mais la gestion couleur,
+  non.** Le point « `Export.cc` ne lit jamais `clip.effects` » reste vrai et
+  distinct de `color_management`, qui, lui, est bien appliqué à l'export :
+  mesuré sur la même image, SATAVG passe de 18,0 (rush log) à 40,4
+  (livrable), YAVG de 452 à 616.
+
+### Ordre de prise recommandé
+
+A1 d'abord : lui seul supprime le poste dominant, et A2 comme A9 s'appuient sur
+l'enveloppe qu'il fabrique. A3, A5 et A8 sont indépendants, courts, et
+gagnables en parallèle. A4 et A6 ensuite. A7 est le seul qui touche au schéma
+document, donc il suit les règles de la Phase 0 (bump de version, migration
+refusée) et se fait seul.
+
+**A1 à A4 sont faits.** Notes laissées par cette passe, pour qui prend la
+suite :
+
+- A3 a finalement touché au schéma document (`LibraryMedia::audio_level`,
+  v5 → v6), ce que l'ordre de prise attribuait à A7 seul. Le niveau moyen est
+  un fait mesuré sur le fichier, au même titre que la cadence, et le ticket le
+  demandait explicitement comme fait du document. Un document v5 se charge
+  toujours, et son entrée se lit « non mesurée » — pas « silencieuse » : la
+  distinction est portée par `audio_level_measured`, et un ré-`--ingest`
+  remplit le champ. Même précédent que la migration v4 → v5 de l'opacité.
+  `--ingest` décode désormais l'audio de chaque rush : mesuré à 0,3 s sur un
+  fichier 4K de 268 Mo, contre les 11× temps réel qu'une transcription inutile
+  coûtait.
+- A2 ne crée pas d'opération : il résout une `RemoveWordsOperation`, qui fait
+  déjà exactement le travail (couper des plages source, refermer en ripple,
+  emporter la paire A/V de Q4b, décaler les pistes synchronisées) et le fait
+  réversiblement. Une seconde opération qui referme des plages source serait
+  une seconde implémentation de la même chose.
+- A2 ne touche pas à l'air de tête et de queue d'un plan : c'est la question
+  de `SpeechOnset.h` et d'un rognage, et y répondre ici ferait un autre
+  montage que celui demandé. Les deux sont mesurés et publiés dans le rapport.
+- `LinkedClipIdsFor` a quitté `McpTools.cc` pour `Operations.h`
+  (`LinkedClipIdsCoveringRanges`) : la CLI en avait besoin aussi, et une règle
+  sur les plans qu'une coupe doit emporter est du moteur.
+- A4 rend la queue d'un rognage **inclusive** : `source_frame` y désigne la
+  dernière image gardée, pas la première écartée. C'est ce que veut dire un
+  numéro d'image pour un monteur, et le +1 appartient au moteur.
+- Corrigé en passant, sans rapport avec A1–A4 : `cutmachine_ui_smoke_tests`
+  était **intermittent**. Ses vérifications démarrent sur le tour de boucle
+  suivant `applicationDidFinishLaunching`, alors que devenir *key* est un
+  aller-retour avec le WindowServer ; quand la course était perdue, AppKit
+  routait le premier clic vers l'activation et non vers la vue, et les sept
+  vérifications de sélection, de renommage et de glissé échouaient ensemble.
+  Mesuré à 1 exécution sur 6 au repos, et 9 sur 12 avec quatre instances en
+  concurrence pour le focus ; 0 sur 12 après correction (attente bornée de la
+  fenêtre *key*, avec un échec explicite si elle ne le devient jamais).
+- Reste ouvert et non traité ici : `McpLiveBackend` (donc le panneau chat)
+  n'expose toujours ni l'enveloppe de parole, ni la transcription, ni
+  l'alignement — c'est le même trou que Q5 a bouché pour
+  `ReadSourceTranscript`, et il concerne maintenant `tighten_pauses` et
+  `align_transcript`. Le serveur MCP et la CLI, eux, les ont.
+
 Toutes les phases (0, 1, 2) sont closes. Reste hors roadmap : validation
 visuelle réelle sur macOS (AppKit/Metal non compilables dans ce
 sandbox Linux) et le fossé `ProjectStorage.cc`/CommonCrypto qui bloque

@@ -679,14 +679,22 @@ bool Document::LoadFromString(const std::string& json, Document& output,
         const JsonValue root = JsonParser(json).Parse();
         Document parsed;
         const int32_t storedVersion = Int32(root, "version", "document");
-        if (storedVersion != 4 && storedVersion != 5) {
+        if (storedVersion != 4 && storedVersion != 5 && storedVersion != 6) {
             throw std::runtime_error("unsupported document version " +
                                      std::to_string(storedVersion));
         }
         // ALPHA-2026-08 -- v4 clips predate compositing opacity. Loading them
         // as fully opaque keeps existing projects usable while the next save
         // emits the canonical v5 representation.
-        parsed.version = 5;
+        //
+        // QC-2026-09 A3 -- v5 library entries predate the measured audio
+        // level. They load as unmeasured, which is the honest reading and
+        // the one `audio_level_measured` exists to express: re-ingesting the
+        // same path fills it in, exactly as it already does for a v1 source
+        // with no technical metadata. Accepted rather than refused because
+        // nothing about an existing edit changes -- this adds a fact about a
+        // file, not a new way to describe a cut.
+        parsed.version = 6;
 
         if (const JsonValue* color =
                 Optional(root, "color_management", JsonValue::Type::Object,
@@ -808,6 +816,14 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                         media.audio_rate = Int32(item, "audio_rate", context);
                         media.audio_channels =
                             Int32(item, "audio_channels", context);
+                        if (Optional(item, "audio_level",
+                                     JsonValue::Type::Number, context)) {
+                            media.audio_level_measured = true;
+                            media.audio_level =
+                                Require(item, "audio_level",
+                                        JsonValue::Type::Number, context)
+                                    .number;
+                        }
                     }
                 }
                 const JsonValue& rate =
@@ -1350,6 +1366,11 @@ std::string Document::SaveToString() const {
             if (media.has_audio) {
                 output << ",\"audio_rate\":" << media.audio_rate
                        << ",\"audio_channels\":" << media.audio_channels;
+                // Written only when measured, so an entry that has never
+                // been through an ingest that measures keeps the bytes it
+                // had before this field existed.
+                if (media.audio_level_measured)
+                    output << ",\"audio_level\":" << media.audio_level;
             }
         }
         output << "}";
@@ -1382,7 +1403,7 @@ std::string Document::SaveToString() const {
 }
 
 bool Document::Validate(std::string& error) const {
-    if (version != 5) {
+    if (version != 6) {
         error = "unsupported document version " + std::to_string(version);
         return false;
     }
@@ -1530,6 +1551,12 @@ bool Document::Validate(std::string& error) const {
             if (media.has_audio &&
                 (media.audio_rate <= 0 || media.audio_channels <= 0)) {
                 error = context + " has invalid audio metadata";
+                return false;
+            }
+            if (media.audio_level_measured &&
+                (!media.has_audio || media.audio_level < 0 ||
+                 media.audio_level > kAudioLevelScale)) {
+                error = context + " has an out-of-range audio level";
                 return false;
             }
         }

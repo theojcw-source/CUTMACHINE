@@ -43,6 +43,14 @@ struct Transcript {
     // repetitions and false starts. Keep it in the cache identity so a
     // standard transcript is never silently substituted for one.
     bool verbatim = false;
+    // QC-2026-09 (A1) -- true once AlignTranscriptToSpeech has been applied to
+    // this cache file, so a reader can tell a boundary Whisper claimed from
+    // one the signal confirmed. It is not a guarantee that every word moved
+    // (most are already right, and the ones with no speech edge nearby are
+    // deliberately refused); it says only that the pass has run, which is
+    // what distinguishes a transcript worth cutting on from one that still
+    // needs probing.
+    bool speech_aligned = false;
     // The exact timebase TranscriptWord::start/end are expressed in. This is
     // normally the source media's own MediaRate (DocumentSource::rate), so a
     // word's RationalTime is already frame-exact in the domain
@@ -75,17 +83,59 @@ struct WhisperSettings {
 // configured path is not a file. Never downloads anything.
 bool ResolveConfiguredWhisperModel(std::string& path, std::string& reason);
 
-// Decodes `inputPath`'s audio locally via FFmpeg (mirrors Waveform.cc's
-// decode pipeline), runs local whisper.cpp inference against the PCM
-// samples, and writes the resulting transcript as JSON to `outputPath`
+// One media to transcribe. The caller resolves the paths and the source's
+// own frame rate, because both are project questions, not model ones.
+struct TranscriptionJob {
+    std::string media_id;
+    std::string input_path;
+    std::string output_path;
+    MediaRate source_rate;
+};
+
+struct TranscriptionOutcome {
+    std::string media_id;
+    bool ok = false;
+    // Empty on success; on failure, why this one media failed. A batch does
+    // not stop at the first one.
+    std::string error;
+    size_t words = 0;
+};
+
+// QC-2026-09 A3 -- transcribes a batch of media against one loaded model.
+// Loading it measured about 8 s, paid once per `--transcribe` call before
+// this existed: on the 43 spoken rushes of one project that was nearly six
+// minutes of loading the same file over and over, against 11 min of actual
+// inference. Decodes each media's audio locally via FFmpeg (mirrors
+// Waveform.cc's decode pipeline), runs local whisper.cpp inference against
+// the PCM samples, and writes each transcript as JSON to its `output_path`
 // (creating parent directories as needed). No network access, no account:
 // `settings.whisper_model_path` must already be a local file.
+//
+// Returns false only when the batch itself could not start -- an empty job
+// list, or a model that will not load. A media that fails on its own is
+// reported in its own outcome, because one unreadable rush is not a reason
+// to throw away the model load the others still need.
+bool GenerateAudioTranscripts(const std::vector<TranscriptionJob>& jobs,
+                              const WhisperSettings& settings,
+                              MediaTaskContext& context,
+                              std::vector<TranscriptionOutcome>& outcomes,
+                              std::string& error);
+
+// The single-media form, in terms of the batch. Kept because most callers
+// have exactly one media and should not have to build a vector for it.
 bool GenerateAudioTranscript(const std::string& inputPath,
                              const std::string& outputPath,
                              const std::string& mediaId,
                              const MediaRate& sourceRate,
                              const WhisperSettings& settings,
                              MediaTaskContext& context, std::string& error);
+
+// QC-2026-09 (A1) -- writing a transcript back is a caller's decision, so
+// the one implementation of the write path is exposed rather than duplicated.
+// Same atomic temp-file-then-rename install GenerateAudioTranscript uses: a
+// cache half-rewritten under a reader would be worse than a stale one.
+bool SaveAudioTranscript(const std::string& path, const Transcript& transcript,
+                         std::string& error);
 
 // Loads a transcript previously written by GenerateAudioTranscript. Rejects
 // genuinely out-of-order input, while deterministically folding legacy

@@ -354,6 +354,9 @@ bool SaveTranscript(const std::filesystem::path& destination,
     output << ",\"whisper_model\":";
     WriteJsonString(output, transcript.whisper_model);
     output << ",\"verbatim\":" << (transcript.verbatim ? "true" : "false");
+    // Written only when set, so a transcript that has never been through the
+    // alignment pass keeps the exact bytes it had before this field existed.
+    if (transcript.speech_aligned) output << ",\"speech_aligned\":true";
     output << ",\"source_rate\":{\"num\":" << transcript.source_rate.num
            << ",\"den\":" << transcript.source_rate.den << "},\"words\":[";
     for (size_t index = 0; index < transcript.words.size(); ++index) {
@@ -531,19 +534,28 @@ RationalTime RoundToSourceFrame(const RationalTime& time,
                         frameRate.num};
 }
 
-bool GenerateAudioTranscript(const std::string& inputPath,
-                             const std::string& outputPath,
-                             const std::string& mediaId,
-                             const MediaRate& sourceRate,
-                             const WhisperSettings& settings,
-                             MediaTaskContext& context, std::string& error) {
+namespace {
+
+// QC-2026-09 A3 -- one media, against a model already in memory. Split out of
+// GenerateAudioTranscript so a batch loads the model once: the load measured
+// about 8 s, which on the 43 spoken rushes of one project was nearly six
+// minutes spent doing the same thing forty-three times. Nothing else about
+// the pass changed when it moved here.
+//
+// Sharing the context across media does not leak one rush's words into the
+// next one's decoding: whisper_full_default_params sets no_context, and
+// whisper.cpp clears prompt_past at the top of every whisper_full call. The
+// verbatim path's per-window prompt seeding below is unaffected for the same
+// reason -- it was always per call, never per context.
+bool TranscribeOneWithModel(whisper_context* ctx, const std::string& inputPath,
+                            const std::string& outputPath,
+                            const std::string& mediaId,
+                            const MediaRate& sourceRate,
+                            const WhisperSettings& settings,
+                            MediaTaskContext& context, std::string& error) {
     error.clear();
     if (sourceRate.num <= 0 || sourceRate.den <= 0) {
         error = "invalid source frame rate";
-        return false;
-    }
-    if (settings.whisper_model_path.empty()) {
-        error = "a local whisper.cpp model path is required";
         return false;
     }
     std::vector<float> samples;
@@ -556,14 +568,6 @@ bool GenerateAudioTranscript(const std::string& inputPath,
         return false;
     }
 
-    whisper_context_params contextParams = whisper_context_default_params();
-    whisper_context* ctx = whisper_init_from_file_with_params(
-        settings.whisper_model_path.c_str(), contextParams);
-    if (!ctx) {
-        error = "unable to load local whisper.cpp model '" +
-                settings.whisper_model_path + "'";
-        return false;
-    }
     context.SetProgress(0.5, "Transcription");
     whisper_full_params params =
         whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
@@ -616,13 +620,11 @@ bool GenerateAudioTranscript(const std::string& inputPath,
         const int result = whisper_full(ctx, params, samples.data(),
                                         static_cast<int>(samples.size()));
         if (result != 0) {
-            whisper_free(ctx);
             error = "local whisper.cpp inference failed with code " +
                     std::to_string(result);
             return false;
         }
         if (context.Cancelled()) {
-            whisper_free(ctx);
             error = "transcription cancelled";
             return false;
         }
@@ -659,7 +661,6 @@ bool GenerateAudioTranscript(const std::string& inputPath,
     transcript.verbatim = settings.verbatim;
     transcript.source_rate = sourceRate;
     transcript.words = std::move(words);
-    whisper_free(ctx);
 
     if (transcript.words.empty()) {
         error = "transcription produced no words";
@@ -669,6 +670,81 @@ bool GenerateAudioTranscript(const std::string& inputPath,
         return false;
     context.SetProgress(1.0, "Transcript prêt");
     return SaveTranscript(outputPath, transcript, error);
+}
+
+}  // namespace
+
+bool GenerateAudioTranscripts(const std::vector<TranscriptionJob>& jobs,
+                              const WhisperSettings& settings,
+                              MediaTaskContext& context,
+                              std::vector<TranscriptionOutcome>& outcomes,
+                              std::string& error) {
+    error.clear();
+    outcomes.clear();
+    if (jobs.empty()) {
+        error = "no media to transcribe";
+        return false;
+    }
+    if (settings.whisper_model_path.empty()) {
+        error = "a local whisper.cpp model path is required";
+        return false;
+    }
+    whisper_context_params contextParams = whisper_context_default_params();
+    whisper_context* ctx = whisper_init_from_file_with_params(
+        settings.whisper_model_path.c_str(), contextParams);
+    if (!ctx) {
+        error = "unable to load local whisper.cpp model '" +
+                settings.whisper_model_path + "'";
+        return false;
+    }
+    // One media's failure is not the batch's: a rush that will not decode
+    // should not cost the model load for the forty that would have. Each
+    // outcome carries its own reason, and the caller decides what to do
+    // with a partial result.
+    for (const TranscriptionJob& job : jobs) {
+        TranscriptionOutcome outcome;
+        outcome.media_id = job.media_id;
+        std::string jobError;
+        outcome.ok = TranscribeOneWithModel(
+            ctx, job.input_path, job.output_path, job.media_id, job.source_rate,
+            settings, context, jobError);
+        outcome.error = outcome.ok ? std::string() : jobError;
+        if (outcome.ok) {
+            Transcript written;
+            std::string readError;
+            if (LoadAudioTranscript(job.output_path, written, readError))
+                outcome.words = written.words.size();
+        }
+        outcomes.push_back(std::move(outcome));
+        if (context.Cancelled()) break;
+    }
+    whisper_free(ctx);
+    return true;
+}
+
+bool GenerateAudioTranscript(const std::string& inputPath,
+                             const std::string& outputPath,
+                             const std::string& mediaId,
+                             const MediaRate& sourceRate,
+                             const WhisperSettings& settings,
+                             MediaTaskContext& context, std::string& error) {
+    std::vector<TranscriptionOutcome> outcomes;
+    if (!GenerateAudioTranscripts(
+            {{mediaId, inputPath, outputPath, sourceRate}}, settings, context,
+            outcomes, error))
+        return false;
+    if (outcomes.empty()) {
+        error = "transcription produced no outcome";
+        return false;
+    }
+    error = outcomes.front().error;
+    return outcomes.front().ok;
+}
+
+bool SaveAudioTranscript(const std::string& path, const Transcript& transcript,
+                         std::string& error) {
+    error.clear();
+    return SaveTranscript(std::filesystem::path(path), transcript, error);
 }
 
 bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
@@ -699,6 +775,8 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
         parsed.whisper_model = reader.String();
         if (reader.Consume(",\"verbatim\":"))
             parsed.verbatim = reader.Boolean();
+        if (reader.Consume(",\"speech_aligned\":"))
+            parsed.speech_aligned = reader.Boolean();
         reader.Expect(",\"source_rate\":{\"num\":");
         const int64_t num = reader.Integer();
         reader.Expect(",\"den\":");

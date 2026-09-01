@@ -129,6 +129,16 @@ bool McpProjectBackend::AnalyzeSourceSpeechOnset(const Ulid& sourceId,
                               message);
 }
 
+bool McpProjectBackend::AlignSourceTranscripts(bool apply,
+                                               std::string& resultJson,
+                                               std::string& message) {
+    std::string output;
+    const int result = AlignTranscriptsCommand(project_path_, apply, output);
+    std::string errorName;
+    return ParseCommandResult(output, result == 0, resultJson, errorName,
+                              message);
+}
+
 bool McpProjectBackend::AnalyzeSourceShotQuality(const Ulid& sourceId,
                                                  std::string& resultJson,
                                                  std::string& message) {
@@ -142,16 +152,18 @@ bool McpProjectBackend::AnalyzeSourceShotQuality(const Ulid& sourceId,
                               message);
 }
 
-bool McpProjectBackend::TranscribeSource(const Ulid& sourceId,
-                                         const std::string& language,
-                                         bool verbatim, std::string& resultJson,
-                                         std::string& message) {
+bool McpProjectBackend::TranscribeSources(const std::vector<Ulid>& sourceIds,
+                                          const std::string& language,
+                                          bool verbatim, bool includeSilent,
+                                          std::string& resultJson,
+                                          std::string& message) {
     // Same command `--transcribe` runs. The empty model path is deliberate:
     // it resolves the locally configured model, which is the only form a
     // caller that is not a human typing a path can use.
     std::string output;
-    const int result = TranscribeMediaCommand(project_path_, sourceId, "",
-                                              language, verbatim, output);
+    const int result =
+        TranscribeMediaCommand(project_path_, sourceIds, "", language, verbatim,
+                               includeSilent, output);
     std::string errorName;
     return ParseCommandResult(output, result == 0, resultJson, errorName,
                               message);

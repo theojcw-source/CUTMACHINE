@@ -139,6 +139,44 @@ int main() {
               already.suggested_trim == RationalTime{0, 25},
           "une entrée déjà sur le mot ne propose aucune coupe : " + error);
 
+    // QC-2026-09 (A1) -- une salle qui ne descend qu'à 18 dB sous la voix.
+    // C'est le cas mesuré sur ADS213_ITW_Findetudefevr26, et celui qui faisait
+    // répondre `tight: true` sur 1,2 s d'air mort : à 13 % (-17,7 dB) le seuil
+    // tombait dans le souffle, dont les fenêtres hautes tenaient assez
+    // longtemps pour passer pour une attaque. À 25 % (-12 dB) il passe au
+    // dessus.
+    SpeechOnsetReport noisyRoom;
+    noisyRoom.media_id = "01K30000000000000000000001";
+    noisyRoom.windows_per_second = 50;
+    noisyRoom.decode_sample_rate = 16000;
+    // Le souffle tient 24000 (-18,4 dB sous la voix) avec, de la fenêtre 10 à
+    // la 19, une respiration à 28000 : dix fenêtres, soit deux fois la tenue
+    // exigée. C'est cette bouffée-là que l'ancien seuil prenait pour un mot.
+    for (int64_t index = 0; index < 60; ++index)
+        noisyRoom.levels.push_back(index >= 10 && index < 20 ? 28000 : 24000);
+    for (int64_t index = 0; index < 200; ++index)
+        noisyRoom.levels.push_back(200000);
+    noisyRoom.speech_level = SpeechLevelPercentile(noisyRoom.levels, 90);
+    noisyRoom.noise_floor = SpeechLevelPercentile(noisyRoom.levels, 5);
+    ClipSpeechOnset noisy;
+    Check(SummarizeClipSpeechOnset(Clip({0, 25}, {200, 25}), noisyRoom, {},
+                                   kPal, noisy, error),
+          "une salle bruyante s'analyse : " + error);
+    Check(noisy.measured && noisy.onset == RationalTime{60, 50},
+          "l'attaque tombe sur la voix, pas sur le haut du souffle");
+    Check(!noisy.tight && noisy.suggested_trim == RationalTime{28, 25},
+          "1,2 s d'air mort ne sont pas annoncés serrés");
+    SpeechOnsetThresholds tooLow;
+    tooLow.speech_ratio_percent = 13;
+    ClipSpeechOnset fooled;
+    Check(SummarizeClipSpeechOnset(Clip({0, 25}, {200, 25}), noisyRoom, tooLow,
+                                   kPal, fooled, error) &&
+              fooled.measured && fooled.onset == RationalTime{10, 50} &&
+              fooled.suggested_trim == RationalTime{3, 25},
+          "l'ancien seuil prenait la respiration pour l'attaque et proposait "
+          "les 3 images relevées à l'audit : " +
+              error);
+
     // --- Refus plutôt qu'invention -----------------------------------------
     ClipSpeechOnset rejected;
     DocumentClip foreign = Clip({0, 25}, {200, 25});

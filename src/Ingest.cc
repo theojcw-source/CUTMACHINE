@@ -2,6 +2,7 @@
 
 #include "Document.h"
 #include "ProjectStorage.h"
+#include "SpeechOnset.h"
 #include "Ulid.h"
 
 extern "C" {
@@ -16,8 +17,14 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -29,7 +36,14 @@ extern "C" {
 #include <system_error>
 #include <vector>
 
+extern char** environ;
+
 namespace {
+
+// 8 kHz mono is enough for a level: the measurement is an energy average,
+// not a spectrum, and a lower rate is a shorter decode. The rate does not
+// change the answer beyond rounding, so it is not recorded anywhere.
+constexpr uint32_t kLevelSampleRate = 8000;
 
 struct IngestError {
     std::string file;
@@ -210,6 +224,88 @@ bool ProbeImpl(const std::filesystem::path& absolutePath, LibraryMedia& media,
     return true;
 }
 
+// Decodes the first audio stream to mono 16-bit PCM on a pipe and folds it
+// into one RMS figure. The same posix_spawnp shape Waveform.cc and
+// SpeechOnset.cc use, without their cancellation plumbing: an ingest is a
+// short synchronous command, not a background task a user can interrupt.
+bool MeasureAudioLevelImpl(const std::filesystem::path& path,
+                           const std::string& ffmpegPath, int64_t& level,
+                           std::string& reason) {
+    level = 0;
+    reason.clear();
+    const std::string rate = std::to_string(kLevelSampleRate);
+    std::vector<std::string> storage = {
+        ffmpegPath, "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-i",       path.string(),  "-map",      "0:a:0", "-vn",
+        "-sn",      "-ac",          "1",         "-ar",   rate,
+        "-f",       "s16le",        "pipe:1",
+    };
+    std::vector<char*> argv;
+    argv.reserve(storage.size() + 1);
+    for (std::string& value : storage) argv.push_back(value.data());
+    argv.push_back(nullptr);
+
+    int audioPipe[2] = {-1, -1};
+    if (pipe(audioPipe) != 0) {
+        reason = "unable to create audio level pipe: " +
+                 std::string(std::strerror(errno));
+        return false;
+    }
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, audioPipe[1], STDOUT_FILENO);
+    // FFmpeg's diagnostics are not this function's business: a media with no
+    // audio stream is an expected outcome, not an error to relay.
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
+                                     O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&actions, audioPipe[0]);
+    posix_spawn_file_actions_addclose(&actions, audioPipe[1]);
+    pid_t process = 0;
+    const int spawnResult =
+        posix_spawnp(&process, storage.front().c_str(), &actions, nullptr,
+                     argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(audioPipe[1]);
+    if (spawnResult != 0) {
+        close(audioPipe[0]);
+        reason = "unable to start FFmpeg: " +
+                 std::string(std::strerror(spawnResult));
+        return false;
+    }
+
+    RunningRmsLevel running;
+    std::vector<char> pending;
+    char buffer[65536];
+    ssize_t got = 0;
+    while ((got = read(audioPipe[0], buffer, sizeof(buffer))) > 0) {
+        pending.insert(pending.end(), buffer, buffer + got);
+        // Whole samples only: a read can split one in half, and interpreting
+        // the halves would make the figure depend on buffer boundaries.
+        const size_t whole =
+            (pending.size() / sizeof(int16_t)) * sizeof(int16_t);
+        if (whole > 0) {
+            running.Add(reinterpret_cast<const int16_t*>(pending.data()),
+                        whole / sizeof(int16_t));
+            pending.erase(pending.begin(),
+                          pending.begin() + static_cast<ptrdiff_t>(whole));
+        }
+    }
+    close(audioPipe[0]);
+    int status = 0;
+    while (waitpid(process, &status, 0) < 0 && errno == EINTR) {
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        reason = "FFmpeg could not decode an audio stream";
+        return false;
+    }
+    if (running.Samples() == 0) {
+        reason = "media decoded no audio samples";
+        return false;
+    }
+    level = running.Level();
+    return true;
+}
+
 bool CollectFiles(const std::filesystem::path& directory, bool recursive,
                   std::vector<std::filesystem::path>& files,
                   std::string& reason) {
@@ -263,6 +359,24 @@ bool CollectFiles(const std::filesystem::path& directory, bool recursive,
     return true;
 }
 
+// Fills in the mean level of an entry that has just been probed. A failure
+// to measure is deliberately not an ingest failure and not even an error
+// entry: the file is perfectly usable without the figure, and
+// `audio_level_measured` already says the level is unknown. Re-ingesting the
+// same path fills it in later, exactly as it does for a v1 entry with no
+// technical metadata at all.
+void MeasureIngestedAudioLevel(const std::filesystem::path& absolute,
+                               LibraryMedia& media) {
+    if (!media.has_audio) return;
+    int64_t level = 0;
+    std::string levelReason;
+    if (!MeasureMediaAudioLevel(absolute.string(), "ffmpeg", level,
+                                levelReason))
+        return;
+    media.audio_level_measured = true;
+    media.audio_level = level;
+}
+
 std::string ResultJson(bool ok, size_t added, size_t skipped,
                        const std::vector<IngestError>& errors) {
     std::ostringstream output;
@@ -284,6 +398,13 @@ bool ProbeMediaMetadata(const std::string& path, LibraryMedia& media,
                         std::string& reason) {
     av_log_set_level(AV_LOG_ERROR);
     return ProbeImpl(std::filesystem::path(path), media, reason);
+}
+
+bool MeasureMediaAudioLevel(const std::string& path,
+                            const std::string& ffmpegPath, int64_t& level,
+                            std::string& reason) {
+    return MeasureAudioLevelImpl(std::filesystem::path(path), ffmpegPath, level,
+                                 reason);
 }
 
 int IngestCommand(const std::string& documentPath,
@@ -351,6 +472,7 @@ int IngestCommand(const std::string& documentPath,
                 enriched.path = existing.path;
                 enriched.filename = absolute.filename().string();
                 if (ProbeMediaMetadata(absolute.string(), enriched, reason)) {
+                    MeasureIngestedAudioLevel(absolute, enriched);
                     existing = std::move(enriched);
                     changed = true;
                 } else {
@@ -378,6 +500,7 @@ int IngestCommand(const std::string& documentPath,
             errors.push_back({media.filename, reason});
             continue;
         }
+        MeasureIngestedAudioLevel(absolute, media);
         document.library.push_back(std::move(media));
         const LibraryMedia& addedMedia = document.library.back();
         if (!document.FindSource(addedMedia.id)) {

@@ -87,11 +87,18 @@ int main() {
     Check(Read(createdPath) == createdBytes,
           "refused project creation preserves the existing package");
     Check(TranscribeMediaCommand(createdPath.string(),
-                                 "01K39999999999999999999999", "missing.bin",
-                                 "fr", true, createdOutput) == 1 &&
+                                 {"01K39999999999999999999999"}, "missing.bin",
+                                 "fr", true, false, createdOutput) == 1 &&
               createdOutput.find("\"error\":\"UnknownMedia\"") !=
                   std::string::npos,
           "headless transcription rejects an unknown media identity");
+    // QC-2026-09 A3 -- a batch is refused whole when one of its members is
+    // not a media of this project: silently transcribing the rest would
+    // leave a caller believing it had all of them.
+    Check(TranscribeMediaCommand(createdPath.string(), {}, "missing.bin", "fr",
+                                 true, false, createdOutput) == 1 &&
+              createdOutput.find("at least one media_id") != std::string::npos,
+          "headless transcription refuses an empty batch with a reason");
     Check(Read(createdPath) == createdBytes,
           "refused transcription leaves the project byte-identical");
 

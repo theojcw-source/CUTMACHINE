@@ -176,6 +176,21 @@ int main() {
         Check(media.has_audio && media.audio_rate == 48000 &&
                   media.audio_channels == 1,
               "audio header metadata is extracted");
+        // QC-2026-09 A3 -- FFmpeg's own volumedetect reads this fixture's
+        // AAC audio at -21.1 dBFS, which is 88000 on the kAudioLevelScale
+        // grid. The band below is that figure with room for the mono downmix
+        // and for a different encoder build, and is still far from anything
+        // else the measurement could mean. What the ingest has to get right
+        // is the order of magnitude, because that is what decides whether
+        // Whisper runs.
+        Check(media.audio_level_measured,
+              "ingest measures the mean audio level as a document fact");
+        Check(media.audio_level > 50000 && media.audio_level < 150000,
+              "the measured level lands where FFmpeg's own reading of the "
+              "same audio does: " +
+                  std::to_string(media.audio_level));
+        Check(media.audio_level >= kSilentMediaAudioLevel,
+              "and is not mistaken for a mute cutaway");
         const DocumentSource* source = ingested.FindSource(media.id);
         Check(source && source->rate.num == media.rate.num &&
                   source->rate.den == media.rate.den &&
@@ -195,6 +210,38 @@ int main() {
         std::string editMessage;
         Check(ApplyOperation(ingested, insert, inverse, editError, editMessage),
               "an ingested media can be inserted directly: " + editMessage);
+    }
+
+    // QC-2026-09 A3 -- the case the ticket is about: a mute cutaway. 29 of one
+    // project's 71 rushes were this, and each went to Whisper at eleven times
+    // its own runtime before anyone noticed.
+    {
+        const std::filesystem::path silentPath = root / "silent.mp4";
+        const std::string generateSilent =
+            Quote(FFMPEG_EXECUTABLE) +
+            " -hide_banner -loglevel error "
+            "-f lavfi -i 'color=c=black:s=64x32:r=25:d=1' "
+            "-f lavfi -i 'anullsrc=sample_rate=48000:channel_layout=mono' "
+            "-c:v mpeg4 -c:a aac -shortest " +
+            Quote(silentPath);
+        Check(std::system(generateSilent.c_str()) == 0,
+              "FFmpeg must generate the mute fixture");
+        int64_t level = -1;
+        std::string levelReason;
+        Check(MeasureMediaAudioLevel(silentPath.string(), FFMPEG_EXECUTABLE,
+                                     level, levelReason),
+              "a mute media still measures: " + levelReason);
+        Check(level < kSilentMediaAudioLevel,
+              "digital silence falls under the threshold that skips Whisper: " +
+                  std::to_string(level));
+
+        // A media with no audio stream at all is a refusal with a reason, not
+        // a zero a caller would read as "measured, and silent".
+        int64_t missing = -1;
+        Check(!MeasureMediaAudioLevel(variableRatePath.string(),
+                                      FFMPEG_EXECUTABLE, missing, levelReason),
+              "a media without an audio stream reports that it cannot be "
+              "measured");
     }
 
     const std::string beforeSecondIngest = Read(documentPath);

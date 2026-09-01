@@ -538,6 +538,28 @@ bool ResolveIntervalSplits(const Document& document, const Ulid& clipId,
                            SplitClipAtPositionsOperation& operation,
                            std::string& error);
 
+// Other clips sharing `clip`'s A/V link group *and* genuinely covering the
+// same cut. A word-level cut that touched only the clip it was aimed at
+// would shorten the sound and leave the picture, so a detached A/V pair has
+// to be cut together -- and working out which clips those are is a
+// document-shape question the caller should not have to answer
+// (PHILOSOPHY.md principle 7).
+//
+// The containment test is what keeps this an intent-layer decision rather
+// than a guess. A link group can hold a member that reads from another
+// source, or from another part of the same one; cutting it by these ranges
+// would be meaningless, so it is left alone here. RemoveWordsOperation stays
+// strict about whatever it is finally told: naming such a clip explicitly is
+// still an error, it just is not one this resolver produces.
+//
+// QC-2026-09 (A2) -- lives here rather than in McpTools.cc, where it was
+// written for Q4b, because pause tightening needs the same answer from both
+// the CLI and the MCP surface. A rule about which clips a cut has to carry
+// is engine knowledge; two copies of it would be two chances to drift.
+std::vector<Ulid> LinkedClipIdsCoveringRanges(
+    const Document& document, const DocumentClip& clip,
+    const std::vector<WordRemovalRange>& ranges);
+
 struct ExactProjectState {
     std::string canonical_json;
 };

@@ -7,10 +7,12 @@
 #include "InterviewShort.h"
 #include "Json.h"
 #include "Operations.h"
+#include "PauseTightening.h"
 #include "Project.h"
 #include "ProjectStorage.h"
 #include "SequenceFormat.h"
 #include "ShotQuality.h"
+#include "SourceAddress.h"
 #include "SpeechOnset.h"
 #include "Subtitles.h"
 #include "Timeline.h"
@@ -861,88 +863,168 @@ int CreateProjectCommand(const std::string& packagePath,
 }
 
 int TranscribeMediaCommand(const std::string& projectPath,
-                           const std::string& mediaId,
+                           const std::vector<std::string>& mediaIds,
                            const std::string& whisperModelPath,
                            const std::string& language, bool verbatim,
-                           std::string& output) {
+                           bool includeSilent, std::string& output) {
     Project project;
     std::string error;
     if (!LoadStoredProject(projectPath, project, error)) {
         output = ErrorJson(EditError::ParseError, error);
         return 1;
     }
-    const auto media = std::find_if(
-        project.rushes.begin(), project.rushes.end(),
-        [&](const LibraryMedia& item) { return item.id == mediaId; });
-    const auto source = std::find_if(
-        project.sources.begin(), project.sources.end(),
-        [&](const DocumentSource& item) { return item.id == mediaId; });
-    if (media == project.rushes.end() || source == project.sources.end()) {
-        output = ErrorJson(EditError::UnknownMedia,
-                           "unknown media_id '" + mediaId + "'");
+    if (mediaIds.empty()) {
+        output = ErrorJson(EditError::InvalidOperation,
+                           "at least one media_id is required");
         return 1;
     }
-    if (!media->has_audio) {
-        output =
-            ErrorJson(EditError::InvalidOperation, "media has no audio stream");
-        return 1;
-    }
-    // An empty path means "use the configured model" -- the only form the
-    // agent can use, since it has no way to know where a human keeps a ggml
-    // file. An explicit path still wins, so the CLI stays scriptable.
-    std::string modelPath = whisperModelPath;
-    if (modelPath.empty() && !ResolveConfiguredWhisperModel(modelPath, error)) {
-        output = ErrorJson(EditError::IoError, error);
-        return 1;
-    }
-    if (!std::filesystem::is_regular_file(modelPath)) {
-        output = ErrorJson(
-            EditError::IoError,
-            "Whisper model is not a regular file: '" + modelPath + "'");
-        return 1;
-    }
-
     const std::filesystem::path base =
         std::filesystem::absolute(projectPath).parent_path();
-    std::filesystem::path input(media->path);
-    if (input.is_relative()) input = base / input;
-    input = input.lexically_normal();
-    const std::filesystem::path transcriptPath =
-        base / ".cutmachine" / "transcripts" / (mediaId + ".json");
-    WhisperSettings settings;
-    settings.whisper_model_path = modelPath;
-    settings.language = language.empty() ? "auto" : language;
-    settings.verbatim = verbatim;
-    MediaTaskManager tasks(1);
-    const Ulid taskId = tasks.Enqueue(
-        MediaTaskKind::Transcription, "Whisper " + media->filename,
-        [input, transcriptPath, mediaId, rate = source->rate, settings](
-            MediaTaskContext& context, std::string& taskError) {
-            return GenerateAudioTranscript(input.string(),
-                                           transcriptPath.string(), mediaId,
-                                           rate, settings, context, taskError);
-        });
-    if (!tasks.WaitForIdle(24 * 60 * 60 * 1000)) {
-        tasks.Cancel(taskId);
-        output = ErrorJson(EditError::IoError, "transcription timed out");
-        return 1;
+    struct Skipped {
+        std::string media_id;
+        std::string reason;
+    };
+    std::vector<TranscriptionJob> jobs;
+    std::vector<Skipped> skipped;
+    for (const std::string& mediaId : mediaIds) {
+        const auto media = std::find_if(
+            project.rushes.begin(), project.rushes.end(),
+            [&](const LibraryMedia& item) { return item.id == mediaId; });
+        const auto source = std::find_if(
+            project.sources.begin(), project.sources.end(),
+            [&](const DocumentSource& item) { return item.id == mediaId; });
+        if (media == project.rushes.end() || source == project.sources.end()) {
+            output = ErrorJson(EditError::UnknownMedia,
+                               "unknown media_id '" + mediaId + "'");
+            return 1;
+        }
+        if (!media->has_audio) {
+            output = ErrorJson(EditError::InvalidOperation,
+                               "media '" + mediaId + "' has no audio stream");
+            return 1;
+        }
+        // QC-2026-09 A3 -- a mute cutaway costs eleven times its own runtime
+        // to produce nothing. 29 of one project's 71 rushes were exactly
+        // that, at -74 dBFS. Skipping them is not a guess: the level was
+        // measured at ingest and is a document fact. `includeSilent` exists
+        // because a threshold is still a threshold, and a caller who
+        // disagrees must be able to say so.
+        if (!includeSilent && media->audio_level_measured &&
+            media->audio_level < kSilentMediaAudioLevel) {
+            skipped.push_back(
+                {mediaId, "measured audio level " +
+                              std::to_string(media->audio_level) +
+                              " is below the silence threshold "
+                              "(" +
+                              std::to_string(kSilentMediaAudioLevel) + ")"});
+            continue;
+        }
+        std::filesystem::path input(media->path);
+        if (input.is_relative()) input = base / input;
+        input = input.lexically_normal();
+        jobs.push_back(
+            {mediaId, input.string(),
+             (base / ".cutmachine" / "transcripts" / (mediaId + ".json"))
+                 .string(),
+             source->rate});
     }
-    const std::vector<MediaTaskSnapshot> snapshots = tasks.Snapshot();
-    const auto snapshot = std::find_if(
-        snapshots.begin(), snapshots.end(),
-        [&](const MediaTaskSnapshot& item) { return item.id == taskId; });
-    if (snapshot == snapshots.end() ||
-        snapshot->state != MediaTaskState::Succeeded) {
-        const std::string detail = snapshot == snapshots.end()
-                                       ? "transcription task disappeared"
-                                       : snapshot->error;
-        output = ErrorJson(EditError::IoError, detail);
-        return 1;
+
+    // The model is resolved only once there is something to run it on: a
+    // batch that turned out to be all mute cutaways needs no model, and
+    // failing it for a missing one would be a wrong answer. Resolved after
+    // the media loop for the same reason it used to come after the single
+    // media lookup -- "you named a media that is not in this project" is a
+    // more useful first answer than "the ggml file is missing".
+    std::string modelPath = whisperModelPath;
+    if (!jobs.empty()) {
+        // An empty path means "use the configured model" -- the only form the
+        // agent can use, since it has no way to know where a human keeps a
+        // ggml file. An explicit path still wins, so the CLI stays scriptable.
+        if (modelPath.empty() &&
+            !ResolveConfiguredWhisperModel(modelPath, error)) {
+            output = ErrorJson(EditError::IoError, error);
+            return 1;
+        }
+        if (!std::filesystem::is_regular_file(modelPath)) {
+            output = ErrorJson(
+                EditError::IoError,
+                "Whisper model is not a regular file: '" + modelPath + "'");
+            return 1;
+        }
     }
-    output = "{\"ok\":true,\"media_id\":\"" + EscapeJson(mediaId) +
-             "\",\"path\":\"" + EscapeJson(transcriptPath.string()) +
-             "\",\"verbatim\":" + (verbatim ? "true" : "false") + "}\n";
-    return 0;
+
+    std::vector<TranscriptionOutcome> outcomes;
+    if (!jobs.empty()) {
+        WhisperSettings settings;
+        settings.whisper_model_path = modelPath;
+        settings.language = language.empty() ? "auto" : language;
+        settings.verbatim = verbatim;
+        MediaTaskManager tasks(1);
+        std::string batchError;
+        const Ulid taskId = tasks.Enqueue(
+            MediaTaskKind::Transcription,
+            "Whisper " + std::to_string(jobs.size()) + " media",
+            [&jobs, &outcomes, &batchError, settings](MediaTaskContext& context,
+                                                      std::string& taskError) {
+                const bool started = GenerateAudioTranscripts(
+                    jobs, settings, context, outcomes, batchError);
+                if (!started) taskError = batchError;
+                return started;
+            });
+        if (!tasks.WaitForIdle(24 * 60 * 60 * 1000)) {
+            tasks.Cancel(taskId);
+            output = ErrorJson(EditError::IoError, "transcription timed out");
+            return 1;
+        }
+        const std::vector<MediaTaskSnapshot> snapshots = tasks.Snapshot();
+        const auto snapshot = std::find_if(
+            snapshots.begin(), snapshots.end(),
+            [&](const MediaTaskSnapshot& item) { return item.id == taskId; });
+        if (snapshot == snapshots.end() ||
+            snapshot->state != MediaTaskState::Succeeded) {
+            const std::string detail = snapshot == snapshots.end()
+                                           ? "transcription task disappeared"
+                                           : snapshot->error;
+            output = ErrorJson(EditError::IoError, detail);
+            return 1;
+        }
+    }
+
+    size_t succeeded = 0;
+    std::ostringstream json;
+    json << "{\"ok\":true,\"verbatim\":" << (verbatim ? "true" : "false")
+         << ",\"results\":[";
+    bool first = true;
+    for (const TranscriptionOutcome& outcome : outcomes) {
+        if (!first) json << ',';
+        first = false;
+        if (outcome.ok) ++succeeded;
+        json << "{\"media_id\":\"" << EscapeJson(outcome.media_id)
+             << "\",\"ok\":" << (outcome.ok ? "true" : "false")
+             << ",\"words\":" << outcome.words;
+        if (!outcome.ok)
+            json << ",\"error\":\"" << EscapeJson(outcome.error) << "\"";
+        else
+            json << ",\"path\":\""
+                 << EscapeJson((base / ".cutmachine" / "transcripts" /
+                                (outcome.media_id + ".json"))
+                                   .string())
+                 << "\"";
+        json << "}";
+    }
+    json << "],\"skipped\":[";
+    for (size_t index = 0; index < skipped.size(); ++index) {
+        if (index) json << ',';
+        json << "{\"media_id\":\"" << EscapeJson(skipped[index].media_id)
+             << "\",\"reason\":\"" << EscapeJson(skipped[index].reason)
+             << "\"}";
+    }
+    json << "],\"transcribed\":" << succeeded
+         << ",\"skipped_count\":" << skipped.size() << "}\n";
+    output = json.str();
+    // A batch in which every named media failed is a failed command: a caller
+    // that only checks the exit status must not read it as done.
+    return (!outcomes.empty() && succeeded == 0) ? 1 : 0;
 }
 
 int AnalyzeShotQualityCommand(const std::string& projectPath,
@@ -1043,7 +1125,7 @@ int ShotQualityReportCommand(const std::string& projectPath,
     return 0;
 }
 
-int AlignTranscriptsCommand(const std::string& projectPath,
+int AlignTranscriptsCommand(const std::string& projectPath, bool apply,
                             std::string& output) {
     Project project;
     std::string error;
@@ -1054,7 +1136,8 @@ int AlignTranscriptsCommand(const std::string& projectPath,
     const std::filesystem::path base =
         std::filesystem::absolute(projectPath).parent_path();
     std::ostringstream out;
-    out << "{\"ok\":true,\"sources\":[";
+    out << "{\"ok\":true,\"applied\":" << (apply ? "true" : "false")
+        << ",\"sources\":[";
     bool first = true;
     for (const LibraryMedia& media : project.rushes) {
         Transcript transcript;
@@ -1074,11 +1157,28 @@ int AlignTranscriptsCommand(const std::string& projectPath,
                                      TranscriptAlignmentSettings{}, aligned,
                                      report, message))
             continue;
+        // QC-2026-09 (A1) -- the write is what removes the probing loop. A
+        // report alone leaves every downstream reader (remove_words,
+        // clean_disfluencies, the interview short) still cutting on the
+        // boundaries the signal contradicts, so the correction has to reach
+        // the cache the rest of the toolchain actually reads. It stays
+        // opt-in, and a failed write is reported per source rather than
+        // aborting the pass: the remaining sources are still worth aligning.
+        std::string writeError;
+        bool written = false;
+        if (apply) {
+            aligned.speech_aligned = true;
+            written = SaveAudioTranscript(transcriptPath.string(), aligned,
+                                          writeError);
+        }
         if (!first) out << ',';
         first = false;
         out << "{\"media_id\":\"" << EscapeJson(media.id)
             << "\",\"filename\":\"" << EscapeJson(media.filename)
-            << "\",\"report\":" << SerializeTranscriptAlignmentReport(report)
+            << "\",\"written\":" << (written ? "true" : "false");
+        if (apply && !written)
+            out << ",\"write_error\":\"" << EscapeJson(writeError) << "\"";
+        out << ",\"report\":" << SerializeTranscriptAlignmentReport(report)
             << "}";
     }
     out << "]}\n";
@@ -1316,6 +1416,107 @@ int RemoveWordsCommand(const std::string& projectPath,
     // round-trip guarantee as any other edit.
     return ApplyOperationCommand(projectPath, SerializeOperation(operation),
                                  output);
+}
+
+int TightenPausesCommand(const std::string& projectPath,
+                         const std::string& clipId, int64_t minimumGapMs,
+                         int64_t keepFrames, std::string& output) {
+    Project project;
+    std::string message;
+    if (!LoadStoredProject(projectPath, project, message)) {
+        output = ErrorJson(EditError::ParseError, message);
+        return 1;
+    }
+    const Document document = project.MakeActiveDocument();
+    const DocumentClip* clip = document.FindClip(clipId);
+    if (clip == nullptr) {
+        output =
+            ErrorJson(EditError::UnknownClip, "unknown clip_id '" + clipId +
+                                                  "' on the active timeline");
+        return 1;
+    }
+    const DocumentSource* source = document.FindSource(clip->source_id);
+    if (source == nullptr) {
+        output =
+            ErrorJson(EditError::UnknownSource, "clip '" + clipId +
+                                                    "' reads from an unmounted "
+                                                    "source");
+        return 1;
+    }
+    const std::filesystem::path envelopePath =
+        std::filesystem::absolute(projectPath).parent_path() / ".cutmachine" /
+        "speechonset" / (clip->source_id + ".json");
+    SpeechOnsetReport envelope;
+    if (!LoadSpeechOnset(envelopePath.string(), envelope, message)) {
+        output = ErrorJson(EditError::IoError,
+                           "no speech envelope for source '" + clip->source_id +
+                               "': " + message +
+                               " (run --speech-onset on it first)");
+        return 1;
+    }
+
+    PauseTighteningSettings settings;
+    settings.minimum_gap_milliseconds = minimumGapMs;
+    settings.keep_frames = keepFrames;
+    RemoveWordsOperation operation;
+    PauseTighteningReport report;
+    if (!ResolvePauseTightening(*clip, envelope, settings, source->rate, {},
+                                operation, report, message)) {
+        output = ErrorJson(EditError::InvalidOperation, message);
+        return 1;
+    }
+    if (operation.ranges.empty()) {
+        // Nothing to close is a success: "tighten this clip" on an already
+        // tight clip has been honoured. Applying an empty RemoveWords would
+        // only be refused by the engine.
+        output = "{\"ok\":true,\"clip_id\":\"" + EscapeJson(clip->id) +
+                 "\",\"applied\":false,\"report\":" +
+                 SerializePauseTighteningReport(report) + "}\n";
+        return 0;
+    }
+    operation.linked_clip_ids =
+        LinkedClipIdsCoveringRanges(document, *clip, operation.ranges);
+    // Same hand-off RemoveWordsCommand makes: the serialized operation goes
+    // through ApplyOperationCommand, so this lands on the one reversible
+    // path with the same edit log and the same undo as any other edit.
+    const int result = ApplyOperationCommand(
+        projectPath, SerializeOperation(operation), output);
+    if (result != 0) return result;
+    // The apply result is the document-facing half; the report is what says
+    // which pauses were closed and what was deliberately left standing. Both
+    // are carried back, so one call answers "what changed" and "why" --
+    // parsed and re-emitted rather than spliced, so a change to the shape of
+    // either payload cannot silently produce invalid JSON.
+    mcp_json::Value applied;
+    mcp_json::Value reportView;
+    std::string parseError;
+    if (mcp_json::Value::Parse(output, applied, parseError) &&
+        applied.IsObject() &&
+        mcp_json::Value::Parse(SerializePauseTighteningReport(report),
+                               reportView, parseError)) {
+        applied.Set("report", std::move(reportView));
+        output = applied.Dump() + "\n";
+    }
+    return 0;
+}
+
+int LocateSourceFrameCommand(const std::string& projectPath,
+                             const std::string& mediaId, int64_t sourceFrame,
+                             std::string& output) {
+    Project project;
+    std::string message;
+    if (!LoadStoredProject(projectPath, project, message)) {
+        output = ErrorJson(EditError::ParseError, message);
+        return 1;
+    }
+    const Document document = project.MakeActiveDocument();
+    std::vector<SourceFrameMatch> matches;
+    if (!ResolveSourceFrame(document, mediaId, sourceFrame, matches, message)) {
+        output = ErrorJson(EditError::UnknownMedia, message);
+        return 1;
+    }
+    output = DescribeSourceFrameMatches(mediaId, sourceFrame, matches) + "\n";
+    return 0;
 }
 
 int DescribeCommand(const std::string& documentPath, std::string& output) {

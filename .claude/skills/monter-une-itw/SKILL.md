@@ -146,8 +146,23 @@ La mesure est dans le moteur, ne la refais pas à la main :
 
 ```sh
 ./build/cutmachine --speech-onset "$PROJET" "<media-id>"   # une fois par source
+./build/cutmachine --align-transcripts "$PROJET" --write   # recale les mots
 ./build/cutmachine --speech-onset-report "$PROJET"
 ```
+
+**`--align-transcripts --write` d'abord, avant toute décision de coupe.**
+(MCP : `align_transcript` avec `apply: true`.) Il compare chaque frontière de
+mot à l'enveloppe et corrige celles qui tombent dans le silence, dans le cache
+que lisent `remove_words`, `clean_disfluencies` et le montage d'interview.
+Lis le rapport : `moved_count` dit ce qui a bougé, et un `refused_no_edge`
+élevé veut dire que le transcript annonce des mots là où l'enveloppe n'entend
+rien — regarde plutôt que de faire confiance à l'un ou à l'autre.
+
+Ce qu'il ne fait **pas**, dit franchement : un mot mal placé au milieu d'un
+flux de parole continu a ses deux frontières dans la parole, et rien dans
+l'enveloppe ne dit qu'il est faux. Seules les erreurs bordées de silence sont
+corrigibles — ce sont les nuisibles, d'où l'intérêt, mais ce n'est pas de
+l'alignement forcé. Le contrôle sur le son **monté** (passe 3) reste dû.
 
 ou, en MCP, `analyze_speech_onset` puis `list_speech_onsets`. Le rapport
 publie `lead_in` et **`suggested_trim` en images entières, amorce déduite** :
@@ -163,10 +178,12 @@ souffle est 20 dB sous la parole ; un mot dit doucement, non.
 est fini » est annoncée à 10,52 s et se trouve à 11,64 s. Deux conséquences
 directes :
 
-- **`remove_words` coupe à côté sur ces rushes.** Il résout les images depuis
-  ces horodatages (`ResolveWordRemoval`), donc il enlève les mauvaises. Pour
-  une compression interne, mesure les images dans le signal, puis
-  `split_linked_clips` suivi d'un `ripple_trim` sur la partie droite.
+- **`remove_words` coupait à côté sur ces rushes.** Il résout les images
+  depuis ces horodatages (`ResolveWordRemoval`), donc il enlevait les
+  mauvaises. `--align-transcripts --write` traite la classe bordée de silence,
+  qui est celle qui fait mal ; passe-le avant toute coupe par mot. Pour une
+  compression interne, `tighten_pauses` fait le travail sans lire un mot du
+  tout, ce qui est plus sûr que n'importe quel horodatage.
 - **Ré-transcrire un extrait ne suffit pas.** Whisper étale encore le premier
   mot sur le début du fichier : un extrait qui démarre ~0,2 s avant la parole
   se lit, un extrait qui démarre dans le silence, non. Le seul étalon fiable
@@ -211,7 +228,13 @@ Ne passe **jamais** `--overwrite` sur un nom de livrable existant.
 1. **État des lieux.** `--describe` : format de séquence, pistes, chutiers,
    durée. Repère la timeline de dérushage et celle de montage.
 2. **Transcriptions en verbatim** (`"verbatim": true`), sinon
-   `--transcribe … --verbatim`.
+   `--transcribe … --verbatim`. Nomme **tous** les rushes en une fois
+   (media-id séparés par des virgules, ou `media_ids` en MCP) : le modèle n'est
+   chargé qu'une seule fois, ~8 s économisés par rush. Les rushes muets sont
+   sautés et signalés, à condition qu'ils aient été ingérés par une version qui
+   mesure le niveau — sinon, refais un `--ingest` dessus.
+   Puis `--align-transcripts "$PROJET" --write` (piège 2) avant toute
+   sélection.
 3. **Sélection.** Timeline de dérushage active, `get_timeline_transcript`,
    puis `create_interview_short` en nommant les `span_id` dans l'ordre
    éditorial. **Ne retape jamais un timecode.**
@@ -235,6 +258,21 @@ Resserre en deux temps, dans cet ordre.
 entre phrases et l'air mort en tête de plan se mesurent dans le signal
 (`--speech-onset-report`) et se coupent sans lire un mot. C'est mécanique,
 c'est sûr, et ça se fait avant tout jugement éditorial.
+
+Le geste est outillé, ne le refais pas plan par plan à la main :
+
+```sh
+./build/cutmachine --tighten-pauses "$PROJET" "<clip-id>" 400 6
+```
+
+(MCP : `tighten_pauses`, arguments `min_gap_ms` et `keep_frames`.) Il cherche
+les creux internes d'au moins `min_gap`, ramène chacun à `keep` images, referme
+en ripple, et emporte la paire A/V liée — une seule opération, un seul `undo`.
+Le rapport dit ce qu'il a refermé et ce qu'il a laissé. L'**air de tête et de
+queue n'est pas touché** : ça, c'est un `ripple_trim` piloté par
+`suggested_trim`, et le rapport le publie (`head_air`, `tail_air`) plutôt que
+de le couper en douce. Mesuré : deux appels équivalents ont retiré 6,6 s de
+silences internes sur un seul montage.
 
 **Ensuite la redondance, sur le texte.** Une fois le silence retiré, ce qui
 reste est de la parole, et les choix deviennent éditoriaux.
@@ -272,6 +310,16 @@ Aucune phrase n'a été supprimée en entier : elles ont toutes été resserrée
 de l'intérieur. La compression se fait au mot, avec `remove_words`, ou par
 `split_clip` puis suppression — exactement l'outillage du nettoyage des
 fillers, appliqué à la redondance.
+
+**Ne calcule jamais une position timeline à la main.** Une décision se prend
+dans le rush (« couper juste après le nom »), et la conversion vers la
+timeline est ce qu'on rate. `split_clip`, `trim_clip` et `ripple_trim`
+acceptent `source_frame` **à la place** de `timeline_position` ou de `delta` :
+donne le numéro d'image du rush, le moteur résout la position. Sur un rognage,
+`Head` veut dire « le plan démarre sur cette image » et `Tail` « c'est la
+dernière image jouée » — borne inclusive. Et `locate_source_frame` répond « où
+joue l'image N » quand tu as besoin de le savoir plutôt que de couper : il
+rend **toutes** les correspondances, image et son détaché compris.
 
 **Ne t'arrête pas aux « euh » évidents.** C'est l'erreur du premier montage :
 les fillers ont été nettoyés, et rien d'autre. Quatre familles se coupent, et
@@ -382,7 +430,10 @@ pour 70 secondes**, chacun ne trouvant qu'un ou deux défauts.
        -i "$RUSHES/<rush>.MP4" -ac 1 -ar 16000 -y "p_<n>.wav"
    ffmpeg -nostdin -v error -f concat -safe 0 -i plans.txt -c copy -y son.wav
    ```
-   puis `--ingest` + `--transcribe` sur ce fichier. Tu cherches un mot avalé en
+   puis `--ingest` + `--transcribe` sur ce fichier. **C'est un contrôle, pas
+   une boucle de sondage** : depuis `--align-transcripts --write`, les bornes
+   ne se vérifient plus une par une en extrayant des fragments. Fais-le une
+   fois, sur le son monté entier. Tu cherches un mot avalé en
    tête ou en queue de plan — sur ADS260 : « Je m'appelle » disparu, « Le
    moment » amputé, un plan qui finissait sur un « où ça met » qui pendait —
    pas la qualité de l'image. Corrige les bordures, refais le son, relis.

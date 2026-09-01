@@ -688,11 +688,11 @@ int main() {
 
     Test("document schema version 4 migrates clips to opaque", [] {
         std::string json = ValidDocument().SaveToString();
-        const std::string version5 = "\"version\": 5";
-        const size_t versionPosition = json.find(version5);
+        const std::string current = "\"version\": 6";
+        const size_t versionPosition = json.find(current);
         Check(versionPosition != std::string::npos,
               "canonical fixture contains its schema version");
-        json.replace(versionPosition, version5.size(), "\"version\": 4");
+        json.replace(versionPosition, current.size(), "\"version\": 4");
         const std::string opacity = ",\"opacity\":{\"num\":1,\"den\":1}";
         size_t opacityPosition = 0;
         while ((opacityPosition = json.find(opacity, opacityPosition)) !=
@@ -703,7 +703,7 @@ int main() {
         std::string error;
         Check(Document::LoadFromString(json, document, error),
               "version 4 loads through the opacity migration: " + error);
-        Check(document.version == 5,
+        Check(document.version == 6,
               "the migrated document uses the current schema version");
         bool allOpaque = true;
         for (const DocumentTrack& track : document.sequence.tracks) {
@@ -714,9 +714,67 @@ int main() {
         }
         Check(allOpaque, "every migrated clip defaults to exact full opacity");
         Check(
-            document.SaveToString().find("\"version\": 5") != std::string::npos,
-            "saving a migrated document emits canonical version 5");
+            document.SaveToString().find("\"version\": 6") != std::string::npos,
+            "saving a migrated document emits canonical version 6");
     });
+
+    // QC-2026-09 A3 -- the measured audio level is a document fact, so it has
+    // to survive the canonical round trip, and a v5 library entry that never
+    // saw it has to load as unmeasured rather than as digital silence. Those
+    // are the same zero and not the same statement.
+    Test("a measured audio level round-trips, and its absence stays unknown",
+         [] {
+             Document document = ValidDocument();
+             LibraryMedia media;
+             media.id = document.sources[0].id;
+             media.path = document.sources[0].path;
+             media.filename = "A.MP4";
+             media.codec = "h264";
+             media.width = 1920;
+             media.height = 1080;
+             media.pixel_format = "yuv420p";
+             media.orientation = "landscape";
+             media.rate = document.sources[0].rate;
+             media.duration = document.sources[0].duration;
+             media.has_audio = true;
+             media.audio_rate = 48000;
+             media.audio_channels = 2;
+             media.audio_level_measured = true;
+             media.audio_level = 200;  // -74 dBFS: a mute cutaway.
+             document.library = {media};
+
+             std::string error;
+             Check(document.Validate(error),
+                   "a measured level validates: " + error);
+             const std::string json = document.SaveToString();
+             Check(json.find("\"audio_level\":200") != std::string::npos,
+                   "the level reaches the canonical bytes");
+             Document reloaded;
+             Check(Document::LoadFromString(json, reloaded, error) &&
+                       reloaded.library.size() == 1 &&
+                       reloaded.library[0].audio_level_measured &&
+                       reloaded.library[0].audio_level == 200,
+                   "and reads back unchanged: " + error);
+             Check(reloaded.SaveToString() == json,
+                   "a second save is byte-identical");
+
+             document.library[0].audio_level_measured = false;
+             document.library[0].audio_level = 0;
+             const std::string silent = document.SaveToString();
+             Check(silent.find("audio_level") == std::string::npos,
+                   "an unmeasured entry keeps the bytes it had before the "
+                   "field existed");
+             Document legacy;
+             Check(Document::LoadFromString(silent, legacy, error) &&
+                       !legacy.library[0].audio_level_measured,
+                   "and loads back as unknown, not as silence: " + error);
+
+             document.library[0].audio_level_measured = true;
+             document.library[0].audio_level = kAudioLevelScale + 1;
+             Check(!document.Validate(error) &&
+                       error.find("audio level") != std::string::npos,
+                   "a level above full scale is refused rather than stored");
+         });
 
     Test("track lock state persists", [] {
         Document document = ValidDocument();
