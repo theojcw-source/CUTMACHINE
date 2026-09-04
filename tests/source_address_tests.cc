@@ -26,6 +26,7 @@ void Check(bool condition, const std::string& message) {
 
 const char kRush[] = "01K30000000000000000000001";
 const char kNtsc[] = "01K30000000000000000000002";
+const char kNonAligned[] = "01K30000000000000000000003";
 
 // Une image et son son détaché, tous deux pris à l'image 100 du rush et posés
 // à 50 images de timeline. Plus un second rush en 24000/1001, parce qu'un
@@ -185,6 +186,49 @@ int main() {
         Check(oneFrameClip != nullptr &&
                   oneFrameClip->duration == RationalTime{1, 25},
               "ce rognage laisse exactement une image");
+
+        Document nonAlignedSource;
+        nonAlignedSource.sources = {
+            {kNonAligned, "non-aligned.MP4", {24000, 1001},
+             {2000 * 1001 + 500, 24000}},
+        };
+        nonAlignedSource.sequence.tracks = {
+            {"01K30000000000000000000030",
+             "video",
+             0,
+             {{"01K30000000000000000000031",
+               kNonAligned,
+               {0, 24000},
+               {2000 * 1001 + 500, 24000},
+               {0, 25}}}},
+        };
+        Check(ResolveClipSourceFrameTrim(
+                  nonAlignedSource, "01K30000000000000000000031", 2000,
+                  TrimEdge::Tail, delta, error),
+              "la dernière image d'une source non alignée est admise : " +
+                  error);
+        Check(!ResolveClipSourceFrameTrim(
+                  nonAlignedSource, "01K30000000000000000000031", 2001,
+                  TrimEdge::Tail, delta, error),
+              "une image après la fin d'une source non alignée est refusée");
+
+        Document nonAlignedClip;
+        nonAlignedClip.sources = {
+            {kNonAligned, "non-aligned-clip.MP4", {25, 1}, {1000, 25}},
+        };
+        nonAlignedClip.sequence.tracks = {
+            {"01K30000000000000000000032",
+             "video",
+             0,
+             {{"01K30000000000000000000033", kNonAligned, {41, 2},
+               {10, 25}, {0, 25}}}},
+        };
+        Check(ResolveClipSourceFrameTrim(
+                  nonAlignedClip, "01K30000000000000000000033", 512,
+                  TrimEdge::Tail, delta, error) &&
+                  delta == RationalTime{-19, 50},
+              "la frame contenante de l'entrée non alignée est admise : " +
+                  error);
         // 175 est la première image après le plan : y entrer ne laisserait
         // rien. 174, la dernière qu'il joue, en laisse une et reste licite.
         Check(ResolveClipSourceFrameTrim(document, "01K30000000000000000000010",

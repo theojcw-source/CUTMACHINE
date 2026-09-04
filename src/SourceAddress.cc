@@ -39,10 +39,6 @@ bool SourceFrameTime(const MediaRate& rate, int64_t frame, RationalTime& time,
     return true;
 }
 
-int64_t FrameCount(const DocumentSource& source) {
-    return source.duration.to_frames(source.rate.num, source.rate.den);
-}
-
 bool LastFrameBefore(const RationalTime& time, const MediaRate& rate,
                      int64_t& frame, std::string& error) {
     frame = time.to_frames(rate.num, rate.den);
@@ -64,21 +60,6 @@ bool FirstFrameAfter(const RationalTime& time, const MediaRate& rate,
     RationalTime frameTime;
     if (!SourceFrameTime(rate, frame, frameTime, error)) return false;
     if (frameTime <= time) {
-        if (frame == std::numeric_limits<int64_t>::max()) {
-            error = "source frame bound overflows";
-            return false;
-        }
-        ++frame;
-    }
-    return true;
-}
-
-bool FirstFrameAtOrAfter(const RationalTime& time, const MediaRate& rate,
-                         int64_t& frame, std::string& error) {
-    frame = time.to_frames(rate.num, rate.den);
-    RationalTime frameTime;
-    if (!SourceFrameTime(rate, frame, frameTime, error)) return false;
-    if (frameTime < time) {
         if (frame == std::numeric_limits<int64_t>::max()) {
             error = "source frame bound overflows";
             return false;
@@ -196,14 +177,15 @@ bool ResolveClipSourceFrameTrim(const Document& document, const Ulid& clipId,
         error = "clip '" + clipId + "' reads from an unmounted source";
         return false;
     }
-    int64_t clipFirst = 0;
+    const int64_t clipFirst =
+        clip->source_in.to_frames(source->rate.num, source->rate.den);
     int64_t clipLast = 0;
-    if (!FirstFrameAtOrAfter(clip->source_in, source->rate, clipFirst,
-                             error) ||
-        !LastFrameBefore(clip->source_in.add(clip->duration), source->rate,
+    if (!LastFrameBefore(clip->source_in.add(clip->duration), source->rate,
                          clipLast, error))
         return false;
-    const int64_t sourceLast = FrameCount(*source) - 1;
+    int64_t sourceLast = 0;
+    if (!LastFrameBefore(source->duration, source->rate, sourceLast, error))
+        return false;
     const int64_t first = edge == TrimEdge::Head ? 0 : clipFirst;
     const int64_t last = edge == TrimEdge::Head ? clipLast : sourceLast;
     if (!ValidateSourceFrameBounds("trim_clip", sourceFrame, first, last,
