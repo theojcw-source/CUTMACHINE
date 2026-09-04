@@ -1991,25 +1991,17 @@ bool LoadOptionalProjectLog(const std::string& projectPath, ProjectEditLog& log,
            ProjectEditLog::Deserialize(json, log, error, message);
 }
 
-int MutateProjectLogCommand(const std::string& projectPath,
-                            const std::optional<ProjectOperation>& operation,
-                            bool redo, std::string& output) {
+int MutateProjectLogCommand(
+    const std::string& projectPath,
+    const std::optional<ProjectOperation>& operation,
+    const std::optional<std::vector<ProjectOperation>>& operationBatch,
+    bool redo, std::string& output) {
     std::string message;
     EditError error = EditError::None;
     Project project;
     if (!LoadStoredProject(projectPath, project, message)) {
         output = ErrorJson(EditError::ParseError, message);
         return 1;
-    }
-    std::map<std::string, EditLog> timelineLogs;
-    for (const DocumentSequence& timeline : project.timelines) {
-        EditLog timelineLog;
-        if (!LoadOptionalTimelineLog(projectPath, timeline.id, timelineLog,
-                                     error, message)) {
-            output = ErrorJson(error, message);
-            return 1;
-        }
-        timelineLogs.emplace(timeline.id, std::move(timelineLog));
     }
     ProjectEditLog projectLog;
     if (!LoadOptionalProjectLog(projectPath, projectLog, error, message)) {
@@ -2019,6 +2011,9 @@ int MutateProjectLogCommand(const std::string& projectPath,
     bool changed = false;
     if (operation)
         changed = projectLog.Apply(project, *operation, error, message);
+    else if (operationBatch)
+        changed =
+            projectLog.ApplyBatch(project, *operationBatch, error, message);
     else if (redo)
         changed = projectLog.Redo(project, error, message);
     else
@@ -2027,8 +2022,10 @@ int MutateProjectLogCommand(const std::string& projectPath,
         output = ErrorJson(error, message);
         return 1;
     }
-    for (const DocumentSequence& timeline : project.timelines)
-        timelineLogs.try_emplace(timeline.id, EditLog{});
+    // B10 -- ROADMAP.md. Project operations do not edit timeline histories.
+    // An empty partial write set preserves existing journals and creates one
+    // only for a newly added timeline in CommitStoredProjectAndLogs.
+    const std::map<std::string, EditLog> timelineLogs;
     if (!CommitStoredProjectAndLogs(projectPath, project, timelineLogs,
                                     projectLog, message)) {
         output = ErrorJson(EditError::IoError, message);
@@ -2044,6 +2041,29 @@ int MutateProjectLogCommand(const std::string& projectPath,
 int ApplyProjectOperationCommand(const std::string& projectPath,
                                  const std::string& operationJson,
                                  std::string& output) {
+    mcp_json::Value input;
+    std::string jsonError;
+    if (mcp_json::Value::Parse(operationJson, input, jsonError) &&
+        input.IsArray()) {
+        std::vector<ProjectOperation> operations;
+        operations.reserve(input.AsArray().size());
+        for (size_t index = 0; index < input.AsArray().size(); ++index) {
+            ProjectOperation operation = AddProjectTimelineOperation{};
+            EditError error = EditError::None;
+            std::string message;
+            if (!DeserializeProjectOperation(input.AsArray()[index].Dump(),
+                                             operation, error, message)) {
+                output = ErrorJson(error, "project operation batch item " +
+                                              std::to_string(index) + ": " +
+                                              message);
+                return 1;
+            }
+            operations.push_back(std::move(operation));
+        }
+        return MutateProjectLogCommand(projectPath, std::nullopt,
+                                       std::move(operations), false, output);
+    }
+
     ProjectOperation operation = AddProjectTimelineOperation{};
     EditError error = EditError::None;
     std::string message;
@@ -2052,17 +2072,20 @@ int ApplyProjectOperationCommand(const std::string& projectPath,
         output = ErrorJson(error, message);
         return 1;
     }
-    return MutateProjectLogCommand(projectPath, operation, false, output);
+    return MutateProjectLogCommand(projectPath, operation, std::nullopt, false,
+                                   output);
 }
 
 int UndoProjectOperationCommand(const std::string& projectPath,
                                 std::string& output) {
-    return MutateProjectLogCommand(projectPath, std::nullopt, false, output);
+    return MutateProjectLogCommand(projectPath, std::nullopt, std::nullopt,
+                                   false, output);
 }
 
 int RedoProjectOperationCommand(const std::string& projectPath,
                                 std::string& output) {
-    return MutateProjectLogCommand(projectPath, std::nullopt, true, output);
+    return MutateProjectLogCommand(projectPath, std::nullopt, std::nullopt,
+                                   true, output);
 }
 
 namespace {

@@ -475,10 +475,25 @@ bool CommitStoredProjectAndLogs(
             {(timelines / (timeline.id + ".json")).string(),
              StandaloneTimelineDocument(project, timeline).SaveToString()});
         const auto log = timelineLogs.find(timeline.id);
-        artifacts.push_back(
-            {TimelineEditLogPathForProject(projectPath, timeline.id),
-             (log == timelineLogs.end() ? EditLog{} : log->second)
-                 .Serialize()});
+        const std::string logPath =
+            TimelineEditLogPathForProject(projectPath, timeline.id);
+        if (log != timelineLogs.end()) {
+            artifacts.push_back({logPath, log->second.Serialize()});
+        } else {
+            // B10 -- ROADMAP.md. An absent map entry means "not loaded", not
+            // "replace this history with an empty one". Only a timeline that
+            // has no journal yet (normally a newly added timeline) needs a
+            // default artifact.
+            std::error_code existsError;
+            const bool logExists = fs::exists(logPath, existsError);
+            if (existsError) {
+                error = "unable to inspect timeline history: " +
+                        existsError.message();
+                return false;
+            }
+            if (!logExists)
+                artifacts.push_back({logPath, EditLog{}.Serialize()});
+        }
     }
     artifacts.push_back(
         {ProjectEditLogPathForProject(projectPath), projectLog.Serialize()});

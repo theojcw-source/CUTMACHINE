@@ -277,6 +277,41 @@ bool ProjectEditLog::Apply(Project& project, ProjectOperation operation,
     return true;
 }
 
+bool ProjectEditLog::ApplyBatch(Project& project,
+                                std::vector<ProjectOperation> operations,
+                                EditError& error, std::string& message) {
+    if (operations.empty()) {
+        error = EditError::InvalidOperation;
+        message = "project operation batch is empty";
+        return false;
+    }
+
+    // B10 -- ROADMAP.md. Apply every intention to a private candidate first:
+    // a refusal at any position leaves both the project and its history
+    // untouched. The log entry itself uses the ordinary exact-state replay
+    // path, so the whole ordered batch is one undo/redo step without adding a
+    // parallel mutation mechanism.
+    Project candidate = project;
+    for (ProjectOperation& operation : operations) {
+        ProjectOperation ignoredInverse = AddProjectTimelineOperation{};
+        if (!ApplyProjectOperation(candidate, operation, ignoredInverse, error,
+                                   message))
+            return false;
+    }
+
+    ProjectOperation redo = SetActiveProjectTimelineOperation{
+        candidate.active_timeline_id,
+        ExactProjectState{candidate.SaveToString()}};
+    ProjectOperation undo = SetActiveProjectTimelineOperation{
+        project.active_timeline_id, ExactProjectState{project.SaveToString()}};
+    project = std::move(candidate);
+    applied_.push_back({std::move(redo), std::move(undo)});
+    undone_.clear();
+    error = EditError::None;
+    message.clear();
+    return true;
+}
+
 bool ProjectEditLog::Undo(Project& project, EditError& error,
                           std::string& message) {
     if (applied_.empty()) {

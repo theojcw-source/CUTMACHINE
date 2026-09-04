@@ -45,6 +45,8 @@ class ProjectEditLog {
 public:
     bool Apply(Project& project, ProjectOperation operation, EditError& error,
                std::string& message);
+    bool ApplyBatch(Project& project, std::vector<ProjectOperation> operations,
+                    EditError& error, std::string& message);
     bool Undo(Project& project, EditError& error, std::string& message);
     bool Redo(Project& project, EditError& error, std::string& message);
 

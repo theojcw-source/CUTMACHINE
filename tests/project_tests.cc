@@ -254,6 +254,58 @@ int main() {
     Check(shortProject.SaveToString() == afterShort,
           "redo short timeline restores byte-identical project JSON");
 
+    // B10 -- one ordered project batch is one exact history step. The rename
+    // deliberately depends on the preceding add, so reversing execution order
+    // would fail instead of merely producing a different cosmetic result.
+    Project batchProject("Batch project");
+    const std::string beforeBatch = batchProject.SaveToString();
+    const Ulid batchTimelineId = GenerateUlid();
+    ProjectEditLog batchLog;
+    Check(batchLog.ApplyBatch(
+              batchProject,
+              {ProjectOperation{AddProjectTimelineOperation{"Added first",
+                                                            1920,
+                                                            1080,
+                                                            {25, 1},
+                                                            batchTimelineId,
+                                                            GenerateUlid(),
+                                                            GenerateUlid()}},
+               ProjectOperation{
+                   RenameProjectItemOperation{batchTimelineId, "Renamed"}}},
+              editError, error),
+          "ordered project batch applies: " + error);
+    const std::string afterBatch = batchProject.SaveToString();
+    Check(batchProject.FindTimeline(batchTimelineId) != nullptr &&
+              batchProject.FindTimeline(batchTimelineId)->name == "Renamed",
+          "project batch applies operations in input order");
+    Check(batchLog.AppliedCount() == 1,
+          "project batch creates exactly one history entry");
+    ProjectEditLog decodedBatchLog;
+    Check(ProjectEditLog::Deserialize(batchLog.Serialize(), decodedBatchLog,
+                                      editError, error) &&
+              decodedBatchLog.AppliedCount() == 1,
+          "project batch history round-trips canonically: " + error);
+    Check(batchLog.Undo(batchProject, editError, error) &&
+              batchProject.SaveToString() == beforeBatch,
+          "one undo restores the bytes before a project batch: " + error);
+    Check(batchLog.Redo(batchProject, editError, error) &&
+              batchProject.SaveToString() == afterBatch,
+          "one redo restores the bytes after a project batch: " + error);
+
+    const std::string beforeRejectedBatch = batchProject.SaveToString();
+    const std::string logBeforeRejectedBatch = batchLog.Serialize();
+    Check(!batchLog.ApplyBatch(batchProject,
+                               {ProjectOperation{RenameProjectItemOperation{
+                                    batchTimelineId, "Must roll back"}},
+                                ProjectOperation{RemoveProjectTimelineOperation{
+                                    "01K39999999999999999999999"}}},
+                               editError, error) &&
+              editError == EditError::UnknownSequence,
+          "a refusal makes the whole project batch fail");
+    Check(batchProject.SaveToString() == beforeRejectedBatch &&
+              batchLog.Serialize() == logBeforeRejectedBatch,
+          "a refused project batch leaves project and history byte-identical");
+
     const std::string serialized = stored.SaveToString();
     Project loaded("placeholder");
     Check(Project::LoadFromString(serialized, loaded, error),

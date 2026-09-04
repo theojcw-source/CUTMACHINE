@@ -9,6 +9,7 @@
 #include "ResolveImport.h"
 #include "Ulid.h"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -54,6 +55,20 @@ std::string Read(const std::filesystem::path& path) {
     std::ostringstream output;
     output << input.rdbuf();
     return output.str();
+}
+
+void Write(const std::filesystem::path& path, const std::string& contents) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output << contents;
+}
+
+std::string ProjectBatchJson(const std::vector<ProjectOperation>& operations) {
+    std::string result = "[";
+    for (size_t index = 0; index < operations.size(); ++index) {
+        if (index) result += ',';
+        result += SerializeProjectOperation(operations[index]);
+    }
+    return result + ']';
 }
 
 Document Fixture() {
@@ -472,6 +487,106 @@ int main() {
     Check(Read(ProjectEditLogPathForProject(projectPath.string())) ==
               projectLogBeforeRejection,
           "refused project operation leaves project log byte-identical");
+
+    // B10 -- reproduce the measured project cardinality and the exact cleanup
+    // shape. Corrupt journals are stronger than a timing-only assertion: an
+    // eager reader would reject them, while the lazy project path must leave
+    // every surviving byte untouched. Ten seconds is the product criterion,
+    // not a microbenchmark threshold, and leaves ample room for loaded CI.
+    Project largeProject("B10 performance fixture");
+    for (int index = 1; index < 24; ++index) {
+        DocumentSequence timeline;
+        timeline.name = "Timeline " + std::to_string(index + 1);
+        largeProject.timelines.push_back(std::move(timeline));
+    }
+    for (int index = 0; index < 210; ++index) {
+        const Ulid mediaId = GenerateUlid();
+        const std::string filename = "rush-" + std::to_string(index) + ".mov";
+        LibraryMedia media;
+        media.id = mediaId;
+        media.path = filename;
+        media.filename = filename;
+        media.rate = {25, 1};
+        media.duration = {250, 25};
+        media.metadata_complete = false;
+        largeProject.rushes.push_back(std::move(media));
+        largeProject.sources.push_back({mediaId, filename, {25, 1}, {250, 25}});
+    }
+    std::string largeProjectPathString;
+    Check(CreatePortableProject((directory / "B10.cutmachine-project").string(),
+                                largeProject, largeProjectPathString, error),
+          "B10 fixture saves: " + error);
+    const std::filesystem::path largeProjectPath = largeProjectPathString;
+    const std::string beforeLargeBatch = Read(largeProjectPath);
+
+    std::map<Ulid, std::string> journalSentinels;
+    for (const DocumentSequence& timeline : largeProject.timelines) {
+        const std::string sentinel =
+            "not a journal; must stay unread: " + timeline.id + "\n";
+        journalSentinels.emplace(timeline.id, sentinel);
+        Write(TimelineEditLogPathForProject(largeProjectPath.string(),
+                                            timeline.id),
+              sentinel);
+    }
+    std::vector<ProjectOperation> removals;
+    for (size_t index = 9; index < largeProject.timelines.size(); ++index) {
+        removals.push_back(
+            RemoveProjectTimelineOperation{largeProject.timelines[index].id});
+    }
+    Check(removals.size() == 15,
+          "B10 fixture contains exactly fifteen removals");
+    const auto cleanupStart = std::chrono::steady_clock::now();
+    Check(ApplyProjectOperationCommand(largeProjectPath.string(),
+                                       ProjectBatchJson(removals), result) == 0,
+          "fifteen project removals apply as one batch: " + result);
+    const auto cleanupElapsed = std::chrono::steady_clock::now() - cleanupStart;
+    Check(cleanupElapsed < std::chrono::seconds(10),
+          "fifteen timeline removals stay below ten seconds");
+
+    Project cleanedProject;
+    Check(LoadStoredProject(largeProjectPath.string(), cleanedProject, error) &&
+              cleanedProject.timelines.size() == 9,
+          "B10 batch removes exactly fifteen timelines: " + error);
+    ProjectEditLog batchProjectLog;
+    Check(ProjectEditLog::Load(
+              ProjectEditLogPathForProject(largeProjectPath.string()),
+              batchProjectLog, editError, detail) &&
+              batchProjectLog.AppliedCount() == 1,
+          "B10 batch occupies one project undo entry: " + detail);
+    for (const DocumentSequence& timeline : cleanedProject.timelines) {
+        Check(Read(TimelineEditLogPathForProject(largeProjectPath.string(),
+                                                 timeline.id)) ==
+                  journalSentinels[timeline.id],
+              "an untouched timeline journal remains byte-identical");
+    }
+    Check(UndoProjectOperationCommand(largeProjectPath.string(), result) == 0 &&
+              Read(largeProjectPath) == beforeLargeBatch,
+          "one project undo restores the entire fifteen-removal batch: " +
+              result);
+    Check(RedoProjectOperationCommand(largeProjectPath.string(), result) == 0,
+          "one project redo reapplies the entire batch: " + result);
+
+    const std::string beforeAtomicRefusal = Read(largeProjectPath);
+    const std::string logBeforeAtomicRefusal =
+        Read(ProjectEditLogPathForProject(largeProjectPath.string()));
+    const Ulid survivingTimeline = cleanedProject.timelines.front().id;
+    const std::vector<ProjectOperation> rejectedBatch = {
+        RenameProjectItemOperation{survivingTimeline, "Must roll back"},
+        RemoveProjectTimelineOperation{"01K39999999999999999999999"}};
+    Check(ApplyProjectOperationCommand(largeProjectPath.string(),
+                                       ProjectBatchJson(rejectedBatch),
+                                       result) == 1,
+          "a refused project batch returns status 1");
+    CheckFailureEnvelope(result, "refused project batch", "UnknownSequence");
+    Check(Read(largeProjectPath) == beforeAtomicRefusal &&
+              Read(ProjectEditLogPathForProject(largeProjectPath.string())) ==
+                  logBeforeAtomicRefusal,
+          "a refused project batch is atomic on disk");
+
+    Check(ApplyProjectOperationCommand(largeProjectPath.string(), "[]",
+                                       result) == 1,
+          "an empty project batch is refused");
+    CheckFailureEnvelope(result, "empty project batch", "InvalidOperation");
 
     std::filesystem::remove_all(directory);
     if (failures != 0) {
