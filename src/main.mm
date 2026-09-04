@@ -6910,16 +6910,15 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         std::filesystem::path(self.documentPath.UTF8String ?: ""));
     const std::filesystem::path transcriptDirectory =
         projectPath.parent_path() / ".cutmachine" / "transcripts";
-    const std::string expectedModel =
-        std::filesystem::path(modelPath.UTF8String ?: "").filename().string();
+    WhisperSettings requestedSettings;
+    requestedSettings.whisper_model_path = modelPath.UTF8String ?: "";
     for (const Ulid& mediaId : mediaIds) {
         const std::filesystem::path cachedPath =
             transcriptDirectory / (mediaId + ".json");
         Transcript cached;
         std::string cacheError;
         if (LoadAudioTranscript(cachedPath.string(), cached, cacheError) &&
-            cached.media_id == mediaId &&
-            cached.whisper_model == expectedModel && !cached.verbatim) {
+            TranscriptCacheMatches(cached, mediaId, requestedSettings)) {
             batch.transcript_paths.emplace(mediaId, cachedPath);
             continue;
         }

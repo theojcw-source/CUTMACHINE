@@ -353,6 +353,8 @@ bool SaveTranscript(const std::filesystem::path& destination,
     WriteJsonString(output, transcript.media_id);
     output << ",\"whisper_model\":";
     WriteJsonString(output, transcript.whisper_model);
+    output << ",\"language\":";
+    WriteJsonString(output, transcript.language);
     output << ",\"verbatim\":" << (transcript.verbatim ? "true" : "false");
     // Written only when set, so a transcript that has never been through the
     // alignment pass keeps the exact bytes it had before this field existed.
@@ -658,6 +660,8 @@ bool TranscribeOneWithModel(whisper_context* ctx, const std::string& inputPath,
     transcript.media_id = mediaId;
     transcript.whisper_model =
         std::filesystem::path(settings.whisper_model_path).filename().string();
+    transcript.language =
+        settings.language.empty() ? "auto" : settings.language;
     transcript.verbatim = settings.verbatim;
     transcript.source_rate = sourceRate;
     transcript.words = std::move(words);
@@ -747,6 +751,19 @@ bool SaveAudioTranscript(const std::string& path, const Transcript& transcript,
     return SaveTranscript(std::filesystem::path(path), transcript, error);
 }
 
+bool TranscriptCacheMatches(const Transcript& transcript,
+                            const std::string& mediaId,
+                            const WhisperSettings& settings) {
+    const std::string model =
+        std::filesystem::path(settings.whisper_model_path).filename().string();
+    const std::string language =
+        settings.language.empty() ? "auto" : settings.language;
+    return transcript.media_id == mediaId &&
+           transcript.whisper_model == model &&
+           transcript.language == language &&
+           transcript.verbatim == settings.verbatim;
+}
+
 bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
                          std::string& error) {
     error.clear();
@@ -773,6 +790,8 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
         parsed.media_id = reader.String();
         reader.Expect(",\"whisper_model\":");
         parsed.whisper_model = reader.String();
+        if (reader.Consume(",\"language\":"))
+            parsed.language = reader.String();
         if (reader.Consume(",\"verbatim\":"))
             parsed.verbatim = reader.Boolean();
         if (reader.Consume(",\"speech_aligned\":"))

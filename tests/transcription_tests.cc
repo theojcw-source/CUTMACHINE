@@ -214,7 +214,8 @@ int main() {
                 LoadAudioTranscript(good.string(), parsed, error);
             Check(loadedGood, "loads a well-formed transcript cache: " + error);
             Check(parsed.words.size() == 2 && parsed.words[0].text == "hi" &&
-                      parsed.source_rate.num == 25 && parsed.verbatim,
+                      parsed.source_rate.num == 25 && parsed.verbatim &&
+                      parsed.language == "auto",
                   "parsed transcript matches the cache contents exactly");
 
             const std::filesystem::path rounded =
@@ -268,6 +269,7 @@ int main() {
         Transcript transcript;
         transcript.media_id = "01K300000000000000000000AA";
         transcript.whisper_model = "ggml-large-v3.bin";
+        transcript.language = "fr";
         transcript.verbatim = true;
         transcript.speech_aligned = true;
         transcript.source_rate = {25, 1};
@@ -279,9 +281,20 @@ int main() {
         Transcript reloaded;
         Check(LoadAudioTranscript(path.string(), reloaded, error) &&
                   reloaded.speech_aligned && reloaded.verbatim &&
+                  reloaded.language == "fr" &&
                   reloaded.words.size() == 2 &&
                   reloaded.words[1].text == "tout",
               "an aligned transcript reads back aligned: " + error);
+
+        WhisperSettings matching;
+        matching.whisper_model_path = "/models/ggml-large-v3.bin";
+        matching.language = "fr";
+        matching.verbatim = true;
+        Check(TranscriptCacheMatches(reloaded, transcript.media_id, matching),
+              "cache identity accepts the exact model, language and mode");
+        matching.language = "en";
+        Check(!TranscriptCacheMatches(reloaded, transcript.media_id, matching),
+              "cache identity rejects a transcript from another language");
 
         transcript.speech_aligned = false;
         Check(SaveAudioTranscript(path.string(), transcript, error),

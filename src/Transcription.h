@@ -39,6 +39,10 @@ struct Transcript {
     // silently reused as if it were this one -- e.g. a project migrated to a
     // larger local model should re-transcribe, not read stale words.
     std::string whisper_model;
+    // Whisper's language constraint changes the decoded words just as much
+    // as the model does. It is therefore part of the cache identity; "auto"
+    // is explicit so legacy caches have a deterministic meaning.
+    std::string language = "auto";
     // Verbatim decoding deliberately biases Whisper toward audible fillers,
     // repetitions and false starts. Keep it in the cache identity so a
     // standard transcript is never silently substituted for one.
@@ -70,6 +74,13 @@ struct WhisperSettings {
     std::string language = "auto";
     bool verbatim = false;
 };
+
+// A cache can be reused only for the exact decoding request that produced it.
+// The model is compared by filename because caches deliberately never persist
+// a machine-local absolute path.
+bool TranscriptCacheMatches(const Transcript& transcript,
+                            const std::string& mediaId,
+                            const WhisperSettings& settings);
 
 // ALPHA-2026-08 -- the model path is the one thing standing between the
 // agent and a transcript it can produce rather than only read. It cannot be a
