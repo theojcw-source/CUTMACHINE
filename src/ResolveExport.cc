@@ -1,20 +1,12 @@
 #include "ResolveExport.h"
 
+#include "Cli.h"
 #include "Json.h"
 #include "ProjectStorage.h"
 
 #include <algorithm>
 #include <filesystem>
 #include <sstream>
-
-namespace {
-
-std::string ErrorJson(const std::string& detail) {
-    return "{\"ok\":false,\"detail\":\"" + mcp_json::EscapeJsonString(detail) +
-           "\"}\n";
-}
-
-}  // namespace
 
 bool ExactFrameCount(const RationalTime& time, const MediaRate& rate,
                      int64_t& frames) {
@@ -180,8 +172,7 @@ int ExportResolveTimelineCommand(const std::string& projectPath,
     Project project;
     std::string error;
     if (!LoadStoredProject(projectPath, project, error)) {
-        output = ErrorJson(error);
-        return 1;
+        return FailCliCommand("InvalidDocument", error, output);
     }
     Document document = project.MakeActiveDocument();
     // Media paths are stored relative to the package; the bridge matches them
@@ -198,8 +189,7 @@ int ExportResolveTimelineCommand(const std::string& projectPath,
     }
     ResolveTimelineExport exported;
     if (!BuildResolveTimelineExport(document, exported, error)) {
-        output = ErrorJson(error);
-        return 1;
+        return FailCliCommand("InvalidExport", error, output);
     }
     output = SerializeResolveTimelineExport(exported);
     return 0;

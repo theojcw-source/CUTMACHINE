@@ -105,13 +105,11 @@ struct SkippedClip {
 // user to diff the Media Pool by hand. Same errors array as IngestCommand --
 // and, as there, a rush already in the library is counted, never listed: it
 // is the expected outcome of re-importing, not a failure.
-std::string ResultJson(bool ok, size_t addedMedia, size_t knownMedia,
-                       size_t addedBins, size_t reusedBins,
-                       const std::string& detail,
-                       const std::vector<SkippedClip>& skipped) {
+std::string SuccessJson(size_t addedMedia, size_t knownMedia, size_t addedBins,
+                        size_t reusedBins, const std::string& detail,
+                        const std::vector<SkippedClip>& skipped) {
     std::ostringstream output;
-    output << "{\"ok\":" << (ok ? "true" : "false")
-           << ",\"added\":" << addedMedia
+    output << "{\"ok\":true,\"added\":" << addedMedia
            << ",\"skipped\":" << (knownMedia + skipped.size())
            << ",\"bins_created\":" << addedBins
            << ",\"bins_reused\":" << reusedBins << ",\"detail\":\""
@@ -312,44 +310,37 @@ int ImportResolveCommand(const std::string& projectPath,
                          const std::string& manifestPath, std::string& output) {
     std::string reason;
     std::string manifestText;
-    const std::vector<SkippedClip> none;
     if (!ReadWholeFile(std::filesystem::path(manifestPath), manifestText,
                        reason)) {
-        output = ResultJson(false, 0, 0, 0, 0, reason, none);
-        return 1;
+        return FailCliCommand("IoError", reason, output);
     }
     ResolveManifest manifest;
     if (!ParseResolveManifest(manifestText, manifest, reason)) {
-        output = ResultJson(false, 0, 0, 0, 0, reason, none);
-        return 1;
+        return FailCliCommand("ParseError", reason, output);
     }
 
     Project project;
     if (!LoadStoredProject(projectPath, project, reason)) {
-        output = ResultJson(false, 0, 0, 0, 0, reason, none);
-        return 1;
+        return FailCliCommand("ParseError", reason, output);
     }
     Document document = project.MakeActiveDocument();
 
     ResolveImportPlan plan;
     if (!PlanResolveImport(document, manifest, plan, reason)) {
-        output = ResultJson(false, 0, 0, 0, 0, reason, none);
-        return 1;
+        return FailCliCommand("ValidationFailed", reason, output);
     }
 
     std::map<std::string, EditLog> logs;
     ProjectEditLog projectLog;
     if (!LoadOptionalLogs(projectPath, project, logs, projectLog, reason)) {
-        output = ResultJson(false, 0, 0, 0, 0, reason, none);
-        return 1;
+        return FailCliCommand("ParseError", reason, output);
     }
     EditLog& log = logs[project.active_timeline_id];
 
     EditError error = EditError::None;
     for (const AddBinOperation& operation : plan.new_bins) {
         if (!log.Apply(document, operation, error, reason)) {
-            output = ResultJson(false, 0, 0, 0, plan.reused_bins, reason, none);
-            return 1;
+            return FailCliCommand(EditErrorName(error), reason, output);
         }
     }
 
@@ -386,10 +377,7 @@ int ImportResolveCommand(const std::string& projectPath,
             filing.bin_id = binId;
             if (document.library[known->second].bin_id != binId &&
                 !log.Apply(document, filing, error, reason)) {
-                output = ResultJson(false, added, alreadyPresent,
-                                    plan.new_bins.size(), plan.reused_bins,
-                                    reason, skipped);
-                return 1;
+                return FailCliCommand(EditErrorName(error), reason, output);
             }
             continue;
         }
@@ -418,27 +406,20 @@ int ImportResolveCommand(const std::string& projectPath,
             filing.media_id = media.id;
             filing.bin_id = binId;
             if (!log.Apply(document, filing, error, reason)) {
-                output = ResultJson(false, added, alreadyPresent,
-                                    plan.new_bins.size(), plan.reused_bins,
-                                    reason, skipped);
-                return 1;
+                return FailCliCommand(EditErrorName(error), reason, output);
             }
         }
     }
 
     if (!document.Validate(reason)) {
-        output = ResultJson(false, added, alreadyPresent, plan.new_bins.size(),
-                            plan.reused_bins, reason, skipped);
-        return 1;
+        return FailCliCommand("ValidationFailed", reason, output);
     }
     if (!project.CommitActiveDocument(document, reason) ||
         !CommitStoredProjectAndLogs(projectPath, project, logs, projectLog,
                                     reason)) {
-        output = ResultJson(false, added, alreadyPresent, plan.new_bins.size(),
-                            plan.reused_bins, reason, skipped);
-        return 1;
+        return FailCliCommand("IoError", reason, output);
     }
-    output = ResultJson(true, added, alreadyPresent, plan.new_bins.size(),
-                        plan.reused_bins, manifest.project, skipped);
+    output = SuccessJson(added, alreadyPresent, plan.new_bins.size(),
+                         plan.reused_bins, manifest.project, skipped);
     return 0;
 }

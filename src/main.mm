@@ -12579,13 +12579,20 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
 @end
 
 int main(int argc, char* argv[]) {
+    const auto failCli = [](const std::string& errorCode,
+                            const std::string& detail, int exitStatus) {
+        std::string output;
+        const int result =
+            FailCliCommand(errorCode, detail, output, exitStatus);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    };
 #if defined(CUTMACHINE_UI_SMOKE_TEST)
     if (argc == 2 && std::string(argv[1]) == "--ui-smoke") {
         std::string error;
         if (!PrepareUiSmokeProject(error)) {
-            std::fprintf(stderr, "Unable to prepare UI smoke project: %s\n",
-                         error.c_str());
-            return 1;
+            return failCli("IoError",
+                           "unable to prepare UI smoke project: " + error, 1);
         }
         gUiSmokeTesting = true;
     }
@@ -12642,9 +12649,10 @@ int main(int argc, char* argv[]) {
                 language = option;
                 ++positional;
             } else {
-                std::fprintf(stderr, "Unexpected transcription argument: %s\n",
-                             argv[index]);
-                return 2;
+                return failCli("ValidationFailed",
+                               "unexpected transcription argument '" +
+                                   std::string(argv[index]) + "'",
+                               2);
             }
         }
         std::string output;
@@ -12733,9 +12741,10 @@ int main(int argc, char* argv[]) {
         int port = 0;
         if (argc == 5) {
             if (std::string(argv[3]) != "--port") {
-                std::fprintf(stderr, "Unknown --mcp-serve option: %s\n",
-                             argv[3]);
-                return 2;
+                return failCli("ValidationFailed",
+                               "unknown --mcp-serve option '" +
+                                   std::string(argv[3]) + "'",
+                               2);
             }
             port = std::atoi(argv[4]);
         }
@@ -12750,9 +12759,8 @@ int main(int argc, char* argv[]) {
         McpServer server(backend);
         std::string startError;
         if (!server.Start(port, startError)) {
-            std::fprintf(stderr, "mcp-serve failed to start: %s\n",
-                         startError.c_str());
-            return 1;
+            return failCli("IoError",
+                           "mcp-serve failed to start: " + startError, 1);
         }
         std::fprintf(stderr,
                      "MCP server listening on http://127.0.0.1:%d/mcp for "
@@ -12784,9 +12792,10 @@ int main(int argc, char* argv[]) {
     if ((argc == 3 || argc == 4) &&
         std::string(argv[1]) == "--align-transcripts") {
         if (argc == 4 && std::string(argv[3]) != "--write") {
-            std::fprintf(stderr, "Unknown --align-transcripts option: %s\n",
-                         argv[3]);
-            return 2;
+            return failCli("ValidationFailed",
+                           "unknown --align-transcripts option '" +
+                               std::string(argv[3]) + "'",
+                           2);
         }
         std::string output;
         const int result = AlignTranscriptsCommand(argv[2], argc == 4, output);
@@ -12832,9 +12841,8 @@ int main(int argc, char* argv[]) {
             else if (option == "--overwrite")
                 settings.overwrite = true;
             else {
-                std::fprintf(stderr, "Unknown export option: %s\n",
-                             argv[index]);
-                return 2;
+                return failCli("ValidationFailed",
+                               "unknown export option '" + option + "'", 2);
             }
         }
         std::string output;
@@ -12863,50 +12871,11 @@ int main(int argc, char* argv[]) {
                      && !gUiSmokeTesting
 #endif
                      )) {
-        std::fprintf(
-            stderr,
-            "Usage: %s [/path/to/project.cutmachine.json]\n"
-            "       %s --create-project /path/to/Film.cutmachine-project "
-            "'<name>'\n"
-            "       %s --transcribe /path/to/project.cutmachine.json "
-            "'<media-id>' [/path/to/ggml-model.bin] [language] "
-            "[--verbatim]\n"
-            "       %s --shot-quality /path/to/project.cutmachine.json "
-            "'<media-id>'\n"
-            "       %s --shot-quality-report "
-            "/path/to/project.cutmachine.json\n"
-            "       %s --speech-onset /path/to/project.cutmachine.json "
-            "'<media-id>'\n"
-            "       %s --speech-onset-report "
-            "/path/to/project.cutmachine.json\n"
-            "       %s --disfluencies /path/to/project.cutmachine.json "
-            "'<clip-id>'\n"
-            "       %s --remove-words /path/to/project.cutmachine.json "
-            "'<clip-id>' '<[{\"start_word_index\":0,\"end_word_index\":0}]>'\n"
-            "       %s --describe /path/to/project.cutmachine.json\n"
-            "       %s --apply-op /path/to/project.cutmachine.json "
-            "'<op.json>'\n"
-            "       %s --apply-project-op /path/to/project.cutmachine.json "
-            "'<op.json>'\n"
-            "       %s --undo-project-op /path/to/project.cutmachine.json\n"
-            "       %s --redo-project-op /path/to/project.cutmachine.json\n"
-            "       %s --mcp-serve /path/to/project.cutmachine.json "
-            "[--port N]\n"
-            "       %s --ingest /path/to/project.cutmachine.json "
-            "/path/to/media "
-            "[--recursive]\n"
-            "       %s --import-resolve /path/to/project.cutmachine.json "
-            "/path/to/manifest.json\n"
-            "       %s --propose-sequence "
-            "/path/to/project.cutmachine.json\n"
-            "       %s --export /path/to/project.cutmachine.json output.mp4 "
-            "[--software] [--overwrite]\n"
-            "       %s --export-srt /path/to/project.cutmachine.json "
-            "output.srt\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
-        return 2;
+        return failCli(
+            "ValidationFailed",
+            "invalid command line; expected a project path or a supported "
+            "--command with its documented arguments",
+            2);
     }
 
     @autoreleasepool {

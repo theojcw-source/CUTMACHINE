@@ -43,6 +43,10 @@ struct McpTool {
 
 struct McpToolCallOutcome {
     bool ok = false;
+    // B2 -- ROADMAP.md. Always a JSON object: the tool payload on success,
+    // or {"ok":false,"error":...,"detail":...} on refusal. The named
+    // fields below remain available to callers that need branching without
+    // parsing the payload.
     std::string result_json;
     std::string error_name;
     std::string message;

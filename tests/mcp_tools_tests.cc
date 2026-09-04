@@ -49,6 +49,37 @@ void Check(bool condition, const std::string& message) {
     }
 }
 
+void CheckFailureEnvelope(const McpToolCallOutcome& outcome,
+                          const std::string& label,
+                          const std::string& expectedError = std::string()) {
+    mcp_json::Value envelope;
+    std::string parseError;
+    const bool parsed = mcp_json::Value::Parse(outcome.result_json, envelope,
+                                               parseError) &&
+                        envelope.IsObject();
+    Check(!outcome.ok, label + " is refused");
+    Check(parsed, label + " returns a JSON object: " + parseError);
+    if (!parsed) return;
+    const mcp_json::Value* ok = envelope.Find("ok");
+    const mcp_json::Value* error = envelope.Find("error");
+    const mcp_json::Value* detail = envelope.Find("detail");
+    Check(ok != nullptr && ok->IsBool() && !ok->AsBool(),
+          label + " returns ok:false");
+    Check(error != nullptr && error->IsString() &&
+              !error->AsString().empty() &&
+              error->AsString() == outcome.error_name,
+          label + " returns its stable error code");
+    Check(detail != nullptr && detail->IsString() &&
+              !detail->AsString().empty() &&
+              detail->AsString() == outcome.message,
+          label + " returns its detail");
+    if (!expectedError.empty()) {
+        Check(error != nullptr && error->IsString() &&
+                  error->AsString() == expectedError,
+              label + " preserves " + expectedError);
+    }
+}
+
 Document Fixture() {
     Document document;
     document.sources = {
@@ -316,6 +347,28 @@ int main() {
     // "expected" comparison below copies this same fixture rather than
     // calling Fixture() again.
     const Document fixture = Fixture();
+
+    // B2 -- every registered tool crosses the same refusal boundary. A
+    // non-object arguments value is invalid for all tools, including the
+    // no-argument ones, so this walks the catalog without mutating the
+    // fixture or depending on each tool's required fields.
+    {
+        McpToolRegistry registry;
+        InMemoryBackend backend(fixture);
+        const mcp_json::Value invalidArguments =
+            mcp_json::Value::MakeArray();
+        Check(!registry.Tools().empty(), "the MCP catalog is not empty");
+        for (const McpTool& tool : registry.Tools()) {
+            const McpToolCallOutcome refused =
+                registry.Call(backend, tool.name, invalidArguments);
+            CheckFailureEnvelope(refused, "catalog tool " + tool.name,
+                                 "ValidationFailed");
+        }
+        const McpToolCallOutcome unknown =
+            registry.Call(backend, "not_a_tool", invalidArguments);
+        CheckFailureEnvelope(unknown, "unknown catalog tool", "UnknownTool");
+    }
+
     IdResolver fixtureResolver(fixture);
     Ulid resolvedLinkGroup;
     std::string resolutionError;
@@ -426,6 +479,8 @@ int main() {
     Check(!gapOutcome.ok &&
               gapOutcome.message.find("breath") != std::string::npos,
           "a run spanning a real silence is refused, not stitched over");
+    CheckFailureEnvelope(gapOutcome, "non-contiguous interview span",
+                         "ValidationFailed");
 
     Check(!callShort(R"({"segments":[{"span_id":"S9"}]})").ok,
           "an unknown span id is refused");
@@ -959,13 +1014,37 @@ int main() {
           "error response body is valid JSON: " + parseError);
     const mcp_json::Value* badResult = badBody.Find("result");
     bool badIsError = false;
+    bool badTextIsEnvelope = false;
     if (badResult) {
         const mcp_json::Value* isError = badResult->Find("isError");
         badIsError = isError && isError->IsBool() && isError->AsBool();
+        const mcp_json::Value* content = badResult->Find("content");
+        if (content != nullptr && content->IsArray() &&
+            !content->AsArray().empty()) {
+            const mcp_json::Value* text = content->AsArray()[0].Find("text");
+            mcp_json::Value envelope;
+            std::string envelopeError;
+            if (text != nullptr && text->IsString() &&
+                mcp_json::Value::Parse(text->AsString(), envelope,
+                                       envelopeError) &&
+                envelope.IsObject()) {
+                const mcp_json::Value* ok = envelope.Find("ok");
+                const mcp_json::Value* error = envelope.Find("error");
+                const mcp_json::Value* detail = envelope.Find("detail");
+                badTextIsEnvelope =
+                    ok != nullptr && ok->IsBool() && !ok->AsBool() &&
+                    error != nullptr && error->IsString() &&
+                    error->AsString() == "ValidationFailed" &&
+                    detail != nullptr && detail->IsString() &&
+                    !detail->AsString().empty();
+            }
+        }
     }
     Check(badIsError,
           "an unknown clip_id is reported as isError, not a "
           "JSON-RPC protocol error");
+    Check(badTextIsEnvelope,
+          "a refused tools/call exposes an ok/error/detail JSON object");
     Check(backend.CurrentDocument().SaveToString() == beforeError,
           "a refused tool call leaves the document byte-identical");
 

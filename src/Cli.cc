@@ -39,6 +39,14 @@
 #include <system_error>
 #include <vector>
 
+int FailCliCommand(const std::string& errorCode, const std::string& detail,
+                   std::string& output, int exitStatus) {
+    output = "{\"ok\":false,\"error\":\"" +
+             mcp_json::EscapeJsonString(errorCode) + "\",\"detail\":\"" +
+             mcp_json::EscapeJsonString(detail) + "\"}\n";
+    return exitStatus;
+}
+
 namespace {
 
 std::string EscapeJson(const std::string& input) {
@@ -80,8 +88,9 @@ std::string EscapeJson(const std::string& input) {
 }
 
 std::string ErrorJson(EditError error, const std::string& detail) {
-    return "{\"ok\":false,\"error\":\"" + std::string(EditErrorName(error)) +
-           "\",\"detail\":\"" + EscapeJson(detail) + "\"}\n";
+    std::string output;
+    FailCliCommand(EditErrorName(error), detail, output);
+    return output;
 }
 
 bool ReadFile(const std::string& path, std::string& contents,
@@ -769,9 +778,7 @@ int ExportSrtCommand(const std::string& projectPath,
     Project project;
     std::string error;
     if (!LoadStoredProject(projectPath, project, error)) {
-        output = "{\"ok\":false,\"error\":\"InvalidDocument\",\"detail\":\"" +
-                 EscapeJson(error) + "\"}\n";
-        return 1;
+        return FailCliCommand("InvalidDocument", error, output);
     }
     Document document = project.MakeActiveDocument();
     const std::filesystem::path transcriptDirectory =
@@ -780,9 +787,7 @@ int ExportSrtCommand(const std::string& projectPath,
     std::vector<TimelineTranscriptSpan> spans;
     if (!BuildTimelineTranscriptSpans(document, transcriptDirectory, spans,
                                       error)) {
-        output = "{\"ok\":false,\"error\":\"InvalidTranscript\",\"detail\":\"" +
-                 EscapeJson(error) + "\"}\n";
-        return 1;
+        return FailCliCommand("InvalidTranscript", error, output);
     }
     // The spans are already the readable groupings SubtitleCuesForClip cuts
     // -- about 42 characters, a sentence end, or a pause -- and they already
@@ -792,9 +797,7 @@ int ExportSrtCommand(const std::string& projectPath,
     for (const TimelineTranscriptSpan& span : spans)
         cues.push_back({span.timeline_in, span.duration, span.text});
     if (!WriteSrt(cues, outputPath, error)) {
-        output = "{\"ok\":false,\"error\":\"InvalidSubtitles\",\"detail\":\"" +
-                 EscapeJson(error) + "\"}\n";
-        return 1;
+        return FailCliCommand("InvalidSubtitles", error, output);
     }
     output = "{\"ok\":true,\"cues\":" + std::to_string(cues.size()) +
              ",\"path\":\"" + EscapeJson(outputPath) + "\"}\n";
@@ -808,9 +811,7 @@ int ExportCommand(const std::string& documentPath,
     Project project;
     std::string error;
     if (!LoadStoredProject(documentPath, project, error)) {
-        output = "{\"ok\":false,\"error\":\"InvalidDocument\",\"detail\":\"" +
-                 EscapeJson(error) + "\"}\n";
-        return 1;
+        return FailCliCommand("InvalidDocument", error, output);
     }
     Document document = project.MakeActiveDocument();
     ExportSettings resolvedSettings = settings;
@@ -826,14 +827,10 @@ int ExportCommand(const std::string& documentPath,
     ExportPlan plan;
     if (!Exporter::BuildPlan(document, documentPath, resolvedSettings, plan,
                              error)) {
-        output = "{\"ok\":false,\"error\":\"InvalidExport\",\"detail\":\"" +
-                 EscapeJson(error) + "\"}\n";
-        return 1;
+        return FailCliCommand("InvalidExport", error, output);
     }
     if (!Exporter::Run(plan, progress, cancel, error)) {
-        output = "{\"ok\":false,\"error\":\"ExportFailed\",\"detail\":\"" +
-                 EscapeJson(error) + "\"}\n";
-        return 1;
+        return FailCliCommand("ExportFailed", error, output);
     }
     output = "{\"ok\":true,\"codec\":\"hevc\",\"profile\":\"" +
              std::string(plan.settings.main10 ? "main10" : "main") +
@@ -1024,7 +1021,13 @@ int TranscribeMediaCommand(const std::string& projectPath,
     output = json.str();
     // A batch in which every named media failed is a failed command: a caller
     // that only checks the exit status must not read it as done.
-    return (!outcomes.empty() && succeeded == 0) ? 1 : 0;
+    if (!outcomes.empty() && succeeded == 0) {
+        const std::string detail = outcomes.size() == 1
+                                       ? outcomes.front().error
+                                       : "all transcription jobs failed";
+        return FailCliCommand("IoError", detail, output);
+    }
+    return 0;
 }
 
 int AnalyzeShotQualityCommand(const std::string& projectPath,

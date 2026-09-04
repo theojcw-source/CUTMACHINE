@@ -1,5 +1,6 @@
 #include "Ingest.h"
 
+#include "Cli.h"
 #include "Document.h"
 #include "ProjectStorage.h"
 #include "SpeechOnset.h"
@@ -377,11 +378,11 @@ void MeasureIngestedAudioLevel(const std::filesystem::path& absolute,
     media.audio_level = level;
 }
 
-std::string ResultJson(bool ok, size_t added, size_t skipped,
-                       const std::vector<IngestError>& errors) {
+std::string SuccessJson(size_t added, size_t skipped,
+                        const std::vector<IngestError>& errors) {
     std::ostringstream output;
-    output << "{\"ok\":" << (ok ? "true" : "false") << ",\"added\":" << added
-           << ",\"skipped\":" << skipped << ",\"errors\":[";
+    output << "{\"ok\":true,\"added\":" << added << ",\"skipped\":"
+           << skipped << ",\"errors\":[";
     for (size_t index = 0; index < errors.size(); ++index) {
         if (index) output << ',';
         output << "{\"file\":\"" << EscapeJson(errors[index].file)
@@ -414,8 +415,7 @@ int IngestCommand(const std::string& documentPath,
     Project project;
     std::string reason;
     if (!LoadStoredProject(documentPath, project, reason)) {
-        output = ResultJson(false, 0, 0, {{documentPath, reason}});
-        return 1;
+        return FailCliCommand("ParseError", reason, output);
     }
     Document document = project.MakeActiveDocument();
 
@@ -423,20 +423,16 @@ int IngestCommand(const std::string& documentPath,
     const std::filesystem::path resolvedDocument =
         Resolved(documentPath, pathError);
     if (pathError) {
-        output = ResultJson(false, 0, 0, {{documentPath, pathError.message()}});
-        return 1;
+        return FailCliCommand("IoError", pathError.message(), output);
     }
     const std::filesystem::path resolvedDirectory =
         Resolved(directoryPath, pathError);
     if (pathError) {
-        output =
-            ResultJson(false, 0, 0, {{directoryPath, pathError.message()}});
-        return 1;
+        return FailCliCommand("IoError", pathError.message(), output);
     }
     std::vector<std::filesystem::path> files;
     if (!CollectFiles(resolvedDirectory, recursive, files, reason)) {
-        output = ResultJson(false, 0, 0, {{directoryPath, reason}});
-        return 1;
+        return FailCliCommand("IoError", reason, output);
     }
 
     std::map<std::string, size_t> knownPaths;
@@ -513,17 +509,14 @@ int IngestCommand(const std::string& documentPath,
     }
 
     if (!document.Validate(reason)) {
-        output = ResultJson(false, added, skipped, {{documentPath, reason}});
-        return 1;
+        return FailCliCommand("ValidationFailed", reason, output);
     }
     if (changed) {
         if (!project.CommitActiveDocument(document, reason) ||
             !CommitStoredProject(documentPath, project, reason)) {
-            output =
-                ResultJson(false, added, skipped, {{documentPath, reason}});
-            return 1;
+            return FailCliCommand("IoError", reason, output);
         }
     }
-    output = ResultJson(true, added, skipped, errors);
+    output = SuccessJson(added, skipped, errors);
     return 0;
 }

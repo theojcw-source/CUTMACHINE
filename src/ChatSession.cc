@@ -200,9 +200,7 @@ bool ChatSession::SubmitUserMessage(const std::string& text,
 
             const McpToolCallOutcome outcome =
                 registry_.Call(backend_, use.tool_name, use.tool_input);
-            const std::string resultText =
-                outcome.ok ? outcome.result_json
-                           : (outcome.error_name + ": " + outcome.message);
+            const std::string& resultText = outcome.result_json;
             const std::string modelResultText =
                 outcome.ok && use.tool_name == "describe" &&
                         llm_.Config().provider == ChatLlmProvider::Ollama

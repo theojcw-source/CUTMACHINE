@@ -1,15 +1,21 @@
 #include "Cli.h"
 #include "Document.h"
 #include "EditLog.h"
+#include "Ingest.h"
+#include "Json.h"
 #include "Operations.h"
 #include "ProjectStorage.h"
+#include "ResolveExport.h"
+#include "ResolveImport.h"
 #include "Ulid.h"
 
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -20,6 +26,28 @@ void Check(bool condition, const std::string& message) {
         ++failures;
         std::cerr << "FAIL: " << message << '\n';
     }
+}
+
+void CheckFailureEnvelope(const std::string& output, const std::string& label,
+                          const std::string& expectedError) {
+    mcp_json::Value envelope;
+    std::string parseError;
+    const bool parsed =
+        mcp_json::Value::Parse(output, envelope, parseError) &&
+        envelope.IsObject();
+    Check(parsed, label + " returns a JSON object: " + parseError);
+    if (!parsed) return;
+    const mcp_json::Value* ok = envelope.Find("ok");
+    const mcp_json::Value* error = envelope.Find("error");
+    const mcp_json::Value* detail = envelope.Find("detail");
+    Check(ok != nullptr && ok->IsBool() && !ok->AsBool(),
+          label + " returns ok:false");
+    Check(error != nullptr && error->IsString() &&
+              error->AsString() == expectedError,
+          label + " preserves " + expectedError);
+    Check(detail != nullptr && detail->IsString() &&
+              !detail->AsString().empty(),
+          label + " returns a non-empty detail");
 }
 
 std::string Read(const std::filesystem::path& path) {
@@ -66,6 +94,149 @@ int main() {
         std::filesystem::temp_directory_path() /
         (GenerateUlid() + "-cli-tests");
     std::filesystem::create_directory(directory);
+
+    // B2 -- exercise every headless command at its cheapest refusal point.
+    // This catalog catches a new command that returns a non-zero status with
+    // free text, a success-shaped object, or a missing stable code.
+    {
+        const std::filesystem::path missingProject =
+            directory / "absent.cutmachine.json";
+        const std::filesystem::path missingManifest =
+            directory / "absent-resolve.json";
+        struct FailureCase {
+            std::string name;
+            std::string error;
+            std::function<int(std::string&)> call;
+        };
+        const std::vector<FailureCase> cases = {
+            {"create_project", "InvalidOperation",
+             [&](std::string& output) {
+                 return CreateProjectCommand(
+                     (directory / "unused.cutmachine-project").string(), "",
+                     output);
+             }},
+            {"transcribe_media", "ParseError",
+             [&](std::string& output) {
+                 return TranscribeMediaCommand(
+                     missingProject.string(), {"missing-media"}, "", "auto",
+                     false, false, output);
+             }},
+            {"analyze_shot_quality", "ParseError",
+             [&](std::string& output) {
+                 return AnalyzeShotQualityCommand(
+                     missingProject.string(), "missing-media", output);
+             }},
+            {"shot_quality_report", "ParseError",
+             [&](std::string& output) {
+                 return ShotQualityReportCommand(missingProject.string(),
+                                                 output);
+             }},
+            {"align_transcripts", "ParseError",
+             [&](std::string& output) {
+                 return AlignTranscriptsCommand(missingProject.string(), false,
+                                                output);
+             }},
+            {"analyze_speech_onset", "ParseError",
+             [&](std::string& output) {
+                 return AnalyzeSpeechOnsetCommand(
+                     missingProject.string(), "missing-media", output);
+             }},
+            {"speech_onset_report", "ParseError",
+             [&](std::string& output) {
+                 return SpeechOnsetReportCommand(missingProject.string(),
+                                                 output);
+             }},
+            {"list_disfluencies", "ParseError",
+             [&](std::string& output) {
+                 return ListDisfluenciesCommand(missingProject.string(),
+                                                "missing-clip", output);
+             }},
+            {"remove_words", "ParseError",
+             [&](std::string& output) {
+                 return RemoveWordsCommand(missingProject.string(),
+                                           "missing-clip", "[]", output);
+             }},
+            {"tighten_pauses", "ParseError",
+             [&](std::string& output) {
+                 return TightenPausesCommand(missingProject.string(),
+                                             "missing-clip", 400, 6, output);
+             }},
+            {"locate_source_frame", "ParseError",
+             [&](std::string& output) {
+                 return LocateSourceFrameCommand(
+                     missingProject.string(), "missing-media", 0, output);
+             }},
+            {"describe", "ParseError",
+             [&](std::string& output) {
+                 return DescribeCommand(missingProject.string(), output);
+             }},
+            {"export_srt", "InvalidDocument",
+             [&](std::string& output) {
+                 return ExportSrtCommand(missingProject.string(),
+                                         (directory / "unused.srt").string(),
+                                         output);
+             }},
+            {"propose_sequence", "ParseError",
+             [&](std::string& output) {
+                 return ProposeSequenceCommand(missingProject.string(),
+                                               output);
+             }},
+            {"apply_operation", "ParseError",
+             [&](std::string& output) {
+                 return ApplyOperationCommand(missingProject.string(), "{}",
+                                              output);
+             }},
+            {"apply_project_operation", "ParseError",
+             [&](std::string& output) {
+                 return ApplyProjectOperationCommand(missingProject.string(),
+                                                     "{}", output);
+             }},
+            {"undo_project_operation", "ParseError",
+             [&](std::string& output) {
+                 return UndoProjectOperationCommand(missingProject.string(),
+                                                    output);
+             }},
+            {"redo_project_operation", "ParseError",
+             [&](std::string& output) {
+                 return RedoProjectOperationCommand(missingProject.string(),
+                                                    output);
+             }},
+            {"undo_operation", "ParseError",
+             [&](std::string& output) {
+                 return UndoOperationCommand(missingProject.string(), output);
+             }},
+            {"redo_operation", "ParseError",
+             [&](std::string& output) {
+                 return RedoOperationCommand(missingProject.string(), output);
+             }},
+            {"export", "InvalidDocument",
+             [&](std::string& output) {
+                 return ExportCommand(missingProject.string(), ExportSettings{},
+                                      {}, nullptr, output);
+             }},
+            {"ingest", "ParseError",
+             [&](std::string& output) {
+                 return IngestCommand(missingProject.string(),
+                                      directory.string(), false, output);
+             }},
+            {"export_resolve_timeline", "InvalidDocument",
+             [&](std::string& output) {
+                 return ExportResolveTimelineCommand(missingProject.string(),
+                                                     output);
+             }},
+            {"import_resolve", "IoError",
+             [&](std::string& output) {
+                 return ImportResolveCommand(missingProject.string(),
+                                             missingManifest.string(), output);
+             }},
+        };
+        for (const FailureCase& test : cases) {
+            std::string output;
+            Check(test.call(output) != 0, test.name + " is refused");
+            CheckFailureEnvelope(output, test.name, test.error);
+        }
+    }
+
     std::string error;
     std::string createdOutput;
     const std::filesystem::path createdPackage =

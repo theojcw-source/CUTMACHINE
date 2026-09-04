@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <utility>
 
 namespace {
 
@@ -3286,6 +3287,24 @@ void LiftImagePayload(McpToolCallOutcome& outcome) {
     outcome.result_json = text->AsString();
 }
 
+// B2 -- ROADMAP.md. This is the sole serializer for tool-call refusals.
+// Dispatchers keep reporting the engine's existing stable code separately;
+// every surface then receives the same machine-readable payload.
+McpToolCallOutcome FinalizeOutcome(McpToolCallOutcome outcome) {
+    if (outcome.ok) {
+        LiftImagePayload(outcome);
+        return outcome;
+    }
+    if (outcome.error_name.empty()) outcome.error_name = "InvalidOperation";
+    if (outcome.message.empty()) outcome.message = "tool call failed";
+    outcome.result_json = "{\"ok\":false,\"error\":\"" +
+                          Esc(outcome.error_name) + "\",\"detail\":\"" +
+                          Esc(outcome.message) + "\"}";
+    outcome.image_base64.clear();
+    outcome.image_mime.clear();
+    return outcome;
+}
+
 }  // namespace
 
 McpToolCallOutcome McpToolRegistry::Call(
@@ -3303,7 +3322,7 @@ McpToolCallOutcome McpToolRegistry::Call(
         outcome.ok = false;
         outcome.error_name = "UnknownTool";
         outcome.message = "no such tool '" + toolName + "'";
-        return outcome;
+        return FinalizeOutcome(std::move(outcome));
     }
 
     // MCP allows omitting "arguments" for a no-argument tool; treat Null as
@@ -3315,7 +3334,7 @@ McpToolCallOutcome McpToolRegistry::Call(
         outcome.ok = false;
         outcome.error_name = "ValidationFailed";
         outcome.message = "'" + toolName + "' arguments must be a JSON object";
-        return outcome;
+        return FinalizeOutcome(std::move(outcome));
     }
 
     Document document;
@@ -3324,13 +3343,12 @@ McpToolCallOutcome McpToolRegistry::Call(
         outcome.ok = false;
         outcome.error_name = "IoError";
         outcome.message = snapshotError;
-        return outcome;
+        return FinalizeOutcome(std::move(outcome));
     }
     const IdResolver resolver(document);
 
     outcome.ok = dispatch_[toolIndex](backend, resolver, effectiveArguments,
                                       outcome.result_json, outcome.error_name,
                                       outcome.message);
-    if (outcome.ok) LiftImagePayload(outcome);
-    return outcome;
+    return FinalizeOutcome(std::move(outcome));
 }

@@ -12,6 +12,13 @@ class EditLog;
 class ProjectEditLog;
 class Project;
 
+// B2 -- ROADMAP.md. Every headless surface uses this serializer for a
+// refusal, including commands implemented outside Cli.cc. Keeping the exit
+// status beside the JSON construction prevents a caller from receiving a
+// non-zero status with a success-shaped or free-form payload.
+int FailCliCommand(const std::string& errorCode, const std::string& detail,
+                   std::string& output, int exitStatus = 1);
+
 // Headless command entry points. These functions depend only on the model
 // library and never initialize AppKit, Metal, media decoding, or rendering.
 int CreateProjectCommand(const std::string& packagePath,
