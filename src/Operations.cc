@@ -175,8 +175,7 @@ const DocumentTrack* LockedTrackTouchedBy(const Document& document,
                 for (const Ulid& trackId : value.sync_track_ids)
                     addTrack(trackId);
                 addExactTracks(value.exact_track_result);
-            } else if constexpr (std::is_same_v<T,
-                                                TrimBoundaryAirOperation>) {
+            } else if constexpr (std::is_same_v<T, TrimBoundaryAirOperation>) {
                 for (const BoundaryAirTrim& trim : value.trims) {
                     addClipTrack(trim.clip_id);
                     for (const Ulid& clipId : trim.linked_clip_ids)
@@ -1515,8 +1514,7 @@ bool ApplyTrimBoundaryAir(Document& candidate,
 
     if (operation.trims.empty()) {
         Fail(EditError::InvalidOperation,
-             "TrimBoundaryAir requires at least one boundary", error,
-             message);
+             "TrimBoundaryAir requires at least one boundary", error, message);
         return false;
     }
     std::vector<std::pair<Ulid, TrimEdge>> seen;
@@ -1540,8 +1538,8 @@ bool ApplyTrimBoundaryAir(Document& candidate,
             candidate.FindTrackForClip(trim.clip_id);
         if (!anchorTrack) {
             Fail(EditError::UnknownClip,
-                 "unknown boundary trim clip_id '" + trim.clip_id + "'",
-                 error, message);
+                 "unknown boundary trim clip_id '" + trim.clip_id + "'", error,
+                 message);
             return false;
         }
         addTrack(anchorTrack->id);
@@ -1550,8 +1548,7 @@ bool ApplyTrimBoundaryAir(Document& candidate,
                 candidate.FindTrackForClip(linkedId);
             if (!linkedTrack) {
                 Fail(EditError::UnknownClip,
-                     "unknown boundary trim linked clip_id '" + linkedId +
-                         "'",
+                     "unknown boundary trim linked clip_id '" + linkedId + "'",
                      error, message);
                 return false;
             }
@@ -1561,8 +1558,8 @@ bool ApplyTrimBoundaryAir(Document& candidate,
     for (const Ulid& trackId : operation.sync_track_ids) {
         if (!candidate.FindTrack(trackId)) {
             Fail(EditError::UnknownTrack,
-                 "unknown boundary trim sync track_id '" + trackId + "'",
-                 error, message);
+                 "unknown boundary trim sync track_id '" + trackId + "'", error,
+                 message);
             return false;
         }
         addTrack(trackId);
