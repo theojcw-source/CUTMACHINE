@@ -30,22 +30,22 @@ jobs:
   # -----------------------------------------------------------------------
   test:
     name: Build & CTest (standard)
-    runs-on: macos-latest
+    runs-on: macos-14
     timeout-minutes: 45
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup dependencies (Homebrew)
         run: |
-          brew bundle --no-lock
+          brew bundle --file=Brewfile
           # Vérifier que ffmpeg est disponible
           ffmpeg -version | head -1
 
       - name: Configure CMake
         run: |
-          cmake -B build-ci \
+          cmake -S . -B build-ci \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBUILD_TESTING=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -71,7 +71,7 @@ jobs:
           name: ctest-results-standard
           path: |
             build-ci/Testing/
-            build-ci/LastTest.log
+            build-ci/Testing/Temporary/LastTest.log
           retention-days: 7
 
   # -----------------------------------------------------------------------
@@ -80,19 +80,19 @@ jobs:
   # -----------------------------------------------------------------------
   sanitize:
     name: Build & CTest (ASan + UBSan)
-    runs-on: macos-latest
+    runs-on: macos-14
     timeout-minutes: 60
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup dependencies
-        run: brew bundle --no-lock
+        run: brew bundle --file=Brewfile
 
       - name: Configure CMake (sanitizers)
         run: |
-          cmake -B build-sanitize \
+          cmake -S . -B build-sanitize \
             -DCMAKE_BUILD_TYPE=Debug \
             -DBUILD_TESTING=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
@@ -130,21 +130,21 @@ jobs:
   # -----------------------------------------------------------------------
   repeat-concurrent:
     name: CTest concurrence (repeat until-fail)
-    runs-on: macos-latest
+    runs-on: macos-14
     timeout-minutes: 30
     # Ne tourne que sur les pushes sur main ET le cron nightly
     if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup dependencies
-        run: brew bundle --no-lock
+        run: brew bundle --file=Brewfile
 
       - name: Configure (ThreadSanitizer -- build séparé car incompatible ASan)
         run: |
-          cmake -B build-tsan \
+          cmake -S . -B build-tsan \
             -DCMAKE_BUILD_TYPE=Debug \
             -DBUILD_TESTING=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \

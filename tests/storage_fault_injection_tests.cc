@@ -1,9 +1,10 @@
-// tests/storage_fault_injection_tests.cc
+// tests/storage_fault_injection_tests.cc -- storage failure coverage.
 //
 // Tests d'injection de pannes de stockage.
 //
 // Objectif : vérifier que le moteur de stockage maintient la propriété
-// "soit l'ancienne génération complète, soit la nouvelle génération complète,
+// "soit l'ancienne génération complète, soit la nouvelle génération
+// complète,
 // jamais un mélange" -- même quand le filesystem panique à mi-chemin.
 //
 // Stratégie :
@@ -23,7 +24,6 @@
 // externalement observables depuis ProjectStorage::SaveProject et les
 // fonctions de vérification d'intégrité.
 
-#include "Document.h"
 #include "EditLog.h"
 #include "Project.h"
 #include "ProjectRecovery.h"
@@ -34,7 +34,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -94,35 +93,8 @@ std::string ReadFile(const fs::path& path) {
             std::istreambuf_iterator<char>()};
 }
 
-void WriteFile(const fs::path& path, const std::string& content) {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    output << content;
-    if (!output) throw std::runtime_error("write fixture failed");
-}
-
 Project MakeProject(const std::string& name) {
-    Project p(name);
-    p.frame_rate = {25, 1};
-    p.width = 1920;
-    p.height = 1080;
-    return p;
-}
-
-// -----------------------------------------------------------------------
-// Vérifier qu'un projet est entièrement cohérent après une opération
-// -----------------------------------------------------------------------
-bool ProjectIsWellFormed(const fs::path& projectPath, std::string& reason) {
-    Project loaded;
-    std::string error;
-    if (!LoadStoredProject(projectPath.string(), loaded, error)) {
-        reason = "LoadStoredProject a échoué : " + error;
-        return false;
-    }
-    if (!loaded.Validate(error)) {
-        reason = "Validate a échoué après rechargement : " + error;
-        return false;
-    }
-    return true;
+    return Project(name);
 }
 
 }  // namespace
@@ -153,7 +125,7 @@ int main() {
 
         // Tentative d'autosave avec un projet invalide
         Project invalid = MakeProject("Invalid");
-        invalid.width = 0;  // invalide selon Project::Validate
+        invalid.timelines.front().width = 0;
         Check(!ProjectRecovery::WriteAutosave(projectPath.string(), invalid,
                                               error),
               "autosave invalide doit échouer");
@@ -190,7 +162,7 @@ int main() {
 
         // Tentative de save avec projet invalide
         Project broken = MakeProject("Broken");
-        broken.width = -1;
+        broken.timelines.front().width = -1;
         const bool saveOk = broken.Save(projectPath.string(), error);
         if (!saveOk) {
             // Le fichier original doit être intact
@@ -238,7 +210,7 @@ int main() {
     // ------------------------------------------------------------------
     // T4 : récupération depuis un autosave plus récent
     // ------------------------------------------------------------------
-    Test("recovery envelope préserve l'état complet et est plus récente", [] {
+    Test("recovery envelope préserve l'état complet", [] {
         TemporaryDirectory dir;
         const fs::path projectPath = dir.path() / "timeline.cut.json";
 
@@ -396,7 +368,8 @@ int main() {
     });
 
     // ------------------------------------------------------------------
-    // T8 : autosave avec historique incomplet => rejeté, précédent préservé
+    // T8 : autosave avec historique incomplet => rejeté, précédent
+    // préservé
     // ------------------------------------------------------------------
     Test("autosave avec historique incomplet est rejeté", [] {
         TemporaryDirectory dir;
@@ -432,7 +405,8 @@ int main() {
 
         const bool rejected = !ProjectRecovery::WriteAutosave(
             projectPath.string(), p, incompleteLogs, plog, error);
-        Check(rejected, "autosave avec historique incomplet doit être rejeté");
+        Check(rejected,
+              "autosave avec historique incomplet doit être rejeté");
 
         if (rejected) {
             const std::string afterReject =

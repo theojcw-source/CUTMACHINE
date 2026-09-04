@@ -1,9 +1,10 @@
-// tests/rational_time_property_tests.cc
+// tests/rational_time_property_tests.cc -- exact-time property coverage.
 //
 // Property-based testing for RationalTime.
 //
-// Pas de framework externe -- même pattern Test/Check que le reste de la suite.
-// Les propriétés sont vérifiées sur une grille exhaustive de rates et valeurs
+// Pas de framework externe -- même pattern Test/Check que le reste de la
+// suite. Les propriétés sont vérifiées sur une grille exhaustive de rates
+// et valeurs
 // représentatives plutôt que sur de l'aléatoire pur, pour que les échecs
 // soient reproductibles sans graine et lisibles dans l'output CI.
 //
@@ -203,7 +204,8 @@ int main() {
     });
 
     // ------------------------------------------------------------------
-    // P5 : rescale non-exact lève une exception (pas de troncature silencieuse)
+    // P5 : rescale non-exact lève une exception (pas de troncature
+    // silencieuse)
     // ------------------------------------------------------------------
     Test("rescale non exact lève std::invalid_argument", [] {
         // 1 frame à 24fps ne peut pas se rescaler exactement en 25fps
@@ -327,8 +329,9 @@ int main() {
             {1, 2}, {12, 24}, {25, 50}, {24000, 48000}};
         for (const auto& a : half_second) {
             for (const auto& b : half_second) {
-                Check(a == b,
-                      "0.5s exprimée en rates différents devrait être égale");
+                Check(
+                    a == b,
+                    "0.5s exprimée en rates différents devrait être égale");
             }
         }
     });
@@ -361,7 +364,8 @@ int main() {
     // ------------------------------------------------------------------
     Test("overflow est détecté et lève std::overflow_error", [] {
         // Deux heures de samples à 48kHz au rate le plus élevé
-        const RationalTime huge{std::numeric_limits<int64_t>::max() / 2, 48000};
+        const RationalTime huge{
+            std::numeric_limits<int64_t>::max() / 2 + 1, 48000};
         bool threw = false;
         try {
             huge.add(huge);

@@ -1,8 +1,9 @@
-// tests/edit_sequence_tests.cc
+// tests/edit_sequence_tests.cc -- stateful edit-log regression coverage.
 //
 // Tests de séquences d'opérations générées (stateful testing).
 //
-// Principe : générer des séquences aléatoires mais reproductibles d'opérations
+// Principe : générer des séquences aléatoires mais reproductibles
+// d'opérations
 // valides sur un Document, et vérifier des invariants à chaque étape :
 //
 //   I1  document.Validate() == true après chaque Apply réussi
@@ -20,14 +21,12 @@
 #include "Document.h"
 #include "EditLog.h"
 #include "Operations.h"
-#include "Project.h"
 #include "RationalTime.h"
 #include "Ulid.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -78,6 +77,9 @@ struct Lcg {
         if (size == 0) return 0;
         return static_cast<size_t>(Next() % size);
     }
+
+private:
+    uint64_t state_;
 };
 
 // -----------------------------------------------------------------------
@@ -144,15 +146,24 @@ Document MakeBaseDocument() {
     doc.sequence.frame_rate = {25, 1};
     doc.sequence.width = 1920;
     doc.sequence.height = 1080;
+    DocumentSource source;
+    source.id = GenerateUlid();
+    source.path = "/tmp/stateful-source.mov";
+    source.rate = {25, 1};
+    source.duration = {100000, 25};
+    doc.sources.push_back(std::move(source));
     return doc;
 }
 
 // Ajouter une piste vidéo (toujours applicable)
-GeneratedOp GenAddTrack(Lcg& rng) {
+GeneratedOp GenAddTrack(const Document& doc, Lcg& rng) {
     AddTrackOperation op;
     op.kind = rng.NextBool() ? "video" : "audio";
     op.index = 0;
-    op.id = GenerateUlid();
+    for (const DocumentTrack& track : doc.sequence.tracks) {
+        op.index = std::max(op.index, track.index + 1);
+    }
+    op.track_id = GenerateUlid();
     return {true, op};
 }
 
@@ -173,10 +184,9 @@ GeneratedOp GenAddClip(const Document& doc, Lcg& rng) {
     const int64_t dur = rng.NextInt64(24, 201);
     const int64_t gap = rng.NextInt64(0, 25);  // 0-24 frames de gap
 
-    AddClipOperation op;
+    InsertClipOperation op;
     op.track_id = track.id;
-    op.id = GenerateUlid();
-    op.source_id = GenerateUlid();
+    op.source_id = doc.sources.front().id;
     op.source_in = {0, kRate};
     op.timeline_in = {latestEnd + gap, kRate};
     op.duration = {dur, kRate};
@@ -221,7 +231,7 @@ GeneratedOp PickOperation(const Document& doc, Lcg& rng) {
     const int choice = static_cast<int>(rng.Next() % 5);
     switch (choice) {
         case 0:
-            return GenAddTrack(rng);
+            return GenAddTrack(doc, rng);
         case 1:
             return GenAddClip(doc, rng);
         case 2:
@@ -252,7 +262,7 @@ int main() {
 
         // D'abord on force quelques pistes pour avoir quelque chose à éditer
         for (int i = 0; i < 3; ++i) {
-            GeneratedOp g = GenAddTrack(rng);
+            GeneratedOp g = GenAddTrack(doc, rng);
             EditError err = EditError::None;
             std::string msg;
             log.Apply(doc, g.op, err, msg);
@@ -279,8 +289,8 @@ int main() {
             }
         }
         // On doit avoir au moins appliqué quelques opérations
-        Check(applied >= 5,
-              "trop peu d'opérations applicables : " + std::to_string(applied));
+        Check(applied >= 5, "trop peu d'opérations applicables : " +
+                                std::to_string(applied));
     });
 
     // ------------------------------------------------------------------
@@ -293,7 +303,7 @@ int main() {
 
         // Construire un document de base
         for (int i = 0; i < 2; ++i) {
-            auto g = GenAddTrack(rng);
+            auto g = GenAddTrack(doc, rng);
             EditError e = EditError::None;
             std::string m;
             log.Apply(doc, g.op, e, m);
@@ -337,7 +347,7 @@ int main() {
         EditLog log;
 
         for (int i = 0; i < 2; ++i) {
-            auto g = GenAddTrack(rng);
+            auto g = GenAddTrack(doc, rng);
             EditError e = EditError::None;
             std::string m;
             log.Apply(doc, g.op, e, m);
@@ -380,7 +390,7 @@ int main() {
         EditLog log;
 
         for (int i = 0; i < 2; ++i) {
-            auto g = GenAddTrack(rng);
+            auto g = GenAddTrack(doc, rng);
             EditError e = EditError::None;
             std::string m;
             log.Apply(doc, g.op, e, m);
@@ -400,8 +410,9 @@ int main() {
             std::string loadMsg;
             const bool loaded =
                 EditLog::Deserialize(s1, reloaded, loadErr, loadMsg);
-            Check(loaded, "Deserialize a échoué step " + std::to_string(step) +
-                              " : " + loadMsg);
+            Check(loaded,
+                  "Deserialize a échoué step " + std::to_string(step) +
+                      " : " + loadMsg);
             if (loaded) {
                 const std::string s2 = reloaded.Serialize();
                 Check(s1 == s2,
@@ -420,7 +431,7 @@ int main() {
 
         // Construire un document non trivial
         for (int i = 0; i < 3; ++i) {
-            auto g = GenAddTrack(rng);
+            auto g = GenAddTrack(doc, rng);
             EditError e = EditError::None;
             std::string m;
             log.Apply(doc, g.op, e, m);
@@ -473,13 +484,13 @@ int main() {
     // ------------------------------------------------------------------
     // T6 : AppliedCount et UndoneCount sont cohérents
     // ------------------------------------------------------------------
-    Test("I8 : AppliedCount et UndoneCount cohérents avec Apply/Undo/Redo", [] {
+    Test("I8 : compteurs cohérents avec Apply/Undo/Redo", [] {
         Lcg rng(0x9999DEADULL);
         Document doc = MakeBaseDocument();
         EditLog log;
 
         {
-            auto g = GenAddTrack(rng);
+            auto g = GenAddTrack(doc, rng);
             EditError e = EditError::None;
             std::string m;
             log.Apply(doc, g.op, e, m);
@@ -544,7 +555,7 @@ int main() {
         EditLog log;
 
         for (int i = 0; i < 2; ++i) {
-            auto g = GenAddTrack(rng);
+            auto g = GenAddTrack(doc, rng);
             EditError e = EditError::None;
             std::string m;
             log.Apply(doc, g.op, e, m);

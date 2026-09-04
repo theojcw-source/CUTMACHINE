@@ -645,6 +645,44 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
 
+    # QC-2026-08 -- these regression suites were delivered as detached
+    # artifacts under "Test copilot/". Register them here so exact-time,
+    # stateful edit-log and storage-failure properties run with the normal
+    # local CTest gate instead of existing only as unaudited source files.
+    add_executable(cutmachine_rational_time_property_tests
+                   tests/rational_time_property_tests.cc)
+    target_link_libraries(cutmachine_rational_time_property_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_rational_time_property_tests
+             COMMAND cutmachine_rational_time_property_tests)
+
+    add_executable(cutmachine_edit_sequence_tests
+                   tests/edit_sequence_tests.cc)
+    target_link_libraries(cutmachine_edit_sequence_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_edit_sequence_tests
+             COMMAND cutmachine_edit_sequence_tests)
+
+    add_executable(cutmachine_storage_fault_injection_tests
+                   tests/storage_fault_injection_tests.cc)
+    target_link_libraries(cutmachine_storage_fault_injection_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_storage_fault_injection_tests
+             COMMAND cutmachine_storage_fault_injection_tests)
+
+    set_tests_properties(
+        cutmachine_rational_time_property_tests
+        cutmachine_edit_sequence_tests
+        cutmachine_storage_fault_injection_tests
+        PROPERTIES LABELS "portable;regression"
+    )
+    set_tests_properties(
+        cutmachine_storage_fault_injection_tests
+        cutmachine_project_recovery_tests
+        cutmachine_project_storage_tests
+        PROPERTIES LABELS "storage"
+    )
+
     # The Resolve plugin's pure core is Lua, so its tests run under fuscript,
     # the Lua 5.1 interpreter DaVinci Resolve ships. Registered only where
     # Resolve is installed: this is a tool test, not a reason to fail a build
