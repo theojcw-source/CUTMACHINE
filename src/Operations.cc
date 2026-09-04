@@ -175,6 +175,16 @@ const DocumentTrack* LockedTrackTouchedBy(const Document& document,
                 for (const Ulid& trackId : value.sync_track_ids)
                     addTrack(trackId);
                 addExactTracks(value.exact_track_result);
+            } else if constexpr (std::is_same_v<T,
+                                                TrimBoundaryAirOperation>) {
+                for (const BoundaryAirTrim& trim : value.trims) {
+                    addClipTrack(trim.clip_id);
+                    for (const Ulid& clipId : trim.linked_clip_ids)
+                        addClipTrack(clipId);
+                }
+                for (const Ulid& trackId : value.sync_track_ids)
+                    addTrack(trackId);
+                addExactTracks(value.exact_track_result);
             } else if constexpr (std::is_same_v<T, RollEditOperation>) {
                 for (const RollEditPair& pair : value.pairs) {
                     addClipTrack(pair.left_clip_id);
@@ -1458,6 +1468,121 @@ bool ApplyRippleTrim(Document& candidate, RippleTrimOperation& operation,
     inverse = RippleTrimOperation{
         operation.clip_id,         operation.edge,           operation.delta,
         operation.linked_clip_ids, operation.sync_track_ids, before};
+    return true;
+}
+
+// B4 -- ROADMAP.md. Boundary cleanup is deliberately a small compound over
+// RippleTrim rather than a second implementation of ripple geometry. The
+// outer ApplyOperation already works on a candidate document, so a refusal
+// from any constituent trim discards them all. One exact snapshot then makes
+// the successful compound one undo/redo step.
+bool ApplyTrimBoundaryAir(Document& candidate,
+                          TrimBoundaryAirOperation& operation,
+                          Operation& inverse, EditError& error,
+                          std::string& message) {
+    std::vector<Ulid> trackIds;
+    const auto addTrack = [&](const Ulid& id) {
+        if (!id.empty() &&
+            std::find(trackIds.begin(), trackIds.end(), id) == trackIds.end())
+            trackIds.push_back(id);
+    };
+    const auto snapshots = [&](const std::vector<Ulid>& ids) {
+        std::vector<ExactTrackState> states;
+        for (const Ulid& id : ids) {
+            const DocumentTrack* track = candidate.FindTrack(id);
+            if (track) states.push_back({id, track->clips});
+        }
+        return states;
+    };
+
+    if (!operation.exact_track_result.empty()) {
+        for (const ExactTrackState& state : operation.exact_track_result)
+            addTrack(state.track_id);
+        const std::vector<ExactTrackState> before = snapshots(trackIds);
+        if (before.size() != operation.exact_track_result.size()) {
+            Fail(EditError::UnknownTrack,
+                 "exact boundary trim references an unknown track", error,
+                 message);
+            return false;
+        }
+        for (const ExactTrackState& state : operation.exact_track_result)
+            candidate.FindTrack(state.track_id)->clips = state.clips;
+        if (!ValidateResult(candidate, error, message)) return false;
+        inverse = TrimBoundaryAirOperation{operation.trims,
+                                           operation.sync_track_ids, before};
+        return true;
+    }
+
+    if (operation.trims.empty()) {
+        Fail(EditError::InvalidOperation,
+             "TrimBoundaryAir requires at least one boundary", error,
+             message);
+        return false;
+    }
+    std::vector<std::pair<Ulid, TrimEdge>> seen;
+    for (const BoundaryAirTrim& trim : operation.trims) {
+        if (trim.delta.rate <= 0 ||
+            (trim.edge == TrimEdge::Head && trim.delta.value <= 0) ||
+            (trim.edge == TrimEdge::Tail && trim.delta.value >= 0)) {
+            Fail(EditError::InvalidOperation,
+                 "TrimBoundaryAir only accepts shortening deltas", error,
+                 message);
+            return false;
+        }
+        const std::pair<Ulid, TrimEdge> key{trim.clip_id, trim.edge};
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+            Fail(EditError::DuplicateId,
+                 "TrimBoundaryAir repeats a clip boundary", error, message);
+            return false;
+        }
+        seen.push_back(key);
+        const DocumentTrack* anchorTrack =
+            candidate.FindTrackForClip(trim.clip_id);
+        if (!anchorTrack) {
+            Fail(EditError::UnknownClip,
+                 "unknown boundary trim clip_id '" + trim.clip_id + "'",
+                 error, message);
+            return false;
+        }
+        addTrack(anchorTrack->id);
+        for (const Ulid& linkedId : trim.linked_clip_ids) {
+            const DocumentTrack* linkedTrack =
+                candidate.FindTrackForClip(linkedId);
+            if (!linkedTrack) {
+                Fail(EditError::UnknownClip,
+                     "unknown boundary trim linked clip_id '" + linkedId +
+                         "'",
+                     error, message);
+                return false;
+            }
+            addTrack(linkedTrack->id);
+        }
+    }
+    for (const Ulid& trackId : operation.sync_track_ids) {
+        if (!candidate.FindTrack(trackId)) {
+            Fail(EditError::UnknownTrack,
+                 "unknown boundary trim sync track_id '" + trackId + "'",
+                 error, message);
+            return false;
+        }
+        addTrack(trackId);
+    }
+    const std::vector<ExactTrackState> before = snapshots(trackIds);
+
+    for (const BoundaryAirTrim& trim : operation.trims) {
+        RippleTrimOperation ripple{trim.clip_id,
+                                   trim.edge,
+                                   trim.delta,
+                                   trim.linked_clip_ids,
+                                   operation.sync_track_ids,
+                                   {}};
+        Operation ignored = RemoveClipOperation{};
+        if (!ApplyRippleTrim(candidate, ripple, ignored, error, message))
+            return false;
+    }
+    operation.exact_track_result = snapshots(trackIds);
+    inverse = TrimBoundaryAirOperation{operation.trims,
+                                       operation.sync_track_ids, before};
     return true;
 }
 
@@ -4115,6 +4240,10 @@ bool ApplyOperation(Document& document, Operation& operation,
                        std::get_if<RippleTrimOperation>(&normalized)) {
             applied = ApplyRippleTrim(candidate, *rippleTrim, generatedInverse,
                                       error, message);
+        } else if (auto* boundaryTrim =
+                       std::get_if<TrimBoundaryAirOperation>(&normalized)) {
+            applied = ApplyTrimBoundaryAir(candidate, *boundaryTrim,
+                                           generatedInverse, error, message);
         } else if (auto* rollEdit =
                        std::get_if<RollEditOperation>(&normalized)) {
             applied = ApplyRollEdit(candidate, *rollEdit, generatedInverse,
@@ -4453,6 +4582,35 @@ std::string SerializeOperation(const Operation& operation) {
         }
         output << "],\"exact_tracks\":";
         WriteExactTracks(output, ripple->exact_track_result);
+        output << '}';
+    } else if (const auto* boundary =
+                   std::get_if<TrimBoundaryAirOperation>(&operation)) {
+        output << "{\"type\":\"TrimBoundaryAir\",\"trims\":[";
+        for (size_t index = 0; index < boundary->trims.size(); ++index) {
+            if (index) output << ',';
+            const BoundaryAirTrim& trim = boundary->trims[index];
+            output << "{\"clip_id\":";
+            WriteString(output, trim.clip_id);
+            output << ",\"edge\":\""
+                   << (trim.edge == TrimEdge::Head ? "Head" : "Tail")
+                   << "\",\"delta\":";
+            WriteTime(output, trim.delta);
+            output << ",\"linked_clip_ids\":[";
+            for (size_t linked = 0; linked < trim.linked_clip_ids.size();
+                 ++linked) {
+                if (linked) output << ',';
+                WriteString(output, trim.linked_clip_ids[linked]);
+            }
+            output << "]}";
+        }
+        output << "],\"sync_track_ids\":[";
+        for (size_t index = 0; index < boundary->sync_track_ids.size();
+             ++index) {
+            if (index) output << ',';
+            WriteString(output, boundary->sync_track_ids[index]);
+        }
+        output << "],\"exact_tracks\":";
+        WriteExactTracks(output, boundary->exact_track_result);
         output << '}';
     } else if (const auto* roll = std::get_if<RollEditOperation>(&operation)) {
         output << "{\"type\":\"RollEdit\",\"pairs\":[";
@@ -5132,6 +5290,49 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             if (!reader.Consume("]")) {
                 while (true) {
                     value.linked_clip_ids.push_back(reader.String());
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"sync_track_ids\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    value.sync_track_ids.push_back(reader.String());
+                    if (reader.Consume("]")) break;
+                    reader.Expect(",");
+                }
+            }
+            reader.Expect(",\"exact_tracks\":");
+            value.exact_track_result = ReadExactTracks(reader);
+            reader.Expect("}");
+            operation = std::move(value);
+        } else if (type == "TrimBoundaryAir") {
+            TrimBoundaryAirOperation value;
+            reader.Expect(",\"trims\":[");
+            if (!reader.Consume("]")) {
+                while (true) {
+                    BoundaryAirTrim trim;
+                    reader.Expect("{\"clip_id\":");
+                    trim.clip_id = reader.String();
+                    reader.Expect(",\"edge\":");
+                    const std::string edge = reader.String();
+                    if (edge != "Head" && edge != "Tail")
+                        throw std::runtime_error(
+                            "invalid boundary air trim edge");
+                    trim.edge =
+                        edge == "Head" ? TrimEdge::Head : TrimEdge::Tail;
+                    reader.Expect(",\"delta\":");
+                    trim.delta = ReadTime(reader);
+                    reader.Expect(",\"linked_clip_ids\":[");
+                    if (!reader.Consume("]")) {
+                        while (true) {
+                            trim.linked_clip_ids.push_back(reader.String());
+                            if (reader.Consume("]")) break;
+                            reader.Expect(",");
+                        }
+                    }
+                    reader.Expect("}");
+                    value.trims.push_back(std::move(trim));
                     if (reader.Consume("]")) break;
                     reader.Expect(",");
                 }

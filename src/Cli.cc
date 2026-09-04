@@ -1,5 +1,6 @@
 #include "Cli.h"
 
+#include "BoundaryAir.h"
 #include "Document.h"
 #include "DocumentDelta.h"
 #include "EditLog.h"
@@ -1893,6 +1894,190 @@ int TightenPausesCommand(const std::string& projectPath,
         applied.Set("report", std::move(reportView));
         output = applied.Dump() + "\n";
     }
+    return 0;
+}
+
+int TrimBoundaryAirCommand(const std::string& projectPath,
+                           const std::string& clipId, int64_t keepFrames,
+                           int64_t minimumAirMs, std::string& output) {
+    Project project;
+    std::string message;
+    if (!LoadStoredProject(projectPath, project, message)) {
+        output = ErrorJson(EditError::ParseError, message);
+        return 1;
+    }
+    const Document document = project.MakeActiveDocument();
+    const DocumentClip* clip = document.FindClip(clipId);
+    if (!clip) {
+        output =
+            ErrorJson(EditError::UnknownClip, "unknown clip_id '" + clipId +
+                                                  "' on the active timeline");
+        return 1;
+    }
+    const DocumentSource* source = document.FindSource(clip->source_id);
+    if (!source) {
+        output =
+            ErrorJson(EditError::UnknownSource,
+                      "clip '" + clipId + "' reads from an unmounted source");
+        return 1;
+    }
+    const std::filesystem::path envelopePath =
+        std::filesystem::absolute(projectPath).parent_path() / ".cutmachine" /
+        "speechonset" / (clip->source_id + ".json");
+    SpeechOnsetReport envelope;
+    if (!LoadSpeechOnset(envelopePath.string(), envelope, message)) {
+        output = ErrorJson(EditError::IoError,
+                           "no speech envelope for source '" + clip->source_id +
+                               "': " + message +
+                               " (run --speech-onset on it first)");
+        return 1;
+    }
+
+    BoundaryAirSettings settings;
+    settings.keep_frames = keepFrames;
+    settings.minimum_air_milliseconds = minimumAirMs;
+    TrimBoundaryAirOperation operation;
+    BoundaryAirReport report;
+    if (!ResolveBoundaryAir(*clip, envelope, settings, source->rate, {},
+                            operation, report, message)) {
+        output = ErrorJson(EditError::InvalidOperation, message);
+        return 1;
+    }
+    for (BoundaryAirTrim& trim : operation.trims) {
+        const DocumentClip* target = document.FindClip(trim.clip_id);
+        if (target)
+            trim.linked_clip_ids = LinkedBoundaryClipIds(document, *target);
+    }
+    operation.sync_track_ids = BoundarySyncTrackIds(document, operation.trims);
+
+    mcp_json::Value root = mcp_json::Value::MakeObject();
+    root.Set("ok", mcp_json::Value::MakeBool(true));
+    root.Set("clip_id", mcp_json::Value::MakeString(clip->id));
+    mcp_json::Value reportView;
+    std::string parseError;
+    if (mcp_json::Value::Parse(SerializeBoundaryAirReport(report), reportView,
+                               parseError)) {
+        root.Set("report", std::move(reportView));
+    }
+    if (operation.trims.empty()) {
+        root.Set("applied", mcp_json::Value::MakeBool(false));
+        output = root.Dump() + "\n";
+        return 0;
+    }
+    std::string appliedJson;
+    const int result = ApplyOperationCommand(
+        projectPath, SerializeOperation(operation), appliedJson);
+    if (result != 0) {
+        output = std::move(appliedJson);
+        return result;
+    }
+    root.Set("applied", mcp_json::Value::MakeBool(true));
+    mcp_json::Value applied;
+    if (mcp_json::Value::Parse(appliedJson, applied, parseError) &&
+        applied.IsObject()) {
+        const mcp_json::Value* hash = applied.Find("doc_hash");
+        if (hash) root.Set("doc_hash", *hash);
+    }
+    output = root.Dump() + "\n";
+    return 0;
+}
+
+int CloseJunctionAirCommand(const std::string& projectPath,
+                            const std::string& leftClipId,
+                            const std::string& rightClipId, int64_t keepFrames,
+                            int64_t minimumAirMs, std::string& output) {
+    Project project;
+    std::string message;
+    if (!LoadStoredProject(projectPath, project, message)) {
+        output = ErrorJson(EditError::ParseError, message);
+        return 1;
+    }
+    const Document document = project.MakeActiveDocument();
+    const DocumentClip* left = document.FindClip(leftClipId);
+    const DocumentClip* right = document.FindClip(rightClipId);
+    if (!left || !right) {
+        output = ErrorJson(EditError::UnknownClip,
+                           "unknown clip in junction '" + leftClipId +
+                               "' -> '" + rightClipId + "'");
+        return 1;
+    }
+    const DocumentTrack* leftTrack = document.FindTrackForClip(left->id);
+    const DocumentTrack* rightTrack = document.FindTrackForClip(right->id);
+    if (!leftTrack || !rightTrack || leftTrack->id != rightTrack->id) {
+        output = ErrorJson(EditError::InvalidOperation,
+                           "junction clips must be on the same track");
+        return 1;
+    }
+    const DocumentSource* leftSource = document.FindSource(left->source_id);
+    const DocumentSource* rightSource = document.FindSource(right->source_id);
+    if (!leftSource || !rightSource) {
+        output = ErrorJson(EditError::UnknownSource,
+                           "junction clip reads from an unmounted source");
+        return 1;
+    }
+    const std::filesystem::path cacheRoot =
+        std::filesystem::absolute(projectPath).parent_path() / ".cutmachine" /
+        "speechonset";
+    SpeechOnsetReport leftEnvelope;
+    SpeechOnsetReport rightEnvelope;
+    if (!LoadSpeechOnset((cacheRoot / (left->source_id + ".json")).string(),
+                         leftEnvelope, message) ||
+        !LoadSpeechOnset((cacheRoot / (right->source_id + ".json")).string(),
+                         rightEnvelope, message)) {
+        output = ErrorJson(EditError::IoError,
+                           "missing speech envelope for junction: " + message +
+                               " (run --speech-onset first)");
+        return 1;
+    }
+
+    BoundaryAirSettings settings;
+    settings.keep_frames = keepFrames;
+    settings.minimum_air_milliseconds = minimumAirMs;
+    TrimBoundaryAirOperation operation;
+    JunctionAirReport report;
+    if (!ResolveJunctionAir(*left, leftEnvelope, leftSource->rate, *right,
+                            rightEnvelope, rightSource->rate, settings, {},
+                            operation, report, message)) {
+        output = ErrorJson(EditError::InvalidOperation, message);
+        return 1;
+    }
+    for (BoundaryAirTrim& trim : operation.trims) {
+        const DocumentClip* target = document.FindClip(trim.clip_id);
+        if (target)
+            trim.linked_clip_ids = LinkedBoundaryClipIds(document, *target);
+    }
+    operation.sync_track_ids = BoundarySyncTrackIds(document, operation.trims);
+
+    mcp_json::Value root = mcp_json::Value::MakeObject();
+    root.Set("ok", mcp_json::Value::MakeBool(true));
+    root.Set("left_clip_id", mcp_json::Value::MakeString(left->id));
+    root.Set("right_clip_id", mcp_json::Value::MakeString(right->id));
+    mcp_json::Value reportView;
+    std::string parseError;
+    if (mcp_json::Value::Parse(SerializeJunctionAirReport(report), reportView,
+                               parseError)) {
+        root.Set("report", std::move(reportView));
+    }
+    if (operation.trims.empty()) {
+        root.Set("applied", mcp_json::Value::MakeBool(false));
+        output = root.Dump() + "\n";
+        return 0;
+    }
+    std::string appliedJson;
+    const int result = ApplyOperationCommand(
+        projectPath, SerializeOperation(operation), appliedJson);
+    if (result != 0) {
+        output = std::move(appliedJson);
+        return result;
+    }
+    root.Set("applied", mcp_json::Value::MakeBool(true));
+    mcp_json::Value applied;
+    if (mcp_json::Value::Parse(appliedJson, applied, parseError) &&
+        applied.IsObject()) {
+        const mcp_json::Value* hash = applied.Find("doc_hash");
+        if (hash) root.Set("doc_hash", *hash);
+    }
+    output = root.Dump() + "\n";
     return 0;
 }
 

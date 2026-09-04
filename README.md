@@ -437,6 +437,11 @@ décodage média :
   ./Film.cutmachine-project/project.cutmachine.json --write
 ./build/cutmachine --tighten-pauses \
   ./Film.cutmachine-project/project.cutmachine.json '<clip-id>' 400 6
+./build/cutmachine --trim-boundary-air \
+  ./Film.cutmachine-project/project.cutmachine.json '<clip-id>' 3 300
+./build/cutmachine --close-junction-air \
+  ./Film.cutmachine-project/project.cutmachine.json \
+  '<clip-gauche-id>' '<clip-droit-id>' 3 300
 ./build/cutmachine --locate-source-frame \
   ./Film.cutmachine-project/project.cutmachine.json '<media-id>' 1412
 ./build/cutmachine --disfluencies \
@@ -753,6 +758,22 @@ referme en ripple. Une seule `RemoveWordsOperation`, donc un seul `undo`, et
 la paire A/V liée est emportée avec. L'air de tête et de queue n'est pas
 touché : c'est un rognage, la question de `--speech-onset`, et il est publié
 dans le rapport plutôt que coupé en douce.
+
+`--trim-boundary-air` (MCP : `trim_boundary_air`) ferme précisément ces
+silences de tête et de queue. Les deux nombres optionnels sont, dans l'ordre,
+les images source conservées près de la parole (3 par défaut) et la durée
+minimale d'air traitée en millisecondes (300 par défaut). Les bornes viennent
+des groupes de parole mesurés par `--speech-onset`, jamais des mots Whisper.
+La paire A/V et les autres pistes en sync-lock suivent dans une seule
+`TrimBoundaryAirOperation`, donc un seul `undo`.
+
+À une coupe, utiliser `--close-junction-air` (MCP :
+`close_junction_air`) avec le plan sortant puis le plan entrant. Le moteur
+additionne l'air de queue du premier et l'air de tête du second avant de
+comparer le seuil, puis rogne les deux côtés atomiquement. Ainsi deux moitiés
+de 280 ms sont bien reconnues comme un creux audible de 560 ms, et une seconde
+passe ne déplace plus la jonction. Les outils MCP acceptent en plus
+`sync_track_ids` pour remplacer explicitement les pistes sync-lock déduites.
 
 ### Adresser la timeline par le rush
 

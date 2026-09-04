@@ -115,6 +115,16 @@ int RemoveWordsCommand(const std::string& projectPath,
 int TightenPausesCommand(const std::string& projectPath,
                          const std::string& clipId, int64_t minimumGapMs,
                          int64_t keepFrames, std::string& output);
+// B4 -- ROADMAP.md. Closes measured head/tail air without consulting word
+// timestamps. The junction form measures both sides before applying one
+// atomic operation, so it cannot oscillate over successive passes.
+int TrimBoundaryAirCommand(const std::string& projectPath,
+                           const std::string& clipId, int64_t keepFrames,
+                           int64_t minimumAirMs, std::string& output);
+int CloseJunctionAirCommand(const std::string& projectPath,
+                            const std::string& leftClipId,
+                            const std::string& rightClipId, int64_t keepFrames,
+                            int64_t minimumAirMs, std::string& output);
 // QC-2026-09 A4 -- read-only. Reports which clips of the active timeline play
 // a given frame of a given rush, and where. The conversion it performs is the
 // one every hand-computed timeline position in a measured session got wrong

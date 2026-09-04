@@ -1,5 +1,6 @@
 #include "McpTools.h"
 
+#include "BoundaryAir.h"
 #include "Document.h"
 #include "EditLog.h"
 #include "PauseTightening.h"
@@ -197,6 +198,8 @@ bool IsTimelineEditingTool(const std::string& name) {
         "create_interview_short",
         "clean_disfluencies",
         "tighten_pauses",
+        "trim_boundary_air",
+        "close_junction_air",
         "remove_words",
         "conform_sequence",
         "undo",
@@ -2247,6 +2250,238 @@ bool DispatchTightenPauses(McpBackend& backend, const IdResolver& resolver,
     return true;
 }
 
+// B4 -- ROADMAP.md. Both boundary tools resolve B1 speech groups into one
+// TrimBoundaryAir operation. No transcript is read here: the measured defect
+// was precisely that word timestamps can miss the audible edge by 13--22
+// frames.
+bool DispatchTrimBoundaryAir(McpBackend& backend, const IdResolver& resolver,
+                             const Value& args, std::string& resultJson,
+                             std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {
+        "clip_id", "keep_frames", "min_air_ms", "sync_track_ids"};
+    if (!CheckKnownKeys(args, kAllowed, "trim_boundary_air", message))
+        return Fail(errorName, message, message);
+    Ulid clipId;
+    BoundaryAirSettings settings;
+    std::vector<Ulid> explicitSync;
+    const bool syncExplicit = args.Find("sync_track_ids") != nullptr;
+    if (!ReadId(args, "clip_id", "trim_boundary_air", resolver, true, clipId,
+                message) ||
+        !ReadInt64(args, "keep_frames", "trim_boundary_air", false,
+                   settings.keep_frames, settings.keep_frames, message) ||
+        !ReadInt64(args, "min_air_ms", "trim_boundary_air", false,
+                   settings.minimum_air_milliseconds,
+                   settings.minimum_air_milliseconds, message) ||
+        !ReadIdArray(args, "sync_track_ids", "trim_boundary_air", resolver,
+                     explicitSync, message)) {
+        return Fail(errorName, message, message);
+    }
+
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    const DocumentClip* clip = document.FindClip(clipId);
+    if (!clip) {
+        errorName = EditErrorName(EditError::UnknownClip);
+        message = "unknown clip_id '" + clipId + "'";
+        return false;
+    }
+    const DocumentSource* source = document.FindSource(clip->source_id);
+    if (!source) {
+        errorName = EditErrorName(EditError::UnknownSource);
+        message = "clip '" + clipId + "' reads from an unmounted source";
+        return false;
+    }
+    SpeechOnsetReport envelope;
+    if (!backend.ReadSourceSpeechOnset(clip->source_id, envelope, message)) {
+        errorName = "IoError";
+        message = "no speech envelope for source '" + clip->source_id +
+                  "': " + message;
+        return false;
+    }
+
+    TrimBoundaryAirOperation operation;
+    BoundaryAirReport report;
+    if (!ResolveBoundaryAir(*clip, envelope, settings, source->rate, {},
+                            operation, report, message)) {
+        return Fail(errorName, message, message);
+    }
+    for (BoundaryAirTrim& trim : operation.trims) {
+        const DocumentClip* target = document.FindClip(trim.clip_id);
+        if (target)
+            trim.linked_clip_ids = LinkedBoundaryClipIds(document, *target);
+    }
+    operation.sync_track_ids =
+        syncExplicit ? explicitSync
+                     : BoundarySyncTrackIds(document, operation.trims);
+
+    Value root = Value::MakeObject();
+    root.Set("clip_id", Value::MakeString(clip->id));
+    Value reportView;
+    std::string parseError;
+    if (Value::Parse(SerializeBoundaryAirReport(report), reportView,
+                     parseError)) {
+        root.Set("report", std::move(reportView));
+    }
+    if (operation.trims.empty()) {
+        root.Set("applied", Value::MakeBool(false));
+        resultJson = root.Dump();
+        return true;
+    }
+    Value alsoCut = Value::MakeArray();
+    std::vector<Ulid> reported;
+    for (const BoundaryAirTrim& trim : operation.trims) {
+        for (const Ulid& linkedId : trim.linked_clip_ids) {
+            if (std::find(reported.begin(), reported.end(), linkedId) ==
+                reported.end()) {
+                reported.push_back(linkedId);
+                alsoCut.Push(Value::MakeString(linkedId));
+            }
+        }
+    }
+    root.Set("also_cut", std::move(alsoCut));
+    Value syncTracks = Value::MakeArray();
+    for (const Ulid& trackId : operation.sync_track_ids)
+        syncTracks.Push(Value::MakeString(trackId));
+    root.Set("sync_track_ids", std::move(syncTracks));
+    std::string appliedJson;
+    if (!backend.ApplyOperation(operation, appliedJson, errorName, message))
+        return false;
+    root.Set("applied", Value::MakeBool(true));
+    Value applied;
+    if (Value::Parse(appliedJson, applied, parseError) && applied.IsObject()) {
+        const Value* hash = applied.Find("doc_hash");
+        if (hash) root.Set("doc_hash", *hash);
+    }
+    resultJson = root.Dump();
+    return true;
+}
+
+bool DispatchCloseJunctionAir(McpBackend& backend, const IdResolver& resolver,
+                              const Value& args, std::string& resultJson,
+                              std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {
+        "left_clip_id", "right_clip_id", "keep_frames", "min_air_ms",
+        "sync_track_ids"};
+    if (!CheckKnownKeys(args, kAllowed, "close_junction_air", message))
+        return Fail(errorName, message, message);
+    Ulid leftId;
+    Ulid rightId;
+    BoundaryAirSettings settings;
+    std::vector<Ulid> explicitSync;
+    const bool syncExplicit = args.Find("sync_track_ids") != nullptr;
+    if (!ReadId(args, "left_clip_id", "close_junction_air", resolver, true,
+                leftId, message) ||
+        !ReadId(args, "right_clip_id", "close_junction_air", resolver, true,
+                rightId, message) ||
+        !ReadInt64(args, "keep_frames", "close_junction_air", false,
+                   settings.keep_frames, settings.keep_frames, message) ||
+        !ReadInt64(args, "min_air_ms", "close_junction_air", false,
+                   settings.minimum_air_milliseconds,
+                   settings.minimum_air_milliseconds, message) ||
+        !ReadIdArray(args, "sync_track_ids", "close_junction_air", resolver,
+                     explicitSync, message)) {
+        return Fail(errorName, message, message);
+    }
+
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    const DocumentClip* left = document.FindClip(leftId);
+    const DocumentClip* right = document.FindClip(rightId);
+    if (!left || !right) {
+        errorName = EditErrorName(EditError::UnknownClip);
+        message =
+            "unknown clip in junction '" + leftId + "' -> '" + rightId + "'";
+        return false;
+    }
+    const DocumentTrack* leftTrack = document.FindTrackForClip(left->id);
+    const DocumentTrack* rightTrack = document.FindTrackForClip(right->id);
+    if (!leftTrack || !rightTrack || leftTrack->id != rightTrack->id) {
+        return Fail(errorName, message,
+                    "junction clips must be on the same track");
+    }
+    const DocumentSource* leftSource = document.FindSource(left->source_id);
+    const DocumentSource* rightSource = document.FindSource(right->source_id);
+    if (!leftSource || !rightSource) {
+        errorName = EditErrorName(EditError::UnknownSource);
+        message = "junction clip reads from an unmounted source";
+        return false;
+    }
+    SpeechOnsetReport leftEnvelope;
+    SpeechOnsetReport rightEnvelope;
+    if (!backend.ReadSourceSpeechOnset(left->source_id, leftEnvelope,
+                                       message) ||
+        !backend.ReadSourceSpeechOnset(right->source_id, rightEnvelope,
+                                       message)) {
+        errorName = "IoError";
+        message = "missing speech envelope for junction: " + message;
+        return false;
+    }
+
+    TrimBoundaryAirOperation operation;
+    JunctionAirReport report;
+    if (!ResolveJunctionAir(*left, leftEnvelope, leftSource->rate, *right,
+                            rightEnvelope, rightSource->rate, settings, {},
+                            operation, report, message)) {
+        return Fail(errorName, message, message);
+    }
+    for (BoundaryAirTrim& trim : operation.trims) {
+        const DocumentClip* target = document.FindClip(trim.clip_id);
+        if (target)
+            trim.linked_clip_ids = LinkedBoundaryClipIds(document, *target);
+    }
+    operation.sync_track_ids =
+        syncExplicit ? explicitSync
+                     : BoundarySyncTrackIds(document, operation.trims);
+
+    Value root = Value::MakeObject();
+    root.Set("left_clip_id", Value::MakeString(left->id));
+    root.Set("right_clip_id", Value::MakeString(right->id));
+    Value reportView;
+    std::string parseError;
+    if (Value::Parse(SerializeJunctionAirReport(report), reportView,
+                     parseError)) {
+        root.Set("report", std::move(reportView));
+    }
+    if (operation.trims.empty()) {
+        root.Set("applied", Value::MakeBool(false));
+        resultJson = root.Dump();
+        return true;
+    }
+    Value alsoCut = Value::MakeArray();
+    std::vector<Ulid> reported;
+    for (const BoundaryAirTrim& trim : operation.trims) {
+        for (const Ulid& linkedId : trim.linked_clip_ids) {
+            if (std::find(reported.begin(), reported.end(), linkedId) ==
+                reported.end()) {
+                reported.push_back(linkedId);
+                alsoCut.Push(Value::MakeString(linkedId));
+            }
+        }
+    }
+    root.Set("also_cut", std::move(alsoCut));
+    Value syncTracks = Value::MakeArray();
+    for (const Ulid& trackId : operation.sync_track_ids)
+        syncTracks.Push(Value::MakeString(trackId));
+    root.Set("sync_track_ids", std::move(syncTracks));
+    std::string appliedJson;
+    if (!backend.ApplyOperation(operation, appliedJson, errorName, message))
+        return false;
+    root.Set("applied", Value::MakeBool(true));
+    Value applied;
+    if (Value::Parse(appliedJson, applied, parseError) && applied.IsObject()) {
+        const Value* hash = applied.Find("doc_hash");
+        if (hash) root.Set("doc_hash", *hash);
+    }
+    resultJson = root.Dump();
+    return true;
+}
+
 // QC-2026-09 A4 -- the read-only half: which clips play a frame of a rush,
 // and where. Answers the question an editor asks of a transcript or a
 // contact sheet ("where is 1412 in the montage?") without asking them to
@@ -3653,6 +3888,53 @@ McpToolRegistry::McpToolRegistry() {
                    false)
             .Build("tighten_pauses arguments"),
         DispatchTightenPauses);
+
+    add("trim_boundary_air",
+        "Trim measured silence from the head and tail of one clip in one "
+        "reversible operation. Boundaries come from the cached B1 speech "
+        "groups, never transcript word timestamps. The linked A/V group and "
+        "all other sync-locked tracks follow automatically unless "
+        "sync_track_ids is supplied explicitly.",
+        SchemaBuilder()
+            .Field("clip_id", IdSchema("Clip whose boundaries to tighten."),
+                   true)
+            .Field("keep_frames",
+                   IntSchema("Source frames kept beside each speech attack "
+                             "or decay (default 3)."),
+                   false)
+            .Field("min_air_ms",
+                   IntSchema("Shortest boundary silence to close, in "
+                             "milliseconds (default 300)."),
+                   false)
+            .Field("sync_track_ids",
+                   IdArraySchema("Explicit tracks to ripple. When omitted, "
+                                 "all other sync-locked tracks follow."),
+                   false)
+            .Build("trim_boundary_air arguments"),
+        DispatchTrimBoundaryAir);
+
+    add("close_junction_air",
+        "Close the audible silence across one exact clip junction. Measures "
+        "the outgoing tail and incoming head together, then trims both in "
+        "one reversible operation; this converges in one pass even when "
+        "neither side alone reaches min_air_ms. Uses speech groups rather "
+        "than word timestamps and preserves linked A/V plus sync tracks.",
+        SchemaBuilder()
+            .Field("left_clip_id", IdSchema("Outgoing clip."), true)
+            .Field("right_clip_id", IdSchema("Incoming clip."), true)
+            .Field("keep_frames",
+                   IntSchema("Source frames kept on each side (default 3)."),
+                   false)
+            .Field("min_air_ms",
+                   IntSchema("Shortest combined junction air to close, in "
+                             "milliseconds (default 300)."),
+                   false)
+            .Field("sync_track_ids",
+                   IdArraySchema("Explicit tracks to ripple. When omitted, "
+                                 "all other sync-locked tracks follow."),
+                   false)
+            .Build("close_junction_air arguments"),
+        DispatchCloseJunctionAir);
 
     add("list_shot_quality",
         "Report measured picture quality for every video clip on the active "

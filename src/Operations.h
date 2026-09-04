@@ -173,6 +173,27 @@ struct RippleTrimOperation {
     std::vector<ExactTrackState> exact_track_result;
 };
 
+// B4 -- ROADMAP.md. One measured boundary trim, already resolved to the
+// exact delta ApplyRippleTrim understands. Keeping the linked members beside
+// each boundary matters at a junction: the outgoing and incoming clips have
+// different A/V groups, while the whole gesture must still be one event-log
+// entry.
+struct BoundaryAirTrim {
+    Ulid clip_id;
+    TrimEdge edge = TrimEdge::Head;
+    RationalTime delta;
+    std::vector<Ulid> linked_clip_ids;
+};
+
+// Applies one clip's head/tail cleanup, or both sides of a junction,
+// atomically. The exact snapshots are both the rollback representation and
+// the canonical inverse, matching the other multi-track operations.
+struct TrimBoundaryAirOperation {
+    std::vector<BoundaryAirTrim> trims;
+    std::vector<Ulid> sync_track_ids;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 struct RollEditPair {
     Ulid left_clip_id;
     Ulid right_clip_id;
@@ -523,7 +544,8 @@ using Operation = std::variant<
     ClearClipsOperation, PasteClipsOperation, TrimClipOperation,
     MoveClipOperation, MoveClipsOperation, DeleteGapOperation,
     DetachAudioOperation, MoveLinkedClipsOperation, TrimLinkedClipsOperation,
-    RippleTrimOperation, RollEditOperation, SlipEditOperation,
+    RippleTrimOperation, TrimBoundaryAirOperation, RollEditOperation,
+    SlipEditOperation,
     RemoveLinkedClipsOperation, ClearLinkedClipsOperation, AddTrackOperation,
     RemoveTrackOperation, SetTrackLockOperation, SetTrackSyncLockOperation,
     SetTrackOutputOperation, UpdateSequenceOperation,

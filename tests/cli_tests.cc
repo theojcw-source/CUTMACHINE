@@ -200,6 +200,17 @@ int main() {
                  return TightenPausesCommand(missingProject.string(),
                                              "missing-clip", 400, 6, output);
              }},
+            {"trim_boundary_air", "ParseError",
+             [&](std::string& output) {
+                 return TrimBoundaryAirCommand(missingProject.string(),
+                                               "missing-clip", 3, 300, output);
+             }},
+            {"close_junction_air", "ParseError",
+             [&](std::string& output) {
+                 return CloseJunctionAirCommand(missingProject.string(),
+                                                "missing-left", "missing-right",
+                                                3, 300, output);
+             }},
             {"locate_source_frame", "ParseError",
              [&](std::string& output) {
                  return LocateSourceFrameCommand(missingProject.string(),

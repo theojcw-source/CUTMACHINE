@@ -27,6 +27,7 @@ extern "C" {
 #include <vector>
 
 #include "AudioPlayback.h"
+#include "BoundaryAir.h"
 #include "Cli.h"
 #include "ColorEffects.h"
 #include "DecodeWorker.h"
@@ -12894,6 +12895,39 @@ int main(int argc, char* argv[]) {
         std::string output;
         const int result = TightenPausesCommand(argv[2], argv[3], minimumGapMs,
                                                 keepFrames, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    // B4 -- boundary air uses the B1 speech groups, not transcript words.
+    // Short forms use the engine's three-frame / 300 ms safety defaults;
+    // scripts can pin both values positionally after the clip ids.
+    if ((argc == 4 || argc == 6) &&
+        std::string(argv[1]) == "--trim-boundary-air") {
+        BoundaryAirSettings defaults;
+        int64_t keepFrames = defaults.keep_frames;
+        int64_t minimumAirMs = defaults.minimum_air_milliseconds;
+        if (argc == 6) {
+            keepFrames = std::atoll(argv[4]);
+            minimumAirMs = std::atoll(argv[5]);
+        }
+        std::string output;
+        const int result = TrimBoundaryAirCommand(argv[2], argv[3], keepFrames,
+                                                  minimumAirMs, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if ((argc == 5 || argc == 7) &&
+        std::string(argv[1]) == "--close-junction-air") {
+        BoundaryAirSettings defaults;
+        int64_t keepFrames = defaults.keep_frames;
+        int64_t minimumAirMs = defaults.minimum_air_milliseconds;
+        if (argc == 7) {
+            keepFrames = std::atoll(argv[5]);
+            minimumAirMs = std::atoll(argv[6]);
+        }
+        std::string output;
+        const int result = CloseJunctionAirCommand(
+            argv[2], argv[3], argv[4], keepFrames, minimumAirMs, output);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }

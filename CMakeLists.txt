@@ -125,6 +125,7 @@ add_custom_target(cutmachine_ui_icons DEPENDS ${CUTMACHINE_ICON_PNGS})
 
 add_library(cutmachine_model
     src/BeatDetection.cc
+    src/BoundaryAir.cc
     src/ChatLlmClient.cc
     src/ChatSession.cc
     src/Cli.cc
@@ -513,6 +514,13 @@ if(BUILD_TESTING)
         PRIVATE cutmachine_model)
     add_test(NAME cutmachine_pause_tightening_tests
              COMMAND cutmachine_pause_tightening_tests)
+
+    add_executable(cutmachine_boundary_air_tests
+        tests/boundary_air_tests.cc)
+    target_link_libraries(cutmachine_boundary_air_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_boundary_air_tests
+             COMMAND cutmachine_boundary_air_tests)
 
     add_executable(cutmachine_speech_onset_tests tests/speech_onset_tests.cc)
     target_link_libraries(cutmachine_speech_onset_tests PRIVATE cutmachine_model)

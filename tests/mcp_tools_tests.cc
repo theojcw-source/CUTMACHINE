@@ -1998,6 +1998,126 @@ int main() {
               "a source with no envelope reports what is missing");
     }
 
+    // B4 -- boundary and junction air are intent-level MCP tools backed by
+    // one serialized operation. The pure arithmetic and four-pass regression
+    // live in boundary_air_tests; this pins ID parsing, cache access, linked
+    // A/V propagation, sync-lock defaults, and the public result envelope.
+    {
+        Document boundaries;
+        boundaries.sources = {
+            {"01K30000000000000000000201", "rush.MP4", {25, 1}, {1000, 25}}};
+        DocumentClip picture;
+        picture.id = "01K30000000000000000000210";
+        picture.source_id = "01K30000000000000000000201";
+        picture.source_in = {0, 25};
+        picture.duration = {50, 25};
+        picture.timeline_in = {0, 25};
+        picture.link_group_id = "01K30000000000000000000220";
+        DocumentClip sound = picture;
+        sound.id = "01K30000000000000000000211";
+        DocumentClip follower = picture;
+        follower.id = "01K30000000000000000000212";
+        follower.link_group_id.clear();
+        follower.source_in = {100, 25};
+        follower.duration = {10, 25};
+        follower.timeline_in = {50, 25};
+        boundaries.sequence.tracks = {
+            {"01K30000000000000000000230", "video", 0, {picture}},
+            {"01K30000000000000000000231", "audio", 1, {sound}},
+            {"01K30000000000000000000232", "video", 2, {follower}},
+        };
+        SpeechOnsetReport envelope;
+        envelope.media_id = "01K30000000000000000000201";
+        envelope.windows_per_second = 50;
+        envelope.decode_sample_rate = 16000;
+        envelope.levels.insert(envelope.levels.end(), 20, 20000);
+        envelope.levels.insert(envelope.levels.end(), 50, 200000);
+        envelope.levels.insert(envelope.levels.end(), 30, 20000);
+        envelope.speech_level = SpeechLevelPercentile(envelope.levels, 90);
+        envelope.noise_floor = SpeechLevelPercentile(envelope.levels, 5);
+
+        McpToolRegistry registry;
+        InMemoryBackend backend(boundaries);
+        backend.SetSourceSpeechOnset(envelope);
+        mcp_json::Value arguments;
+        std::string parseError;
+        mcp_json::Value::Parse(R"({"clip_id":"01K30000000000000000000210"})",
+                               arguments, parseError);
+        const McpToolCallOutcome outcome =
+            registry.Call(backend, "trim_boundary_air", arguments);
+        Check(outcome.ok, "trim_boundary_air succeeds: " + outcome.message);
+        mcp_json::Value result;
+        Check(mcp_json::Value::Parse(outcome.result_json, result, parseError),
+              "trim_boundary_air returns JSON: " + parseError);
+        const mcp_json::Value* alsoCut = result.Find("also_cut");
+        const mcp_json::Value* syncTracks = result.Find("sync_track_ids");
+        Check(alsoCut && alsoCut->IsArray() && alsoCut->AsArray().size() == 1 &&
+                  alsoCut->AsArray()[0].AsString() == sound.id,
+              "trim_boundary_air reports the linked sound it carried");
+        Check(syncTracks && syncTracks->IsArray() &&
+                  syncTracks->AsArray().size() == 1 &&
+                  syncTracks->AsArray()[0].AsString() ==
+                      "01K30000000000000000000232",
+              "trim_boundary_air derives the other sync-locked track");
+        Check(
+            backend.CurrentDocument().FindClip(picture.id)->source_in ==
+                    RationalTime{7, 25} &&
+                backend.CurrentDocument().FindClip(sound.id)->source_in ==
+                    RationalTime{7, 25} &&
+                backend.CurrentDocument().FindClip(follower.id)->timeline_in ==
+                    RationalTime{31, 25},
+            "MCP reaches the atomic engine operation on every track");
+    }
+
+    {
+        Document junction;
+        junction.sources = {
+            {"01K30000000000000000000301", "rush.MP4", {25, 1}, {1000, 25}}};
+        DocumentClip left;
+        left.id = "01K30000000000000000000310";
+        left.source_id = "01K30000000000000000000301";
+        left.source_in = {0, 25};
+        left.duration = {32, 25};
+        left.timeline_in = {0, 25};
+        DocumentClip right = left;
+        right.id = "01K30000000000000000000311";
+        right.source_in = {32, 25};
+        right.timeline_in = {32, 25};
+        junction.sequence.tracks = {
+            {"01K30000000000000000000320", "audio", 0, {left, right}},
+        };
+        SpeechOnsetReport envelope;
+        envelope.media_id = "01K30000000000000000000301";
+        envelope.windows_per_second = 50;
+        envelope.decode_sample_rate = 16000;
+        envelope.levels.insert(envelope.levels.end(), 50, 200000);
+        envelope.levels.insert(envelope.levels.end(), 28, 20000);
+        envelope.levels.insert(envelope.levels.end(), 50, 200000);
+        envelope.speech_level = SpeechLevelPercentile(envelope.levels, 90);
+        envelope.noise_floor = SpeechLevelPercentile(envelope.levels, 5);
+
+        McpToolRegistry registry;
+        InMemoryBackend backend(junction);
+        backend.SetSourceSpeechOnset(envelope);
+        mcp_json::Value arguments;
+        std::string parseError;
+        mcp_json::Value::Parse(
+            R"({"left_clip_id":"01K30000000000000000000310","right_clip_id":"01K30000000000000000000311","keep_frames":2})",
+            arguments, parseError);
+        const McpToolCallOutcome outcome =
+            registry.Call(backend, "close_junction_air", arguments);
+        Check(outcome.ok, "close_junction_air succeeds: " + outcome.message);
+        const DocumentClip* newLeft =
+            backend.CurrentDocument().FindClip(left.id);
+        const DocumentClip* newRight =
+            backend.CurrentDocument().FindClip(right.id);
+        Check(newLeft && newRight &&
+                  newLeft->duration == RationalTime{27, 25} &&
+                  newRight->source_in == RationalTime{37, 25} &&
+                  newRight->timeline_in == RationalTime{27, 25},
+              "close_junction_air trims both sides in its MCP call");
+    }
+
     // QC-2026-09 (A1) -- align_transcript. The correction only reaches the
     // tools that cut on words when `apply` does, so what this pins is that
     // the flag survives the dispatcher rather than defaulting either way by
