@@ -22,6 +22,9 @@ struct TimelineTranscriptSpan {
     RationalTime duration;
     RationalTime timeline_in;
     std::string text;
+    // B6 -- ROADMAP.md. True when at least one word in this span crossed an
+    // edit boundary and was attributed here by greatest played overlap.
+    bool straddles_cut = false;
 };
 
 // Collects the spans of every audible audio track, in timeline order, from

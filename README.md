@@ -977,8 +977,11 @@ Pour monter une interview, `get_timeline_transcript` renvoie des spans
 sélectionnables et `create_interview_short` **n'accepte que leurs `span_id`**.
 Le modèle ne recopie aucun temps : c'est le moteur qui résout chaque
 identifiant en position exacte, ce qui rend une coupe au milieu d'un mot
-inexprimable au lieu de simplement déconseillée. Quand une idée dépasse un
-span — ils sont découpés pour la lisibilité d'un sous-titre, environ
+inexprimable au lieu de simplement déconseillée. Si un mot chevauche une coupe,
+il n'apparaît qu'une fois, du côté qui en joue la plus grande part, et son span
+porte `straddles_cut: true` pour signaler que son rendu peut être approximatif.
+Quand une idée dépasse un span — ils sont découpés pour la lisibilité d'un
+sous-titre, environ
 42 caractères, ce qui n'est pas une unité de montage — `span_id` et
 `end_span_id` désignent un intervalle contigu que le moteur fusionne en une
 seule plage. Un intervalle qui enjambe un silence ou change de source est

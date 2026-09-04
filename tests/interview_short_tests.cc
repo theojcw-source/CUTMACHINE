@@ -1,6 +1,7 @@
 #include "InterviewShort.h"
 #include "Json.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -67,6 +68,59 @@ int main() {
           "spans build: " + error);
     Check(built.size() == 1 && built[0].span_id == "S1",
           "spans are numbered in timeline order");
+
+    // B6 -- both clips overlap the word "milieu", but the incoming clip
+    // plays four of its six frames while the outgoing clip plays only two.
+    // It must be emitted once on the incoming side and marked as cut.
+    Document splitDocument = document;
+    splitDocument.sequence.tracks[0].clips = {
+        {"01K50000000000000000000003", sourceId, {0, 25}, {6, 25}, {0, 25}},
+        {"01K50000000000000000000004", sourceId, {6, 25}, {8, 25}, {6, 25}},
+    };
+    {
+        std::ofstream cache(directory / (sourceId + ".json"),
+                            std::ios::trunc);
+        cache << "{\"version\":1,\"media_id\":\"" << sourceId
+              << "\",\"whisper_model\":\"test.bin\","
+                 "\"source_rate\":{\"num\":25,\"den\":1},\"words\":["
+                 "{\"text\":\"Avant\",\"start\":{\"value\":0,\"rate\":25},"
+                 "\"end\":{\"value\":4,\"rate\":25}},"
+                 "{\"text\":\"milieu\",\"start\":{\"value\":4,\"rate\":25},"
+                 "\"end\":{\"value\":10,\"rate\":25}},"
+                 "{\"text\":\"Après\",\"start\":{\"value\":10,\"rate\":25},"
+                 "\"end\":{\"value\":14,\"rate\":25}},"
+                 "{\"text\":\"Hors\",\"start\":{\"value\":20,\"rate\":25},"
+                 "\"end\":{\"value\":22,\"rate\":25}}]}";
+    }
+    std::vector<TimelineTranscriptSpan> splitSpans;
+    Check(BuildTimelineTranscriptSpans(splitDocument, directory, splitSpans,
+                                       error),
+          "a transcript split through a word builds: " + error);
+    std::string splitText;
+    size_t middleCount = 0;
+    bool middleStraddles = false;
+    for (const TimelineTranscriptSpan& item : splitSpans) {
+        splitText += item.text + " ";
+        if (item.text.find("milieu") != std::string::npos) {
+            ++middleCount;
+            middleStraddles = item.straddles_cut;
+            Check(item.source_in >= RationalTime{6, 25},
+                  "the straddled word is attributed to its greatest overlap");
+        }
+    }
+    Check(middleCount == 1 && middleStraddles,
+          "a word cut between two clips appears once with straddles_cut");
+    Check(splitText.find("Hors") == std::string::npos,
+          "a word outside every played source range is omitted");
+    const std::string splitJson =
+        SerializeTimelineTranscriptSpans(splitDocument, splitSpans);
+    std::vector<TimelineTranscriptSpan> splitReparsed;
+    Check(ParseTimelineTranscriptSpans(splitJson, splitReparsed, error) &&
+              std::any_of(splitReparsed.begin(), splitReparsed.end(),
+                          [](const TimelineTranscriptSpan& item) {
+                              return item.straddles_cut;
+                          }),
+          "straddles_cut survives the transcript view round trip");
 
     // Two contiguous spans of one source, and a third after a gap: the
     // shape that separates a legitimate merge from one that would swallow

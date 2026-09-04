@@ -3307,7 +3307,9 @@ McpToolRegistry::McpToolRegistry() {
         "Read the cached transcript of audible clips as selectable semantic "
         "spans. Call this before planning an interview edit, then name the "
         "spans you want by their span_id. The exact times are shown so a "
-        "human can check them; never retype one into another tool.",
+        "human can check them; never retype one into another tool. A span "
+        "with straddles_cut=true contains a word cut at an edit and may be "
+        "approximate.",
         SchemaBuilder().Build("get_timeline_transcript takes no arguments"),
         DispatchGetTimelineTranscript);
 
