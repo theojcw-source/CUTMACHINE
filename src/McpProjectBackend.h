@@ -51,6 +51,10 @@ public:
     bool CaptureSourceFrame(const Ulid& sourceId, const RationalTime& time,
                             std::string& jpegBytes,
                             std::string& message) override;
+    bool CaptureTimelineSheet(const TimelineSheetPlan& plan,
+                              const TimelineSheetSettings& settings,
+                              std::string& jpegBytes,
+                              std::string& message) override;
     bool ReadTimelineTranscript(std::string& json,
                                 std::string& message) override;
     bool Undo(std::string& resultJson, std::string& errorName,

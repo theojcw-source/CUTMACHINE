@@ -17,6 +17,7 @@
 #include "SpeechOnset.h"
 #include "Subtitles.h"
 #include "Timeline.h"
+#include "TimelineSheets.h"
 #include "TimelineStats.h"
 #include "TimelineTranscription.h"
 #include "TranscriptAlignment.h"
@@ -1412,6 +1413,69 @@ int TimelineStatsCommand(const std::string& projectPath, std::string& output) {
     }
     output = "{\"ok\":true,\"stats\":" + SerializeTimelineStats(stats) + "}\n";
     return 0;
+}
+
+namespace {
+
+int TimelineSheetCommand(const std::string& projectPath,
+                         const std::string& outputPath,
+                         const std::string& timelineId, int32_t maximumImages,
+                         TimelineSheetKind kind, std::string& output) {
+    Project project;
+    std::string error;
+    if (!LoadStoredProject(projectPath, project, error)) {
+        output = ErrorJson(EditError::ParseError, error);
+        return 1;
+    }
+    const Ulid selected =
+        timelineId.empty() ? project.active_timeline_id : timelineId;
+    if (project.FindTimeline(selected) == nullptr) {
+        output = ErrorJson(EditError::UnknownSequence,
+                           "unknown timeline_id '" + selected + "'");
+        return 1;
+    }
+    TimelineSheetSettings settings;
+    settings.maximum_images = maximumImages;
+    const Document document = project.MakeDocument(selected);
+    TimelineSheetPlan plan;
+    if (!BuildTimelineSheetPlan(document, kind, settings, plan, error)) {
+        output = ErrorJson(EditError::ValidationFailed, error);
+        return 1;
+    }
+    const std::filesystem::path projectFile =
+        std::filesystem::absolute(projectPath);
+    std::string jpeg;
+    if (!RenderTimelineSheet(document, projectFile.parent_path(), plan,
+                             settings, jpeg, error)) {
+        output = ErrorJson(EditError::IoError, error);
+        return 1;
+    }
+    if (!WriteFile(outputPath, jpeg, error)) {
+        output = ErrorJson(EditError::IoError, error);
+        return 1;
+    }
+    output = "{\"ok\":true,\"output_path\":\"" + EscapeJson(outputPath) +
+             "\",\"sheet\":" + SerializeTimelineSheetPlan(plan) + "}\n";
+    return 0;
+}
+
+}  // namespace
+
+int ContactSheetCommand(const std::string& projectPath,
+                        const std::string& outputPath,
+                        const std::string& timelineId, int32_t maximumImages,
+                        std::string& output) {
+    return TimelineSheetCommand(projectPath, outputPath, timelineId,
+                                maximumImages, TimelineSheetKind::Contact,
+                                output);
+}
+
+int CutSheetCommand(const std::string& projectPath,
+                    const std::string& outputPath,
+                    const std::string& timelineId, int32_t maximumImages,
+                    std::string& output) {
+    return TimelineSheetCommand(projectPath, outputPath, timelineId,
+                                maximumImages, TimelineSheetKind::Cuts, output);
 }
 
 int AlignTranscriptsCommand(const std::string& projectPath, bool apply,

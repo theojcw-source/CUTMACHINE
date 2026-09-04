@@ -4312,7 +4312,22 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             return true;
         },
         [[CMUiPreferences sharedPreferences]
-            requiresExplicitTimelineForAgentEdits]);
+            requiresExplicitTimelineForAgentEdits],
+        [weakSelf](const TimelineSheetPlan& plan,
+                   const TimelineSheetSettings& settings,
+                   std::string& jpegBytes, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            return RenderTimelineSheet(strongSelf.state->document,
+                                       projectPath.parent_path(), plan,
+                                       settings, jpegBytes, message);
+        });
     self.chatPanelView = [[CMChatPanelView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];
     [self.chatPanelView configureWithBackend:*self.chatBackend];
@@ -12821,6 +12836,33 @@ int main(int argc, char* argv[]) {
     if (argc == 3 && std::string(argv[1]) == "--timeline-stats") {
         std::string output;
         const int result = TimelineStatsCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc >= 4 && (std::string(argv[1]) == "--contact-sheet" ||
+                      std::string(argv[1]) == "--cut-sheet")) {
+        std::string timelineId;
+        int32_t maximumImages = 24;
+        for (int index = 4; index < argc; ++index) {
+            const std::string option(argv[index]);
+            if (option == "--timeline" && index + 1 < argc &&
+                timelineId.empty()) {
+                timelineId = argv[++index];
+            } else if (option == "--max-images" && index + 1 < argc) {
+                maximumImages = std::atoi(argv[++index]);
+            } else {
+                return failCli("ValidationFailed",
+                               "unknown timeline sheet option '" + option + "'",
+                               2);
+            }
+        }
+        std::string output;
+        const int result =
+            std::string(argv[1]) == "--contact-sheet"
+                ? ContactSheetCommand(argv[2], argv[3], timelineId,
+                                      maximumImages, output)
+                : CutSheetCommand(argv[2], argv[3], timelineId, maximumImages,
+                                  output);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }

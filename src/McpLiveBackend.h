@@ -62,6 +62,9 @@ public:
         std::function<bool(const Ulid&, std::string&, std::string&)>;
     using CaptureFrameCallback = std::function<bool(
         const Ulid&, const RationalTime&, std::string&, std::string&)>;
+    using CaptureSheetCallback = std::function<bool(
+        const TimelineSheetPlan&, const TimelineSheetSettings&, std::string&,
+        std::string&)>;
     using SourceSpeechOnsetCallback =
         std::function<bool(const Ulid&, SpeechOnsetReport&, std::string&)>;
     using AnalyzeSpeechOnsetCallback = std::function<bool(
@@ -89,7 +92,8 @@ public:
                    SourceSpeechOnsetCallback readSourceSpeechOnset = nullptr,
                    AnalyzeSpeechOnsetCallback analyzeSpeechOnset = nullptr,
                    TimelineSelectCallback selectTimeline = nullptr,
-                   bool requireExplicitTimeline = false);
+                   bool requireExplicitTimeline = false,
+                   CaptureSheetCallback captureSheet = nullptr);
 
     bool SelectTimelineForEdit(const std::string& timelineId,
                                std::string& errorName,
@@ -117,6 +121,10 @@ public:
     bool CaptureSourceFrame(const Ulid& sourceId, const RationalTime& time,
                             std::string& jpegBytes,
                             std::string& message) override;
+    bool CaptureTimelineSheet(const TimelineSheetPlan& plan,
+                              const TimelineSheetSettings& settings,
+                              std::string& jpegBytes,
+                              std::string& message) override;
     bool Undo(std::string& resultJson, std::string& errorName,
               std::string& message) override;
     bool Redo(std::string& resultJson, std::string& errorName,
@@ -134,6 +142,7 @@ private:
     SourceShotQualityCallback read_source_shot_quality_;
     AnalyzeShotQualityCallback analyze_shot_quality_;
     CaptureFrameCallback capture_frame_;
+    CaptureSheetCallback capture_sheet_;
     SourceSpeechOnsetCallback read_source_speech_onset_;
     AnalyzeSpeechOnsetCallback analyze_speech_onset_;
     TimelineSelectCallback select_timeline_;

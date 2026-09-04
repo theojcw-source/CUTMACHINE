@@ -31,6 +31,7 @@
 #include "Operations.h"
 #include "ShotQuality.h"
 #include "SpeechOnset.h"
+#include "TimelineSheets.h"
 #include "Transcription.h"
 
 #include <string>
@@ -119,6 +120,17 @@ public:
     virtual bool CaptureSourceFrame(const Ulid&, const RationalTime&,
                                     std::string&, std::string& message) {
         message = "this backend cannot render a frame";
+        return false;
+    }
+
+    // QC-2026-09 (A6) -- unlike read_frame, a timeline sheet depends on the
+    // mounted media paths and on the document colour pipeline. The engine
+    // has already selected every exact position in `plan`; the backend only
+    // resolves those files and renders the read-only result.
+    virtual bool CaptureTimelineSheet(const TimelineSheetPlan&,
+                                      const TimelineSheetSettings&,
+                                      std::string&, std::string& message) {
+        message = "this backend cannot render a timeline sheet";
         return false;
     }
 

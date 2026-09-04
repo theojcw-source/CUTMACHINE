@@ -157,6 +157,19 @@ int main() {
                  return ShotQualityReportCommand(missingProject.string(),
                                                  output);
              }},
+            {"contact_sheet", "ParseError",
+             [&](std::string& output) {
+                 return ContactSheetCommand(
+                     missingProject.string(),
+                     (directory / "unused-contact.jpg").string(), "", 24,
+                     output);
+             }},
+            {"cut_sheet", "ParseError",
+             [&](std::string& output) {
+                 return CutSheetCommand(
+                     missingProject.string(),
+                     (directory / "unused-cuts.jpg").string(), "", 24, output);
+             }},
             {"align_transcripts", "ParseError",
              [&](std::string& output) {
                  return AlignTranscriptsCommand(missingProject.string(), false,

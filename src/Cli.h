@@ -68,6 +68,17 @@ int ShotQualityReportCommand(const std::string& projectPath,
 // timeline. The command publishes exact time and ratio values so callers do
 // not have to count clips or convert frame rates themselves.
 int TimelineStatsCommand(const std::string& projectPath, std::string& output);
+// QC-2026-09 (A6) -- render the same deterministic timeline sampling exposed
+// to MCP. The JPEG is written to outputPath and exact cell metadata is
+// returned in the ordinary CLI envelope.
+int ContactSheetCommand(const std::string& projectPath,
+                        const std::string& outputPath,
+                        const std::string& timelineId, int32_t maximumImages,
+                        std::string& output);
+int CutSheetCommand(const std::string& projectPath,
+                    const std::string& outputPath,
+                    const std::string& timelineId, int32_t maximumImages,
+                    std::string& output);
 // ONSET-2026-08 -- same shape, and for the same reason: where the voice
 // starts is a measurement, so it has to be reachable without the app. The
 // report publishes the trim in whole frames precisely so a caller never

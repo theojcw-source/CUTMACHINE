@@ -238,6 +238,20 @@ bool McpProjectBackend::CaptureSourceFrame(const Ulid& sourceId,
                                 FrameCaptureSettings{}, jpegBytes, message);
 }
 
+bool McpProjectBackend::CaptureTimelineSheet(
+    const TimelineSheetPlan& plan, const TimelineSheetSettings& settings,
+    std::string& jpegBytes, std::string& message) {
+    Project project;
+    if (!LoadStoredProject(project_path_, project, message)) return false;
+    const Document document = selected_timeline_id_.empty()
+                                  ? project.MakeActiveDocument()
+                                  : project.MakeDocument(selected_timeline_id_);
+    const std::filesystem::path projectPath =
+        std::filesystem::absolute(project_path_);
+    return RenderTimelineSheet(document, projectPath.parent_path(), plan,
+                               settings, jpegBytes, message);
+}
+
 bool McpProjectBackend::Undo(std::string& resultJson, std::string& errorName,
                              std::string& message) {
     std::string output;

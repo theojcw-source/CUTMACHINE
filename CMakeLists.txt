@@ -165,6 +165,7 @@ add_library(cutmachine_model
     src/Subtitles.cc
     src/Thumbnail.cc
     src/Timeline.cc
+    src/TimelineSheets.cc
     src/TimelineTranscription.cc
     src/TimelineStats.cc
     src/TimelineView.cc
@@ -321,6 +322,15 @@ if(BUILD_TESTING)
                           PRIVATE cutmachine_model)
     add_test(NAME cutmachine_timeline_stats_tests
              COMMAND cutmachine_timeline_stats_tests)
+
+    add_executable(cutmachine_timeline_sheets_tests
+                   tests/timeline_sheets_tests.cc)
+    target_link_libraries(cutmachine_timeline_sheets_tests
+                          PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_timeline_sheets_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_timeline_sheets_tests
+             COMMAND cutmachine_timeline_sheets_tests)
 
     add_executable(cutmachine_cli_tests tests/cli_tests.cc)
     target_link_libraries(cutmachine_cli_tests PRIVATE cutmachine_model)

@@ -7,6 +7,7 @@
 #include "SequenceFormat.h"
 #include "SourceAddress.h"
 #include "Subtitles.h"
+#include "TimelineSheets.h"
 #include "TimelineStats.h"
 #include "Ulid.h"
 
@@ -2321,6 +2322,63 @@ bool DispatchTimelineStats(McpBackend& backend, const IdResolver&,
     return true;
 }
 
+bool DispatchTimelineSheet(McpBackend& backend, const Value& args,
+                           TimelineSheetKind kind, const std::string& toolName,
+                           std::string& resultJson, std::string& errorName,
+                           std::string& message) {
+    static const std::vector<std::string> kAllowed = {"max_images"};
+    if (!CheckKnownKeys(args, kAllowed, toolName, message))
+        return Fail(errorName, message, message);
+    int32_t maximumImages = 24;
+    if (!ReadInt32(args, "max_images", toolName, false, maximumImages,
+                   maximumImages, message))
+        return Fail(errorName, message, message);
+    if (maximumImages <= 0 || maximumImages > 64)
+        return Fail(errorName, message,
+                    "'" + toolName + ".max_images' must be between 1 and 64");
+    if (kind == TimelineSheetKind::Cuts && maximumImages < 2)
+        return Fail(errorName, message,
+                    "'cut_sheet.max_images' must be at least 2");
+
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    TimelineSheetSettings settings;
+    settings.maximum_images = maximumImages;
+    TimelineSheetPlan plan;
+    if (!BuildTimelineSheetPlan(document, kind, settings, plan, message))
+        return Fail(errorName, message, message);
+    std::string jpeg;
+    if (!backend.CaptureTimelineSheet(plan, settings, jpeg, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    Value envelope = Value::MakeObject();
+    envelope.Set(kMcpImageDataKey, Value::MakeString(EncodeBase64(jpeg)));
+    envelope.Set(kMcpImageMimeKey, Value::MakeString("image/jpeg"));
+    envelope.Set(kMcpImageTextKey,
+                 Value::MakeString(SerializeTimelineSheetPlan(plan)));
+    resultJson = envelope.Dump();
+    return true;
+}
+
+bool DispatchContactSheet(McpBackend& backend, const IdResolver&,
+                          const Value& args, std::string& resultJson,
+                          std::string& errorName, std::string& message) {
+    return DispatchTimelineSheet(backend, args, TimelineSheetKind::Contact,
+                                 "contact_sheet", resultJson, errorName,
+                                 message);
+}
+
+bool DispatchCutSheet(McpBackend& backend, const IdResolver&, const Value& args,
+                      std::string& resultJson, std::string& errorName,
+                      std::string& message) {
+    return DispatchTimelineSheet(backend, args, TimelineSheetKind::Cuts,
+                                 "cut_sheet", resultJson, errorName, message);
+}
+
 bool DispatchReadFrame(McpBackend& backend, const IdResolver& resolver,
                        const Value& args, std::string& resultJson,
                        std::string& errorName, std::string& message) {
@@ -3618,6 +3676,35 @@ McpToolRegistry::McpToolRegistry() {
         "higher visible video track do not count as visible changes.",
         SchemaBuilder().Build("timeline_stats takes no arguments"),
         DispatchTimelineStats);
+
+    add("contact_sheet",
+        "Look at the edit as one JPEG grid. Samples the middle frame of each "
+        "visible shot across the whole active timeline; clips hidden under a "
+        "higher visible video track are omitted. The document display colour "
+        "transform is applied, so log rushes are shown as the edit presents "
+        "them. Exact clip, source and timeline addresses accompany every "
+        "cell.",
+        SchemaBuilder()
+            .Field("max_images",
+                   PositiveIntSchema("Maximum cells (default 24, maximum "
+                                     "64). Longer edits are sampled evenly."),
+                   false)
+            .Build("contact_sheet arguments"),
+        DispatchContactSheet);
+
+    add("cut_sheet",
+        "Look at every sampled visible cut as adjacent before/after frames in "
+        "one JPEG grid. Each pair is the last sequence frame before the cut "
+        "and the first at it, after higher-track compositing and through the "
+        "document display colour transform. Exact clip, source and cut "
+        "addresses accompany every cell.",
+        SchemaBuilder()
+            .Field("max_images",
+                   PositiveIntSchema("Maximum cells, kept in complete pairs "
+                                     "(default 24, maximum 64)."),
+                   false)
+            .Build("cut_sheet arguments"),
+        DispatchCutSheet);
 
     add("list_speech_onsets",
         "Report where the voice actually starts inside every audible clip, "

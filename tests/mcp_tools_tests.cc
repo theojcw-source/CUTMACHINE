@@ -271,6 +271,14 @@ public:
         return true;
     }
 
+    bool CaptureTimelineSheet(const TimelineSheetPlan& plan,
+                              const TimelineSheetSettings&,
+                              std::string& jpegBytes, std::string&) override {
+        captured_sheet_ = plan;
+        jpegBytes = "fake-jpeg";
+        return true;
+    }
+
     bool ApplyOperation(Operation operation, std::string& resultJson,
                         std::string& errorName, std::string&) override {
         EditError error = EditError::None;
@@ -353,6 +361,9 @@ public:
 
     const Document& CurrentDocument() const { return document_; }
     EditLog& Log() { return log_; }
+    const std::optional<TimelineSheetPlan>& CapturedSheet() const {
+        return captured_sheet_;
+    }
     const ProjectOperation* LastProjectOperation() const {
         return project_operation_ ? &*project_operation_ : nullptr;
     }
@@ -370,6 +381,7 @@ private:
     Transcript transcript_;
     ShotQualityReport shot_quality_;
     SpeechOnsetReport speech_onset_;
+    std::optional<TimelineSheetPlan> captured_sheet_;
 };
 
 // Minimal blocking HTTP client: sends one POST and reads the response until
@@ -538,6 +550,42 @@ int main() {
 
     InMemoryBackend backend(fixture);
     McpToolRegistry shortRegistry;
+
+    // A6 -- both visual summaries return one MCP image with exact cell
+    // metadata, without asking the caller to compute any timeline position.
+    {
+        const McpToolCallOutcome contact = shortRegistry.Call(
+            backend, "contact_sheet", mcp_json::Value::MakeObject());
+        Check(
+            contact.ok && contact.image_mime == "image/jpeg" &&
+                contact.image_base64 == "ZmFrZS1qcGVn" &&
+                contact.result_json.find("\"role\":\"middle\"") !=
+                    std::string::npos,
+            "contact_sheet returns an image and exact middle-cell metadata: " +
+                contact.message);
+
+        Document adjacent = fixture;
+        adjacent.sequence.tracks[0].clips[0].timeline_in = {0, 25};
+        adjacent.sequence.tracks[0].clips[1].timeline_in = {10, 25};
+        InMemoryBackend cutBackend(adjacent);
+        const McpToolCallOutcome cuts = shortRegistry.Call(
+            cutBackend, "cut_sheet", mcp_json::Value::MakeObject());
+        Check(cuts.ok && cuts.image_mime == "image/jpeg" &&
+                  cuts.result_json.find("\"role\":\"before\"") !=
+                      std::string::npos &&
+                  cuts.result_json.find("\"role\":\"after\"") !=
+                      std::string::npos &&
+                  cuts.result_json.find(
+                      "\"timeline_position\":{\"value\":9,\"rate\":25}") !=
+                      std::string::npos,
+              "cut_sheet returns exact adjacent frame pairs: " + cuts.message);
+
+        mcp_json::Value invalid = mcp_json::Value::MakeObject();
+        invalid.Set("max_images", mcp_json::Value::MakeInt(1));
+        CheckFailureEnvelope(
+            shortRegistry.Call(cutBackend, "cut_sheet", invalid),
+            "cut sheet incomplete pair", "ValidationFailed");
+    }
 
     // B11 -- image tools reject audio-only media by capability before a
     // backend starts FFmpeg and returns a generic I/O failure.
@@ -1187,6 +1235,8 @@ int main() {
     bool sawSetColorManagement = false;
     bool sawSetClipOpacity = false;
     bool sawSetClipAudio = false;
+    bool sawContactSheet = false;
+    bool sawCutSheet = false;
     bool sawUndo = false;
     if (toolsField) {
         for (const mcp_json::Value& tool : toolsField->AsArray()) {
@@ -1200,6 +1250,8 @@ int main() {
             if (name->AsString() == "set_clip_opacity")
                 sawSetClipOpacity = true;
             if (name->AsString() == "set_clip_audio") sawSetClipAudio = true;
+            if (name->AsString() == "contact_sheet") sawContactSheet = true;
+            if (name->AsString() == "cut_sheet") sawCutSheet = true;
             if (name->AsString() == "undo") sawUndo = true;
             // Multicam operations are stubbed pending F1.5; must not be
             // offered as a working tool.
@@ -1214,6 +1266,8 @@ int main() {
     Check(sawSetColorManagement, "tools/list includes set_color_management");
     Check(sawSetClipOpacity, "tools/list includes set_clip_opacity");
     Check(sawSetClipAudio, "tools/list includes set_clip_audio");
+    Check(sawContactSheet, "tools/list includes contact_sheet");
+    Check(sawCutSheet, "tools/list includes cut_sheet");
     Check(sawUndo, "tools/list includes undo");
 
     // ---- tools/call: trim_clip, compared against a direct EditLog::Apply ----

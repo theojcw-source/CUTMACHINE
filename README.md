@@ -448,6 +448,12 @@ décodage média :
   ./Film.cutmachine-project/project.cutmachine.json '<media-id>'
 ./build/cutmachine --shot-quality-report \
   ./Film.cutmachine-project/project.cutmachine.json
+./build/cutmachine --contact-sheet \
+  ./Film.cutmachine-project/project.cutmachine.json ./contacts.jpg \
+  --timeline '<timeline-id>' --max-images 24
+./build/cutmachine --cut-sheet \
+  ./Film.cutmachine-project/project.cutmachine.json ./raccords.jpg \
+  --timeline '<timeline-id>' --max-images 24
 ./build/cutmachine --describe ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --apply-op ./Film.cutmachine-project/project.cutmachine.json \
   '{"type":"TrimClip","clip_id":"01K00000000000000000000003","edge":"Tail","delta":{"value":-1,"rate":25},"exact_clip":null}'
@@ -894,6 +900,26 @@ Côté transport, l'image traverse MCP comme un bloc `image` à côté du bloc
 Elle n'est transmise qu'aux fournisseurs dont l'API accepte une image dans un
 résultat d'outil ; ailleurs le texte passe et l'image est écartée, plutôt que
 remplacée par une description que le modèle prendrait pour une observation.
+
+## Regarder le montage en planches
+
+Une image isolée ne permet pas de juger le rythme ou la continuité d'un
+montage. `--contact-sheet` (MCP : `contact_sheet`) rend donc les milieux des
+plans réellement visibles, après occultation par les pistes vidéo supérieures.
+`--cut-sheet` (MCP : `cut_sheet`) place côte à côte, pour chaque raccord
+visible retenu, la dernière image avant la coupe et la première image après.
+
+Les deux commandes produisent un JPEG et un JSON qui relie chaque cellule à
+son `clip_id`, son `source_id`, sa position timeline et son `source_in`, tous
+exprimés en `RationalTime`. Elles passent par la vue SDR du pipeline couleur du
+document : un rush log est présenté comme dans le moniteur, pas comme une image
+délavée tirée directement du fichier. Aucune donnée du projet n'est modifiée.
+
+Par défaut, une planche contient au plus 24 images. Si le montage en offre
+davantage, le moteur échantillonne uniformément du début à la fin ; une planche
+de raccords ne casse jamais une paire. `--max-images` ajuste la borne en CLI,
+et `max_images` l'ajuste en MCP (1 à 64 pour `contact_sheet`, 2 à 64 pour
+`cut_sheet`).
 
 ## Export vidéo final
 

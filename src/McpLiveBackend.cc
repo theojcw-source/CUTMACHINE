@@ -15,7 +15,8 @@ McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
                                SourceSpeechOnsetCallback readSourceSpeechOnset,
                                AnalyzeSpeechOnsetCallback analyzeSpeechOnset,
                                TimelineSelectCallback selectTimeline,
-                               bool requireExplicitTimeline)
+                               bool requireExplicitTimeline,
+                               CaptureSheetCallback captureSheet)
     : document_(document),
       edit_log_(editLog),
       on_applied_(std::move(onApplied)),
@@ -26,6 +27,7 @@ McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
       read_source_shot_quality_(std::move(readSourceShotQuality)),
       analyze_shot_quality_(std::move(analyzeShotQuality)),
       capture_frame_(std::move(captureFrame)),
+      capture_sheet_(std::move(captureSheet)),
       read_source_speech_onset_(std::move(readSourceSpeechOnset)),
       analyze_speech_onset_(std::move(analyzeSpeechOnset)),
       select_timeline_(std::move(selectTimeline)),
@@ -151,6 +153,17 @@ bool McpLiveBackend::CaptureSourceFrame(const Ulid& sourceId,
         return false;
     }
     return capture_frame_(sourceId, time, jpegBytes, message);
+}
+
+bool McpLiveBackend::CaptureTimelineSheet(const TimelineSheetPlan& plan,
+                                          const TimelineSheetSettings& settings,
+                                          std::string& jpegBytes,
+                                          std::string& message) {
+    if (!capture_sheet_) {
+        message = "the live backend cannot render a timeline sheet";
+        return false;
+    }
+    return capture_sheet_(plan, settings, jpegBytes, message);
 }
 
 bool McpLiveBackend::Undo(std::string& resultJson, std::string& errorName,
