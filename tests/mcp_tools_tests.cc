@@ -137,6 +137,18 @@ public:
         speech_onset_ = std::move(report);
     }
 
+    SpeechOnsetSettings speech_onset_settings;
+    bool speech_onset_analysis_seen = false;
+
+    bool AnalyzeSourceSpeechOnset(
+        const Ulid&, const SpeechOnsetSettings& settings,
+        std::string& resultJson, std::string&) override {
+        speech_onset_settings = settings;
+        speech_onset_analysis_seen = true;
+        resultJson = "{\"ok\":true}";
+        return true;
+    }
+
     bool ReadSourceSpeechOnset(const Ulid&, SpeechOnsetReport& report,
                                std::string& message) override {
         if (speech_onset_.levels.empty()) {
@@ -551,6 +563,62 @@ int main() {
     Check(transcriptOutcome.ok && transcriptOutcome.result_json.find(
                                       "A strong hook") != std::string::npos,
           "get_timeline_transcript returns the backend's semantic spans");
+
+    // B1 -- the tool surfaces both measured groups and the derived onset,
+    // and analysis settings reach the cache-producing backend unchanged.
+    {
+        Document speechDocument = fixture;
+        DocumentTrack audio = speechDocument.sequence.tracks.front();
+        audio.id = "01K30000000000000000000006";
+        audio.kind = "audio";
+        audio.clips.resize(1);
+        audio.clips[0].id = "01K30000000000000000000007";
+        audio.clips[0].source_in = {0, 50};
+        audio.clips[0].duration = {160, 50};
+        audio.clips[0].timeline_in = {0, 25};
+        speechDocument.sequence.tracks.push_back(audio);
+
+        SpeechOnsetReport report;
+        report.media_id = "01K30000000000000000000001";
+        report.windows_per_second = 50;
+        report.decode_sample_rate = 16000;
+        report.levels.insert(report.levels.end(), 50, 90000);
+        report.levels.insert(report.levels.end(), 10, 1000);
+        report.levels.insert(report.levels.end(), 100, 280000);
+        report.speech_level = SpeechLevelPercentile(report.levels, 90);
+        report.noise_floor = SpeechLevelPercentile(report.levels, 5);
+
+        InMemoryBackend speechBackend(speechDocument);
+        speechBackend.SetSourceSpeechOnset(report);
+        McpToolRegistry speechRegistry;
+        const McpToolCallOutcome speechList = speechRegistry.Call(
+            speechBackend, "list_speech_onsets",
+            mcp_json::Value::MakeObject());
+        Check(speechList.ok &&
+                  speechList.result_json.find("\"groups\":[{") !=
+                      std::string::npos &&
+                  speechList.result_json.find(
+                      "\"dominant_onset\":{\"value\":60,\"rate\":50}") !=
+                      std::string::npos,
+              "list_speech_onsets publishes groups and dominant_onset");
+
+        mcp_json::Value analyzeArguments;
+        std::string analyzeError;
+        Check(mcp_json::Value::Parse(
+                  R"({"media_id":"01K30000000000000000000001","group_gap_ms":300,"group_floor_db":8})",
+                  analyzeArguments, analyzeError),
+              "speech analysis arguments parse: " + analyzeError);
+        Check(speechRegistry
+                  .Call(speechBackend, "analyze_speech_onset",
+                        analyzeArguments)
+                  .ok &&
+                  speechBackend.speech_onset_analysis_seen &&
+                  speechBackend.speech_onset_settings.thresholds
+                          .group_gap_milliseconds == 300 &&
+                  speechBackend.speech_onset_settings.thresholds
+                          .group_floor_db == 8,
+              "analyze_speech_onset forwards configurable group settings");
+    }
     // Segments are named by span id and resolved by the engine. A caller
     // that could state a source_in could state one landing mid-word, and
     // ApplyOperation would accept it: it only checks that a range sits

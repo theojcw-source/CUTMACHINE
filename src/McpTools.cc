@@ -2283,14 +2283,17 @@ bool DispatchListSpeechOnsets(McpBackend& backend, const IdResolver&,
                               const Value& args, std::string& resultJson,
                               std::string& errorName, std::string& message) {
     static const std::vector<std::string> kAllowed = {
-        "group_gap_ms", "dominant_percentile", "dominance_db",
-        "dominant_sustain_windows"};
+        "group_gap_ms", "group_floor_db", "dominant_percentile",
+        "dominance_db", "dominant_sustain_windows"};
     if (!CheckKnownKeys(args, kAllowed, "list_speech_onsets", message))
         return Fail(errorName, message, message);
     SpeechOnsetThresholds thresholds;
     if (!ReadInt64(args, "group_gap_ms", "list_speech_onsets", false,
                    thresholds.group_gap_milliseconds,
                    thresholds.group_gap_milliseconds, message) ||
+        !ReadInt64(args, "group_floor_db", "list_speech_onsets", false,
+                   thresholds.group_floor_db, thresholds.group_floor_db,
+                   message) ||
         !ReadInt64(args, "dominant_percentile", "list_speech_onsets", false,
                    thresholds.dominant_percentile,
                    thresholds.dominant_percentile, message) ||
@@ -2303,6 +2306,7 @@ bool DispatchListSpeechOnsets(McpBackend& backend, const IdResolver&,
         return Fail(errorName, message, message);
     if (thresholds.group_gap_milliseconds < 20 ||
         thresholds.group_gap_milliseconds > 60000 ||
+        thresholds.group_floor_db < 0 || thresholds.group_floor_db > 120 ||
         thresholds.dominant_percentile < 1 ||
         thresholds.dominant_percentile > 100 || thresholds.dominance_db < 0 ||
         thresholds.dominance_db > 120 ||
@@ -2333,8 +2337,8 @@ bool DispatchListSpeechOnsets(McpBackend& backend, const IdResolver&,
 bool DispatchAnalyzeSpeechOnset(McpBackend& backend, const IdResolver& resolver,
                                 const Value& args, std::string& resultJson,
                                 std::string& errorName, std::string& message) {
-    static const std::vector<std::string> kAllowed = {"media_id",
-                                                      "group_gap_ms"};
+    static const std::vector<std::string> kAllowed = {
+        "media_id", "group_gap_ms", "group_floor_db"};
     if (!CheckKnownKeys(args, kAllowed, "analyze_speech_onset", message))
         return Fail(errorName, message, message);
     Ulid mediaId;
@@ -2343,13 +2347,18 @@ bool DispatchAnalyzeSpeechOnset(McpBackend& backend, const IdResolver& resolver,
                 mediaId, message) ||
         !ReadInt64(args, "group_gap_ms", "analyze_speech_onset", false,
                    settings.thresholds.group_gap_milliseconds,
-                   settings.thresholds.group_gap_milliseconds, message))
+                   settings.thresholds.group_gap_milliseconds, message) ||
+        !ReadInt64(args, "group_floor_db", "analyze_speech_onset", false,
+                   settings.thresholds.group_floor_db,
+                   settings.thresholds.group_floor_db, message))
         return Fail(errorName, message, message);
     if (settings.thresholds.group_gap_milliseconds < 20 ||
-        settings.thresholds.group_gap_milliseconds > 60000)
+        settings.thresholds.group_gap_milliseconds > 60000 ||
+        settings.thresholds.group_floor_db < 0 ||
+        settings.thresholds.group_floor_db > 120)
         return Fail(errorName, message,
-                    "'analyze_speech_onset.group_gap_ms' must be between 20 "
-                    "and 60000");
+                    "speech group settings are outside their documented "
+                    "bounds");
     return backend.AnalyzeSourceSpeechOnset(mediaId, settings, resultJson,
                                             message)
                ? true
@@ -3435,6 +3444,10 @@ McpToolRegistry::McpToolRegistry() {
                    IntSchema("Silence that separates two speech groups, in "
                              "milliseconds (default 200)."),
                    false)
+            .Field("group_floor_db",
+                   IntSchema("Level above the source noise floor required "
+                             "for a speech group (default 6 dB)."),
+                   false)
             .Field("dominant_percentile",
                    IntSchema("Clip level reference percentile (default 90)."),
                    false)
@@ -3458,6 +3471,10 @@ McpToolRegistry::McpToolRegistry() {
             .Field("group_gap_ms",
                    IntSchema("Silence that separates two speech groups, in "
                              "milliseconds (default 200)."),
+                   false)
+            .Field("group_floor_db",
+                   IntSchema("Level above the source noise floor required "
+                             "for a speech group (default 6 dB)."),
                    false)
             .Build("analyze_speech_onset arguments"),
         DispatchAnalyzeSpeechOnset);

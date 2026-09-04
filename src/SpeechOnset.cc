@@ -74,6 +74,10 @@ bool ValidateGroupThresholds(const SpeechOnsetThresholds& thresholds,
         error = "group_gap_milliseconds must be between 20 and 60000";
         return false;
     }
+    if (thresholds.group_floor_db < 0 || thresholds.group_floor_db > 120) {
+        error = "group_floor_db must be between 0 and 120";
+        return false;
+    }
     if (thresholds.dominant_percentile < 1 ||
         thresholds.dominant_percentile > 100) {
         error = "dominant_percentile must be between 1 and 100";
@@ -244,15 +248,16 @@ bool BuildSpeechGroups(const std::vector<int64_t>& levels,
             noiseFloor * thresholds.minimum_dynamic_range_percent)
         return true;
 
-    const int64_t threshold =
-        speechLevel * thresholds.speech_ratio_percent / 100;
+    const int64_t floorDbfs = std::min<int64_t>(
+        0, SpeechLevelDbfs(noiseFloor) + thresholds.group_floor_db);
     const int64_t gapWindows = WindowsForMilliseconds(
         thresholds.group_gap_milliseconds, windowsPerSecond);
     const int64_t count = static_cast<int64_t>(levels.size());
     int64_t groupStart = -1;
     int64_t lastVoiceEnd = -1;
     for (int64_t index = 0; index < count; ++index) {
-        if (levels[static_cast<size_t>(index)] < threshold) continue;
+        if (SpeechLevelDbfs(levels[static_cast<size_t>(index)]) < floorDbfs)
+            continue;
         if (groupStart < 0) {
             groupStart = index;
         } else if (index - lastVoiceEnd >= gapWindows) {
@@ -327,7 +332,8 @@ bool SummarizeClipSpeechOnset(const DocumentClip& clip,
     std::vector<SpeechGroup> regrouped;
     const std::vector<SpeechGroup>* sourceGroups = &report.groups;
     if (report.groups.empty() ||
-        report.group_gap_milliseconds != thresholds.group_gap_milliseconds) {
+        report.group_gap_milliseconds != thresholds.group_gap_milliseconds ||
+        report.group_floor_db != thresholds.group_floor_db) {
         if (!BuildSpeechGroups(report.levels, report.windows_per_second,
                                report.speech_level, report.noise_floor,
                                thresholds, regrouped, error))
@@ -401,7 +407,8 @@ std::string SerializeSpeechOnset(const SpeechOnsetReport& report) {
            << ",\"speech_level\":" << report.speech_level
            << ",\"noise_floor\":" << report.noise_floor
            << ",\"group_gap_milliseconds\":"
-           << report.group_gap_milliseconds << ",\"groups\":[";
+           << report.group_gap_milliseconds << ",\"group_floor_db\":"
+           << report.group_floor_db << ",\"groups\":[";
     for (size_t index = 0; index < report.groups.size(); ++index) {
         if (index) output << ',';
         const SpeechGroup& group = report.groups[index];
@@ -475,16 +482,20 @@ bool DeserializeSpeechOnset(const std::string& json, SpeechOnsetReport& report,
     SpeechOnsetThresholds cacheThresholds;
     if (version == 2) {
         int64_t groupGap = 0;
-        if (!ReadInt64Field(root, "group_gap_milliseconds", groupGap)) {
-            error = "speech onset cache has no group gap";
+        int64_t groupFloorDb = 0;
+        if (!ReadInt64Field(root, "group_gap_milliseconds", groupGap) ||
+            !ReadInt64Field(root, "group_floor_db", groupFloorDb)) {
+            error = "speech onset cache has no group settings";
             return false;
         }
         cacheThresholds.group_gap_milliseconds = groupGap;
+        cacheThresholds.group_floor_db = groupFloorDb;
         if (!ValidateGroupThresholds(cacheThresholds, error)) {
             error = "invalid speech onset cache: " + error;
             return false;
         }
         report.group_gap_milliseconds = groupGap;
+        report.group_floor_db = groupFloorDb;
         const Value* groups = root.Find("groups");
         if (groups == nullptr || !groups->IsArray()) {
             error = "speech onset cache has no groups";
@@ -716,6 +727,7 @@ bool GenerateSpeechOnset(const std::string& inputPath,
     report.noise_floor = SpeechLevelPercentile(report.levels, 5);
     report.group_gap_milliseconds =
         settings.thresholds.group_gap_milliseconds;
+    report.group_floor_db = settings.thresholds.group_floor_db;
     if (!BuildSpeechGroups(report.levels, report.windows_per_second,
                            report.speech_level, report.noise_floor,
                            settings.thresholds, report.groups, error))
@@ -847,6 +859,7 @@ std::string DescribeSpeechOnsetForAgent(
                Value::MakeInt(thresholds.tolerance_milliseconds));
     limits.Set("group_gap_milliseconds",
                Value::MakeInt(thresholds.group_gap_milliseconds));
+    limits.Set("group_floor_db", Value::MakeInt(thresholds.group_floor_db));
     limits.Set("dominant_percentile",
                Value::MakeInt(thresholds.dominant_percentile));
     limits.Set("dominance_db", Value::MakeInt(thresholds.dominance_db));

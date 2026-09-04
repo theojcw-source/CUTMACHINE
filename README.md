@@ -652,6 +652,16 @@ sont retirées que si `include_repetitions` est demandé — un mot répété pe
 
 ### Recaler les mots sur le signal, et refermer les silences
 
+`--speech-onset` met aussi en cache les groupes de parole séparés par au
+moins 200 ms de creux. `--speech-onset-report` (MCP :
+`list_speech_onsets`) publie pour chaque groupe ses bornes source, son niveau
+moyen et sa crête en dBFS. Le champ `dominant_onset` désigne le premier groupe
+tenu au moins six fenêtres de 20 ms et situé à moins de 9 dB du 90e centile du
+plan. Une question faible hors micro reste donc visible dans `groups`, mais
+n'est plus confondue avec l'entrée du sujet équipé d'un micro-cravate. Le
+seuil séparant les groupes et leur plancher au-dessus du bruit sont
+paramétrables dans les outils MCP (`group_gap_ms`, `group_floor_db`).
+
 Les horodatages de Whisper sont excellents la plupart du temps et
 occasionnellement faux d'une seconde. `--align-transcripts` (MCP :
 `align_transcript`) compare chaque frontière de mot à l'enveloppe d'énergie

@@ -111,6 +111,66 @@ int main() {
     Check(FirstSustainedWindow({0, 0, 0}, 0, 500, 2) == -1,
           "une enveloppe sans parole se refuse au lieu de rendre zéro");
 
+    // --- Speech groups and dominant speaker (B1) --------------------------
+    // An off-mic question for 1 s, exactly 0.2 s of room, then a lavalier
+    // answer. The group floor must retain both voices while dominance picks
+    // the second one.
+    SpeechOnsetReport interview;
+    interview.media_id = "01K30000000000000000000001";
+    interview.windows_per_second = 50;
+    interview.decode_sample_rate = 16000;
+    interview.levels.insert(interview.levels.end(), 50, 90000);
+    interview.levels.insert(interview.levels.end(), 10, 1000);
+    interview.levels.insert(interview.levels.end(), 100, 280000);
+    interview.speech_level = SpeechLevelPercentile(interview.levels, 90);
+    interview.noise_floor = SpeechLevelPercentile(interview.levels, 5);
+    SpeechOnsetThresholds groupThresholds;
+    std::vector<SpeechGroup> groups;
+    std::string groupError;
+    Check(BuildSpeechGroups(interview.levels, interview.windows_per_second,
+                            interview.speech_level, interview.noise_floor,
+                            groupThresholds, groups, groupError),
+          "les groupes synthétiques se calculent : " + groupError);
+    Check(groups.size() == 2 && groups[0].start == RationalTime{0, 50} &&
+              groups[0].end == RationalTime{50, 50} &&
+              groups[1].start == RationalTime{60, 50} &&
+              groups[1].end == RationalTime{160, 50},
+          "parole faible, creux de 0,2 s et parole forte rendent deux groupes");
+    Check(groups.size() == 2 &&
+              groups[0].level_dbfs < groups[1].level_dbfs &&
+              groups[0].peak_dbfs < groups[1].peak_dbfs,
+          "chaque groupe publie son niveau et sa crête en dBFS");
+    interview.groups = groups;
+    interview.group_gap_milliseconds =
+        groupThresholds.group_gap_milliseconds;
+    interview.group_floor_db = groupThresholds.group_floor_db;
+    ClipSpeechOnset interviewSummary;
+    Check(SummarizeClipSpeechOnset(Clip({0, 50}, {160, 50}), interview,
+                                   groupThresholds, kPal, interviewSummary,
+                                   groupError),
+          "le plan avec question se résume : " + groupError);
+    Check(interviewSummary.measured && interviewSummary.onset ==
+                                              RationalTime{0, 50} &&
+              interviewSummary.dominant_measured &&
+              interviewSummary.dominant_onset == RationalTime{60, 50},
+          "l'attaque dominante saute la question faible et choisit la réponse");
+
+    SpeechOnsetReport answerOnly = interview;
+    answerOnly.levels.assign(100, 280000);
+    answerOnly.speech_level = SpeechLevelPercentile(answerOnly.levels, 90);
+    answerOnly.noise_floor = 1000;
+    Check(BuildSpeechGroups(answerOnly.levels, answerOnly.windows_per_second,
+                            answerOnly.speech_level, answerOnly.noise_floor,
+                            groupThresholds, answerOnly.groups, groupError),
+          "le plan sans question groupe la réponse : " + groupError);
+    ClipSpeechOnset answerSummary;
+    Check(SummarizeClipSpeechOnset(Clip({0, 50}, {100, 50}), answerOnly,
+                                   groupThresholds, kPal, answerSummary,
+                                   groupError) &&
+              answerSummary.measured && answerSummary.dominant_measured &&
+              answerSummary.dominant_onset == answerSummary.onset,
+          "sans question initiale, dominant_onset reste égal à onset");
+
     // --- Résumé par clip ---------------------------------------------------
     // 34 fenêtres de souffle (0,68 s) puis de la parole : le cas mesuré sur
     // C7429, où whisper annonçait le premier mot à l'image 0.
@@ -223,6 +283,24 @@ int main() {
     Check(!DeserializeSpeechOnset("{\"version\":0,\"media_id\":\"x\"}", old,
                                   error),
           "une version de cache inconnue est refusée, pas migrée");
+    const std::string versionOne =
+        R"({"version":1,"media_id":"01K30000000000000000000001","windows_per_second":50,"decode_sample_rate":16000,"speech_level":280000,"noise_floor":1000,"levels":[90000,90000,1000,1000,280000,280000,280000,280000,280000,280000]})";
+    SpeechOnsetReport upgraded;
+    Check(DeserializeSpeechOnset(versionOne, upgraded, error) &&
+              !upgraded.groups.empty() &&
+              SerializeSpeechOnset(upgraded).find("\"version\":2") !=
+                  std::string::npos,
+          "un cache v1 est enrichi avec les réglages et groupes par défaut : " +
+              error);
+    const std::string groupedJson = SerializeSpeechOnset(interview);
+    SpeechOnsetReport groupedParsed;
+    Check(DeserializeSpeechOnset(groupedJson, groupedParsed, error) &&
+              groupedParsed.groups.size() == 2 &&
+              groupedParsed.group_gap_milliseconds == 200 &&
+              groupedParsed.group_floor_db == 6 &&
+              SerializeSpeechOnset(groupedParsed) == groupedJson,
+          "les groupes et leurs seuils font un aller-retour canonique : " +
+              error);
 
     // --- Passe d'analyse, avec un vrai FFmpeg -------------------------------
     // Le cœur pur ci-dessus ne prouve pas que le décodage produit la bonne
@@ -269,6 +347,10 @@ int main() {
               "la grille d'analyse est celle demandée");
         Check(decoded.speech_level > decoded.noise_floor * 4,
               "le ton se détache nettement du silence");
+        Check(decoded.groups.size() == 1 &&
+                  decoded.groups[0].start.value >= 58 &&
+                  decoded.groups[0].start.value <= 63,
+              "l'analyse FFmpeg met aussi en cache le groupe de parole");
         DocumentClip whole = Clip({0, 25}, {80, 25});
         whole.source_id = mediaId;
         ClipSpeechOnset decodedSummary;
