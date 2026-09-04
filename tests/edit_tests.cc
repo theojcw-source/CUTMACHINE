@@ -1337,6 +1337,170 @@ int main() {
               "rejected trim is never journaled");
     });
 
+    Test("A5 synchronized ripple and cuts are exact and reversible", [] {
+        const Ulid syncTrackId = "01K20000000000000000000020";
+        {
+            Document document = EditDocument();
+            DocumentTrack synced{syncTrackId,
+                                 "video",
+                                 1,
+                                 {{"01K20000000000000000000021",
+                                   document.sources[0].id,
+                                   {400, 25},
+                                   {10, 25},
+                                   {20, 25}}}};
+            document.sequence.tracks.push_back(synced);
+            const std::string before = document.SaveToString();
+            EditLog log;
+            RemoveClipOperation remove{
+                document.sequence.tracks[0].clips[0].id, {syncTrackId}, {}};
+            Check(Apply(log, document, remove, "synchronized remove"),
+                  "remove_clip accepts a synchronized track");
+            Check(document.sequence.tracks[0].clips[0].timeline_in ==
+                          RationalTime{10, 25} &&
+                      document.sequence.tracks[1].clips[0].timeline_in ==
+                          RationalTime{10, 25},
+                  "remove_clip ripples every named track by the same exact "
+                  "duration");
+            const std::string json =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Operation parsed = RemoveClipOperation{};
+            EditError error = EditError::None;
+            std::string message;
+            Check(DeserializeOperation(json, parsed, error, message) &&
+                      std::get<RemoveClipOperation>(parsed).sync_track_ids ==
+                          std::vector<Ulid>{syncTrackId} &&
+                      SerializeOperation(parsed) == json,
+                  "RemoveClip sync_track_ids round-trip canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == before,
+                  "RemoveClip synchronized undo restores exact bytes");
+        }
+
+        const auto linkedDocument = [&](bool crossingSyncClip) {
+            Document document;
+            document.sources = {{"01K20000000000000000000001",
+                                 "A.MP4",
+                                 {25, 1},
+                                 {1000, 25}}};
+            const Ulid group = "01K20000000000000000000030";
+            DocumentClip video{"01K20000000000000000000031",
+                               document.sources[0].id,
+                               {100, 25},
+                               {10, 25},
+                               {0, 25}};
+            video.link_group_id = group;
+            video.sync_anchor_clip_id = video.id;
+            DocumentClip audio = video;
+            audio.id = "01K20000000000000000000032";
+            audio.sync_anchor_clip_id = video.id;
+            DocumentClip followingVideo{"01K20000000000000000000033",
+                                        document.sources[0].id,
+                                        {200, 25},
+                                        {10, 25},
+                                        {10, 25}};
+            DocumentClip followingAudio = followingVideo;
+            followingAudio.id = "01K20000000000000000000034";
+            const RationalTime syncStart =
+                crossingSyncClip ? RationalTime{0, 25}
+                                 : RationalTime{10, 25};
+            DocumentClip synced{"01K20000000000000000000035",
+                                document.sources[0].id,
+                                {300, 25},
+                                {10, 25},
+                                syncStart};
+            document.sequence.tracks = {
+                {"01K20000000000000000000036",
+                 "video",
+                 0,
+                 {video, followingVideo}},
+                {syncTrackId, "video", 1, {synced}},
+                {"01K20000000000000000000037",
+                 "audio",
+                 2,
+                 {audio, followingAudio}},
+            };
+            return document;
+        };
+
+        {
+            Document document = linkedDocument(false);
+            const std::string before = document.SaveToString();
+            const Ulid videoId = document.sequence.tracks[0].clips[0].id;
+            const Ulid audioId = document.sequence.tracks[2].clips[0].id;
+            const Ulid group = document.FindClip(videoId)->link_group_id;
+            EditLog log;
+            RemoveLinkedClipsOperation remove{
+                group, {videoId, audioId}, {syncTrackId}, {}};
+            Check(Apply(log, document, remove, "synchronized linked remove"),
+                  "remove_linked_clips accepts a synchronized track");
+            Check(document.sequence.tracks[0].clips[0].timeline_in ==
+                          RationalTime{0, 25} &&
+                      document.sequence.tracks[1].clips[0].timeline_in ==
+                          RationalTime{0, 25} &&
+                      document.sequence.tracks[2].clips[0].timeline_in ==
+                          RationalTime{0, 25},
+                  "linked removal leaves all three downstream tracks "
+                  "aligned");
+            const std::string json =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Operation parsed = RemoveClipOperation{};
+            EditError error = EditError::None;
+            std::string message;
+            Check(DeserializeOperation(json, parsed, error, message) &&
+                      std::get<RemoveLinkedClipsOperation>(parsed)
+                              .sync_track_ids ==
+                          std::vector<Ulid>{syncTrackId} &&
+                      SerializeOperation(parsed) == json,
+                  "RemoveLinkedClips sync_track_ids round-trip canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == before,
+                  "linked synchronized removal undo restores exact bytes");
+        }
+
+        {
+            Document document = linkedDocument(true);
+            const std::string before = document.SaveToString();
+            const Ulid videoId = document.sequence.tracks[0].clips[0].id;
+            const Ulid audioId = document.sequence.tracks[2].clips[0].id;
+            const Ulid group = document.FindClip(videoId)->link_group_id;
+            EditLog log;
+            SplitLinkedClipsOperation split{group,
+                                            {videoId, audioId},
+                                            {5, 25},
+                                            {},
+                                            {},
+                                            {},
+                                            {syncTrackId},
+                                            {}};
+            Check(Apply(log, document, split, "synchronized linked split"),
+                  "split_linked_clips accepts a synchronized track");
+            Check(document.sequence.tracks[0].clips.size() == 3 &&
+                      document.sequence.tracks[1].clips.size() == 2 &&
+                      document.sequence.tracks[2].clips.size() == 3,
+                  "linked split cuts the crossing clip on the synchronized "
+                  "track too");
+            const std::string after = document.SaveToString();
+            const std::string json =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Operation parsed = RemoveClipOperation{};
+            EditError error = EditError::None;
+            std::string message;
+            Check(DeserializeOperation(json, parsed, error, message) &&
+                      std::get<SplitLinkedClipsOperation>(parsed)
+                              .sync_track_ids ==
+                          std::vector<Ulid>{syncTrackId} &&
+                      SerializeOperation(parsed) == json,
+                  "SplitLinkedClips sync_track_ids round-trip canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == before,
+                  "linked synchronized split undo restores exact bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == after,
+                  "linked synchronized split redo restores generated IDs");
+        }
+    });
+
     Test("roll edit moves one contiguous cut without changing total duration",
          [] {
              Document document = EditDocument();

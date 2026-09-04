@@ -1584,6 +1584,136 @@ int main() {
             "a backend without transcription reports the gap explicitly");
     }
 
+    // QC-2026-09 B5 -- ripple_trim carries the linked picture/sound pair by
+    // default, while an explicit linked_clip_ids array is an intentional
+    // subset. A1 is deliberately left outside the default set so the tool
+    // can warn that an omitted sync_track_ids would break V1/V2/A1 alignment.
+    {
+        const Ulid sourceId = "01K30000000000000000000001";
+        const Ulid groupId = "01K30000000000000000000010";
+        Document ripple;
+        ripple.sources = {{sourceId, "rush.MP4", {25, 1}, {1000, 25}}};
+        DocumentClip v1{"01K30000000000000000000011", sourceId,
+                        {0, 25}, {10, 25}, {0, 25}};
+        v1.link_group_id = groupId;
+        v1.sync_anchor_clip_id = v1.id;
+        DocumentClip v2 = v1;
+        v2.id = "01K30000000000000000000012";
+        v2.sync_anchor_clip_id = v1.id;
+        DocumentClip v1After{"01K30000000000000000000013", sourceId,
+                             {20, 25}, {10, 25}, {10, 25}};
+        DocumentClip v2After = v1After;
+        v2After.id = "01K30000000000000000000014";
+        DocumentClip a1{"01K30000000000000000000015", sourceId,
+                        {40, 25}, {10, 25}, {10, 25}};
+        const Ulid v1TrackId = "01K30000000000000000000016";
+        const Ulid v2TrackId = "01K30000000000000000000017";
+        const Ulid a1TrackId = "01K30000000000000000000018";
+        ripple.sequence.tracks = {
+            {v1TrackId, "video", 0, {v1, v1After}},
+            {v2TrackId, "video", 1, {v2, v2After}},
+            {a1TrackId, "audio", 2, {a1}},
+        };
+
+        McpToolRegistry registry;
+        InMemoryBackend backend(ripple);
+        const auto call = [&](const std::string& argumentsJson) {
+            mcp_json::Value arguments;
+            std::string parseFailure;
+            Check(mcp_json::Value::Parse(argumentsJson, arguments,
+                                         parseFailure),
+                  "ripple_trim arguments parse: " + parseFailure);
+            return registry.Call(backend, "ripple_trim", arguments);
+        };
+
+        const std::string before = backend.CurrentDocument().SaveToString();
+        const McpToolCallOutcome carried = call(
+            R"({"clip_id":"01K30000000000000000000011","edge":"Tail",)"
+            R"("delta":{"value":5,"rate":25}})");
+        Check(carried.ok, "ripple_trim carries the linked group by default: " +
+                           carried.message);
+        const Document& carriedDocument = backend.CurrentDocument();
+        Check(carriedDocument.FindClip("01K30000000000000000000011")
+                          ->duration == RationalTime{15, 25} &&
+                  carriedDocument.FindClip("01K30000000000000000000012")
+                          ->duration == RationalTime{15, 25},
+              "default ripple trims both V1 and V2");
+        Check(carriedDocument.FindClip("01K30000000000000000000013")
+                          ->timeline_in == RationalTime{15, 25} &&
+                  carriedDocument.FindClip("01K30000000000000000000014")
+                          ->timeline_in == RationalTime{15, 25},
+              "default ripple keeps downstream V1/V2 aligned");
+        Check(carriedDocument.FindClip("01K30000000000000000000015")
+                          ->timeline_in == RationalTime{10, 25},
+              "unlisted A1 is not shifted without sync_track_ids");
+        mcp_json::Value carriedResult;
+        std::string resultError;
+        Check(mcp_json::Value::Parse(carried.result_json, carriedResult,
+                                     resultError),
+              "ripple_trim result is JSON: " + resultError);
+        const mcp_json::Value* alsoCut = carriedResult.Find("also_cut");
+        Check(alsoCut && alsoCut->IsArray() && alsoCut->AsArray().size() == 1 &&
+                  alsoCut->AsArray()[0].AsString() == v2.id,
+              "ripple_trim reports the linked partner in also_cut");
+        Check(carriedResult.Find("warning") != nullptr &&
+                  carriedResult.Find("warning_track_ids") != nullptr,
+              "omitting sync_track_ids warns about downstream A1");
+        EditError undoError = EditError::None;
+        std::string undoMessage;
+        Check(backend.Log().Undo(
+                  const_cast<Document&>(backend.CurrentDocument()), undoError,
+                  undoMessage) &&
+                  backend.CurrentDocument().SaveToString() == before,
+              "default ripple undo restores V1/V2/A1 byte-identically");
+
+        InMemoryBackend subset(ripple);
+        const McpToolCallOutcome explicitSubset = [&] {
+            mcp_json::Value arguments;
+            std::string parseFailure;
+            mcp_json::Value::Parse(
+                R"({"clip_id":"01K30000000000000000000011","edge":"Tail",)"
+                R"("delta":{"value":5,"rate":25},"linked_clip_ids":[]})",
+                arguments, parseFailure);
+            return registry.Call(subset, "ripple_trim", arguments);
+        }();
+        Check(explicitSubset.ok &&
+                  subset.CurrentDocument()
+                          .FindClip("01K30000000000000000000011")
+                          ->duration == RationalTime{15, 25} &&
+                  subset.CurrentDocument()
+                          .FindClip("01K30000000000000000000012")
+                          ->duration == RationalTime{10, 25},
+              "explicit empty linked_clip_ids preserves a subset");
+        mcp_json::Value subsetResult;
+        Check(mcp_json::Value::Parse(explicitSubset.result_json,
+                                     subsetResult, resultError) &&
+                  subsetResult.Find("also_cut") &&
+                  subsetResult.Find("also_cut")->AsArray().empty(),
+              "explicit subset reports no linked partner cut");
+
+        InMemoryBackend aligned(ripple);
+        mcp_json::Value alignedArguments;
+        std::string alignedParseError;
+        Check(mcp_json::Value::Parse(
+                  R"({"clip_id":"01K30000000000000000000011","edge":"Tail",)"
+                  R"("delta":{"value":5,"rate":25},)"
+                  R"("sync_track_ids":["01K30000000000000000000018"]})",
+                  alignedArguments, alignedParseError),
+              "aligned ripple arguments parse: " + alignedParseError);
+        const McpToolCallOutcome alignment =
+            registry.Call(aligned, "ripple_trim", alignedArguments);
+        Check(alignment.ok &&
+                  aligned.CurrentDocument()
+                          .FindClip("01K30000000000000000000015")
+                          ->timeline_in == RationalTime{15, 25},
+              "explicit sync_track_ids keeps V1/V2/A1 aligned");
+        mcp_json::Value alignmentResult;
+        Check(mcp_json::Value::Parse(alignment.result_json,
+                                     alignmentResult, resultError) &&
+                  alignmentResult.Find("warning") == nullptr,
+              "explicit synchronization suppresses the omission warning");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " assertion(s) failed\n";
         return 1;

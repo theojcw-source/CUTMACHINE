@@ -458,12 +458,15 @@ bool DispatchInsertClip(McpBackend& backend, const IdResolver& resolver,
 bool DispatchRemoveClip(McpBackend& backend, const IdResolver& resolver,
                         const Value& args, std::string& resultJson,
                         std::string& errorName, std::string& message) {
-    static const std::vector<std::string> kAllowed = {"clip_id"};
+    static const std::vector<std::string> kAllowed = {"clip_id",
+                                                      "sync_track_ids"};
     if (!CheckKnownKeys(args, kAllowed, "remove_clip", message))
         return Fail(errorName, message, message);
     RemoveClipOperation op;
     if (!ReadId(args, "clip_id", "remove_clip", resolver, true, op.clip_id,
-                message))
+                message) ||
+        !ReadIdArray(args, "sync_track_ids", "remove_clip", resolver,
+                     op.sync_track_ids, message))
         return Fail(errorName, message, message);
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
@@ -882,6 +885,8 @@ bool DispatchRippleTrim(McpBackend& backend, const IdResolver& resolver,
         "linked_clip_ids", "sync_track_ids"};
     if (!CheckKnownKeys(args, kAllowed, "ripple_trim", message))
         return Fail(errorName, message, message);
+    const bool linkedIdsExplicit = args.Find("linked_clip_ids") != nullptr;
+    const bool syncTracksExplicit = args.Find("sync_track_ids") != nullptr;
     RippleTrimOperation op;
     if (!ReadId(args, "clip_id", "ripple_trim", resolver, true, op.clip_id,
                 message) ||
@@ -894,7 +899,91 @@ bool DispatchRippleTrim(McpBackend& backend, const IdResolver& resolver,
     if (!ReadTrimAmount(backend, args, "ripple_trim", op.clip_id, op.edge,
                         op.delta, errorName, message))
         return false;
-    return backend.ApplyOperation(op, resultJson, errorName, message);
+
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    const DocumentClip* anchor = document.FindClip(op.clip_id);
+    if (!anchor) {
+        errorName = EditErrorName(EditError::UnknownClip);
+        message = "unknown clip_id '" + op.clip_id + "'";
+        return false;
+    }
+
+    // QC-2026-09 B5 -- absence means the editing default (the whole A/V
+    // group); a present array, including [], is an intentional subset.
+    if (!linkedIdsExplicit && !anchor->link_group_id.empty()) {
+        for (const DocumentTrack& track : document.sequence.tracks) {
+            for (const DocumentClip& clip : track.clips) {
+                if (clip.id != anchor->id &&
+                    clip.link_group_id == anchor->link_group_id)
+                    op.linked_clip_ids.push_back(clip.id);
+            }
+        }
+    }
+
+    std::vector<Ulid> warningTrackIds;
+    if (!syncTracksExplicit) {
+        std::vector<Ulid> affectedTrackIds;
+        const auto addAffectedTrack = [&](const Ulid& clipId) {
+            const DocumentTrack* track = document.FindTrackForClip(clipId);
+            if (track &&
+                std::find(affectedTrackIds.begin(), affectedTrackIds.end(),
+                          track->id) == affectedTrackIds.end())
+                affectedTrackIds.push_back(track->id);
+        };
+        addAffectedTrack(anchor->id);
+        for (const Ulid& linkedId : op.linked_clip_ids)
+            addAffectedTrack(linkedId);
+        const RationalTime boundary =
+            op.edge == TrimEdge::Head
+                ? anchor->timeline_in
+                : anchor->timeline_in.add(anchor->duration);
+        for (const DocumentTrack& track : document.sequence.tracks) {
+            if (std::find(affectedTrackIds.begin(), affectedTrackIds.end(),
+                          track.id) != affectedTrackIds.end())
+                continue;
+            if (std::any_of(track.clips.begin(), track.clips.end(),
+                            [&](const DocumentClip& clip) {
+                                return clip.timeline_in >= boundary;
+                            }))
+                warningTrackIds.push_back(track.id);
+        }
+    }
+
+    std::string appliedJson;
+    if (!backend.ApplyOperation(op, appliedJson, errorName, message))
+        return false;
+    Value result;
+    std::string parseError;
+    if (!Value::Parse(appliedJson, result, parseError) || !result.IsObject())
+        result = Value::MakeObject();
+    Value alsoCut = Value::MakeArray();
+    std::vector<Ulid> reported;
+    for (const Ulid& linkedId : op.linked_clip_ids) {
+        if (linkedId == op.clip_id ||
+            std::find(reported.begin(), reported.end(), linkedId) !=
+                reported.end())
+            continue;
+        reported.push_back(linkedId);
+        alsoCut.Push(Value::MakeString(linkedId));
+    }
+    result.Set("also_cut", std::move(alsoCut));
+    if (!warningTrackIds.empty()) {
+        result.Set(
+            "warning",
+            Value::MakeString(
+                "sync_track_ids omis : des plans en aval sur d'autres "
+                "pistes n'ont pas ete decales"));
+        Value tracks = Value::MakeArray();
+        for (const Ulid& trackId : warningTrackIds)
+            tracks.Push(Value::MakeString(trackId));
+        result.Set("warning_track_ids", std::move(tracks));
+    }
+    resultJson = result.Dump();
+    return true;
 }
 
 bool DispatchRollEdit(McpBackend& backend, const IdResolver& resolver,
@@ -950,15 +1039,17 @@ bool DispatchSlipEdit(McpBackend& backend, const IdResolver& resolver,
 bool DispatchRemoveLinkedClips(McpBackend& backend, const IdResolver& resolver,
                                const Value& args, std::string& resultJson,
                                std::string& errorName, std::string& message) {
-    static const std::vector<std::string> kAllowed = {"link_group_id",
-                                                      "clip_ids"};
+    static const std::vector<std::string> kAllowed = {
+        "link_group_id", "clip_ids", "sync_track_ids"};
     if (!CheckKnownKeys(args, kAllowed, "remove_linked_clips", message))
         return Fail(errorName, message, message);
     RemoveLinkedClipsOperation op;
     if (!ReadId(args, "link_group_id", "remove_linked_clips", resolver, true,
                 op.link_group_id, message) ||
         !ReadIdArray(args, "clip_ids", "remove_linked_clips", resolver,
-                     op.clip_ids, message))
+                     op.clip_ids, message) ||
+        !ReadIdArray(args, "sync_track_ids", "remove_linked_clips", resolver,
+                     op.sync_track_ids, message))
         return Fail(errorName, message, message);
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
@@ -983,7 +1074,7 @@ bool DispatchSplitLinkedClips(McpBackend& backend, const IdResolver& resolver,
                               const Value& args, std::string& resultJson,
                               std::string& errorName, std::string& message) {
     static const std::vector<std::string> kAllowed = {
-        "link_group_id", "clip_ids", "timeline_position"};
+        "link_group_id", "clip_ids", "timeline_position", "sync_track_ids"};
     if (!CheckKnownKeys(args, kAllowed, "split_linked_clips", message))
         return Fail(errorName, message, message);
     SplitLinkedClipsOperation op;
@@ -992,7 +1083,9 @@ bool DispatchSplitLinkedClips(McpBackend& backend, const IdResolver& resolver,
         !ReadIdArray(args, "clip_ids", "split_linked_clips", resolver,
                      op.clip_ids, message) ||
         !ReadTime(args, "timeline_position", "split_linked_clips", true,
-                  op.timeline_position, message))
+                  op.timeline_position, message) ||
+        !ReadIdArray(args, "sync_track_ids", "split_linked_clips", resolver,
+                     op.sync_track_ids, message))
         return Fail(errorName, message, message);
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
@@ -2358,9 +2451,13 @@ McpToolRegistry::McpToolRegistry() {
 
     add("remove_clip",
         "Remove a clip and ripple later clips on its track backward to "
-        "close the gap.",
+        "close the gap, plus any explicitly synchronized tracks.",
         SchemaBuilder()
             .Field("clip_id", IdSchema("Clip to remove."), true)
+            .Field("sync_track_ids",
+                   IdArraySchema("Additional tracks whose downstream clips "
+                                 "must follow the same ripple."),
+                   false)
             .Build("remove_clip arguments"),
         DispatchRemoveClip);
 
@@ -2539,10 +2636,11 @@ McpToolRegistry::McpToolRegistry() {
         DispatchShortenLinkedClip);
 
     add("ripple_trim",
-        "Trim one clip's edge and shift every downstream clip on its track "
-        "(and optionally other synced tracks) by the same amount. Say either "
-        "how far to move the edge (delta) or which frame of the rush it "
-        "should land on (source_frame) -- exactly one of the two.",
+        "Trim one clip's edge, every member of its A/V link group by default, "
+        "and shift downstream clips by the same amount. Say either how far "
+        "to move the edge (delta) or which frame of the rush it should land "
+        "on (source_frame) -- exactly one of the two. Supplying "
+        "linked_clip_ids explicitly selects that subset instead.",
         SchemaBuilder()
             .Field("clip_id", IdSchema("Clip whose edge is trimmed."), true)
             .Field("edge", EnumSchema({"Head", "Tail"}, "Which edge to trim."),
@@ -2593,12 +2691,16 @@ McpToolRegistry::McpToolRegistry() {
 
     add("remove_linked_clips",
         "Remove every member of one A/V-linked group (at least two), "
-        "rippling each affected track.",
+        "rippling each affected and explicitly synchronized track.",
         SchemaBuilder()
             .Field("link_group_id", IdSchema("Shared link group."), true)
             .Field("clip_ids",
                    IdArraySchema("Every member of the link group to remove."),
                    true)
+            .Field("sync_track_ids",
+                   IdArraySchema("Additional tracks whose downstream clips "
+                                 "must follow the same ripple."),
+                   false)
             .Build("remove_linked_clips arguments"),
         DispatchRemoveLinkedClips);
 
@@ -2615,13 +2717,18 @@ McpToolRegistry::McpToolRegistry() {
 
     add("split_linked_clips",
         "Split every member of one A/V-linked group at the same timeline "
-        "position in one atomic cut, producing two new link groups.",
+        "position in one atomic cut, producing two new link groups and "
+        "optionally cutting synchronized tracks there too.",
         SchemaBuilder()
             .Field("link_group_id", IdSchema("Shared link group."), true)
             .Field("clip_ids",
                    IdArraySchema("Every member of the link group to split."),
                    true)
             .Field("timeline_position", kTimeSchemaText, true)
+            .Field("sync_track_ids",
+                   IdArraySchema("Additional tracks to cut at the same exact "
+                                 "timeline position."),
+                   false)
             .Build("split_linked_clips arguments"),
         DispatchSplitLinkedClips);
 

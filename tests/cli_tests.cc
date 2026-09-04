@@ -351,6 +351,48 @@ int main() {
     Check(Read(activeTimelineLog) == logBeforeRejection,
           "refused apply-op leaves edit log byte-identical");
 
+    // QC-2026-09 A5 -- --apply-op is the CLI surface for synchronized ripple
+    // removal; the undo command must restore every named track and the full
+    // removed clip representation, not just its five timeline fields.
+    Document syncFixture = Fixture();
+    syncFixture.sequence.tracks.push_back(
+        {"01K30000000000000000000020",
+         "audio",
+         1,
+         {{"01K30000000000000000000021",
+           syncFixture.sources[0].id,
+           {400, 25},
+           {10, 25},
+           {20, 25}}}});
+    Project syncProject = Project::FromDocument(syncFixture, "CLI sync");
+    std::string syncPathString;
+    Check(CreatePortableProject(
+              (directory / "Sync.cutmachine-project").string(), syncProject,
+              syncPathString, error),
+          "synchronized CLI fixture saves: " + error);
+    const std::filesystem::path syncPath = syncPathString;
+    const std::string syncBefore = Read(syncPath);
+    const Operation synchronizedRemove = RemoveClipOperation{
+        "01K30000000000000000000003",
+        {"01K30000000000000000000020"},
+        {}};
+    Check(ApplyOperationCommand(syncPath.string(),
+                                SerializeOperation(synchronizedRemove),
+                                result) == 0,
+          "CLI synchronized remove applies: " + result);
+    Project syncAfterProject;
+    Check(Project::Load(syncPath.string(), syncAfterProject, error),
+          "CLI synchronized result reloads: " + error);
+    const Document syncAfter = syncAfterProject.MakeActiveDocument();
+    Check(syncAfter.FindClip("01K30000000000000000000004")
+                      ->timeline_in == RationalTime{10, 25} &&
+              syncAfter.FindClip("01K30000000000000000000021")
+                      ->timeline_in == RationalTime{10, 25},
+          "CLI synchronized remove ripples the named track");
+    Check(UndoOperationCommand(syncPath.string(), result) == 0 &&
+              Read(syncPath) == syncBefore,
+          "CLI synchronized undo restores canonical bytes");
+
     Check(ApplyOperationCommand(path.string(), "{not json", result) == 1,
           "malformed operation returns status 1");
     Check(result.find("\"error\":\"ParseError\"") != std::string::npos,

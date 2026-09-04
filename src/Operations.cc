@@ -37,6 +37,38 @@ std::vector<ExactTimelinePosition> PositionsAfter(const DocumentTrack& track,
     return positions;
 }
 
+void AppendPositionsAtOrAfter(
+    const DocumentTrack& track, const RationalTime& boundary,
+    std::vector<ExactTimelinePosition>& positions) {
+    for (const DocumentClip& clip : track.clips) {
+        if (clip.timeline_in >= boundary)
+            positions.push_back({clip.id, clip.timeline_in});
+    }
+}
+
+void ShiftPositionsAtOrAfter(DocumentTrack& track,
+                             const RationalTime& boundary,
+                             const RationalTime& delta) {
+    for (DocumentClip& clip : track.clips) {
+        if (clip.timeline_in >= boundary)
+            clip.timeline_in = clip.timeline_in.add(delta);
+    }
+}
+
+std::vector<ExactTimelinePosition> CurrentPositionsFor(
+    const Document& document,
+    const std::vector<ExactTimelinePosition>& reference) {
+    std::vector<ExactTimelinePosition> positions;
+    positions.reserve(reference.size());
+    for (const ExactTimelinePosition& item : reference) {
+        const DocumentClip* clip = document.FindClip(item.clip_id);
+        if (clip) positions.push_back({clip->id, clip->timeline_in});
+    }
+    return positions;
+}
+
+bool Negate(const RationalTime& value, RationalTime& output);
+
 bool ApplyExactPositions(Document& document,
                          const std::vector<ExactTimelinePosition>& positions,
                          EditError& error, std::string& message) {
@@ -102,8 +134,11 @@ const DocumentTrack* LockedTrackTouchedBy(const Document& document,
                                  std::is_same_v<T, TrimClipOperation> ||
                                  std::is_same_v<T, SplitClipOperation>) {
                 addClipTrack(value.clip_id);
-                if constexpr (std::is_same_v<T, RemoveClipOperation>)
+                if constexpr (std::is_same_v<T, RemoveClipOperation>) {
+                    for (const Ulid& trackId : value.sync_track_ids)
+                        addTrack(trackId);
                     addExactPositions(value.exact_timeline_result);
+                }
             } else if constexpr (std::is_same_v<T, ClearClipOperation>) {
                 addClipTrack(value.clip_id);
                 addExactTracks(value.exact_track_result);
@@ -154,6 +189,11 @@ const DocumentTrack* LockedTrackTouchedBy(const Document& document,
                                                 RemoveLinkedClipsOperation> ||
                                  std::is_same_v<T, ClearLinkedClipsOperation>) {
                 for (const Ulid& clipId : value.clip_ids) addClipTrack(clipId);
+                if constexpr (
+                    std::is_same_v<T, RemoveLinkedClipsOperation>) {
+                    for (const Ulid& trackId : value.sync_track_ids)
+                        addTrack(trackId);
+                }
                 addExactTracks(value.exact_track_result);
             } else if constexpr (std::is_same_v<T, DeleteGapOperation>) {
                 addTrack(value.track_id);
@@ -178,6 +218,8 @@ const DocumentTrack* LockedTrackTouchedBy(const Document& document,
                     addTrack(transition->track_id);
             } else if constexpr (std::is_same_v<T, SplitLinkedClipsOperation>) {
                 for (const Ulid& clipId : value.clip_ids) addClipTrack(clipId);
+                for (const Ulid& trackId : value.sync_track_ids)
+                    addTrack(trackId);
                 addExactTracks(value.exact_track_result);
             } else if constexpr (std::is_same_v<T, JoinClipOperation>) {
                 addClipTrack(value.left_clip_id);
@@ -308,12 +350,14 @@ bool ApplyInsert(Document& candidate, InsertClipOperation& operation,
         operation.exact_timeline_result =
             PositionsAfter(*updated, insertionIndex + 1);
     }
-    inverse = RemoveClipOperation{operation.clip_id, before};
+    inverse = RemoveClipOperation{operation.clip_id, {}, before};
     return true;
 }
 
 bool ApplyRemove(Document& candidate, RemoveClipOperation& operation,
                  Operation& inverse, EditError& error, std::string& message) {
+    const bool hadExactTimelineResult =
+        !operation.exact_timeline_result.empty();
     DocumentTrack* track = candidate.FindTrackForClip(operation.clip_id);
     if (!track) {
         Fail(EditError::UnknownClip,
@@ -327,14 +371,56 @@ bool ApplyRemove(Document& candidate, RemoveClipOperation& operation,
         static_cast<size_t>(std::distance(track->clips.begin(), found));
     const DocumentClip removed = *found;
     const Ulid trackId = track->id;
-    const std::vector<ExactTimelinePosition> before =
+    const RationalTime followingBoundary =
+        removed.timeline_in.add(removed.duration);
+    std::vector<Ulid> affectedTrackIds{trackId};
+    const auto addAffectedTrack = [&](const Ulid& id) {
+        if (std::find(affectedTrackIds.begin(), affectedTrackIds.end(), id) ==
+            affectedTrackIds.end())
+            affectedTrackIds.push_back(id);
+    };
+    for (const Ulid& syncTrackId : operation.sync_track_ids) {
+        if (!candidate.FindTrack(syncTrackId)) {
+            Fail(EditError::UnknownTrack,
+                 "unknown remove sync track_id '" + syncTrackId + "'", error,
+                 message);
+            return false;
+        }
+        addAffectedTrack(syncTrackId);
+    }
+    std::vector<ExactTrackState> beforeTracks;
+    for (const Ulid& affectedTrackId : affectedTrackIds) {
+        const DocumentTrack* affectedTrack =
+            candidate.FindTrack(affectedTrackId);
+        beforeTracks.push_back({affectedTrackId, affectedTrack->clips});
+    }
+    std::vector<ExactTimelinePosition> before =
         PositionsAfter(*track, index + 1);
+    std::vector<Ulid> shiftedTrackIds{trackId};
+    for (const Ulid& syncTrackId : operation.sync_track_ids) {
+        DocumentTrack* syncTrack = candidate.FindTrack(syncTrackId);
+        if (std::find(shiftedTrackIds.begin(), shiftedTrackIds.end(),
+                      syncTrackId) != shiftedTrackIds.end())
+            continue;
+        shiftedTrackIds.push_back(syncTrackId);
+        AppendPositionsAtOrAfter(*syncTrack, followingBoundary, before);
+    }
     for (size_t next = index + 1; next < track->clips.size(); ++next) {
         track->clips[next].timeline_in =
             track->clips[next].timeline_in.sub(removed.duration);
     }
     track->clips.erase(track->clips.begin() +
                        static_cast<std::ptrdiff_t>(index));
+    RationalTime rippleDelta;
+    if (!Negate(removed.duration, rippleDelta)) {
+        Fail(EditError::ArithmeticError,
+             "removed clip duration cannot be negated", error, message);
+        return false;
+    }
+    for (size_t index = 1; index < shiftedTrackIds.size(); ++index) {
+        ShiftPositionsAtOrAfter(*candidate.FindTrack(shiftedTrackIds[index]),
+                                followingBoundary, rippleDelta);
+    }
     if (!operation.exact_timeline_result.empty() &&
         !ApplyExactPositions(candidate, operation.exact_timeline_result, error,
                              message)) {
@@ -342,16 +428,25 @@ bool ApplyRemove(Document& candidate, RemoveClipOperation& operation,
     }
     if (!ValidateResult(candidate, error, message)) return false;
     if (operation.exact_timeline_result.empty()) {
-        DocumentTrack* updated = candidate.FindTrack(trackId);
-        operation.exact_timeline_result = PositionsAfter(*updated, index);
+        operation.exact_timeline_result =
+            CurrentPositionsFor(candidate, before);
     }
-    inverse = InsertClipOperation{trackId,
-                                  removed.source_id,
-                                  removed.source_in,
-                                  removed.duration,
-                                  removed.timeline_in,
-                                  removed.id,
-                                  before};
+    // A first remove must restore the complete clip (including legacy and
+    // linked metadata) on undo. A remove carrying exact positions is the
+    // inverse of an insert and intentionally keeps the historical insert
+    // inverse, whose clip is known to have been created by InsertClip.
+    if (!hadExactTimelineResult) {
+        inverse = ClearClipsOperation{{operation.clip_id},
+                                      std::move(beforeTracks)};
+    } else {
+        inverse = InsertClipOperation{trackId,
+                                      removed.source_id,
+                                      removed.source_in,
+                                      removed.duration,
+                                      removed.timeline_in,
+                                      removed.id,
+                                      before};
+    }
     return true;
 }
 
@@ -1583,7 +1678,8 @@ bool ApplyRemoveLinked(Document& candidate,
             candidate.FindTrack(state.track_id)->clips = state.clips;
         if (!ValidateResult(candidate, error, message)) return false;
         inverse = RemoveLinkedClipsOperation{operation.link_group_id,
-                                             operation.clip_ids, before};
+                                             operation.clip_ids,
+                                             operation.sync_track_ids, before};
         return true;
     }
     if (operation.clip_ids.size() < 2 || operation.link_group_id.empty()) {
@@ -1593,7 +1689,9 @@ bool ApplyRemoveLinked(Document& candidate,
         return false;
     }
     std::vector<Ulid> trackIds;
+    std::vector<Ulid> memberTrackIds;
     std::vector<Ulid> seen;
+    const DocumentClip* rippleAnchor = nullptr;
     for (const Ulid& id : operation.clip_ids) {
         const DocumentClip* clip = candidate.FindClip(id);
         const DocumentTrack* track = candidate.FindTrackForClip(id);
@@ -1605,18 +1703,54 @@ bool ApplyRemoveLinked(Document& candidate,
             return false;
         }
         seen.push_back(id);
-        trackIds.push_back(track->id);
+        if (std::find(trackIds.begin(), trackIds.end(), track->id) ==
+            trackIds.end())
+            trackIds.push_back(track->id);
+        if (std::find(memberTrackIds.begin(), memberTrackIds.end(),
+                      track->id) == memberTrackIds.end())
+            memberTrackIds.push_back(track->id);
+        if (!rippleAnchor || clip->sync_anchor_clip_id == clip->id)
+            rippleAnchor = clip;
+    }
+    for (const Ulid& syncTrackId : operation.sync_track_ids) {
+        if (!candidate.FindTrack(syncTrackId)) {
+            Fail(EditError::UnknownTrack,
+                 "unknown linked remove sync track_id '" + syncTrackId +
+                     "'",
+                 error, message);
+            return false;
+        }
+        if (std::find(trackIds.begin(), trackIds.end(), syncTrackId) ==
+            trackIds.end())
+            trackIds.push_back(syncTrackId);
     }
     const std::vector<ExactTrackState> before = snapshots(trackIds);
+    const RationalTime followingBoundary =
+        rippleAnchor->timeline_in.add(rippleAnchor->duration);
+    RationalTime rippleDelta;
+    if (!Negate(rippleAnchor->duration, rippleDelta)) {
+        Fail(EditError::ArithmeticError,
+             "linked remove duration cannot be negated", error, message);
+        return false;
+    }
     for (const Ulid& id : operation.clip_ids) {
-        RemoveClipOperation single{id, {}};
+        RemoveClipOperation single{id, {}, {}};
         Operation ignored = RemoveClipOperation{};
         if (!ApplyRemove(candidate, single, ignored, error, message))
             return false;
     }
+    for (const Ulid& syncTrackId : operation.sync_track_ids) {
+        if (std::find(memberTrackIds.begin(), memberTrackIds.end(),
+                      syncTrackId) != memberTrackIds.end())
+            continue;
+        ShiftPositionsAtOrAfter(*candidate.FindTrack(syncTrackId),
+                                followingBoundary, rippleDelta);
+    }
+    if (!ValidateResult(candidate, error, message)) return false;
     operation.exact_track_result = snapshots(trackIds);
     inverse = RemoveLinkedClipsOperation{operation.link_group_id,
-                                         operation.clip_ids, before};
+                                         operation.clip_ids,
+                                         operation.sync_track_ids, before};
     return true;
 }
 
@@ -2759,7 +2893,7 @@ bool ApplySplitLinked(Document& candidate, SplitLinkedClipsOperation& operation,
     const auto snapshots = [&](const std::vector<Ulid>& ids) {
         std::vector<ExactTrackState> result;
         for (const Ulid& id : ids) {
-            const DocumentTrack* track = candidate.FindTrackForClip(id);
+            const DocumentTrack* track = candidate.FindTrack(id);
             if (!track || std::any_of(result.begin(), result.end(),
                                       [&](const ExactTrackState& state) {
                                           return state.track_id == track->id;
@@ -2790,6 +2924,7 @@ bool ApplySplitLinked(Document& candidate, SplitLinkedClipsOperation& operation,
                                             operation.left_group_id,
                                             operation.right_group_id,
                                             operation.right_clip_ids,
+                                            operation.sync_track_ids,
                                             std::move(before)};
         return true;
     }
@@ -2800,10 +2935,13 @@ bool ApplySplitLinked(Document& candidate, SplitLinkedClipsOperation& operation,
         return false;
     }
     std::vector<Ulid> seen;
+    std::vector<Ulid> memberTrackIds;
+    std::vector<Ulid> affectedTrackIds;
     for (const Ulid& id : operation.clip_ids) {
         const DocumentClip* clip = candidate.FindClip(id);
+        const DocumentTrack* track = candidate.FindTrackForClip(id);
         if (!clip || clip->link_group_id != operation.link_group_id ||
-            std::find(seen.begin(), seen.end(), id) != seen.end()) {
+            !track || std::find(seen.begin(), seen.end(), id) != seen.end()) {
             Fail(EditError::InvalidOperation,
                  "split_linked_clips members must be unique and share "
                  "link_group_id",
@@ -2824,6 +2962,23 @@ bool ApplySplitLinked(Document& candidate, SplitLinkedClipsOperation& operation,
             return false;
         }
         seen.push_back(id);
+        if (std::find(memberTrackIds.begin(), memberTrackIds.end(),
+                      track->id) == memberTrackIds.end())
+            memberTrackIds.push_back(track->id);
+        if (std::find(affectedTrackIds.begin(), affectedTrackIds.end(),
+                      track->id) == affectedTrackIds.end())
+            affectedTrackIds.push_back(track->id);
+    }
+    for (const Ulid& syncTrackId : operation.sync_track_ids) {
+        if (!candidate.FindTrack(syncTrackId)) {
+            Fail(EditError::UnknownTrack,
+                 "unknown linked split sync track_id '" + syncTrackId + "'",
+                 error, message);
+            return false;
+        }
+        if (std::find(affectedTrackIds.begin(), affectedTrackIds.end(),
+                      syncTrackId) == affectedTrackIds.end())
+            affectedTrackIds.push_back(syncTrackId);
     }
     if (operation.left_group_id.empty())
         operation.left_group_id = GenerateUlid();
@@ -2861,7 +3016,7 @@ bool ApplySplitLinked(Document& candidate, SplitLinkedClipsOperation& operation,
         generated.push_back(id);
     }
 
-    const std::vector<ExactTrackState> before = snapshots(operation.clip_ids);
+    const std::vector<ExactTrackState> before = snapshots(affectedTrackIds);
     Ulid leftAnchor = operation.clip_ids.front();
     for (const Ulid& id : operation.clip_ids) {
         const DocumentClip* clip = candidate.FindClip(id);
@@ -2892,14 +3047,36 @@ bool ApplySplitLinked(Document& candidate, SplitLinkedClipsOperation& operation,
         right->link_group_id = operation.right_group_id;
         right->sync_anchor_clip_id = rightAnchor;
     }
+    for (const Ulid& syncTrackId : operation.sync_track_ids) {
+        if (std::find(memberTrackIds.begin(), memberTrackIds.end(),
+                      syncTrackId) != memberTrackIds.end())
+            continue;
+        const DocumentTrack* syncTrack = candidate.FindTrack(syncTrackId);
+        Ulid crossingClipId;
+        for (const DocumentClip& clip : syncTrack->clips) {
+            if (clip.timeline_in < operation.timeline_position &&
+                operation.timeline_position <
+                    clip.timeline_in.add(clip.duration)) {
+                crossingClipId = clip.id;
+                break;
+            }
+        }
+        if (crossingClipId.empty()) continue;
+        SplitClipOperation split{crossingClipId,
+                                 operation.timeline_position};
+        Operation ignored = RemoveClipOperation{};
+        if (!ApplySplit(candidate, split, ignored, error, message))
+            return false;
+    }
     if (!ValidateResult(candidate, error, message)) return false;
-    operation.exact_track_result = snapshots(operation.clip_ids);
+    operation.exact_track_result = snapshots(affectedTrackIds);
     inverse = SplitLinkedClipsOperation{operation.link_group_id,
                                         operation.clip_ids,
                                         operation.timeline_position,
                                         operation.left_group_id,
                                         operation.right_group_id,
                                         operation.right_clip_ids,
+                                        operation.sync_track_ids,
                                         before};
     return true;
 }
@@ -4078,7 +4255,12 @@ std::string SerializeOperation(const Operation& operation) {
     } else if (const auto* remove =
                    std::get_if<RemoveClipOperation>(&operation)) {
         output << "{\"type\":\"RemoveClip\",\"clip_id\":\"" << remove->clip_id
-               << "\",\"exact_timeline\":";
+               << "\",\"sync_track_ids\":[";
+        for (size_t index = 0; index < remove->sync_track_ids.size(); ++index) {
+            if (index) output << ',';
+            WriteString(output, remove->sync_track_ids[index]);
+        }
+        output << "],\"exact_timeline\":";
         WriteExactPositions(output, remove->exact_timeline_result);
         output << '}';
     } else if (const auto* clear =
@@ -4259,6 +4441,12 @@ std::string SerializeOperation(const Operation& operation) {
             if (index) output << ',';
             WriteString(output, linkedRemove->clip_ids[index]);
         }
+        output << "],\"sync_track_ids\":[";
+        for (size_t index = 0; index < linkedRemove->sync_track_ids.size();
+             ++index) {
+            if (index) output << ',';
+            WriteString(output, linkedRemove->sync_track_ids[index]);
+        }
         output << "],\"exact_tracks\":";
         WriteExactTracks(output, linkedRemove->exact_track_result);
         output << '}';
@@ -4306,6 +4494,11 @@ std::string SerializeOperation(const Operation& operation) {
         for (size_t index = 0; index < split->right_clip_ids.size(); ++index) {
             if (index) output << ',';
             WriteString(output, split->right_clip_ids[index]);
+        }
+        output << "],\"sync_track_ids\":[";
+        for (size_t index = 0; index < split->sync_track_ids.size(); ++index) {
+            if (index) output << ',';
+            WriteString(output, split->sync_track_ids[index]);
         }
         output << "],\"exact_tracks\":";
         WriteExactTracks(output, split->exact_track_result);
@@ -4666,6 +4859,15 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             reader.Expect(",\"clip_id\":");
             RemoveClipOperation value;
             value.clip_id = reader.String();
+            if (reader.Consume(",\"sync_track_ids\":[")) {
+                if (!reader.Consume("]")) {
+                    while (true) {
+                        value.sync_track_ids.push_back(reader.String());
+                        if (reader.Consume("]")) break;
+                        reader.Expect(",");
+                    }
+                }
+            }
             reader.Expect(",\"exact_timeline\":");
             value.exact_timeline_result = ReadExactPositions(reader);
             reader.Expect("}");
@@ -4941,6 +5143,15 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
                     reader.Expect(",");
                 }
             }
+            if (reader.Consume(",\"sync_track_ids\":[")) {
+                if (!reader.Consume("]")) {
+                    while (true) {
+                        value.sync_track_ids.push_back(reader.String());
+                        if (reader.Consume("]")) break;
+                        reader.Expect(",");
+                    }
+                }
+            }
             reader.Expect(",\"exact_tracks\":");
             value.exact_track_result = ReadExactTracks(reader);
             reader.Expect("}");
@@ -5010,6 +5221,15 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
                     value.right_clip_ids.push_back(reader.String());
                     if (reader.Consume("]")) break;
                     reader.Expect(",");
+                }
+            }
+            if (reader.Consume(",\"sync_track_ids\":[")) {
+                if (!reader.Consume("]")) {
+                    while (true) {
+                        value.sync_track_ids.push_back(reader.String());
+                        if (reader.Consume("]")) break;
+                        reader.Expect(",");
+                    }
                 }
             }
             reader.Expect(",\"exact_tracks\":");

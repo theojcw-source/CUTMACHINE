@@ -66,6 +66,9 @@ struct InsertClipOperation {
 
 struct RemoveClipOperation {
     Ulid clip_id;
+    // QC-2026-09 A5 -- tracks without the removed A/V member still need the
+    // same ripple to preserve their downstream alignment.
+    std::vector<Ulid> sync_track_ids;
     std::vector<ExactTimelinePosition> exact_timeline_result;
 };
 
@@ -192,6 +195,7 @@ struct SlipEditOperation {
 struct RemoveLinkedClipsOperation {
     Ulid link_group_id;
     std::vector<Ulid> clip_ids;
+    std::vector<Ulid> sync_track_ids;
     std::vector<ExactTrackState> exact_track_result;
 };
 
@@ -371,6 +375,9 @@ struct SplitLinkedClipsOperation {
     Ulid left_group_id;
     Ulid right_group_id;
     std::vector<Ulid> right_clip_ids;
+    // Additional tracks receive an edit at the same exact position even
+    // when they hold no member of the linked group.
+    std::vector<Ulid> sync_track_ids;
     std::vector<ExactTrackState> exact_track_result;
 };
 
