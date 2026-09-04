@@ -63,6 +63,10 @@ struct Transcript {
     bool speech_assessed = false;
     RationalTime measured_speech_duration{0, 1};
     bool likely_hallucinated = false;
+    // A9 -- measured speech long enough to assess, but implausibly few words.
+    // This is the opposite failure from likely_hallucinated: audio evidence
+    // exists and the inference appears to have dropped most of it.
+    bool likely_incomplete = false;
     // A known caption/credit/subscription phrase is supporting evidence only.
     // It never marks a transcript by itself: a real speaker may use the same
     // words, and measured speech must win over a blacklist match.
@@ -125,6 +129,7 @@ struct TranscriptionOutcome {
     bool speech_assessed = false;
     RationalTime measured_speech_duration{0, 1};
     bool likely_hallucinated = false;
+    bool likely_incomplete = false;
     bool known_hallucination_phrase = false;
 };
 
@@ -133,12 +138,17 @@ struct TranscriptSpeechAssessment {
     RationalTime measured_speech_duration{0, 1};
     bool known_hallucination_phrase = false;
     bool likely_hallucinated = false;
+    bool likely_incomplete = false;
 };
 
-// B12 -- ROADMAP.md. Compares decoded words with B1's measured speech
+constexpr int64_t kSparseTranscriptMinSpeechSeconds = 10;
+constexpr int64_t kSparseTranscriptMinWordsPerMinute = 30;
+
+// A9/B12 -- ROADMAP.md. Compares decoded words with B1's measured speech
 // groups. The exact sum of group durations is retained rather than converted
 // to floating point. Known caption/credit/subscription phrases strengthen the
-// evidence reported to a caller but cannot make a voiced rush unsafe.
+// hallucination evidence but cannot make a voiced rush unsafe; sustained
+// speech below the conservative word-density floor is flagged incomplete.
 bool AssessTranscriptAgainstSpeech(const Transcript& transcript,
                                    const SpeechOnsetReport& envelope,
                                    TranscriptSpeechAssessment& assessment,

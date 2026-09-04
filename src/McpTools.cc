@@ -1874,6 +1874,8 @@ bool DispatchListDisfluencies(McpBackend& backend, const IdResolver& resolver,
              Value::MakeInt(static_cast<int64_t>(transcript.words.size())));
     root.Set("likely_hallucinated",
              Value::MakeBool(transcript.likely_hallucinated));
+    root.Set("likely_incomplete",
+             Value::MakeBool(transcript.likely_incomplete));
     Value list = Value::MakeArray();
     for (const Disfluency& item : found) {
         Value entry = Value::MakeObject();
@@ -3461,7 +3463,9 @@ McpToolRegistry::McpToolRegistry() {
         "with straddles_cut=true contains a word cut at an edit and may be "
         "approximate. likely_hallucinated=true means words exist without "
         "any measured speech group and selection tools refuse them unless "
-        "force:true is explicit.",
+        "force:true is explicit. likely_incomplete=true means sustained "
+        "measured speech produced too few words, so missing text must not be "
+        "treated as silence.",
         SchemaBuilder().Build("get_timeline_transcript takes no arguments"),
         DispatchGetTimelineTranscript);
 

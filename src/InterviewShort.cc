@@ -199,6 +199,7 @@ bool BuildTimelineTranscriptSpans(
             span.timeline_in = cue.timeline_in;
             span.text = cue.text;
             span.likely_hallucinated = audible.transcript->likely_hallucinated;
+            span.likely_incomplete = audible.transcript->likely_incomplete;
             const RationalTime cueEnd = span.source_in.add(span.duration);
             for (const auto& selectedWord : audible.selected_words) {
                 if (!selectedWord.second) continue;
@@ -247,6 +248,8 @@ std::string SerializeTimelineTranscriptSpans(
                   mcp_json::Value::MakeBool(span.straddles_cut));
         value.Set("likely_hallucinated",
                   mcp_json::Value::MakeBool(span.likely_hallucinated));
+        value.Set("likely_incomplete",
+                  mcp_json::Value::MakeBool(span.likely_incomplete));
         list.Push(std::move(value));
     }
     mcp_json::Value root = mcp_json::Value::MakeObject();
@@ -280,6 +283,8 @@ bool ParseTimelineTranscriptSpans(const std::string& json,
         const mcp_json::Value* straddlesCut = value.Find("straddles_cut");
         const mcp_json::Value* likelyHallucinated =
             value.Find("likely_hallucinated");
+        const mcp_json::Value* likelyIncomplete =
+            value.Find("likely_incomplete");
         if (spanId == nullptr || !spanId->IsString() || sourceId == nullptr ||
             !sourceId->IsString() ||
             !ReadTimeValue(value.Find("source_in"), span.source_in) ||
@@ -308,6 +313,15 @@ bool ParseTimelineTranscriptSpans(const std::string& json,
                 return false;
             }
             span.likely_hallucinated = likelyHallucinated->AsBool();
+        }
+        if (likelyIncomplete != nullptr) {
+            if (!likelyIncomplete->IsBool()) {
+                error =
+                    "transcript span view contains an invalid "
+                    "likely_incomplete flag";
+                return false;
+            }
+            span.likely_incomplete = likelyIncomplete->AsBool();
         }
         spans.push_back(std::move(span));
     }

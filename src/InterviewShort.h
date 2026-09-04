@@ -29,6 +29,10 @@ struct TimelineTranscriptSpan {
     // still shown for diagnosis, but editing tools must require an explicit
     // force override before trusting words no measured speech group supports.
     bool likely_hallucinated = false;
+    // A9 -- visible warning that measured speech contains substantially more
+    // material than this inference returned. Unlike hallucination, this does
+    // not make an existing span unsafe to cut; it warns that spans are absent.
+    bool likely_incomplete = false;
 };
 
 // Collects the spans of every audible audio track, in timeline order, from

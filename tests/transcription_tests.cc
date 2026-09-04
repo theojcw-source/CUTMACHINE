@@ -414,11 +414,36 @@ int main() {
                                             error) &&
                   assessment.measured_speech_duration == RationalTime{75, 50} &&
                   assessment.known_hallucination_phrase &&
-                  !assessment.likely_hallucinated,
+                  !assessment.likely_hallucinated &&
+                  !assessment.likely_incomplete,
               "a known phrase carried by real measured speech is never "
               "blacklisted: " +
                   error);
 
+        transcript.words.assign(6, TranscriptWord{"mot", {0, 25}, {1, 25}});
+        envelope.groups = {{{0, 50}, {1600, 50}, -19, -11}};
+        Check(
+            AssessTranscriptAgainstSpeech(transcript, envelope, assessment,
+                                          error) &&
+                assessment.measured_speech_duration == RationalTime{1600, 50} &&
+                assessment.word_count == 6 && assessment.likely_incomplete &&
+                !assessment.likely_hallucinated,
+            "six words over 32 seconds of measured speech reproduce the "
+            "A9 incomplete-transcript signal: " +
+                error);
+        transcript.words.assign(85, TranscriptWord{"mot", {0, 25}, {1, 25}});
+        Check(AssessTranscriptAgainstSpeech(transcript, envelope, assessment,
+                                            error) &&
+                  !assessment.likely_incomplete,
+              "85 words over the same measured speech clear the sparse-text "
+              "guard: " +
+                  error);
+
+        transcript.words = {
+            {"Sous-titrage", {0, 25}, {5, 25}},
+            {"Société", {5, 25}, {10, 25}},
+            {"Radio-Canada", {10, 25}, {15, 25}},
+        };
         envelope.groups.clear();
         Check(AssessTranscriptAgainstSpeech(transcript, envelope, assessment,
                                             error),

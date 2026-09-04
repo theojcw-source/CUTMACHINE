@@ -1233,6 +1233,7 @@ int TranscribeMediaCommand(const std::string& projectPath,
         outcome.speech_assessed = true;
         outcome.measured_speech_duration = assessment.measured_speech_duration;
         outcome.likely_hallucinated = assessment.likely_hallucinated;
+        outcome.likely_incomplete = assessment.likely_incomplete;
         outcome.known_hallucination_phrase =
             assessment.known_hallucination_phrase;
     }
@@ -1256,6 +1257,8 @@ int TranscribeMediaCommand(const std::string& projectPath,
                  << ",\"rate\":" << outcome.measured_speech_duration.rate << "}"
                  << ",\"likely_hallucinated\":"
                  << (outcome.likely_hallucinated ? "true" : "false")
+                 << ",\"likely_incomplete\":"
+                 << (outcome.likely_incomplete ? "true" : "false")
                  << ",\"known_hallucination_phrase\":"
                  << (outcome.known_hallucination_phrase ? "true" : "false");
         }
@@ -1576,6 +1579,8 @@ int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
             std::to_string(assessment.measured_speech_duration.rate) +
             "},\"likely_hallucinated\":" +
             (assessment.likely_hallucinated ? "true" : "false") +
+            ",\"likely_incomplete\":" +
+            (assessment.likely_incomplete ? "true" : "false") +
             ",\"known_hallucination_phrase\":" +
             (assessment.known_hallucination_phrase ? "true" : "false");
     }

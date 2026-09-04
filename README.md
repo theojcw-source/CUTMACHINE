@@ -485,12 +485,16 @@ produire un SRT depuis un livrable sans créer de projet jetable.
 
 Lorsqu'une enveloppe de parole B1 est disponible, le cache de transcription
 indique `speech_assessed`, `measured_speech_duration`,
-`likely_hallucinated` et `known_hallucination_phrase`. Des mots sans aucun
+`likely_hallucinated`, `likely_incomplete` et
+`known_hallucination_phrase`. Des mots sans aucun
 groupe de parole mesuré sont signalés comme probablement inventés ; une
 tournure connue de sous-titrage ou d'abonnement ne fait que renforcer ce
 diagnostic et ne suffit jamais à elle seule. Les outils MCP
 `list_disfluencies`, `remove_words` et `create_interview_short` refusent ces
 transcriptions, sauf demande explicite avec `force: true`.
+À l'inverse, au moins dix secondes de parole mesurée sous le plancher
+conservateur de 30 mots/minute déclenchent `likely_incomplete` : le texte ne
+doit alors pas être interprété comme la preuve que le rush ne dit rien.
 
 `--apply-project-op` accepte soit une opération canonique, soit un tableau.
 Dans ce second cas, les opérations sont appliquées dans l'ordre et forment un

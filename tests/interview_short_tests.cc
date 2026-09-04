@@ -133,6 +133,7 @@ int main() {
          {50, 25},
          "Puis la suite.",
          false,
+         true,
          true},
         {"S3", sourceId, {200, 25}, {20, 25}, {80, 25}, "Et la chute."},
         {"S4",
@@ -215,7 +216,7 @@ int main() {
     Check(reparsed.size() == run.size() && reparsed[1].span_id == "S2" &&
               reparsed[1].source_in.compare(run[1].source_in) == 0 &&
               reparsed[1].duration.compare(run[1].duration) == 0 &&
-              reparsed[1].likely_hallucinated,
+              reparsed[1].likely_hallucinated && reparsed[1].likely_incomplete,
           "a span survives the view round trip with its exact times and "
           "transcript guard");
 

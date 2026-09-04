@@ -370,6 +370,8 @@ bool SaveTranscript(const std::filesystem::path& destination,
         WriteTime(output, transcript.measured_speech_duration);
         output << ",\"likely_hallucinated\":"
                << (transcript.likely_hallucinated ? "true" : "false")
+               << ",\"likely_incomplete\":"
+               << (transcript.likely_incomplete ? "true" : "false")
                << ",\"known_hallucination_phrase\":"
                << (transcript.known_hallucination_phrase ? "true" : "false");
     }
@@ -853,6 +855,8 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
             parsed.measured_speech_duration = ReadTime(reader);
             reader.Expect(",\"likely_hallucinated\":");
             parsed.likely_hallucinated = reader.Boolean();
+            if (reader.Consume(",\"likely_incomplete\":"))
+                parsed.likely_incomplete = reader.Boolean();
             reader.Expect(",\"known_hallucination_phrase\":");
             parsed.known_hallucination_phrase = reader.Boolean();
             if (!parsed.speech_assessed) {
@@ -1045,6 +1049,16 @@ bool AssessTranscriptAgainstSpeech(const Transcript& transcript,
     // subtitles must remain usable; words over zero measured speech cannot.
     assessment.likely_hallucinated =
         assessment.word_count > 0 && duration.value == 0;
+    const bool enoughSpeech =
+        duration.value >=
+        static_cast<int64_t>(duration.rate) * kSparseTranscriptMinSpeechSeconds;
+    const __int128 wordsPerMinuteLeft =
+        static_cast<__int128>(assessment.word_count) * 60 * duration.rate;
+    const __int128 minimumWordsRight =
+        static_cast<__int128>(kSparseTranscriptMinWordsPerMinute) *
+        duration.value;
+    assessment.likely_incomplete =
+        enoughSpeech && wordsPerMinuteLeft < minimumWordsRight;
     error.clear();
     return true;
 }
@@ -1054,6 +1068,7 @@ void ApplyTranscriptSpeechAssessment(
     transcript.speech_assessed = true;
     transcript.measured_speech_duration = assessment.measured_speech_duration;
     transcript.likely_hallucinated = assessment.likely_hallucinated;
+    transcript.likely_incomplete = assessment.likely_incomplete;
     transcript.known_hallucination_phrase =
         assessment.known_hallucination_phrase;
 }
