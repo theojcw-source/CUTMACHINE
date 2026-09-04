@@ -165,6 +165,7 @@ add_library(cutmachine_model
     src/Subtitles.cc
     src/Thumbnail.cc
     src/Timeline.cc
+    src/TimelineTranscription.cc
     src/TimelineStats.cc
     src/TimelineView.cc
     src/Transcription.cc

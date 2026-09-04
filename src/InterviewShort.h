@@ -25,6 +25,10 @@ struct TimelineTranscriptSpan {
     // B6 -- ROADMAP.md. True when at least one word in this span crossed an
     // edit boundary and was attributed here by greatest played overlap.
     bool straddles_cut = false;
+    // B12 -- inherited from the source transcript cache. Selectable text is
+    // still shown for diagnosis, but editing tools must require an explicit
+    // force override before trusting words no measured speech group supports.
+    bool likely_hallucinated = false;
 };
 
 // Collects the spans of every audible audio track, in timeline order, from

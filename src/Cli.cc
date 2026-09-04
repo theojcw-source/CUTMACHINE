@@ -4,6 +4,7 @@
 #include "DocumentDelta.h"
 #include "EditLog.h"
 #include "Export.h"
+#include "Ingest.h"
 #include "InterviewShort.h"
 #include "Json.h"
 #include "Operations.h"
@@ -17,6 +18,7 @@
 #include "Subtitles.h"
 #include "Timeline.h"
 #include "TimelineStats.h"
+#include "TimelineTranscription.h"
 #include "TranscriptAlignment.h"
 #include "Transcription.h"
 #include "Ulid.h"
@@ -921,6 +923,149 @@ int CreateProjectCommand(const std::string& packagePath,
     return 0;
 }
 
+int TranscribeTimelineCommand(const std::string& projectPath,
+                              const std::string& timelineId,
+                              const std::string& language, bool verbatim,
+                              std::string& output) {
+    Project project;
+    std::string error;
+    if (!LoadStoredProject(projectPath, project, error))
+        return FailCliCommand("InvalidDocument", error, output);
+    const Ulid selected =
+        timelineId.empty() ? project.active_timeline_id : timelineId;
+    if (!project.FindTimeline(selected)) {
+        return FailCliCommand("UnknownSequence",
+                              "unknown timeline_id '" + selected + "'", output);
+    }
+    std::string modelPath;
+    if (!ResolveConfiguredWhisperModel(modelPath, error))
+        return FailCliCommand("IoError", error, output);
+    WhisperSettings settings;
+    settings.whisper_model_path = modelPath;
+    settings.language = language.empty() ? "auto" : language;
+    settings.verbatim = verbatim;
+    const std::filesystem::path base =
+        std::filesystem::absolute(projectPath).parent_path();
+    const std::filesystem::path cache =
+        base / ".cutmachine" / "timeline-transcripts" / (selected + ".json");
+    Transcript transcript;
+    bool cacheHit = false;
+    MediaTaskManager tasks(1);
+    const Ulid task = tasks.Enqueue(
+        MediaTaskKind::Transcription, "Whisper timeline",
+        [&](MediaTaskContext& context, std::string& taskError) {
+            return TranscribeTimelineAudio(
+                project.MakeDocument(selected), projectPath, cache, settings,
+                context, transcript, cacheHit, taskError);
+        });
+    if (!tasks.WaitForIdle(24 * 60 * 60 * 1000)) {
+        tasks.Cancel(task);
+        return FailCliCommand("IoError", "timeline transcription timed out",
+                              output);
+    }
+    const std::vector<MediaTaskSnapshot> snapshots = tasks.Snapshot();
+    const auto snapshot = std::find_if(
+        snapshots.begin(), snapshots.end(),
+        [&](const MediaTaskSnapshot& item) { return item.id == task; });
+    if (snapshot == snapshots.end() ||
+        snapshot->state != MediaTaskState::Succeeded) {
+        return FailCliCommand("IoError",
+                              snapshot == snapshots.end()
+                                  ? "timeline transcription task disappeared"
+                                  : snapshot->error,
+                              output);
+    }
+    std::ostringstream text;
+    for (size_t index = 0; index < transcript.words.size(); ++index) {
+        if (index) text << ' ';
+        text << transcript.words[index].text;
+    }
+    output = "{\"ok\":true,\"timeline_id\":\"" + EscapeJson(selected) +
+             "\",\"cached\":" + (cacheHit ? "true" : "false") +
+             ",\"words\":" + std::to_string(transcript.words.size()) +
+             ",\"text\":\"" + EscapeJson(text.str()) + "\"}\n";
+    return 0;
+}
+
+int SrtFromMediaCommand(const std::string& mediaPath,
+                        const std::string& outputPath,
+                        const std::string& language, bool verbatim,
+                        std::string& output) {
+    if (!std::filesystem::is_regular_file(mediaPath)) {
+        return FailCliCommand(
+            "IoError", "media is not a regular file: '" + mediaPath + "'",
+            output);
+    }
+    LibraryMedia media;
+    std::string error;
+    if (!ProbeMediaMetadata(mediaPath, media, error) || !media.has_audio) {
+        return FailCliCommand(
+            "InvalidOperation",
+            error.empty() ? "media has no audio stream" : error, output);
+    }
+    std::string modelPath;
+    if (!ResolveConfiguredWhisperModel(modelPath, error))
+        return FailCliCommand("IoError", error, output);
+    WhisperSettings settings;
+    settings.whisper_model_path = modelPath;
+    settings.language = language.empty() ? "auto" : language;
+    settings.verbatim = verbatim;
+    const std::filesystem::path cache =
+        std::filesystem::temp_directory_path() /
+        ("cutmachine-srt-" + GenerateUlid() + ".json");
+    const Ulid mediaId = "media:" + GenerateUlid();
+    Transcript transcript;
+    MediaTaskManager tasks(1);
+    const Ulid task =
+        tasks.Enqueue(MediaTaskKind::Transcription, "Whisper SRT",
+                      [&](MediaTaskContext& context, std::string& taskError) {
+                          return GenerateAudioTranscript(
+                              mediaPath, cache.string(), mediaId, media.rate,
+                              settings, context, taskError);
+                      });
+    const auto removeCache = [&]() {
+        std::error_code ignored;
+        std::filesystem::remove(cache, ignored);
+    };
+    if (!tasks.WaitForIdle(24 * 60 * 60 * 1000)) {
+        tasks.Cancel(task);
+        removeCache();
+        return FailCliCommand("IoError", "media transcription timed out",
+                              output);
+    }
+    const std::vector<MediaTaskSnapshot> snapshots = tasks.Snapshot();
+    const auto snapshot = std::find_if(
+        snapshots.begin(), snapshots.end(),
+        [&](const MediaTaskSnapshot& item) { return item.id == task; });
+    if (snapshot == snapshots.end() ||
+        snapshot->state != MediaTaskState::Succeeded) {
+        const std::string detail = snapshot == snapshots.end()
+                                       ? "media transcription task disappeared"
+                                       : snapshot->error;
+        removeCache();
+        return FailCliCommand("IoError", detail, output);
+    }
+    if (!LoadAudioTranscript(cache.string(), transcript, error)) {
+        removeCache();
+        return FailCliCommand("IoError", error, output);
+    }
+    DocumentClip wholeMedia;
+    wholeMedia.source_id = mediaId;
+    wholeMedia.source_in = {0, media.rate.num};
+    wholeMedia.timeline_in = {0, media.rate.num};
+    wholeMedia.duration = media.duration;
+    std::vector<SubtitleCue> cues;
+    if (!SubtitleCuesForClip(transcript, wholeMedia, cues, error) ||
+        !WriteSrt(cues, outputPath, error)) {
+        removeCache();
+        return FailCliCommand("InvalidSubtitles", error, output);
+    }
+    removeCache();
+    output = "{\"ok\":true,\"cues\":" + std::to_string(cues.size()) +
+             ",\"path\":\"" + EscapeJson(outputPath) + "\"}\n";
+    return 0;
+}
+
 int TranscribeMediaCommand(const std::string& projectPath,
                            const std::vector<std::string>& mediaIds,
                            const std::string& whisperModelPath,
@@ -1049,6 +1194,49 @@ int TranscribeMediaCommand(const std::string& projectPath,
         }
     }
 
+    // B12 -- pair whichever artifact arrived second. Speech analysis and
+    // transcription are independent, expensive commands, so neither forces
+    // the other to run; when a B1 envelope is already cached, this pass makes
+    // the transcript's safety marker part of the same successful command.
+    for (TranscriptionOutcome& outcome : outcomes) {
+        if (!outcome.ok) continue;
+        const std::filesystem::path transcriptPath =
+            base / ".cutmachine" / "transcripts" / (outcome.media_id + ".json");
+        const std::filesystem::path envelopePath =
+            base / ".cutmachine" / "speechonset" / (outcome.media_id + ".json");
+        std::error_code existsError;
+        if (!std::filesystem::exists(envelopePath, existsError) || existsError)
+            continue;
+        Transcript transcript;
+        SpeechOnsetReport envelope;
+        TranscriptSpeechAssessment assessment;
+        std::string assessmentError;
+        if (!LoadAudioTranscript(transcriptPath.string(), transcript,
+                                 assessmentError) ||
+            !LoadSpeechOnset(envelopePath.string(), envelope,
+                             assessmentError) ||
+            !AssessTranscriptAgainstSpeech(transcript, envelope, assessment,
+                                           assessmentError)) {
+            outcome.ok = false;
+            outcome.error =
+                "cannot assess transcript against speech: " + assessmentError;
+            continue;
+        }
+        ApplyTranscriptSpeechAssessment(transcript, assessment);
+        if (!SaveAudioTranscript(transcriptPath.string(), transcript,
+                                 assessmentError)) {
+            outcome.ok = false;
+            outcome.error =
+                "cannot save transcript speech assessment: " + assessmentError;
+            continue;
+        }
+        outcome.speech_assessed = true;
+        outcome.measured_speech_duration = assessment.measured_speech_duration;
+        outcome.likely_hallucinated = assessment.likely_hallucinated;
+        outcome.known_hallucination_phrase =
+            assessment.known_hallucination_phrase;
+    }
+
     size_t succeeded = 0;
     std::ostringstream json;
     json << "{\"ok\":true,\"verbatim\":" << (verbatim ? "true" : "false")
@@ -1060,7 +1248,17 @@ int TranscribeMediaCommand(const std::string& projectPath,
         if (outcome.ok) ++succeeded;
         json << "{\"media_id\":\"" << EscapeJson(outcome.media_id)
              << "\",\"ok\":" << (outcome.ok ? "true" : "false")
-             << ",\"words\":" << outcome.words;
+             << ",\"words\":" << outcome.words << ",\"speech_assessed\":"
+             << (outcome.speech_assessed ? "true" : "false");
+        if (outcome.speech_assessed) {
+            json << ",\"measured_speech_duration\":{\"value\":"
+                 << outcome.measured_speech_duration.value
+                 << ",\"rate\":" << outcome.measured_speech_duration.rate << "}"
+                 << ",\"likely_hallucinated\":"
+                 << (outcome.likely_hallucinated ? "true" : "false")
+                 << ",\"known_hallucination_phrase\":"
+                 << (outcome.known_hallucination_phrase ? "true" : "false");
+        }
         if (!outcome.ok)
             json << ",\"error\":\"" << EscapeJson(outcome.error) << "\"";
         else
@@ -1335,12 +1533,53 @@ int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
         output = ErrorJson(EditError::IoError, loadError);
         return 1;
     }
-    output = "{\"ok\":true,\"media_id\":\"" + EscapeJson(mediaId) +
-             "\",\"path\":\"" + EscapeJson(reportPath.string()) +
-             "\",\"windows\":" + std::to_string(report.levels.size()) +
-             ",\"groups\":" + std::to_string(report.groups.size()) +
-             ",\"speech_level\":" + std::to_string(report.speech_level) +
-             ",\"noise_floor\":" + std::to_string(report.noise_floor) + "}\n";
+    bool transcriptAssessed = false;
+    TranscriptSpeechAssessment assessment;
+    const std::filesystem::path transcriptPath =
+        base / ".cutmachine" / "transcripts" / (mediaId + ".json");
+    std::error_code transcriptExistsError;
+    if (std::filesystem::exists(transcriptPath, transcriptExistsError) &&
+        !transcriptExistsError) {
+        Transcript transcript;
+        if (!LoadAudioTranscript(transcriptPath.string(), transcript,
+                                 loadError) ||
+            !AssessTranscriptAgainstSpeech(transcript, report, assessment,
+                                           loadError)) {
+            output = ErrorJson(EditError::IoError,
+                               "cannot assess cached transcript: " + loadError);
+            return 1;
+        }
+        ApplyTranscriptSpeechAssessment(transcript, assessment);
+        if (!SaveAudioTranscript(transcriptPath.string(), transcript,
+                                 loadError)) {
+            output = ErrorJson(
+                EditError::IoError,
+                "cannot save transcript speech assessment: " + loadError);
+            return 1;
+        }
+        transcriptAssessed = true;
+    }
+    output =
+        "{\"ok\":true,\"media_id\":\"" + EscapeJson(mediaId) +
+        "\",\"path\":\"" + EscapeJson(reportPath.string()) +
+        "\",\"windows\":" + std::to_string(report.levels.size()) +
+        ",\"groups\":" + std::to_string(report.groups.size()) +
+        ",\"speech_level\":" + std::to_string(report.speech_level) +
+        ",\"noise_floor\":" + std::to_string(report.noise_floor) +
+        ",\"transcript_assessed\":" + (transcriptAssessed ? "true" : "false");
+    if (transcriptAssessed) {
+        output +=
+            ",\"transcript_words\":" + std::to_string(assessment.word_count) +
+            ",\"measured_speech_duration\":{\"value\":" +
+            std::to_string(assessment.measured_speech_duration.value) +
+            ",\"rate\":" +
+            std::to_string(assessment.measured_speech_duration.rate) +
+            "},\"likely_hallucinated\":" +
+            (assessment.likely_hallucinated ? "true" : "false") +
+            ",\"known_hallucination_phrase\":" +
+            (assessment.known_hallucination_phrase ? "true" : "false");
+    }
+    output += "}\n";
     return 0;
 }
 

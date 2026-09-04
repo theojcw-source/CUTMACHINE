@@ -1827,21 +1827,38 @@ bool ResolveClipAndTranscript(McpBackend& backend, const Ulid& clipId,
     return true;
 }
 
+bool RefuseLikelyHallucinatedTranscript(const Transcript& transcript,
+                                        bool force, const std::string& toolName,
+                                        std::string& errorName,
+                                        std::string& message) {
+    if (!transcript.likely_hallucinated || force) return true;
+    errorName = "ValidationFailed";
+    message = toolName + " refuses source '" + transcript.media_id +
+              "': its transcript has words but no measured speech group; "
+              "inspect the rush and pass force:true only to override";
+    return false;
+}
+
 bool DispatchListDisfluencies(McpBackend& backend, const IdResolver& resolver,
                               const Value& args, std::string& resultJson,
                               std::string& errorName, std::string& message) {
-    static const std::vector<std::string> kAllowed = {"clip_id"};
+    static const std::vector<std::string> kAllowed = {"clip_id", "force"};
     if (!CheckKnownKeys(args, kAllowed, "list_disfluencies", message))
         return Fail(errorName, message, message);
     Ulid clipId;
+    bool force = false;
     if (!ReadId(args, "clip_id", "list_disfluencies", resolver, true, clipId,
-                message))
+                message) ||
+        !ReadBool(args, "force", "list_disfluencies", false, force, message))
         return Fail(errorName, message, message);
     Document document;
     const DocumentClip* clip = nullptr;
     Transcript transcript;
     if (!ResolveClipAndTranscript(backend, clipId, document, clip, transcript,
                                   errorName, message))
+        return false;
+    if (!RefuseLikelyHallucinatedTranscript(
+            transcript, force, "list_disfluencies", errorName, message))
         return false;
 
     const std::vector<Disfluency> found =
@@ -1855,6 +1872,8 @@ bool DispatchListDisfluencies(McpBackend& backend, const IdResolver& resolver,
     root.Set("verbatim", Value::MakeBool(transcript.verbatim));
     root.Set("words",
              Value::MakeInt(static_cast<int64_t>(transcript.words.size())));
+    root.Set("likely_hallucinated",
+             Value::MakeBool(transcript.likely_hallucinated));
     Value list = Value::MakeArray();
     for (const Disfluency& item : found) {
         Value entry = Value::MakeObject();
@@ -1878,12 +1897,15 @@ bool DispatchListDisfluencies(McpBackend& backend, const IdResolver& resolver,
 bool DispatchRemoveWords(McpBackend& backend, const IdResolver& resolver,
                          const Value& args, std::string& resultJson,
                          std::string& errorName, std::string& message) {
-    static const std::vector<std::string> kAllowed = {"clip_id", "ranges"};
+    static const std::vector<std::string> kAllowed = {"clip_id", "ranges",
+                                                      "force"};
     if (!CheckKnownKeys(args, kAllowed, "remove_words", message))
         return Fail(errorName, message, message);
     Ulid clipId;
+    bool force = false;
     if (!ReadId(args, "clip_id", "remove_words", resolver, true, clipId,
-                message))
+                message) ||
+        !ReadBool(args, "force", "remove_words", false, force, message))
         return Fail(errorName, message, message);
     const Value* ranges = args.Find("ranges");
     if (ranges == nullptr || !ranges->IsArray() || ranges->AsArray().empty())
@@ -1894,6 +1916,9 @@ bool DispatchRemoveWords(McpBackend& backend, const IdResolver& resolver,
     Transcript transcript;
     if (!ResolveClipAndTranscript(backend, clipId, document, clip, transcript,
                                   errorName, message))
+        return false;
+    if (!RefuseLikelyHallucinatedTranscript(transcript, force, "remove_words",
+                                            errorName, message))
         return false;
 
     std::vector<WordRange> wordRanges;
@@ -1934,12 +1959,16 @@ bool DispatchCreateInterviewShort(McpBackend& backend,
                                   std::string& resultJson,
                                   std::string& errorName,
                                   std::string& message) {
-    static const std::vector<std::string> kAllowed = {"name", "segments"};
+    static const std::vector<std::string> kAllowed = {"name", "segments",
+                                                      "force"};
     if (!CheckKnownKeys(args, kAllowed, "create_interview_short", message))
         return Fail(errorName, message, message);
     CreateProjectTimelineFromSegmentsOperation operation;
+    bool force = false;
     if (!ReadString(args, "name", "create_interview_short", false,
-                    "Short interview — 60 s", operation.name, message))
+                    "Short interview — 60 s", operation.name, message) ||
+        !ReadBool(args, "force", "create_interview_short", false, force,
+                  message))
         return Fail(errorName, message, message);
     const Value* segments = args.Find("segments");
     if (!segments || !segments->IsArray() || segments->AsArray().empty())
@@ -1989,6 +2018,20 @@ bool DispatchCreateInterviewShort(McpBackend& backend,
             return Fail(errorName, message,
                         "create_interview_short.segments[" +
                             std::to_string(index) + "]: " + message);
+        }
+        const bool unsafeSource =
+            std::any_of(spans.begin(), spans.end(),
+                        [&](const TimelineTranscriptSpan& span) {
+                            return span.source_id == segment.source_id &&
+                                   span.likely_hallucinated;
+                        });
+        if (unsafeSource && !force) {
+            return Fail(errorName, message,
+                        "create_interview_short refuses source '" +
+                            segment.source_id +
+                            "': its transcript has words but no measured "
+                            "speech group; inspect the rush and pass "
+                            "force:true only to override");
         }
         operation.segments.push_back(std::move(segment));
     }
@@ -2555,6 +2598,30 @@ bool DispatchTranscribeMedia(McpBackend& backend, const IdResolver& resolver,
         return Fail(errorName, message, message);
     return backend.TranscribeSources(mediaIds, language, verbatim,
                                      includeSilent, resultJson, message)
+               ? true
+               : Fail(errorName, message, message);
+}
+
+bool DispatchTranscribeTimeline(McpBackend& backend, const IdResolver&,
+                                const Value& args, std::string& resultJson,
+                                std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"timeline_id", "language",
+                                                      "verbatim"};
+    if (!CheckKnownKeys(args, kAllowed, "transcribe_timeline", message))
+        return Fail(errorName, message, message);
+    std::string timelineId;
+    std::string language;
+    bool verbatim = false;
+    if (!ReadString(args, "timeline_id", "transcribe_timeline", false, "",
+                    timelineId, message) ||
+        !ReadString(args, "language", "transcribe_timeline", false, "auto",
+                    language, message) ||
+        !ReadBool(args, "verbatim", "transcribe_timeline", false, verbatim,
+                  message)) {
+        return Fail(errorName, message, message);
+    }
+    return backend.TranscribeTimeline(timelineId, language, verbatim,
+                                      resultJson, message)
                ? true
                : Fail(errorName, message, message);
 }
@@ -3392,7 +3459,9 @@ McpToolRegistry::McpToolRegistry() {
         "spans you want by their span_id. The exact times are shown so a "
         "human can check them; never retype one into another tool. A span "
         "with straddles_cut=true contains a word cut at an edit and may be "
-        "approximate.",
+        "approximate. likely_hallucinated=true means words exist without "
+        "any measured speech group and selection tools refuse them unless "
+        "force:true is explicit.",
         SchemaBuilder().Build("get_timeline_transcript takes no arguments"),
         DispatchGetTimelineTranscript);
 
@@ -3420,6 +3489,10 @@ McpToolRegistry::McpToolRegistry() {
                    ArraySchema(spanSegmentSchema,
                                "Transcript spans in final editorial order."),
                    true)
+            .Field("force",
+                   BoolSchema("Override the refusal of transcript spans with "
+                              "likely_hallucinated=true. Defaults to false."),
+                   false)
             .Build("create_interview_short arguments"),
         DispatchCreateInterviewShort);
 
@@ -3576,6 +3649,10 @@ McpToolRegistry::McpToolRegistry() {
         SchemaBuilder()
             .Field("clip_id", IdSchema("Clip whose transcript to inspect."),
                    true)
+            .Field("force",
+                   BoolSchema("Override the refusal of a transcript with "
+                              "likely_hallucinated=true. Defaults to false."),
+                   false)
             .Build("list_disfluencies arguments"),
         DispatchListDisfluencies);
 
@@ -3597,6 +3674,10 @@ McpToolRegistry::McpToolRegistry() {
                    ArraySchema(wordRangeSchema,
                                "Sorted, non-overlapping word index ranges."),
                    true)
+            .Field("force",
+                   BoolSchema("Override the refusal of a transcript with "
+                              "likely_hallucinated=true. Defaults to false."),
+                   false)
             .Build("remove_words arguments"),
         DispatchRemoveWords);
 
@@ -3706,6 +3787,25 @@ McpToolRegistry::McpToolRegistry() {
                    false)
             .Build("transcribe_media arguments"),
         DispatchTranscribeMedia);
+
+    add("transcribe_timeline",
+        "Transcribe exactly the audible audio assembled by a timeline: each "
+        "audio clip is decoded at its source bounds, placed at its exact "
+        "timeline position and mixed directly into Whisper. No exported "
+        "video or temporary project is involved. The cache is invalidated "
+        "when an audible clip boundary changes.",
+        SchemaBuilder()
+            .Field("timeline_id",
+                   StringSchema("Timeline ID; omit for the active timeline."),
+                   false)
+            .Field("language",
+                   StringSchema("ISO 639-1 code such as \"fr\", or \"auto\" "
+                                "to detect it. Defaults to \"auto\"."),
+                   false)
+            .Field("verbatim", BoolSchema("Keep hesitations and filler words."),
+                   false)
+            .Build("transcribe_timeline arguments"),
+        DispatchTranscribeTimeline);
 
     add("set_active_timeline",
         "Switch which timeline the other tools act on. Every editing tool "

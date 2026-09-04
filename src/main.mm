@@ -12701,6 +12701,58 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    // B7 -- the timeline's assembled PCM goes straight to Whisper. Unlike
+    // --transcribe this command has no media id: its optional timeline id is
+    // resolved by the project and its model is the local configured model.
+    if (argc >= 3 && std::string(argv[1]) == "--transcribe-timeline") {
+        std::string timelineId;
+        std::string language = "auto";
+        bool verbatim = false;
+        for (int index = 3; index < argc; ++index) {
+            const std::string option(argv[index]);
+            if (option == "--timeline" && index + 1 < argc &&
+                timelineId.empty()) {
+                timelineId = argv[++index];
+            } else if (option == "--language" && index + 1 < argc) {
+                language = argv[++index];
+            } else if (option == "--verbatim") {
+                verbatim = true;
+            } else {
+                return failCli(
+                    "ValidationFailed",
+                    "unknown --transcribe-timeline option '" + option + "'", 2);
+            }
+        }
+        std::string output;
+        const int result = TranscribeTimelineCommand(
+            argv[2], timelineId, language, verbatim, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    // B7 -- direct SRT from a delivered media file, with no disposable
+    // project. The local Whisper model remains configured exactly as for the
+    // other transcription surfaces.
+    if (argc >= 4 && std::string(argv[1]) == "--srt-from-media") {
+        std::string language = "auto";
+        bool verbatim = false;
+        for (int index = 4; index < argc; ++index) {
+            const std::string option(argv[index]);
+            if (option == "--language" && index + 1 < argc) {
+                language = argv[++index];
+            } else if (option == "--verbatim") {
+                verbatim = true;
+            } else {
+                return failCli(
+                    "ValidationFailed",
+                    "unknown --srt-from-media option '" + option + "'", 2);
+            }
+        }
+        std::string output;
+        const int result =
+            SrtFromMediaCommand(argv[2], argv[3], language, verbatim, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
     // ALPHA-2026-08 -- the model path became optional the day it became a
     // local setting (Transcription.h). Omitting it entirely, or passing it
     // empty to reach the arguments behind it, resolves the configured model.

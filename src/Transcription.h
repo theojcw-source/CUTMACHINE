@@ -4,6 +4,7 @@
 #include "MediaTaskManager.h"
 #include "Operations.h"
 #include "RationalTime.h"
+#include "SpeechOnset.h"
 #include "Ulid.h"
 
 #include <cstdint>
@@ -55,6 +56,17 @@ struct Transcript {
     // what distinguishes a transcript worth cutting on from one that still
     // needs probing.
     bool speech_aligned = false;
+    // QC-2026-09b B12 -- result of comparing this text with the measured
+    // speech groups. This belongs to the transcript cache, not the project:
+    // it describes whether one inference artifact is supported by another
+    // measured artifact and can change when either is regenerated.
+    bool speech_assessed = false;
+    RationalTime measured_speech_duration{0, 1};
+    bool likely_hallucinated = false;
+    // A known caption/credit/subscription phrase is supporting evidence only.
+    // It never marks a transcript by itself: a real speaker may use the same
+    // words, and measured speech must win over a blacklist match.
+    bool known_hallucination_phrase = false;
     // The exact timebase TranscriptWord::start/end are expressed in. This is
     // normally the source media's own MediaRate (DocumentSource::rate), so a
     // word's RationalTime is already frame-exact in the domain
@@ -110,7 +122,33 @@ struct TranscriptionOutcome {
     // not stop at the first one.
     std::string error;
     size_t words = 0;
+    bool speech_assessed = false;
+    RationalTime measured_speech_duration{0, 1};
+    bool likely_hallucinated = false;
+    bool known_hallucination_phrase = false;
 };
+
+struct TranscriptSpeechAssessment {
+    size_t word_count = 0;
+    RationalTime measured_speech_duration{0, 1};
+    bool known_hallucination_phrase = false;
+    bool likely_hallucinated = false;
+};
+
+// B12 -- ROADMAP.md. Compares decoded words with B1's measured speech
+// groups. The exact sum of group durations is retained rather than converted
+// to floating point. Known caption/credit/subscription phrases strengthen the
+// evidence reported to a caller but cannot make a voiced rush unsafe.
+bool AssessTranscriptAgainstSpeech(const Transcript& transcript,
+                                   const SpeechOnsetReport& envelope,
+                                   TranscriptSpeechAssessment& assessment,
+                                   std::string& error);
+
+// Copies an assessment into the cache fields consumers enforce. Kept
+// separate from the pure comparison so tests can inspect the decision before
+// any artifact is rewritten.
+void ApplyTranscriptSpeechAssessment(
+    Transcript& transcript, const TranscriptSpeechAssessment& assessment);
 
 // QC-2026-09 A3 -- transcribes a batch of media against one loaded model.
 // Loading it measured about 8 s, paid once per `--transcribe` call before
@@ -140,6 +178,28 @@ bool GenerateAudioTranscript(const std::string& inputPath,
                              const MediaRate& sourceRate,
                              const WhisperSettings& settings,
                              MediaTaskContext& context, std::string& error);
+
+// B7 -- ROADMAP.md. The timeline decoder already has an FFmpeg filter graph
+// for the audible edit; it must be able to hand its 16 kHz float PCM directly
+// to Whisper instead of writing a throw-away media file only to decode it
+// again. `ffmpegArguments` excludes the executable and must write f32le PCM
+// to stdout. This is deliberately an engine seam rather than a CLI shortcut:
+// a timeline's audio is an arrangement, not a LibraryMedia file.
+bool DecodeFfmpegAudioToPcm16k(const std::string& ffmpegPath,
+                               const std::vector<std::string>& ffmpegArguments,
+                               MediaTaskContext& context,
+                               std::vector<float>& samples, std::string& error);
+
+// Runs one local Whisper model against already decoded mono 16 kHz PCM and
+// atomically writes the normal Transcript cache. See
+// DecodeFfmpegAudioToPcm16k for why B7 needs this form.
+bool GenerateAudioTranscriptFromPcm(const std::vector<float>& samples,
+                                    const std::string& outputPath,
+                                    const std::string& mediaId,
+                                    const MediaRate& sourceRate,
+                                    const WhisperSettings& settings,
+                                    MediaTaskContext& context,
+                                    std::string& error);
 
 // QC-2026-09 (A1) -- writing a transcript back is a caller's decision, so
 // the one implementation of the write path is exposed rather than duplicated.

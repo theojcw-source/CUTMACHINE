@@ -154,6 +154,14 @@ public:
         return false;
     }
 
+    // B7 -- the timeline is not a source media: its audible PCM is assembled
+    // from clips and may be cached only against that exact arrangement.
+    virtual bool TranscribeTimeline(const std::string&, const std::string&,
+                                    bool, std::string&, std::string& message) {
+        message = "this backend cannot transcribe a timeline";
+        return false;
+    }
+
     // Read-only cached picture-quality report for one mounted source, keyed
     // on the same media identity DocumentSource::id and LibraryMedia::id
     // share. Kept behind the backend for the same reason the transcript

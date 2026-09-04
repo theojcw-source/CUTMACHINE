@@ -135,6 +135,9 @@ public:
     void SetSourceSpeechOnset(SpeechOnsetReport report) {
         speech_onset_ = std::move(report);
     }
+    void SetTimelineTranscriptHallucinated(bool value) {
+        timeline_transcript_hallucinated_ = value;
+    }
 
     SpeechOnsetSettings speech_onset_settings;
     bool speech_onset_analysis_seen = false;
@@ -180,6 +183,14 @@ public:
     };
     TranscriptionRequest transcription_request;
 
+    struct TimelineTranscriptionRequest {
+        std::string timeline_id;
+        std::string language;
+        bool verbatim = false;
+        bool seen = false;
+    };
+    TimelineTranscriptionRequest timeline_transcription_request;
+
     bool TranscribeSources(const std::vector<Ulid>& mediaIds,
                            const std::string& language, bool verbatim,
                            bool includeSilent, std::string& resultJson,
@@ -190,6 +201,14 @@ public:
             message = "no Whisper model configured";
             return false;
         }
+        resultJson = "{\"ok\":true}";
+        return true;
+    }
+
+    bool TranscribeTimeline(const std::string& timelineId,
+                            const std::string& language, bool verbatim,
+                            std::string& resultJson, std::string&) override {
+        timeline_transcription_request = {timelineId, language, verbatim, true};
         resultJson = "{\"ok\":true}";
         return true;
     }
@@ -289,11 +308,18 @@ public:
     // the tests below tell a legitimate merge from one that would silently
     // swallow a silence.
     bool ReadTimelineTranscript(std::string& json, std::string&) override {
-        json =
-            R"({"timeline_id":"fixture","spans":[)"
-            R"({"span_id":"S1","source_id":"01K30000000000000000000001","source_in":{"value":100,"rate":25},"duration":{"value":10,"rate":25},"timeline_in":{"value":0,"rate":25},"text":"A strong hook."},)"
-            R"({"span_id":"S2","source_id":"01K30000000000000000000001","source_in":{"value":110,"rate":25},"duration":{"value":15,"rate":25},"timeline_in":{"value":10,"rate":25},"text":"It keeps going."},)"
-            R"({"span_id":"S3","source_id":"01K30000000000000000000001","source_in":{"value":200,"rate":25},"duration":{"value":12,"rate":25},"timeline_in":{"value":25,"rate":25},"text":"And the payoff."}]})";
+        const std::string flag =
+            timeline_transcript_hallucinated_ ? "true" : "false";
+        json = R"({"timeline_id":"fixture","spans":[)";
+        json +=
+            R"({"span_id":"S1","source_id":"01K30000000000000000000001","source_in":{"value":100,"rate":25},"duration":{"value":10,"rate":25},"timeline_in":{"value":0,"rate":25},"text":"A strong hook.","likely_hallucinated":)" +
+            flag + "},";
+        json +=
+            R"({"span_id":"S2","source_id":"01K30000000000000000000001","source_in":{"value":110,"rate":25},"duration":{"value":15,"rate":25},"timeline_in":{"value":10,"rate":25},"text":"It keeps going.","likely_hallucinated":)" +
+            flag + "},";
+        json +=
+            R"({"span_id":"S3","source_id":"01K30000000000000000000001","source_in":{"value":200,"rate":25},"duration":{"value":12,"rate":25},"timeline_in":{"value":25,"rate":25},"text":"And the payoff.","likely_hallucinated":)" +
+            flag + "}]}";
         return true;
     }
 
@@ -327,6 +353,7 @@ private:
     bool transcription_fails_ = false;
     bool require_explicit_timeline_ = false;
     bool apply_project_operations_ = false;
+    bool timeline_transcript_hallucinated_ = false;
     Document document_;
     EditLog log_;
     std::optional<ProjectOperation> project_operation_;
@@ -754,12 +781,84 @@ int main() {
     Check(!callShort(R"({"segments":[{"span_id":"S9"}]})").ok,
           "an unknown span id is refused");
 
+    backend.SetTimelineTranscriptHallucinated(true);
+    const McpToolCallOutcome unsafeShort =
+        callShort(R"({"segments":[{"span_id":"S1"}]})");
+    CheckFailureEnvelope(unsafeShort, "hallucinated interview transcript",
+                         "ValidationFailed");
+    Check(unsafeShort.message.find("force:true") != std::string::npos,
+          "the interview refusal names the explicit override");
+    Check(callShort(R"({"segments":[{"span_id":"S1"}],"force":true})").ok,
+          "create_interview_short accepts an explicit hallucination "
+          "override");
+    backend.SetTimelineTranscriptHallucinated(false);
+
     // The regression this whole shape exists to prevent.
     Check(
         !callShort(
              R"({"segments":[{"source_id":"01K30000000000000000000001","source_in":{"value":103,"rate":25},"duration":{"value":10,"rate":25}}]})")
              .ok,
         "a raw source range is refused: the model never states a time");
+
+    // B12 -- a transcript whose words overlap no measured speech group is
+    // visible for diagnosis but cannot drive word cuts without an explicit
+    // override. Both the read-only proposal and the mutating tool enforce the
+    // same cache marker.
+    {
+        Transcript unsafeTranscript;
+        unsafeTranscript.media_id = "01K30000000000000000000001";
+        unsafeTranscript.whisper_model = "large-v3";
+        unsafeTranscript.source_rate = {25, 1};
+        unsafeTranscript.speech_assessed = true;
+        unsafeTranscript.measured_speech_duration = {0, 50};
+        unsafeTranscript.likely_hallucinated = true;
+        unsafeTranscript.known_hallucination_phrase = true;
+        unsafeTranscript.words = {
+            {"Sous-titrage", {100, 25}, {102, 25}},
+            {"Société", {102, 25}, {104, 25}},
+        };
+        InMemoryBackend guardedBackend(fixture);
+        guardedBackend.SetSourceTranscript(unsafeTranscript);
+        McpToolRegistry guardedRegistry;
+        mcp_json::Value listArguments;
+        std::string parseError;
+        Check(mcp_json::Value::Parse(
+                  R"({"clip_id":"01K30000000000000000000003"})", listArguments,
+                  parseError),
+              "guarded list arguments parse: " + parseError);
+        const McpToolCallOutcome refusedList = guardedRegistry.Call(
+            guardedBackend, "list_disfluencies", listArguments);
+        CheckFailureEnvelope(refusedList, "hallucinated disfluency list",
+                             "ValidationFailed");
+        Check(refusedList.message.find("force:true") != std::string::npos,
+              "the disfluency refusal names the explicit override");
+        Check(mcp_json::Value::Parse(
+                  R"({"clip_id":"01K30000000000000000000003","force":true})",
+                  listArguments, parseError) &&
+                  guardedRegistry
+                      .Call(guardedBackend, "list_disfluencies", listArguments)
+                      .ok,
+              "list_disfluencies accepts force:true");
+
+        mcp_json::Value removeArguments;
+        Check(
+            mcp_json::Value::Parse(
+                R"({"clip_id":"01K30000000000000000000003","ranges":[{"start_word_index":0,"end_word_index":0}]})",
+                removeArguments, parseError),
+            "guarded removal arguments parse: " + parseError);
+        const McpToolCallOutcome refusedRemoval = guardedRegistry.Call(
+            guardedBackend, "remove_words", removeArguments);
+        CheckFailureEnvelope(refusedRemoval, "hallucinated word removal",
+                             "ValidationFailed");
+        Check(
+            mcp_json::Value::Parse(
+                R"({"clip_id":"01K30000000000000000000003","ranges":[{"start_word_index":0,"end_word_index":0}],"force":true})",
+                removeArguments, parseError) &&
+                guardedRegistry
+                    .Call(guardedBackend, "remove_words", removeArguments)
+                    .ok,
+            "remove_words accepts force:true");
+    }
 
     // ---- clean_disfluencies: one intention, one reversible operation ----
     // The clip covers source frames [100, 110) at 25/s, so every word below
@@ -1569,6 +1668,37 @@ int main() {
         Check(!failure.ok &&
                   failure.message.find("Whisper model") != std::string::npos,
               "an unconfigured model surfaces as a named reason");
+    }
+
+    // B7 -- timeline transcription has its own address and preserves the
+    // language/model-mode cache identity inputs through MCP.
+    {
+        McpToolRegistry registry;
+        InMemoryBackend backend(fixture);
+        mcp_json::Value arguments;
+        std::string parseError;
+        Check(
+            mcp_json::Value::Parse(
+                R"({"timeline_id":"01K30000000000000000000020","language":"fr","verbatim":true})",
+                arguments, parseError),
+            "transcribe_timeline arguments parse: " + parseError);
+        const McpToolCallOutcome outcome =
+            registry.Call(backend, "transcribe_timeline", arguments);
+        Check(outcome.ok && backend.timeline_transcription_request.seen &&
+                  backend.timeline_transcription_request.timeline_id ==
+                      "01K30000000000000000000020" &&
+                  backend.timeline_transcription_request.language == "fr" &&
+                  backend.timeline_transcription_request.verbatim,
+              "timeline id, language and verbatim reach timeline "
+              "transcription unchanged");
+
+        arguments = mcp_json::Value::MakeObject();
+        Check(registry.Call(backend, "transcribe_timeline", arguments).ok &&
+                  backend.timeline_transcription_request.timeline_id.empty() &&
+                  backend.timeline_transcription_request.language == "auto" &&
+                  !backend.timeline_transcription_request.verbatim,
+              "timeline transcription defaults to the active timeline and "
+              "automatic language detection");
     }
 
     // QC-2026-09 A4 -- addressing by source frame. The fixture's clip A1

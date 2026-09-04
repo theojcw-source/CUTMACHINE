@@ -38,20 +38,15 @@ void AppendTail(std::string& tail, const char* bytes, size_t count) {
 // Decodes `inputPath`'s audio to mono 16 kHz float32 PCM -- whisper.cpp's
 // required input format -- using the same FFmpeg subprocess pipeline
 // Waveform.cc's GenerateAudioWaveform already uses for its own decode.
-bool DecodeMonoPcm16k(const std::string& inputPath,
-                      const std::string& ffmpegPath, MediaTaskContext& context,
-                      std::vector<float>& samples, std::string& error) {
-    std::vector<std::string> storage = {
-        ffmpegPath,  "-hide_banner",
-        "-loglevel", "error",
-        "-nostdin",  "-i",
-        inputPath,   "-map",
-        "0:a:0",     "-vn",
-        "-ac",       "1",
-        "-ar",       std::to_string(WHISPER_SAMPLE_RATE),
-        "-f",        "f32le",
-        "pipe:1",
-    };
+bool DecodePcm16k(const std::string& ffmpegPath,
+                  const std::vector<std::string>& ffmpegArguments,
+                  MediaTaskContext& context, std::vector<float>& samples,
+                  std::string& error) {
+    std::vector<std::string> storage;
+    storage.reserve(ffmpegArguments.size() + 1);
+    storage.push_back(ffmpegPath);
+    storage.insert(storage.end(), ffmpegArguments.begin(),
+                   ffmpegArguments.end());
     std::vector<char*> argv;
     argv.reserve(storage.size() + 1);
     for (std::string& value : storage) argv.push_back(value.data());
@@ -169,6 +164,17 @@ bool DecodeMonoPcm16k(const std::string& inputPath,
         return false;
     }
     return true;
+}
+
+bool DecodeMonoPcm16k(const std::string& inputPath,
+                      const std::string& ffmpegPath, MediaTaskContext& context,
+                      std::vector<float>& samples, std::string& error) {
+    return DecodePcm16k(
+        ffmpegPath,
+        {"-hide_banner", "-loglevel", "error", "-nostdin", "-i", inputPath,
+         "-map", "0:a:0", "-vn", "-ac", "1", "-ar",
+         std::to_string(WHISPER_SAMPLE_RATE), "-f", "f32le", "pipe:1"},
+        context, samples, error);
 }
 
 // Groups whisper.cpp's per-token output into words and rounds each word's
@@ -359,6 +365,14 @@ bool SaveTranscript(const std::filesystem::path& destination,
     // Written only when set, so a transcript that has never been through the
     // alignment pass keeps the exact bytes it had before this field existed.
     if (transcript.speech_aligned) output << ",\"speech_aligned\":true";
+    if (transcript.speech_assessed) {
+        output << ",\"speech_assessed\":true,\"measured_speech_duration\":";
+        WriteTime(output, transcript.measured_speech_duration);
+        output << ",\"likely_hallucinated\":"
+               << (transcript.likely_hallucinated ? "true" : "false")
+               << ",\"known_hallucination_phrase\":"
+               << (transcript.known_hallucination_phrase ? "true" : "false");
+    }
     output << ",\"source_rate\":{\"num\":" << transcript.source_rate.num
            << ",\"den\":" << transcript.source_rate.den << "},\"words\":[";
     for (size_t index = 0; index < transcript.words.size(); ++index) {
@@ -549,20 +563,20 @@ namespace {
 // whisper.cpp clears prompt_past at the top of every whisper_full call. The
 // verbatim path's per-window prompt seeding below is unaffected for the same
 // reason -- it was always per call, never per context.
-bool TranscribeOneWithModel(whisper_context* ctx, const std::string& inputPath,
-                            const std::string& outputPath,
-                            const std::string& mediaId,
-                            const MediaRate& sourceRate,
-                            const WhisperSettings& settings,
-                            MediaTaskContext& context, std::string& error) {
+bool TranscribeSamplesWithModel(whisper_context* ctx,
+                                const std::vector<float>& samples,
+                                const std::string& outputPath,
+                                const std::string& mediaId,
+                                const MediaRate& sourceRate,
+                                const WhisperSettings& settings,
+                                MediaTaskContext& context, std::string& error) {
     error.clear();
     if (sourceRate.num <= 0 || sourceRate.den <= 0) {
         error = "invalid source frame rate";
         return false;
     }
-    std::vector<float> samples;
-    if (!DecodeMonoPcm16k(inputPath, settings.ffmpeg_path, context, samples,
-                          error)) {
+    if (samples.empty()) {
+        error = "audio stream produced no samples to transcribe";
         return false;
     }
     if (context.Cancelled()) {
@@ -709,9 +723,12 @@ bool GenerateAudioTranscripts(const std::vector<TranscriptionJob>& jobs,
         TranscriptionOutcome outcome;
         outcome.media_id = job.media_id;
         std::string jobError;
-        outcome.ok = TranscribeOneWithModel(
-            ctx, job.input_path, job.output_path, job.media_id, job.source_rate,
-            settings, context, jobError);
+        std::vector<float> samples;
+        outcome.ok = DecodeMonoPcm16k(job.input_path, settings.ffmpeg_path,
+                                      context, samples, jobError) &&
+                     TranscribeSamplesWithModel(ctx, samples, job.output_path,
+                                                job.media_id, job.source_rate,
+                                                settings, context, jobError);
         outcome.error = outcome.ok ? std::string() : jobError;
         if (outcome.ok) {
             Transcript written;
@@ -724,6 +741,41 @@ bool GenerateAudioTranscripts(const std::vector<TranscriptionJob>& jobs,
     }
     whisper_free(ctx);
     return true;
+}
+
+bool DecodeFfmpegAudioToPcm16k(const std::string& ffmpegPath,
+                               const std::vector<std::string>& ffmpegArguments,
+                               MediaTaskContext& context,
+                               std::vector<float>& samples,
+                               std::string& error) {
+    return DecodePcm16k(ffmpegPath, ffmpegArguments, context, samples, error);
+}
+
+bool GenerateAudioTranscriptFromPcm(const std::vector<float>& samples,
+                                    const std::string& outputPath,
+                                    const std::string& mediaId,
+                                    const MediaRate& sourceRate,
+                                    const WhisperSettings& settings,
+                                    MediaTaskContext& context,
+                                    std::string& error) {
+    error.clear();
+    if (settings.whisper_model_path.empty()) {
+        error = "a local whisper.cpp model path is required";
+        return false;
+    }
+    whisper_context_params contextParams = whisper_context_default_params();
+    whisper_context* ctx = whisper_init_from_file_with_params(
+        settings.whisper_model_path.c_str(), contextParams);
+    if (!ctx) {
+        error = "unable to load local whisper.cpp model '" +
+                settings.whisper_model_path + "'";
+        return false;
+    }
+    const bool result =
+        TranscribeSamplesWithModel(ctx, samples, outputPath, mediaId,
+                                   sourceRate, settings, context, error);
+    whisper_free(ctx);
+    return result;
 }
 
 bool GenerateAudioTranscript(const std::string& inputPath,
@@ -790,12 +842,24 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
         parsed.media_id = reader.String();
         reader.Expect(",\"whisper_model\":");
         parsed.whisper_model = reader.String();
-        if (reader.Consume(",\"language\":"))
-            parsed.language = reader.String();
+        if (reader.Consume(",\"language\":")) parsed.language = reader.String();
         if (reader.Consume(",\"verbatim\":"))
             parsed.verbatim = reader.Boolean();
         if (reader.Consume(",\"speech_aligned\":"))
             parsed.speech_aligned = reader.Boolean();
+        if (reader.Consume(",\"speech_assessed\":")) {
+            parsed.speech_assessed = reader.Boolean();
+            reader.Expect(",\"measured_speech_duration\":");
+            parsed.measured_speech_duration = ReadTime(reader);
+            reader.Expect(",\"likely_hallucinated\":");
+            parsed.likely_hallucinated = reader.Boolean();
+            reader.Expect(",\"known_hallucination_phrase\":");
+            parsed.known_hallucination_phrase = reader.Boolean();
+            if (!parsed.speech_assessed) {
+                throw std::runtime_error(
+                    "transcript speech assessment marker must be true");
+            }
+        }
         reader.Expect(",\"source_rate\":{\"num\":");
         const int64_t num = reader.Integer();
         reader.Expect(",\"den\":");
@@ -925,7 +989,74 @@ bool IsFillerWord(const std::string& folded) {
     return kFillers.count(CollapseRepeatedLetters(folded)) != 0;
 }
 
+bool ContainsKnownHallucinationPhrase(
+    const std::vector<TranscriptWord>& words) {
+    std::string compact;
+    for (const TranscriptWord& word : words) compact += FoldWordText(word.text);
+    static const std::vector<std::string> kKnownPhrases = {
+        "soustitragesocieteradiocanada",
+        "soustitrespar",
+        "abonnezvous",
+        "noubliezpasdevousabonner",
+        "subscribe",
+        "mercidavoirregarde",
+        "generiquedefin",
+    };
+    return std::any_of(kKnownPhrases.begin(), kKnownPhrases.end(),
+                       [&](const std::string& phrase) {
+                           return compact.find(phrase) != std::string::npos;
+                       });
+}
+
 }  // namespace
+
+bool AssessTranscriptAgainstSpeech(const Transcript& transcript,
+                                   const SpeechOnsetReport& envelope,
+                                   TranscriptSpeechAssessment& assessment,
+                                   std::string& error) {
+    assessment = TranscriptSpeechAssessment{};
+    if (transcript.media_id != envelope.media_id) {
+        error = "speech envelope media_id does not match transcript media_id";
+        return false;
+    }
+    if (envelope.windows_per_second == 0) {
+        error = "speech envelope has no valid analysis rate";
+        return false;
+    }
+    RationalTime duration{0, static_cast<int32_t>(envelope.windows_per_second)};
+    RationalTime previousEnd{0,
+                             static_cast<int32_t>(envelope.windows_per_second)};
+    for (const SpeechGroup& group : envelope.groups) {
+        const RationalTime start = group.start.rescale(duration.rate);
+        const RationalTime end = group.end.rescale(duration.rate);
+        if (start < previousEnd || end <= start) {
+            error = "speech envelope contains invalid or overlapping groups";
+            return false;
+        }
+        duration = duration.add(end.sub(start));
+        previousEnd = end;
+    }
+    assessment.word_count = transcript.words.size();
+    assessment.measured_speech_duration = duration;
+    assessment.known_hallucination_phrase =
+        ContainsKnownHallucinationPhrase(transcript.words);
+    // The phrase list is deliberately not part of the decision. It only
+    // raises the evidence level shown to the caller. A voiced interview about
+    // subtitles must remain usable; words over zero measured speech cannot.
+    assessment.likely_hallucinated =
+        assessment.word_count > 0 && duration.value == 0;
+    error.clear();
+    return true;
+}
+
+void ApplyTranscriptSpeechAssessment(
+    Transcript& transcript, const TranscriptSpeechAssessment& assessment) {
+    transcript.speech_assessed = true;
+    transcript.measured_speech_duration = assessment.measured_speech_duration;
+    transcript.likely_hallucinated = assessment.likely_hallucinated;
+    transcript.known_hallucination_phrase =
+        assessment.known_hallucination_phrase;
+}
 
 std::vector<Disfluency> FindDisfluencies(
     const std::vector<TranscriptWord>& words) {

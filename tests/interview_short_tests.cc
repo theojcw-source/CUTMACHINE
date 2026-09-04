@@ -78,8 +78,7 @@ int main() {
         {"01K50000000000000000000004", sourceId, {6, 25}, {8, 25}, {6, 25}},
     };
     {
-        std::ofstream cache(directory / (sourceId + ".json"),
-                            std::ios::trunc);
+        std::ofstream cache(directory / (sourceId + ".json"), std::ios::trunc);
         cache << "{\"version\":1,\"media_id\":\"" << sourceId
               << "\",\"whisper_model\":\"test.bin\","
                  "\"source_rate\":{\"num\":25,\"den\":1},\"words\":["
@@ -127,7 +126,14 @@ int main() {
     // a silence nobody asked to cut.
     const std::vector<TimelineTranscriptSpan> run = {
         {"S1", sourceId, {50, 25}, {25, 25}, {25, 25}, "Une accroche."},
-        {"S2", sourceId, {75, 25}, {30, 25}, {50, 25}, "Puis la suite."},
+        {"S2",
+         sourceId,
+         {75, 25},
+         {30, 25},
+         {50, 25},
+         "Puis la suite.",
+         false,
+         true},
         {"S3", sourceId, {200, 25}, {20, 25}, {80, 25}, "Et la chute."},
         {"S4",
          "01K50000000000000000000009",
@@ -208,8 +214,10 @@ int main() {
           "the rendered view parses back to spans: " + error);
     Check(reparsed.size() == run.size() && reparsed[1].span_id == "S2" &&
               reparsed[1].source_in.compare(run[1].source_in) == 0 &&
-              reparsed[1].duration.compare(run[1].duration) == 0,
-          "a span survives the view round trip with its exact times");
+              reparsed[1].duration.compare(run[1].duration) == 0 &&
+              reparsed[1].likely_hallucinated,
+          "a span survives the view round trip with its exact times and "
+          "transcript guard");
 
     std::filesystem::remove_all(directory);
     std::cout << "interview short tests passed\n";

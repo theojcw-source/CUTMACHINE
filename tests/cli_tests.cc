@@ -32,9 +32,8 @@ void CheckFailureEnvelope(const std::string& output, const std::string& label,
                           const std::string& expectedError) {
     mcp_json::Value envelope;
     std::string parseError;
-    const bool parsed =
-        mcp_json::Value::Parse(output, envelope, parseError) &&
-        envelope.IsObject();
+    const bool parsed = mcp_json::Value::Parse(output, envelope, parseError) &&
+                        envelope.IsObject();
     Check(parsed, label + " returns a JSON object: " + parseError);
     if (!parsed) return;
     const mcp_json::Value* ok = envelope.Find("ok");
@@ -45,9 +44,9 @@ void CheckFailureEnvelope(const std::string& output, const std::string& label,
     Check(error != nullptr && error->IsString() &&
               error->AsString() == expectedError,
           label + " preserves " + expectedError);
-    Check(detail != nullptr && detail->IsString() &&
-              !detail->AsString().empty(),
-          label + " returns a non-empty detail");
+    Check(
+        detail != nullptr && detail->IsString() && !detail->AsString().empty(),
+        label + " returns a non-empty detail");
 }
 
 std::string Read(const std::filesystem::path& path) {
@@ -117,14 +116,26 @@ int main() {
              }},
             {"transcribe_media", "ParseError",
              [&](std::string& output) {
-                 return TranscribeMediaCommand(
-                     missingProject.string(), {"missing-media"}, "", "auto",
-                     false, false, output);
+                 return TranscribeMediaCommand(missingProject.string(),
+                                               {"missing-media"}, "", "auto",
+                                               false, false, output);
+             }},
+            {"transcribe_timeline", "InvalidDocument",
+             [&](std::string& output) {
+                 return TranscribeTimelineCommand(missingProject.string(), "",
+                                                  "auto", false, output);
+             }},
+            {"srt_from_media", "IoError",
+             [&](std::string& output) {
+                 return SrtFromMediaCommand(
+                     (directory / "missing.wav").string(),
+                     (directory / "unused.srt").string(), "auto", false,
+                     output);
              }},
             {"analyze_shot_quality", "ParseError",
              [&](std::string& output) {
-                 return AnalyzeShotQualityCommand(
-                     missingProject.string(), "missing-media", output);
+                 return AnalyzeShotQualityCommand(missingProject.string(),
+                                                  "missing-media", output);
              }},
             {"shot_quality_report", "ParseError",
              [&](std::string& output) {
@@ -138,8 +149,8 @@ int main() {
              }},
             {"analyze_speech_onset", "ParseError",
              [&](std::string& output) {
-                 return AnalyzeSpeechOnsetCommand(
-                     missingProject.string(), "missing-media", output);
+                 return AnalyzeSpeechOnsetCommand(missingProject.string(),
+                                                  "missing-media", output);
              }},
             {"speech_onset_report", "ParseError",
              [&](std::string& output) {
@@ -163,8 +174,8 @@ int main() {
              }},
             {"locate_source_frame", "ParseError",
              [&](std::string& output) {
-                 return LocateSourceFrameCommand(
-                     missingProject.string(), "missing-media", 0, output);
+                 return LocateSourceFrameCommand(missingProject.string(),
+                                                 "missing-media", 0, output);
              }},
             {"describe", "ParseError",
              [&](std::string& output) {
@@ -178,8 +189,7 @@ int main() {
              }},
             {"propose_sequence", "ParseError",
              [&](std::string& output) {
-                 return ProposeSequenceCommand(missingProject.string(),
-                                               output);
+                 return ProposeSequenceCommand(missingProject.string(), output);
              }},
             {"apply_operation", "ParseError",
              [&](std::string& output) {
@@ -301,15 +311,14 @@ int main() {
               firstDescription.find("\"name\":\"Premier raccord\"") !=
                   std::string::npos,
           "describe exposes stable marker IDs and aliases");
-    Check(firstDescription.find("\"timelines\":[{\"id\":") !=
-                  std::string::npos &&
-              firstDescription.find("\"width\":1920,\"height\":1080,") !=
-                  std::string::npos &&
-              firstDescription.find("\"frame_rate\":{\"num\":25,") !=
-                  std::string::npos &&
-              firstDescription.find("\"active\":true") !=
-                  std::string::npos,
-          "describe exposes the active project's timeline summary");
+    Check(
+        firstDescription.find("\"timelines\":[{\"id\":") != std::string::npos &&
+            firstDescription.find("\"width\":1920,\"height\":1080,") !=
+                std::string::npos &&
+            firstDescription.find("\"frame_rate\":{\"num\":25,") !=
+                std::string::npos &&
+            firstDescription.find("\"active\":true") != std::string::npos,
+        "describe exposes the active project's timeline summary");
 
     const std::string before = Read(path);
     const Operation trim = TrimClipOperation{
@@ -364,27 +373,24 @@ int main() {
     // removal; the undo command must restore every named track and the full
     // removed clip representation, not just its five timeline fields.
     Document syncFixture = Fixture();
-    syncFixture.sequence.tracks.push_back(
-        {"01K30000000000000000000020",
-         "audio",
-         1,
-         {{"01K30000000000000000000021",
-           syncFixture.sources[0].id,
-           {400, 25},
-           {10, 25},
-           {20, 25}}}});
+    syncFixture.sequence.tracks.push_back({"01K30000000000000000000020",
+                                           "audio",
+                                           1,
+                                           {{"01K30000000000000000000021",
+                                             syncFixture.sources[0].id,
+                                             {400, 25},
+                                             {10, 25},
+                                             {20, 25}}}});
     Project syncProject = Project::FromDocument(syncFixture, "CLI sync");
     std::string syncPathString;
-    Check(CreatePortableProject(
-              (directory / "Sync.cutmachine-project").string(), syncProject,
-              syncPathString, error),
-          "synchronized CLI fixture saves: " + error);
+    Check(
+        CreatePortableProject((directory / "Sync.cutmachine-project").string(),
+                              syncProject, syncPathString, error),
+        "synchronized CLI fixture saves: " + error);
     const std::filesystem::path syncPath = syncPathString;
     const std::string syncBefore = Read(syncPath);
     const Operation synchronizedRemove = RemoveClipOperation{
-        "01K30000000000000000000003",
-        {"01K30000000000000000000020"},
-        {}};
+        "01K30000000000000000000003", {"01K30000000000000000000020"}, {}};
     Check(ApplyOperationCommand(syncPath.string(),
                                 SerializeOperation(synchronizedRemove),
                                 result) == 0,
@@ -393,10 +399,10 @@ int main() {
     Check(Project::Load(syncPath.string(), syncAfterProject, error),
           "CLI synchronized result reloads: " + error);
     const Document syncAfter = syncAfterProject.MakeActiveDocument();
-    Check(syncAfter.FindClip("01K30000000000000000000004")
-                      ->timeline_in == RationalTime{10, 25} &&
-              syncAfter.FindClip("01K30000000000000000000021")
-                      ->timeline_in == RationalTime{10, 25},
+    Check(syncAfter.FindClip("01K30000000000000000000004")->timeline_in ==
+                  RationalTime{10, 25} &&
+              syncAfter.FindClip("01K30000000000000000000021")->timeline_in ==
+                  RationalTime{10, 25},
           "CLI synchronized remove ripples the named track");
     Check(UndoOperationCommand(syncPath.string(), result) == 0 &&
               Read(syncPath) == syncBefore,

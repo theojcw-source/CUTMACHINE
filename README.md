@@ -421,6 +421,10 @@ décodage média :
 ./build/cutmachine --transcribe \
   ./Film.cutmachine-project/project.cutmachine.json '<media-id>[,<media-id>…]' \
   ./models/ggml-large-v3.bin fr --verbatim
+./build/cutmachine --transcribe-timeline \
+  ./Film.cutmachine-project/project.cutmachine.json \
+  --timeline '<timeline-id>' --language fr --verbatim
+./build/cutmachine --srt-from-media ./film.mp4 ./film.srt --language fr
 ./build/cutmachine --align-transcripts \
   ./Film.cutmachine-project/project.cutmachine.json --write
 ./build/cutmachine --tighten-pauses \
@@ -468,6 +472,23 @@ defaults write com.cutmachine.editor CMRequireExplicitTimeline -bool true
 Une opération MCP d'édition sans `timeline_id` est alors refusée avec l'erreur
 `TimelineRequired`. Ce réglage reste dans `NSUserDefaults` et n'est jamais
 écrit dans le projet.
+
+`transcribe_timeline` décode directement les plages source des plans audio,
+les replace sur leur grille temporelle exacte et transmet le PCM assemblé à
+Whisper sans export vidéo intermédiaire. Son cache dépend de l'identité de la
+timeline, des bornes et positions de ses plans audibles, du modèle, de la
+langue et du mode verbatim : une coupe audio ne peut donc pas réutiliser un
+texte périmé. `--srt-from-media` emploie le même chemin de transcription pour
+produire un SRT depuis un livrable sans créer de projet jetable.
+
+Lorsqu'une enveloppe de parole B1 est disponible, le cache de transcription
+indique `speech_assessed`, `measured_speech_duration`,
+`likely_hallucinated` et `known_hallucination_phrase`. Des mots sans aucun
+groupe de parole mesuré sont signalés comme probablement inventés ; une
+tournure connue de sous-titrage ou d'abonnement ne fait que renforcer ce
+diagnostic et ne suffit jamais à elle seule. Les outils MCP
+`list_disfluencies`, `remove_words` et `create_interview_short` refusent ces
+transcriptions, sauf demande explicite avec `force: true`.
 
 ## Import depuis DaVinci Resolve
 

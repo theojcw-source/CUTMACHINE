@@ -39,6 +39,20 @@ int TranscribeMediaCommand(const std::string& projectPath,
                            const std::string& whisperModelPath,
                            const std::string& language, bool verbatim,
                            bool includeSilent, std::string& output);
+// B7 -- ROADMAP.md. Transcribes the audio arrangement a timeline actually
+// plays. The cache belongs to the project but is keyed by exact audible clip
+// bounds, model and language, never by a temporary exported media file.
+int TranscribeTimelineCommand(const std::string& projectPath,
+                              const std::string& timelineId,
+                              const std::string& language, bool verbatim,
+                              std::string& output);
+// B7 -- transcribe a delivered media file directly into SRT. This is the same
+// local decode/Whisper path as timeline transcription, without constructing a
+// disposable project merely to make a file addressable as LibraryMedia.
+int SrtFromMediaCommand(const std::string& mediaPath,
+                        const std::string& outputPath,
+                        const std::string& language, bool verbatim,
+                        std::string& output);
 // ALPHA-2026-08 -- the reason these take word indices and never a timecode
 // is PHILOSOPHY.md principle 7: the caller (agent or human) names *which
 // words*, CUTMACHINE resolves *which frames*. A caller that could pass a

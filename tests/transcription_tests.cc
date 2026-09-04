@@ -2,9 +2,11 @@
 #include "EditLog.h"
 #include "MediaTaskManager.h"
 #include "Operations.h"
+#include "TimelineTranscription.h"
 #include "Transcription.h"
 
 #include <unistd.h>
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -101,6 +103,70 @@ bool Apply(EditLog& log, Document& document, Operation operation,
 }  // namespace
 
 int main() {
+    Test("B7 plans the exact audible timeline and invalidates its cache", [] {
+        Document document;
+        document.sequence.id = "01K300000000000000000000D1";
+        document.sequence.frame_rate = {25, 1};
+        document.sources = {
+            {"01K300000000000000000000D2", "Media/one.wav", {25, 1}, {100, 25}},
+            {"01K300000000000000000000D3", "Media/two.wav", {25, 1}, {100, 25}},
+        };
+        document.sequence.tracks = {
+            {"01K300000000000000000000D4",
+             "audio",
+             1,
+             {{"01K300000000000000000000D5",
+               "01K300000000000000000000D2",
+               {10, 25},
+               {25, 25},
+               {0, 25}},
+              {"01K300000000000000000000D6",
+               "01K300000000000000000000D3",
+               {5, 25},
+               {10, 25},
+               {30, 25}}}},
+        };
+        TimelineAudioPlan first;
+        std::string error;
+        const std::filesystem::path project =
+            std::filesystem::temp_directory_path() /
+            "B7.cutmachine-project/project.cutmachine.json";
+        Check(BuildTimelineAudioPlan(document, project, first, error) &&
+                  first.audio_clips == 2 &&
+                  first.duration == RationalTime{40, 25} &&
+                  first.ffmpeg_arguments.back() == "pipe:1" &&
+                  first.cache_identity.find(document.sequence.id) !=
+                      std::string::npos,
+              "the audio plan preserves two source-bounded clips, their gap "
+              "and a pipe-only output: " +
+                  error);
+        const auto graph =
+            std::find(first.ffmpeg_arguments.begin(),
+                      first.ffmpeg_arguments.end(), "-filter_complex");
+        Check(graph != first.ffmpeg_arguments.end() &&
+                  graph + 1 != first.ffmpeg_arguments.end() &&
+                  (graph + 1)->find("adelay=19200S") != std::string::npos &&
+                  (graph + 1)->find("amix=inputs=2") != std::string::npos,
+              "the second clip is placed at frame 30 on the 16 kHz PCM grid");
+
+        const std::string originalIdentity = first.cache_identity;
+        document.sequence.tracks[0].clips[0].duration = {24, 25};
+        TimelineAudioPlan trimmed;
+        Check(BuildTimelineAudioPlan(document, project, trimmed, error) &&
+                  trimmed.cache_identity != originalIdentity,
+              "changing an audible source bound invalidates the timeline "
+              "transcript cache: " +
+                  error);
+        document.sequence.tracks[0].clips[0].duration = {25, 25};
+        document.sequence.tracks[0].clips[1].timeline_in = {31, 25};
+        TimelineAudioPlan moved;
+        Check(BuildTimelineAudioPlan(document, project, moved, error) &&
+                  moved.cache_identity != originalIdentity,
+              "changing audible placement invalidates the timeline transcript "
+              "cache: " +
+                  error);
+    });
+
     Test("RoundToSourceFrame rounds outward and is exact on frame boundaries",
          [] {
              const MediaRate rate25{25, 1};
@@ -281,8 +347,7 @@ int main() {
         Transcript reloaded;
         Check(LoadAudioTranscript(path.string(), reloaded, error) &&
                   reloaded.speech_aligned && reloaded.verbatim &&
-                  reloaded.language == "fr" &&
-                  reloaded.words.size() == 2 &&
+                  reloaded.language == "fr" && reloaded.words.size() == 2 &&
                   reloaded.words[1].text == "tout",
               "an aligned transcript reads back aligned: " + error);
 
@@ -311,6 +376,76 @@ int main() {
               "and reads back as not aligned: " + error);
 
         std::filesystem::remove_all(root);
+    });
+
+    Test("B12 compares transcript words with measured speech groups", [] {
+        Transcript transcript;
+        transcript.media_id = "01K300000000000000000000AB";
+        transcript.whisper_model = "ggml-large-v3.bin";
+        transcript.language = "fr";
+        transcript.source_rate = {25, 1};
+        transcript.words = {
+            {"Sous-titrage", {0, 25}, {5, 25}},
+            {"Société", {5, 25}, {10, 25}},
+            {"Radio-Canada", {10, 25}, {15, 25}},
+        };
+        SpeechOnsetReport envelope;
+        envelope.media_id = transcript.media_id;
+        envelope.windows_per_second = 50;
+        envelope.decode_sample_rate = 16000;
+
+        TranscriptSpeechAssessment assessment;
+        std::string error;
+        Check(AssessTranscriptAgainstSpeech(transcript, envelope, assessment,
+                                            error) &&
+                  assessment.word_count == 3 &&
+                  assessment.measured_speech_duration == RationalTime{0, 50} &&
+                  assessment.known_hallucination_phrase &&
+                  assessment.likely_hallucinated,
+              "words over no measured speech are flagged, with the known "
+              "caption phrase as supporting evidence: " +
+                  error);
+
+        envelope.groups = {
+            {{0, 50}, {25, 50}, -18, -10},
+            {{50, 50}, {100, 50}, -16, -8},
+        };
+        Check(AssessTranscriptAgainstSpeech(transcript, envelope, assessment,
+                                            error) &&
+                  assessment.measured_speech_duration == RationalTime{75, 50} &&
+                  assessment.known_hallucination_phrase &&
+                  !assessment.likely_hallucinated,
+              "a known phrase carried by real measured speech is never "
+              "blacklisted: " +
+                  error);
+
+        envelope.groups.clear();
+        Check(AssessTranscriptAgainstSpeech(transcript, envelope, assessment,
+                                            error),
+              "the unvoiced assessment succeeds: " + error);
+        ApplyTranscriptSpeechAssessment(transcript, assessment);
+        const std::filesystem::path root =
+            std::filesystem::temp_directory_path() /
+            (GenerateUlid() + "-transcript-speech-assessment");
+        std::filesystem::create_directories(root);
+        const std::filesystem::path path = root / "assessed.transcript";
+        Check(SaveAudioTranscript(path.string(), transcript, error),
+              "the assessed transcript cache is written: " + error);
+        Transcript reloaded;
+        Check(LoadAudioTranscript(path.string(), reloaded, error) &&
+                  reloaded.speech_assessed &&
+                  reloaded.measured_speech_duration == RationalTime{0, 50} &&
+                  reloaded.likely_hallucinated &&
+                  reloaded.known_hallucination_phrase,
+              "the exact speech comparison and guard flags survive the "
+              "cache round trip: " +
+                  error);
+        std::filesystem::remove_all(root);
+
+        envelope.media_id = "01K300000000000000000000AC";
+        Check(!AssessTranscriptAgainstSpeech(transcript, envelope, assessment,
+                                             error),
+              "a speech envelope for another source is refused");
     });
 
     Test("RemoveWordsOperation cuts a linked A/V pair in one reversible step",
@@ -790,7 +925,9 @@ int main() {
         std::filesystem::create_directories(root);
         const std::filesystem::path envFile = root / ".env";
         const std::filesystem::path model = root / "ggml-test.bin";
-        { std::ofstream(model) << "not a real model, but a real file"; }
+        {
+            std::ofstream(model) << "not a real model, but a real file";
+        }
         ::setenv("CUTMACHINE_ENV_FILE", envFile.string().c_str(), 1);
         ::unsetenv("CUTMACHINE_WHISPER_MODEL");
 
@@ -818,7 +955,9 @@ int main() {
         // The real environment wins over the file, so a one-off override in
         // front of a command works without editing anything.
         const std::filesystem::path other = root / "ggml-other.bin";
-        { std::ofstream(other) << "another real file"; }
+        {
+            std::ofstream(other) << "another real file";
+        }
         ::setenv("CUTMACHINE_WHISPER_MODEL", other.string().c_str(), 1);
         path.clear();
         Check(ResolveConfiguredWhisperModel(path, reason) &&

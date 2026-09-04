@@ -199,6 +199,19 @@ bool McpProjectBackend::TranscribeSources(const std::vector<Ulid>& sourceIds,
                               message);
 }
 
+bool McpProjectBackend::TranscribeTimeline(const std::string& timelineId,
+                                           const std::string& language,
+                                           bool verbatim,
+                                           std::string& resultJson,
+                                           std::string& message) {
+    std::string output;
+    const int result = TranscribeTimelineCommand(project_path_, timelineId,
+                                                 language, verbatim, output);
+    std::string errorName;
+    return ParseCommandResult(output, result == 0, resultJson, errorName,
+                              message);
+}
+
 bool McpProjectBackend::CaptureSourceFrame(const Ulid& sourceId,
                                            const RationalTime& time,
                                            std::string& jpegBytes,

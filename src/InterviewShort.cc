@@ -50,8 +50,7 @@ struct WordCandidate {
     RationalTime overlap;
 };
 
-bool PositiveOverlap(const RationalTime& leftStart,
-                     const RationalTime& leftEnd,
+bool PositiveOverlap(const RationalTime& leftStart, const RationalTime& leftEnd,
                      const RationalTime& rightStart,
                      const RationalTime& rightEnd) {
     return leftStart < rightEnd && rightStart < leftEnd;
@@ -68,9 +67,8 @@ bool SamePlayedOccurrence(const WordCandidate& left,
         return true;
     const bool touches = left.timeline_end == right.timeline_start ||
                          right.timeline_end == left.timeline_start;
-    return touches &&
-           !PositiveOverlap(left.source_start, left.source_end,
-                            right.source_start, right.source_end);
+    return touches && !PositiveOverlap(left.source_start, left.source_end,
+                                       right.source_start, right.source_end);
 }
 
 size_t FindRoot(std::vector<size_t>& parents, size_t index) {
@@ -129,8 +127,8 @@ bool BuildTimelineTranscriptSpans(
             if (word.end <= clip.source_in || word.start >= clipEnd) continue;
             const RationalTime sourceStart =
                 word.start < clip.source_in ? clip.source_in : word.start;
-            const RationalTime sourceEnd = word.end > clipEnd ? clipEnd
-                                                               : word.end;
+            const RationalTime sourceEnd =
+                word.end > clipEnd ? clipEnd : word.end;
             if (sourceEnd <= sourceStart) continue;
             const RationalTime timelineStart =
                 clip.timeline_in.add(sourceStart.sub(clip.source_in));
@@ -174,8 +172,8 @@ bool BuildTimelineTranscriptSpans(
                 audible.transcript->words[chosen.word_index];
             const RationalTime clipEnd =
                 audible.clip->source_in.add(audible.clip->duration);
-            const bool straddles = word.start < audible.clip->source_in ||
-                                   word.end > clipEnd;
+            const bool straddles =
+                word.start < audible.clip->source_in || word.end > clipEnd;
             audibleClips[chosen.clip_index].selected_words.push_back(
                 {chosen.word_index, straddles});
         }
@@ -183,8 +181,7 @@ bool BuildTimelineTranscriptSpans(
 
     for (AudibleClip& audible : audibleClips) {
         const DocumentClip& clip = *audible.clip;
-        std::sort(audible.selected_words.begin(),
-                  audible.selected_words.end());
+        std::sort(audible.selected_words.begin(), audible.selected_words.end());
         Transcript selected = *audible.transcript;
         selected.words.clear();
         for (const auto& word : audible.selected_words)
@@ -201,6 +198,7 @@ bool BuildTimelineTranscriptSpans(
             span.duration = cue.duration;
             span.timeline_in = cue.timeline_in;
             span.text = cue.text;
+            span.likely_hallucinated = audible.transcript->likely_hallucinated;
             const RationalTime cueEnd = span.source_in.add(span.duration);
             for (const auto& selectedWord : audible.selected_words) {
                 if (!selectedWord.second) continue;
@@ -247,6 +245,8 @@ std::string SerializeTimelineTranscriptSpans(
         value.Set("text", mcp_json::Value::MakeString(span.text));
         value.Set("straddles_cut",
                   mcp_json::Value::MakeBool(span.straddles_cut));
+        value.Set("likely_hallucinated",
+                  mcp_json::Value::MakeBool(span.likely_hallucinated));
         list.Push(std::move(value));
     }
     mcp_json::Value root = mcp_json::Value::MakeObject();
@@ -278,6 +278,8 @@ bool ParseTimelineTranscriptSpans(const std::string& json,
         const mcp_json::Value* sourceId = value.Find("source_id");
         const mcp_json::Value* text = value.Find("text");
         const mcp_json::Value* straddlesCut = value.Find("straddles_cut");
+        const mcp_json::Value* likelyHallucinated =
+            value.Find("likely_hallucinated");
         if (spanId == nullptr || !spanId->IsString() || sourceId == nullptr ||
             !sourceId->IsString() ||
             !ReadTimeValue(value.Find("source_in"), span.source_in) ||
@@ -291,11 +293,21 @@ bool ParseTimelineTranscriptSpans(const std::string& json,
         if (text != nullptr && text->IsString()) span.text = text->AsString();
         if (straddlesCut != nullptr) {
             if (!straddlesCut->IsBool()) {
-                error = "transcript span view contains an invalid "
-                        "straddles_cut flag";
+                error =
+                    "transcript span view contains an invalid "
+                    "straddles_cut flag";
                 return false;
             }
             span.straddles_cut = straddlesCut->AsBool();
+        }
+        if (likelyHallucinated != nullptr) {
+            if (!likelyHallucinated->IsBool()) {
+                error =
+                    "transcript span view contains an invalid "
+                    "likely_hallucinated flag";
+                return false;
+            }
+            span.likely_hallucinated = likelyHallucinated->AsBool();
         }
         spans.push_back(std::move(span));
     }

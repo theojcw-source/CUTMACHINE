@@ -44,6 +44,10 @@ public:
                            const std::string& language, bool verbatim,
                            bool includeSilent, std::string& resultJson,
                            std::string& message) override;
+    bool TranscribeTimeline(const std::string& timelineId,
+                            const std::string& language, bool verbatim,
+                            std::string& resultJson,
+                            std::string& message) override;
     bool CaptureSourceFrame(const Ulid& sourceId, const RationalTime& time,
                             std::string& jpegBytes,
                             std::string& message) override;
