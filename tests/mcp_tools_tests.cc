@@ -18,6 +18,9 @@
 #include "McpBackend.h"
 #include "McpServer.h"
 #include "McpTools.h"
+
+#include "Cli.h"
+#include "Project.h"
 #include "Operations.h"
 #include "ShotQuality.h"
 #include "SpeechOnset.h"
@@ -114,7 +117,9 @@ Document Fixture() {
 class InMemoryBackend : public McpBackend {
 public:
     explicit InMemoryBackend(Document document)
-        : document_(std::move(document)) {}
+        : project_(Project::FromDocument(std::move(document))) {
+        document_ = project_.MakeActiveDocument();
+    }
 
     // Cache artifacts the real backends read from the project package. Held
     // here so the tools that consume them can be exercised without a
@@ -246,10 +251,7 @@ public:
     }
 
     bool Describe(std::string& json, std::string&) override {
-        size_t clipCount = 0;
-        for (const DocumentTrack& track : document_.sequence.tracks)
-            clipCount += track.clips.size();
-        json = "{\"clip_count\":" + std::to_string(clipCount) + "}";
+        json = DescribeProject(project_);
         return true;
     }
 
@@ -266,8 +268,14 @@ public:
     }
 
     bool ApplyProjectEdit(ProjectOperation operation, std::string& resultJson,
-                          std::string&, std::string&) override {
-        project_operation_ = std::move(operation);
+                          std::string& errorName, std::string& message) override {
+        EditError error = EditError::None;
+        if (!project_log_.Apply(project_, std::move(operation), error, message)) {
+            errorName = EditErrorName(error);
+            return false;
+        }
+        document_ = project_.MakeActiveDocument();
+        project_operation_ = project_log_.AppliedEntries().back().op;
         resultJson = "{\"ok\":true}";
         return true;
     }
@@ -283,6 +291,8 @@ private:
     Document document_;
     EditLog log_;
     std::optional<ProjectOperation> project_operation_;
+    Project project_;
+    ProjectEditLog project_log_;
     Transcript transcript_;
     ShotQualityReport shot_quality_;
     SpeechOnsetReport speech_onset_;
@@ -430,6 +440,80 @@ int main() {
 
     InMemoryBackend backend(fixture);
     McpToolRegistry shortRegistry;
+
+    // B8 -- timelines are project objects, not an array an MCP client edits.
+    // Exercise the tools through a real ProjectEditLog, including the engine's
+    // stable refusal for the final timeline.
+    {
+        InMemoryBackend timelineBackend(fixture);
+        McpToolRegistry timelineRegistry;
+        const McpToolCallOutcome listed = timelineRegistry.Call(
+            timelineBackend, "list_timelines", mcp_json::Value::MakeObject());
+        Check(listed.ok && listed.result_json.find("\"dimensions\"") !=
+                               std::string::npos &&
+                  listed.result_json.find("\"active\":true") !=
+                               std::string::npos,
+              "list_timelines exposes dimensions and active state");
+        mcp_json::Value addArguments;
+        std::string timelineParseError;
+        Check(mcp_json::Value::Parse(
+                  R"({"name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1}})",
+                  addArguments, timelineParseError),
+              "add_timeline arguments parse: " + timelineParseError);
+        Check(timelineRegistry.Call(timelineBackend, "add_timeline", addArguments)
+                  .ok,
+              "add_timeline applies an AddProjectTimelineOperation");
+        const ProjectOperation* added = timelineBackend.LastProjectOperation();
+        Check(added && std::holds_alternative<AddProjectTimelineOperation>(*added),
+              "add_timeline uses the existing project operation");
+        const Ulid addedId = std::get<AddProjectTimelineOperation>(*added).timeline_id;
+        mcp_json::Value renameArguments;
+        Check(mcp_json::Value::Parse(
+                  "{\"timeline_id\":\"" + addedId.substr(0, 10) +
+                      "\",\"name\":\"Portrait\"}",
+                  renameArguments, timelineParseError),
+              "rename_timeline arguments parse: " + timelineParseError);
+        Check(timelineRegistry.Call(timelineBackend, "rename_timeline",
+                                    renameArguments)
+                  .ok,
+              "rename_timeline resolves an unambiguous ULID prefix");
+        Check(timelineBackend.LastProjectOperation() &&
+                  std::holds_alternative<RenameProjectItemOperation>(
+                      *timelineBackend.LastProjectOperation()),
+              "rename_timeline uses RenameProjectItemOperation");
+        mcp_json::Value removeArguments;
+        Check(mcp_json::Value::Parse("{\"timeline_id\":\"" + addedId + "\"}",
+                                     removeArguments, timelineParseError),
+              "remove_timeline arguments parse: " + timelineParseError);
+        Check(timelineRegistry.Call(timelineBackend, "remove_timeline",
+                                    removeArguments)
+                  .ok,
+              "remove_timeline applies a RemoveProjectTimelineOperation");
+        Check(timelineBackend.LastProjectOperation() &&
+                  std::holds_alternative<RemoveProjectTimelineOperation>(
+                      *timelineBackend.LastProjectOperation()),
+              "remove_timeline uses the existing project operation");
+        const McpToolCallOutcome remaining = timelineRegistry.Call(
+            timelineBackend, "list_timelines", mcp_json::Value::MakeObject());
+        mcp_json::Value remainingJson;
+        Check(mcp_json::Value::Parse(remaining.result_json, remainingJson,
+                                     timelineParseError),
+              "remaining timeline list parses: " + timelineParseError);
+        const mcp_json::Value* remainingTimelines =
+            remainingJson.Find("timelines");
+        const std::string remainingId =
+            remainingTimelines && !remainingTimelines->AsArray().empty()
+                ? remainingTimelines->AsArray().front().Find("id")->AsString()
+                : "";
+        Check(mcp_json::Value::Parse("{\"timeline_id\":\"" + remainingId +
+                                     "\"}",
+                                     removeArguments, timelineParseError),
+              "final removal arguments parse: " + timelineParseError);
+        const McpToolCallOutcome finalRemoval = timelineRegistry.Call(
+            timelineBackend, "remove_timeline", removeArguments);
+        CheckFailureEnvelope(finalRemoval, "remove final timeline",
+                             "InvalidOperation");
+    }
     const McpToolCallOutcome transcriptOutcome = shortRegistry.Call(
         backend, "get_timeline_transcript", mcp_json::Value::MakeObject());
     Check(transcriptOutcome.ok && transcriptOutcome.result_json.find(

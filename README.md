@@ -924,6 +924,22 @@ de métadonnées de chutier et de relink. Son historique distinct est conservé
 dans `<document>.project-editlog.json` et les commandes `--undo-project-op` et
 `--redo-project-op` le parcourent sans initialiser l’interface graphique.
 
+Les objets passés à `--apply-project-op` doivent reprendre exactement l’ordre
+et tous les champs produits par `SerializeProjectOperation`. `exact_project_hex`
+vaut `null` pour une nouvelle intention ; il est rempli par le journal pour un
+rejeu exact. Exemples canoniques complets (les identifiants sont des ULID) :
+
+```json
+{"type":"AddProjectTimeline","name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1},"timeline_id":"","video_track_id":"","audio_track_id":"","exact_project_hex":null}
+{"type":"CreateProjectTimelineFromSegments","name":"Extrait","width":1920,"height":1080,"frame_rate":{"num":25,"den":1},"segments":[{"source_id":"01K00000000000000000000001","source_in":{"value":0,"rate":25},"duration":{"value":50,"rate":25},"video_clip_id":"","audio_clip_id":"","link_group_id":""}],"timeline_id":"","video_track_id":"","audio_track_id":"","make_active":true,"exact_project_hex":null}
+{"type":"RemoveProjectTimeline","timeline_id":"01K00000000000000000000002","exact_project_hex":null}
+{"type":"SetProjectBinMetadata","item_id":"01K00000000000000000000001","metadata":{"description":"Interview retenue","rating":5,"tags":["interview"],"insert_order":0,"display_name":"Interview principale"},"exact_project_hex":null}
+{"type":"SetProjectTimelineBin","timeline_id":"01K00000000000000000000002","bin_id":"01K00000000000000000000003","exact_project_hex":null}
+{"type":"RenameProjectItem","item_id":"01K00000000000000000000002","name":"Montage vertical","exact_project_hex":null}
+{"type":"SetActiveProjectTimeline","timeline_id":"01K00000000000000000000002","exact_project_hex":null}
+{"type":"RelinkProjectMedia","replacements":[{"media_id":"01K00000000000000000000001","replacement":{"id":"01K00000000000000000000001","path":"rushes/interview.mov","filename":"interview.mov","codec":"h264","width":1920,"height":1080,"pixel_format":"yuv420p","color_range":"tv","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709","rotation_degrees":0,"rate":{"num":25,"den":1},"duration":{"value":250,"rate":25},"orientation":"landscape","has_audio":1,"audio_rate":48000,"audio_channels":2,"bin_id":"","proxy_path":"","metadata_complete":1},"stored_path":"rushes/interview.mov"}],"exact_project_hex":null}
+```
+
 ## Agent intégré et clé utilisateur
 
 Le panneau **Agent** contacte directement soit l’API Messages d’Anthropic, soit

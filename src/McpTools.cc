@@ -61,6 +61,12 @@ std::string PositiveIntSchema(const std::string& description) {
            Esc(description) + "\"}";
 }
 
+const char kMediaRateSchemaText[] =
+    "{\"type\":\"object\",\"description\":\"Exact positive integer frame rate.\","
+    "\"properties\":{\"num\":{\"type\":\"integer\",\"minimum\":1},"
+    "\"den\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"num\","
+    "\"den\"],\"additionalProperties\":false}";
+
 std::string EnumSchema(const std::vector<std::string>& values,
                        const std::string& description) {
     std::string valuesJson = "[";
@@ -224,6 +230,34 @@ bool ReadInt32(const Value& args, const std::string& key,
         return false;
     }
     out = static_cast<int32_t>(wide);
+    return true;
+}
+
+bool ReadMediaRate(const Value& args, const std::string& key,
+                   const std::string& path, MediaRate& rate,
+                   std::string& message) {
+    const Value* value = args.Find(key);
+    if (!value || !value->IsObject()) {
+        message = "'" + path + "." + key + "' must be an object";
+        return false;
+    }
+    if (!CheckKnownKeys(*value, {"num", "den"}, path + "." + key,
+                        message))
+        return false;
+    int64_t num = 0;
+    int64_t den = 0;
+    if (!ReadInt64(*value, "num", path + "." + key, true, 0, num,
+                   message) ||
+        !ReadInt64(*value, "den", path + "." + key, true, 0, den,
+                   message))
+        return false;
+    if (num <= 0 || den <= 0 ||
+        num > std::numeric_limits<int32_t>::max() ||
+        den > std::numeric_limits<int32_t>::max()) {
+        message = "'" + path + "." + key + "' must contain positive int32 values";
+        return false;
+    }
+    rate = {static_cast<int32_t>(num), static_cast<int32_t>(den)};
     return true;
 }
 
@@ -2432,6 +2466,121 @@ bool DispatchSetActiveTimeline(McpBackend& backend, const IdResolver& resolver,
                                     message);
 }
 
+bool ReadProjectTimelineId(McpBackend& backend, const std::string& requested,
+                           const std::string& tool, Ulid& timelineId,
+                           std::string& message) {
+    std::string json;
+    if (!backend.Describe(json, message)) return false;
+    Value description;
+    std::string parseError;
+    if (!Value::Parse(json, description, parseError)) {
+        message = "describe returned invalid JSON: " + parseError;
+        return false;
+    }
+    const Value* timelines = description.Find("timelines");
+    if (!timelines || !timelines->IsArray()) {
+        message = "this backend does not expose project timelines";
+        return false;
+    }
+    std::vector<Ulid> matches;
+    for (const Value& item : timelines->AsArray()) {
+        const Value* id = item.Find("id");
+        if (id && id->IsString() &&
+            id->AsString().compare(0, requested.size(), requested) == 0)
+            matches.push_back(id->AsString());
+    }
+    if (matches.empty()) {
+        message = "unknown timeline_id '" + requested + "'";
+        return false;
+    }
+    if (matches.size() != 1) {
+        message = "ambiguous timeline_id prefix '" + requested + "'";
+        return false;
+    }
+    timelineId = matches.front();
+    (void)tool;
+    return true;
+}
+
+bool DispatchListTimelines(McpBackend& backend, const IdResolver&,
+                           const Value& args, std::string& resultJson,
+                           std::string& errorName, std::string& message) {
+    if (!CheckKnownKeys(args, {}, "list_timelines", message))
+        return Fail(errorName, message, message);
+    std::string description;
+    if (!backend.Describe(description, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    Value root;
+    std::string parseError;
+    if (!Value::Parse(description, root, parseError))
+        return Fail(errorName, message,
+                    "describe returned invalid JSON: " + parseError);
+    const Value* timelines = root.Find("timelines");
+    if (!timelines || !timelines->IsArray())
+        return Fail(errorName, message,
+                    "this backend does not expose project timelines");
+    resultJson = "{\"timelines\":" + timelines->Dump() + "}";
+    return true;
+}
+
+bool DispatchAddTimeline(McpBackend& backend, const IdResolver&,
+                         const Value& args, std::string& resultJson,
+                         std::string& errorName, std::string& message) {
+    if (!CheckKnownKeys(args, {"name", "width", "height", "frame_rate"},
+                        "add_timeline", message))
+        return Fail(errorName, message, message);
+    AddProjectTimelineOperation operation;
+    if (!ReadString(args, "name", "add_timeline", true, "", operation.name,
+                    message) ||
+        !ReadInt32(args, "width", "add_timeline", true, operation.width,
+                   operation.width, message) ||
+        !ReadInt32(args, "height", "add_timeline", true, operation.height,
+                   operation.height, message) ||
+        !ReadMediaRate(args, "frame_rate", "add_timeline", operation.frame_rate,
+                       message))
+        return Fail(errorName, message, message);
+    return backend.ApplyProjectEdit(std::move(operation), resultJson, errorName,
+                                    message);
+}
+
+bool DispatchRemoveTimeline(McpBackend& backend, const IdResolver&,
+                            const Value& args, std::string& resultJson,
+                            std::string& errorName, std::string& message) {
+    if (!CheckKnownKeys(args, {"timeline_id"}, "remove_timeline", message))
+        return Fail(errorName, message, message);
+    std::string requested;
+    if (!ReadString(args, "timeline_id", "remove_timeline", true, "",
+                    requested, message))
+        return Fail(errorName, message, message);
+    RemoveProjectTimelineOperation operation;
+    if (!ReadProjectTimelineId(backend, requested, "remove_timeline",
+                               operation.timeline_id, message))
+        return Fail(errorName, message, message);
+    return backend.ApplyProjectEdit(std::move(operation), resultJson, errorName,
+                                    message);
+}
+
+bool DispatchRenameTimeline(McpBackend& backend, const IdResolver&,
+                            const Value& args, std::string& resultJson,
+                            std::string& errorName, std::string& message) {
+    if (!CheckKnownKeys(args, {"timeline_id", "name"}, "rename_timeline",
+                        message))
+        return Fail(errorName, message, message);
+    std::string requested;
+    RenameProjectItemOperation operation;
+    if (!ReadString(args, "timeline_id", "rename_timeline", true, "",
+                    requested, message) ||
+        !ReadString(args, "name", "rename_timeline", true, "", operation.name,
+                    message) ||
+        !ReadProjectTimelineId(backend, requested, "rename_timeline",
+                               operation.item_id, message))
+        return Fail(errorName, message, message);
+    return backend.ApplyProjectEdit(std::move(operation), resultJson, errorName,
+                                    message);
+}
+
 bool DispatchUndo(McpBackend& backend, const IdResolver&, const Value& args,
                   std::string& resultJson, std::string& errorName,
                   std::string& message) {
@@ -3391,6 +3540,43 @@ McpToolRegistry::McpToolRegistry() {
                    StringSchema("Full ID of the timeline to activate."), true)
             .Build("set_active_timeline arguments"),
         DispatchSetActiveTimeline);
+
+    add("list_timelines",
+        "List every project timeline with its stable ID, dimensions, exact "
+        "frame rate, duration and active state. Use its ID with the timeline "
+        "project tools; never address a timeline by list position.",
+        SchemaBuilder().Build("list_timelines takes no arguments"),
+        DispatchListTimelines);
+
+    add("add_timeline",
+        "Create a project timeline through the reversible project edit log. "
+        "All format values are exact integers, never inferred from pixels or "
+        "a floating-point frame rate.",
+        SchemaBuilder()
+            .Field("name", StringSchema("Timeline name."), true)
+            .Field("width", PositiveIntSchema("Stored pixel width."), true)
+            .Field("height", PositiveIntSchema("Stored pixel height."), true)
+            .Field("frame_rate", kMediaRateSchemaText, true)
+            .Build("add_timeline arguments"),
+        DispatchAddTimeline);
+
+    add("remove_timeline",
+        "Remove one project timeline through the reversible project edit log. "
+        "CUTMACHINE refuses to remove the last remaining timeline.",
+        SchemaBuilder()
+            .Field("timeline_id", StringSchema("Full ID or unambiguous prefix."),
+                   true)
+            .Build("remove_timeline arguments"),
+        DispatchRemoveTimeline);
+
+    add("rename_timeline",
+        "Rename one project timeline through the reversible project edit log.",
+        SchemaBuilder()
+            .Field("timeline_id", StringSchema("Full ID or unambiguous prefix."),
+                   true)
+            .Field("name", StringSchema("New timeline name."), true)
+            .Build("rename_timeline arguments"),
+        DispatchRenameTimeline);
 
     add("undo",
         "Undo the most recently applied operation on the active timeline, "

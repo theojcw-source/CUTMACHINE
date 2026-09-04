@@ -707,6 +707,31 @@ std::string Describe(const Document& document) {
     return output.str();
 }
 
+std::string DescribeTimelines(const Project& project) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << '[';
+    for (size_t index = 0; index < project.timelines.size(); ++index) {
+        if (index) output << ',';
+        const DocumentSequence& sequence = project.timelines[index];
+        const RationalTime duration =
+            Timeline(project.MakeDocument(sequence.id)).Duration();
+        output << "{\"id\":\"" << EscapeJson(sequence.id)
+               << "\",\"name\":\"" << EscapeJson(sequence.name)
+               << "\",\"dimensions\":{\"width\":" << sequence.width
+               << ",\"height\":" << sequence.height
+               << "},\"frame_rate\":{\"num\":" << sequence.frame_rate.num
+               << ",\"den\":" << sequence.frame_rate.den
+               << "},\"duration\":";
+        WriteTime(output, duration, sequence.frame_rate);
+        output << ",\"active\":"
+               << (sequence.id == project.active_timeline_id ? "true" : "false")
+               << '}';
+    }
+    output << ']';
+    return output.str();
+}
+
 std::string CanonicalHash(const std::string& json) {
     uint64_t hash = UINT64_C(1469598103934665603);
     for (const unsigned char byte : json) {
@@ -728,6 +753,14 @@ std::string CanonicalHash(const std::string& json) {
 // on) -- just skipping the project-file round trip DescribeCommand does.
 std::string DescribeDocument(const Document& document) {
     return Describe(document);
+}
+
+std::string DescribeProject(const Project& project) {
+    std::string description = Describe(project.MakeActiveDocument());
+    description.pop_back();
+    description.pop_back();
+    description += ",\"timelines\":" + DescribeTimelines(project) + "}\n";
+    return description;
 }
 
 std::string TimelineEditLogPathForProject(const std::string& projectPath,
@@ -1547,9 +1580,8 @@ int DescribeCommand(const std::string& documentPath, std::string& output) {
         output = ErrorJson(EditError::ParseError, message);
         return 1;
     }
-    Document document = project.MakeActiveDocument();
     try {
-        output = Describe(document);
+        output = DescribeProject(project);
         return 0;
     } catch (const std::exception& exception) {
         output = ErrorJson(EditError::ArithmeticError, exception.what());

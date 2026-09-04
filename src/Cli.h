@@ -114,6 +114,7 @@ int ProposeSequenceCommand(const std::string& projectPath, std::string& output);
 // resolver and the chat panel both key off), computed directly from an
 // in-memory Document instead of a project file path. See McpLiveBackend.h.
 std::string DescribeDocument(const Document& document);
+std::string DescribeProject(const Project& project);
 int ApplyOperationCommand(const std::string& documentPath,
                           const std::string& operationJson,
                           std::string& output);

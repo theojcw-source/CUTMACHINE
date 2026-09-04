@@ -301,6 +301,15 @@ int main() {
               firstDescription.find("\"name\":\"Premier raccord\"") !=
                   std::string::npos,
           "describe exposes stable marker IDs and aliases");
+    Check(firstDescription.find("\"timelines\":[{\"id\":") !=
+                  std::string::npos &&
+              firstDescription.find("\"dimensions\":{\"width\":1920,") !=
+                  std::string::npos &&
+              firstDescription.find("\"frame_rate\":{\"num\":25,") !=
+                  std::string::npos &&
+              firstDescription.find("\"active\":true") !=
+                  std::string::npos,
+          "describe exposes the active project's timeline summary");
 
     const std::string before = Read(path);
     const Operation trim = TrimClipOperation{
