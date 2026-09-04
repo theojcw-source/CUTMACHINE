@@ -527,10 +527,12 @@ bool ReadTrimAmount(McpBackend& backend, const Value& args,
         errorName = "IoError";
         return false;
     }
-    return ResolveClipSourceFrameTrim(document, clipId, sourceFrame, edge,
-                                      delta, message)
-               ? true
-               : Fail(errorName, message, message);
+    if (ResolveClipSourceFrameTrim(document, clipId, sourceFrame, edge, delta,
+                                   message)) {
+        return true;
+    }
+    errorName = EditErrorName(EditError::InvalidOperation);
+    return false;
 }
 
 bool DispatchTrimClip(McpBackend& backend, const IdResolver& resolver,
@@ -606,8 +608,10 @@ bool DispatchSplitClip(McpBackend& backend, const IdResolver& resolver,
         return false;
     }
     if (!ResolveClipSourceFramePosition(document, op.clip_id, sourceFrame,
-                                        op.timeline_position, message))
-        return Fail(errorName, message, message);
+                                        op.timeline_position, message)) {
+        errorName = EditErrorName(EditError::InvalidOperation);
+        return false;
+    }
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 

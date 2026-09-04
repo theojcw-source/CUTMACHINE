@@ -1375,10 +1375,17 @@ int main() {
         Check(!call("split_clip", R"({"clip_id":"01K30000000000000000000003"})")
                    .ok,
               "and naming neither is refused too");
-        Check(!call("split_clip", R"({"clip_id":"01K30000000000000000000003",)"
-                                  R"("source_frame":4000})")
-                   .ok,
-              "a frame the clip does not play is refused with a reason");
+        const McpToolCallOutcome outOfBoundsSplit =
+            call("split_clip", R"({"clip_id":"01K30000000000000000000003",)"
+                               R"("source_frame":4000})");
+        Check(!outOfBoundsSplit.ok &&
+                  outOfBoundsSplit.error_name == "InvalidOperation" &&
+                  outOfBoundsSplit.message.find("[101, 109]") !=
+                      std::string::npos &&
+                  outOfBoundsSplit.message.find("got 4000") !=
+                      std::string::npos,
+              "a source-frame cut outside the clip is InvalidOperation with "
+              "its actual bounds and value: " + outOfBoundsSplit.message);
 
         // A trim reads the same address, with the tail inclusive.
         Check(call("trim_clip", R"({"clip_id":"01K30000000000000000000003",)"

@@ -1555,11 +1555,50 @@ int main() {
                   SplitClipOperation{
                       document.sequence.tracks[0].clips[0].id, {10, 10}, {}},
                   error, message) &&
-                  error == EditError::InvalidTimelineIn,
+                  error == EditError::InvalidOperation,
               "cut on head is rejected");
+        Check(message.find("strictly within (10/10, 30/10)") !=
+                  std::string::npos &&
+                  message.find("got 10/10") != std::string::npos,
+              "cut refusal reports the actual bounds and requested position: " +
+                  message);
         Check(log.AppliedCount() == 0 && document.SaveToString() == initial,
               "rejected cut leaves bytes and event log unchanged");
     });
+
+    Test("linked split reports the member bounds before it reaches the log",
+         [] {
+             Document document = Fixture();
+             document.sequence.tracks.push_back(
+                 {"01KT0000000000000000000005", "audio", 1, {}});
+             EditLog setupLog;
+             EditError error = EditError::None;
+             std::string message;
+             const Ulid videoId = document.sequence.tracks[0].clips[0].id;
+             Check(setupLog.Apply(
+                       document,
+                       DetachAudioOperation{
+                           videoId, document.sequence.tracks[1].id,
+                           "01KT0000000000000000000006", {}},
+                       error, message),
+                   "linked split bounds fixture detaches audio: " + message);
+             const Ulid audioId = document.sequence.tracks[1].clips[0].id;
+             const Ulid groupId = document.FindClip(videoId)->link_group_id;
+             const std::string before = document.SaveToString();
+             EditLog log;
+             const SplitLinkedClipsOperation operation{
+                 groupId, {videoId, audioId}, {10, 10}, {}, {}, {}, {}};
+             Check(!log.Apply(document, operation, error, message) &&
+                       error == EditError::InvalidOperation,
+                   "linked cut on its head is InvalidOperation: " + message);
+             Check(message.find("strictly within (10/10, 30/10)") !=
+                       std::string::npos &&
+                       message.find("got 10/10") != std::string::npos,
+                   "linked cut refusal reports actual bounds and request: " +
+                       message);
+             Check(log.AppliedCount() == 0 && document.SaveToString() == before,
+                   "rejected linked cut is never journaled");
+         });
 
     Test("trim drag is clamped before duration can cross zero", [] {
         Document document = Fixture();

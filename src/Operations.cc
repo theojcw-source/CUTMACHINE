@@ -683,6 +683,60 @@ bool Negate(const RationalTime& value, RationalTime& output) {
     return true;
 }
 
+// B3 -- ROADMAP.md. A rejected edit is useful only when it says which exact
+// interval was available and which one was requested. Keeping this check
+// before any candidate mutation also makes a failed edit indistinguishable
+// from no edit to the event log.
+std::string DescribeTime(const RationalTime& value) {
+    return std::to_string(value.value) + "/" + std::to_string(value.rate);
+}
+
+bool ValidateEditedSourceRange(const std::string& operationName,
+                               const DocumentClip& clip,
+                               const DocumentSource& source,
+                               const ExactClipTimes& requested,
+                               EditError& error, std::string& message) {
+    const RationalTime requestedEnd =
+        requested.source_in.add(requested.duration);
+    if (requested.duration.value <= 0 || requested.source_in.value < 0 ||
+        requestedEnd > source.duration) {
+        Fail(EditError::InvalidOperation,
+             operationName + " source range for clip_id '" + clip.id +
+                 "' must stay within [0/" +
+                 std::to_string(source.duration.rate) + ", " +
+                 DescribeTime(source.duration) + "); requested [" +
+                 DescribeTime(requested.source_in) + ", " +
+                 DescribeTime(requestedEnd) + ")",
+             error, message);
+        return false;
+    }
+    return true;
+}
+
+bool ValidateEditedDuration(const std::string& operationName,
+                            const DocumentClip& clip,
+                            const ExactClipTimes& requested,
+                            EditError& error, std::string& message) {
+    if (requested.duration.value <= 0) {
+        Fail(EditError::InvalidOperation,
+             operationName + " duration for clip_id '" + clip.id +
+                 "' must be positive; requested " +
+                 DescribeTime(requested.duration),
+             error, message);
+        return false;
+    }
+    if (requested.timeline_in.value < 0) {
+        Fail(EditError::InvalidOperation,
+             operationName + " timeline_in for clip_id '" + clip.id +
+                 "' must stay within [0/" +
+                 std::to_string(requested.timeline_in.rate) + ", inf); got " +
+                 DescribeTime(requested.timeline_in),
+             error, message);
+        return false;
+    }
+    return true;
+}
+
 bool ApplyTrim(Document& candidate, TrimClipOperation& operation,
                Operation& inverse, EditError& error, std::string& message) {
     DocumentClip* clip = candidate.FindClip(operation.clip_id);
@@ -706,28 +760,32 @@ bool ApplyTrim(Document& candidate, TrimClipOperation& operation,
         return false;
     }
     const ExactClipTimes before = TimesOf(*clip);
+    ExactClipTimes requested = before;
     if (operation.edge == TrimEdge::Head) {
         if (!captionClip)
-            clip->source_in = clip->source_in.add(operation.delta);
-        clip->duration = clip->duration.sub(operation.delta);
-        clip->timeline_in = clip->timeline_in.add(operation.delta);
+            requested.source_in = requested.source_in.add(operation.delta);
+        requested.duration = requested.duration.sub(operation.delta);
+        requested.timeline_in = requested.timeline_in.add(operation.delta);
     } else {
-        clip->duration = clip->duration.add(operation.delta);
+        requested.duration = requested.duration.add(operation.delta);
     }
-    if (clip->duration.value <= 0) {
+    if (requested.duration.value <= 0) {
         Fail(EditError::InvalidDuration,
              "trim would make duration zero or negative", error, message);
         return false;
     }
-    if (clip->timeline_in.value < 0) {
+    if (requested.timeline_in.value < 0) {
         Fail(EditError::InvalidTimelineIn,
              "trim would make timeline_in negative", error, message);
         return false;
     }
-    if (source && !ValidateSourceRange(*source, clip->source_in, clip->duration,
-                                       error, message)) {
+    if (source && !ValidateEditedSourceRange("trim_clip", *clip, *source,
+                                             requested, error, message)) {
         return false;
     }
+    clip->source_in = requested.source_in;
+    clip->duration = requested.duration;
+    clip->timeline_in = requested.timeline_in;
     if (operation.exact_clip_result) {
         clip->source_in = operation.exact_clip_result->source_in;
         clip->duration = operation.exact_clip_result->duration;
@@ -1233,21 +1291,21 @@ bool ApplyRippleTrim(Document& candidate, RippleTrimOperation& operation,
     }
     std::map<Ulid, RationalTime> followingBoundary;
     for (const Ulid& id : trimIds) {
-        DocumentClip* clip = candidate.FindClip(id);
+        const DocumentClip* clip = candidate.FindClip(id);
         const DocumentTrack* track = candidate.FindTrackForClip(id);
-        const RationalTime originalEnd = clip->timeline_in.add(clip->duration);
+        const RationalTime originalEnd =
+            clip->timeline_in.add(clip->duration);
         followingBoundary[track->id] = originalEnd;
+        ExactClipTimes requested = TimesOf(*clip);
         if (operation.edge == TrimEdge::Head) {
-            clip->source_in = clip->source_in.add(operation.delta);
-            clip->duration = clip->duration.sub(operation.delta);
+            requested.source_in = requested.source_in.add(operation.delta);
+            requested.duration = requested.duration.sub(operation.delta);
         } else {
-            clip->duration = clip->duration.add(operation.delta);
+            requested.duration = requested.duration.add(operation.delta);
         }
         const DocumentSource* source = candidate.FindSource(clip->source_id);
-        if (clip->duration.value <= 0) {
-            Fail(EditError::InvalidDuration,
-                 "ripple trim would make duration non-positive", error,
-                 message);
+        if (!ValidateEditedDuration("ripple_trim", *clip, requested, error,
+                                    message)) {
             return false;
         }
         if (!source) {
@@ -1256,9 +1314,18 @@ bool ApplyRippleTrim(Document& candidate, RippleTrimOperation& operation,
                  message);
             return false;
         }
-        if (!ValidateSourceRange(*source, clip->source_in, clip->duration,
-                                 error, message)) {
+        if (!ValidateEditedSourceRange("ripple_trim", *clip, *source,
+                                       requested, error, message)) {
             return false;
+        }
+    }
+    for (const Ulid& id : trimIds) {
+        DocumentClip* clip = candidate.FindClip(id);
+        if (operation.edge == TrimEdge::Head) {
+            clip->source_in = clip->source_in.add(operation.delta);
+            clip->duration = clip->duration.sub(operation.delta);
+        } else {
+            clip->duration = clip->duration.add(operation.delta);
         }
     }
     for (const auto& boundary : followingBoundary) {
@@ -1349,27 +1416,46 @@ bool ApplyRollEdit(Document& candidate, RollEditOperation& operation,
     }
     const std::vector<ExactTrackState> before = snapshots(trackIds);
     for (const RollEditPair& pair : operation.pairs) {
-        DocumentClip* left = candidate.FindClip(pair.left_clip_id);
-        DocumentClip* right = candidate.FindClip(pair.right_clip_id);
-        left->duration = left->duration.add(operation.delta);
-        right->source_in = right->source_in.add(operation.delta);
-        right->duration = right->duration.sub(operation.delta);
-        right->timeline_in = right->timeline_in.add(operation.delta);
-        if (left->duration.value <= 0 || right->duration.value <= 0) {
-            Fail(EditError::InvalidDuration,
-                 "roll edit would make a clip non-positive", error, message);
+        const DocumentClip* left = candidate.FindClip(pair.left_clip_id);
+        const DocumentClip* right = candidate.FindClip(pair.right_clip_id);
+        ExactClipTimes leftRequested = TimesOf(*left);
+        ExactClipTimes rightRequested = TimesOf(*right);
+        leftRequested.duration = leftRequested.duration.add(operation.delta);
+        rightRequested.source_in =
+            rightRequested.source_in.add(operation.delta);
+        rightRequested.duration =
+            rightRequested.duration.sub(operation.delta);
+        rightRequested.timeline_in =
+            rightRequested.timeline_in.add(operation.delta);
+        if (!ValidateEditedDuration("roll_edit", *left, leftRequested, error,
+                                    message) ||
+            !ValidateEditedDuration("roll_edit", *right, rightRequested,
+                                    error, message)) {
             return false;
         }
         const DocumentSource* leftSource =
             candidate.FindSource(left->source_id);
         const DocumentSource* rightSource =
             candidate.FindSource(right->source_id);
-        if (!leftSource || !rightSource ||
-            !ValidateSourceRange(*leftSource, left->source_in, left->duration,
-                                 error, message) ||
-            !ValidateSourceRange(*rightSource, right->source_in,
-                                 right->duration, error, message))
+        if (!leftSource || !rightSource) {
+            Fail(EditError::UnknownSource,
+                 "roll edit pair references an unknown source", error,
+                 message);
             return false;
+        }
+        if (!ValidateEditedSourceRange("roll_edit", *left, *leftSource,
+                                       leftRequested, error, message) ||
+            !ValidateEditedSourceRange("roll_edit", *right, *rightSource,
+                                       rightRequested, error, message))
+            return false;
+    }
+    for (const RollEditPair& pair : operation.pairs) {
+        DocumentClip* left = candidate.FindClip(pair.left_clip_id);
+        DocumentClip* right = candidate.FindClip(pair.right_clip_id);
+        left->duration = left->duration.add(operation.delta);
+        right->source_in = right->source_in.add(operation.delta);
+        right->duration = right->duration.sub(operation.delta);
+        right->timeline_in = right->timeline_in.add(operation.delta);
     }
     if (!ValidateResult(candidate, error, message)) return false;
     operation.exact_track_result = snapshots(trackIds);
@@ -2591,8 +2677,12 @@ bool ApplySplit(Document& candidate, SplitClipOperation& operation,
     if (operation.timeline_position.rate <= 0 ||
         operation.timeline_position <= original.timeline_in ||
         operation.timeline_position >= end) {
-        Fail(EditError::InvalidTimelineIn,
-             "split position must be strictly inside the clip", error, message);
+        Fail(EditError::InvalidOperation,
+             "split_clip timeline_position must be strictly within (" +
+                 DescribeTime(original.timeline_in) + ", " +
+                 DescribeTime(end) + "); got " +
+                 DescribeTime(operation.timeline_position),
+             error, message);
         return false;
     }
     if (operation.right_clip_id.empty())
@@ -2713,13 +2803,23 @@ bool ApplySplitLinked(Document& candidate, SplitLinkedClipsOperation& operation,
     for (const Ulid& id : operation.clip_ids) {
         const DocumentClip* clip = candidate.FindClip(id);
         if (!clip || clip->link_group_id != operation.link_group_id ||
-            std::find(seen.begin(), seen.end(), id) != seen.end() ||
-            operation.timeline_position <= clip->timeline_in ||
-            operation.timeline_position >=
-                clip->timeline_in.add(clip->duration)) {
+            std::find(seen.begin(), seen.end(), id) != seen.end()) {
             Fail(EditError::InvalidOperation,
-                 "linked split members must be unique, share link_group_id, "
-                 "and contain the cut position",
+                 "split_linked_clips members must be unique and share "
+                 "link_group_id",
+                 error, message);
+            return false;
+        }
+        const RationalTime end = clip->timeline_in.add(clip->duration);
+        if (operation.timeline_position.rate <= 0 ||
+            operation.timeline_position <= clip->timeline_in ||
+            operation.timeline_position >= end) {
+            Fail(EditError::InvalidOperation,
+                 "split_linked_clips timeline_position must be strictly "
+                 "within (" +
+                     DescribeTime(clip->timeline_in) + ", " +
+                     DescribeTime(end) + ") for clip_id '" + clip->id +
+                     "'; got " + DescribeTime(operation.timeline_position),
                  error, message);
             return false;
         }

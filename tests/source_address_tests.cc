@@ -143,8 +143,10 @@ int main() {
                   document, "01K30000000000000000000010", 500, position, error),
               "une image que le plan ne joue pas est refusée, pas convertie "
               "en une position hors du plan");
-        Check(error.find("does not play source frame") != std::string::npos,
-              "et le refus dit lequel : " + error);
+        Check(error.find("[101, 174]") != std::string::npos &&
+                  error.find("got 500") != std::string::npos,
+              "et le refus publie les bornes réelles et la valeur : " +
+                  error);
     }
 
     // --- Les deux rognages --------------------------------------------------
@@ -161,6 +163,28 @@ int main() {
                                          160, TrimEdge::Tail, delta, error) &&
                   delta == RationalTime{-14, 25},
               "sortir sur l'image 160 la garde, elle comprise : " + error);
+        Check(ResolveClipSourceFrameTrim(document,
+                                         "01K30000000000000000000010", 100,
+                                         TrimEdge::Tail, delta, error) &&
+                  delta == RationalTime{-74, 25},
+              "sortir sur la première image jouée la garde : " + error);
+        Document oneFrame = Fixture();
+        EditLog oneFrameLog;
+        EditError oneFrameError = EditError::None;
+        std::string oneFrameMessage;
+        Check(oneFrameLog.Apply(
+                  oneFrame,
+                  Operation{TrimClipOperation{
+                      "01K30000000000000000000010", TrimEdge::Tail, delta,
+                      std::nullopt}},
+                  oneFrameError, oneFrameMessage),
+              "le rognage de queue sur la première image s'applique : " +
+                  oneFrameMessage);
+        const DocumentClip* oneFrameClip =
+            oneFrame.FindClip("01K30000000000000000000010");
+        Check(oneFrameClip != nullptr &&
+                  oneFrameClip->duration == RationalTime{1, 25},
+              "ce rognage laisse exactement une image");
         // 175 est la première image après le plan : y entrer ne laisserait
         // rien. 174, la dernière qu'il joue, en laisse une et reste licite.
         Check(ResolveClipSourceFrameTrim(document, "01K30000000000000000000010",
@@ -169,9 +193,10 @@ int main() {
         Check(
             !ResolveClipSourceFrameTrim(document, "01K30000000000000000000010",
                                         175, TrimEdge::Head, delta, error) &&
-                error.find("empty") != std::string::npos,
-            "un rognage de tête qui laisserait le plan vide est refusé : " +
-                error);
+                error.find("[0, 174]") != std::string::npos &&
+                error.find("got 175") != std::string::npos,
+            "un rognage de tête qui laisserait le plan vide publie les "
+            "bornes et la valeur : " + error);
 
         // Et le résultat s'applique vraiment : le contrat du ticket est que
         // ces valeurs soient consommables telles quelles par les opérations

@@ -3,6 +3,7 @@
 #include "Json.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace {
 
@@ -30,8 +31,71 @@ bool SourceFrameTime(const MediaRate& rate, int64_t frame, RationalTime& time,
         error = "source_frame cannot be negative";
         return false;
     }
+    if (frame > std::numeric_limits<int64_t>::max() / rate.den) {
+        error = "source_frame is too large for the source frame rate";
+        return false;
+    }
     time = RationalTime{frame * static_cast<int64_t>(rate.den), rate.num};
     return true;
+}
+
+int64_t FrameCount(const DocumentSource& source) {
+    return source.duration.to_frames(source.rate.num, source.rate.den);
+}
+
+bool LastFrameBefore(const RationalTime& time, const MediaRate& rate,
+                     int64_t& frame, std::string& error) {
+    frame = time.to_frames(rate.num, rate.den);
+    RationalTime frameTime;
+    if (!SourceFrameTime(rate, frame, frameTime, error)) return false;
+    if (frameTime == time) {
+        if (frame == std::numeric_limits<int64_t>::min()) {
+            error = "source frame bound underflows";
+            return false;
+        }
+        --frame;
+    }
+    return true;
+}
+
+bool FirstFrameAfter(const RationalTime& time, const MediaRate& rate,
+                     int64_t& frame, std::string& error) {
+    frame = time.to_frames(rate.num, rate.den);
+    RationalTime frameTime;
+    if (!SourceFrameTime(rate, frame, frameTime, error)) return false;
+    if (frameTime <= time) {
+        if (frame == std::numeric_limits<int64_t>::max()) {
+            error = "source frame bound overflows";
+            return false;
+        }
+        ++frame;
+    }
+    return true;
+}
+
+bool FirstFrameAtOrAfter(const RationalTime& time, const MediaRate& rate,
+                         int64_t& frame, std::string& error) {
+    frame = time.to_frames(rate.num, rate.den);
+    RationalTime frameTime;
+    if (!SourceFrameTime(rate, frame, frameTime, error)) return false;
+    if (frameTime < time) {
+        if (frame == std::numeric_limits<int64_t>::max()) {
+            error = "source frame bound overflows";
+            return false;
+        }
+        ++frame;
+    }
+    return true;
+}
+
+bool ValidateSourceFrameBounds(const std::string& operation,
+                               int64_t sourceFrame, int64_t first,
+                               int64_t last, std::string& error) {
+    if (sourceFrame >= first && sourceFrame <= last) return true;
+    error = operation + " source_frame must be within [" +
+            std::to_string(first) + ", " + std::to_string(last) +
+            "]; got " + std::to_string(sourceFrame);
+    return false;
 }
 
 }  // namespace
@@ -101,16 +165,19 @@ bool ResolveClipSourceFramePosition(const Document& document,
         error = "clip '" + clipId + "' reads from an unmounted source";
         return false;
     }
+    int64_t first = 0;
+    int64_t last = 0;
+    if (!FirstFrameAfter(clip->source_in, source->rate, first, error) ||
+        !LastFrameBefore(clip->source_in.add(clip->duration), source->rate,
+                         last, error))
+        return false;
+    if (!ValidateSourceFrameBounds("split_clip", sourceFrame, first, last,
+                                   error)) {
+        return false;
+    }
     RationalTime sourceTime;
     if (!SourceFrameTime(source->rate, sourceFrame, sourceTime, error))
         return false;
-    const RationalTime clipEnd = clip->source_in.add(clip->duration);
-    if (sourceTime.compare(clip->source_in) < 0 ||
-        sourceTime.compare(clipEnd) >= 0) {
-        error = "clip '" + clipId + "' does not play source frame " +
-                std::to_string(sourceFrame);
-        return false;
-    }
     timelinePosition = clip->timeline_in.add(sourceTime.sub(clip->source_in));
     return true;
 }
@@ -127,6 +194,20 @@ bool ResolveClipSourceFrameTrim(const Document& document, const Ulid& clipId,
     const DocumentSource* source = document.FindSource(clip->source_id);
     if (source == nullptr) {
         error = "clip '" + clipId + "' reads from an unmounted source";
+        return false;
+    }
+    int64_t clipFirst = 0;
+    int64_t clipLast = 0;
+    if (!FirstFrameAtOrAfter(clip->source_in, source->rate, clipFirst,
+                             error) ||
+        !LastFrameBefore(clip->source_in.add(clip->duration), source->rate,
+                         clipLast, error))
+        return false;
+    const int64_t sourceLast = FrameCount(*source) - 1;
+    const int64_t first = edge == TrimEdge::Head ? 0 : clipFirst;
+    const int64_t last = edge == TrimEdge::Head ? clipLast : sourceLast;
+    if (!ValidateSourceFrameBounds("trim_clip", sourceFrame, first, last,
+                                   error)) {
         return false;
     }
     RationalTime sourceTime;
@@ -147,6 +228,10 @@ bool ResolveClipSourceFrameTrim(const Document& document, const Ulid& clipId,
     // run to the start of the frame after it. This +1 is exactly the
     // arithmetic a caller must not be asked to do.
     RationalTime lastFrameEnd;
+    if (sourceFrame == std::numeric_limits<int64_t>::max()) {
+        error = "trim_clip source_frame is too large";
+        return false;
+    }
     if (!SourceFrameTime(source->rate, sourceFrame + 1, lastFrameEnd, error))
         return false;
     delta = lastFrameEnd.sub(clip->source_in.add(clip->duration));

@@ -666,7 +666,7 @@ int main() {
                               TrimEdge::Head,
                               {-101, 25},
                               std::nullopt},
-            EditError::SourceOutOfBounds, "head trim before source start");
+            EditError::InvalidOperation, "head trim before source start");
 
         Document tailOverlap = base;
         tailOverlap.sequence.tracks[0].clips[1].timeline_in = {11, 25};
@@ -1296,6 +1296,47 @@ int main() {
                        "ripple cannot shift a locked sync track");
     });
 
+    Test("ripple trim refuses a source range outside the real rush bounds", [] {
+        Document document = EditDocument();
+        const std::string before = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const RippleTrimOperation operation{
+            document.sequence.tracks[0].clips[0].id, TrimEdge::Tail,
+            {1000, 25}, {}, {}, {}};
+        Check(!log.Apply(document, operation, error, message) &&
+                  error == EditError::InvalidOperation,
+              "ripple trim beyond the rush is InvalidOperation: " + message);
+        Check(message.find("within [0/25, 1000/25)") != std::string::npos &&
+                  message.find("requested [100/25, 1110/25)") !=
+                      std::string::npos,
+              "ripple trim reports the real source bounds and request: " +
+                  message);
+        Check(log.AppliedCount() == 0 && document.SaveToString() == before,
+              "rejected ripple trim is never journaled");
+    });
+
+    Test("trim clip refuses a source range outside the real rush bounds", [] {
+        Document document = EditDocument();
+        const std::string before = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const TrimClipOperation operation{
+            document.sequence.tracks[0].clips[0].id, TrimEdge::Tail,
+            {1000, 25}, std::nullopt};
+        Check(!log.Apply(document, operation, error, message) &&
+                  error == EditError::InvalidOperation,
+              "trim beyond the rush is InvalidOperation: " + message);
+        Check(message.find("within [0/25, 1000/25)") != std::string::npos &&
+                  message.find("requested [100/25, 1110/25)") !=
+                      std::string::npos,
+              "trim reports the real source bounds and request: " + message);
+        Check(log.AppliedCount() == 0 && document.SaveToString() == before,
+              "rejected trim is never journaled");
+    });
+
     Test("roll edit moves one contiguous cut without changing total duration",
          [] {
              Document document = EditDocument();
@@ -1330,6 +1371,32 @@ int main() {
                        document.SaveToString() == before,
                    "one undo restores both sides of the roll edit");
          });
+
+    Test("roll edit refuses a source range outside the real rush bounds", [] {
+        Document document = EditDocument();
+        document.sources.push_back(
+            {"01K20000000000000000000022", "short.MP4", {25, 1}, {110, 25}});
+        document.sequence.tracks[0].clips[0].source_id =
+            "01K20000000000000000000022";
+        document.sequence.tracks[0].clips[1].timeline_in = {10, 25};
+        const std::string before = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const RollEditOperation operation{
+            {{document.sequence.tracks[0].clips[0].id,
+              document.sequence.tracks[0].clips[1].id}},
+            {1, 25}, {}};
+        Check(!log.Apply(document, operation, error, message) &&
+                  error == EditError::InvalidOperation,
+              "roll beyond the rush is InvalidOperation: " + message);
+        Check(message.find("within [0/25, 110/25)") != std::string::npos &&
+                  message.find("requested [100/25, 111/25)") !=
+                      std::string::npos,
+              "roll reports the real source bounds and request: " + message);
+        Check(log.AppliedCount() == 0 && document.SaveToString() == before,
+              "rejected roll edit is never journaled");
+    });
 
     Test("slip edit changes only the source window and is reversible", [] {
         Document document = EditDocument();
