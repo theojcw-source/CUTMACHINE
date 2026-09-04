@@ -157,7 +157,9 @@ public:
         return false;
     }
 
-    virtual bool AnalyzeSourceSpeechOnset(const Ulid&, std::string&,
+    virtual bool AnalyzeSourceSpeechOnset(const Ulid&,
+                                          const SpeechOnsetSettings&,
+                                          std::string&,
                                           std::string& message) {
         message = "this backend cannot run a speech onset analysis";
         return false;

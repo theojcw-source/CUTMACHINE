@@ -51,6 +51,16 @@
 // stored in different places -- one in a cache file, one in the document.
 constexpr int64_t kSpeechLevelScale = kAudioLevelScale;
 
+// B1 -- ROADMAP.md. A contiguous voice region in the source-domain analysis
+// grid. Levels are whole dBFS so the cache stays integer-only and canonical;
+// start is inclusive and end is exclusive.
+struct SpeechGroup {
+    RationalTime start{0, 1};
+    RationalTime end{0, 1};
+    int64_t level_dbfs = -120;
+    int64_t peak_dbfs = -120;
+};
+
 struct SpeechOnsetReport {
     std::string media_id;
     // Windows per second of the analysis grid. Window k covers
@@ -64,6 +74,12 @@ struct SpeechOnsetReport {
     // one is for.
     int64_t speech_level = 0;
     int64_t noise_floor = 0;
+    // Gap used when the persisted groups were measured. It is analysis
+    // identity, not a Document preference: re-running the analysis replaces
+    // it, and loading a version-1 cache derives groups with the default.
+    int64_t group_gap_milliseconds = 200;
+    int64_t group_floor_db = 6;
+    std::vector<SpeechGroup> groups;
     std::vector<int64_t> levels;  // RMS per window, ascending by time.
 };
 
@@ -115,6 +131,21 @@ struct SpeechOnsetThresholds {
     // Lead-in at or below this is already tight; suggesting a trim of one or
     // two frames would churn an edit for nothing audible.
     int64_t tolerance_milliseconds = 120;
+    // A gap this long separates two voice groups. Shorter hollows remain
+    // inside one phrase. At the default 50-window grid, 200 ms is 10 windows.
+    int64_t group_gap_milliseconds = 200;
+    // Group detection starts above the source noise floor, independently of
+    // the onset threshold. This separation is what keeps a quiet interviewer
+    // question visible even when it sits more than 12 dB below the answer.
+    int64_t group_floor_db = 6;
+    // `dominant_onset` is the first group close enough to this percentile of
+    // the clip. The comparison is in dBFS, where amplitude differences are
+    // meaningful across a quiet question and the subject's answer.
+    int64_t dominant_percentile = 90;
+    int64_t dominance_db = 9;
+    // Six 20 ms windows reject a short interjection or transient without
+    // moving a sustained answer.
+    int64_t dominant_sustain_windows = 6;
 };
 
 struct ClipSpeechOnset {
@@ -140,6 +171,10 @@ struct ClipSpeechOnset {
     // caller must not compute: publishing it is what keeps a model from
     // turning a measurement back into arithmetic.
     RationalTime suggested_trim{0, 1};
+    // Persisted source groups clipped to this clip's own source range.
+    std::vector<SpeechGroup> groups;
+    RationalTime dominant_onset{0, 1};
+    bool dominant_measured = false;
     // False when the clip holds no window, or when the source has too little
     // dynamic range to measure, or when no run of windows ever clears the
     // threshold. `detail` says which.
@@ -192,6 +227,19 @@ int64_t FirstSustainedWindow(const std::vector<int64_t>& levels,
                              int64_t firstWindow, int64_t threshold,
                              int64_t sustainWindows);
 
+// Converts one linear RMS level to the nearest whole dBFS. Digital silence is
+// pinned to -120 dBFS, the cache's explicit floor.
+int64_t SpeechLevelDbfs(int64_t level);
+
+// B1 -- ROADMAP.md. Pure envelope -> groups transform. No FFmpeg and no
+// filesystem: callers pass the already measured integer envelope. Returns a
+// named refusal for invalid bounds instead of silently clamping a setting.
+bool BuildSpeechGroups(const std::vector<int64_t>& levels,
+                       uint32_t windowsPerSecond, int64_t speechLevel,
+                       int64_t noiseFloor,
+                       const SpeechOnsetThresholds& thresholds,
+                       std::vector<SpeechGroup>& groups, std::string& error);
+
 // Summarizes the envelope windows that fall inside `clip`'s own source range
 // and resolves the trim that would put the clip's in point on the word.
 // `sequenceRate` is what the suggested trim is expressed in, because that is
@@ -216,6 +264,7 @@ struct SpeechOnsetSettings {
     // decode cheap. The rate is recorded in the cache because changing it
     // changes the numbers.
     uint32_t decode_sample_rate = 16000;
+    SpeechOnsetThresholds thresholds;
     std::string ffmpeg_path = "ffmpeg";
 };
 

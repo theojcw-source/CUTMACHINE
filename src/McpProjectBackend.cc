@@ -119,11 +119,12 @@ bool McpProjectBackend::ReadSourceSpeechOnset(const Ulid& sourceId,
 }
 
 bool McpProjectBackend::AnalyzeSourceSpeechOnset(const Ulid& sourceId,
+                                                 const SpeechOnsetSettings& settings,
                                                  std::string& resultJson,
                                                  std::string& message) {
     std::string output;
-    const int result =
-        AnalyzeSpeechOnsetCommand(project_path_, sourceId, output);
+    const int result = AnalyzeSpeechOnsetCommand(project_path_, sourceId,
+                                                 output, settings);
     std::string errorName;
     return ParseCommandResult(output, result == 0, resultJson, errorName,
                               message);

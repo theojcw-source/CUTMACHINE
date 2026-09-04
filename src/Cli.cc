@@ -1251,7 +1251,8 @@ int AlignTranscriptsCommand(const std::string& projectPath, bool apply,
 }
 
 int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
-                              const std::string& mediaId, std::string& output) {
+                              const std::string& mediaId, std::string& output,
+                              const SpeechOnsetSettings& settings) {
     Project project;
     std::string error;
     if (!LoadStoredProject(projectPath, project, error)) {
@@ -1281,11 +1282,10 @@ int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
     MediaTaskManager tasks(1);
     const Ulid taskId = tasks.Enqueue(
         MediaTaskKind::SpeechOnset, "Analyse parole " + media->filename,
-        [input, reportPath, mediaId](MediaTaskContext& context,
-                                     std::string& taskError) {
+        [input, reportPath, mediaId,
+         settings](MediaTaskContext& context, std::string& taskError) {
             return GenerateSpeechOnset(input.string(), reportPath.string(),
-                                       mediaId, SpeechOnsetSettings{}, context,
-                                       taskError);
+                                       mediaId, settings, context, taskError);
         });
     if (!tasks.WaitForIdle(24 * 60 * 60 * 1000)) {
         tasks.Cancel(taskId);
@@ -1314,13 +1314,15 @@ int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
     output = "{\"ok\":true,\"media_id\":\"" + EscapeJson(mediaId) +
              "\",\"path\":\"" + EscapeJson(reportPath.string()) +
              "\",\"windows\":" + std::to_string(report.levels.size()) +
+             ",\"groups\":" + std::to_string(report.groups.size()) +
              ",\"speech_level\":" + std::to_string(report.speech_level) +
              ",\"noise_floor\":" + std::to_string(report.noise_floor) + "}\n";
     return 0;
 }
 
 int SpeechOnsetReportCommand(const std::string& projectPath,
-                             std::string& output) {
+                             std::string& output,
+                             const SpeechOnsetThresholds& thresholds) {
     Project project;
     std::string error;
     if (!LoadStoredProject(projectPath, project, error)) {
@@ -1344,9 +1346,7 @@ int SpeechOnsetReportCommand(const std::string& projectPath,
                 reports.emplace(clip.source_id, std::move(report));
         }
     }
-    output = DescribeSpeechOnsetForAgent(document, reports,
-                                         SpeechOnsetThresholds{}) +
-             "\n";
+    output = DescribeSpeechOnsetForAgent(document, reports, thresholds) + "\n";
     return 0;
 }
 

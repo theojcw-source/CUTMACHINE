@@ -62,6 +62,10 @@ public:
         std::function<bool(const Ulid&, std::string&, std::string&)>;
     using CaptureFrameCallback = std::function<bool(
         const Ulid&, const RationalTime&, std::string&, std::string&)>;
+    using SourceSpeechOnsetCallback =
+        std::function<bool(const Ulid&, SpeechOnsetReport&, std::string&)>;
+    using AnalyzeSpeechOnsetCallback = std::function<bool(
+        const Ulid&, const SpeechOnsetSettings&, std::string&, std::string&)>;
     // Neither reference is owned; both must outlive this backend. `onApplied`
     // (optional) is invoked after every successful ApplyOperation/Undo/Redo,
     // before the call returns -- main.mm wires it to the same
@@ -79,7 +83,9 @@ public:
                    SourceTranscriptCallback readSourceTranscript = nullptr,
                    SourceShotQualityCallback readSourceShotQuality = nullptr,
                    AnalyzeShotQualityCallback analyzeShotQuality = nullptr,
-                   CaptureFrameCallback captureFrame = nullptr);
+                   CaptureFrameCallback captureFrame = nullptr,
+                   SourceSpeechOnsetCallback readSourceSpeechOnset = nullptr,
+                   AnalyzeSpeechOnsetCallback analyzeSpeechOnset = nullptr);
 
     bool SnapshotDocument(Document& document, std::string& message) override;
     bool ApplyOperation(Operation operation, std::string& resultJson,
@@ -94,6 +100,12 @@ public:
     bool ReadSourceShotQuality(const Ulid& sourceId, ShotQualityReport& report,
                                std::string& message) override;
     bool AnalyzeSourceShotQuality(const Ulid& sourceId, std::string& resultJson,
+                                  std::string& message) override;
+    bool ReadSourceSpeechOnset(const Ulid& sourceId, SpeechOnsetReport& report,
+                               std::string& message) override;
+    bool AnalyzeSourceSpeechOnset(const Ulid& sourceId,
+                                  const SpeechOnsetSettings& settings,
+                                  std::string& resultJson,
                                   std::string& message) override;
     bool CaptureSourceFrame(const Ulid& sourceId, const RationalTime& time,
                             std::string& jpegBytes,
@@ -115,4 +127,6 @@ private:
     SourceShotQualityCallback read_source_shot_quality_;
     AnalyzeShotQualityCallback analyze_shot_quality_;
     CaptureFrameCallback capture_frame_;
+    SourceSpeechOnsetCallback read_source_speech_onset_;
+    AnalyzeSpeechOnsetCallback analyze_speech_onset_;
 };

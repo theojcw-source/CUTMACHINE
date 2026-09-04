@@ -4251,6 +4251,41 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             return ::CaptureSourceFrame(path.lexically_normal().string(), time,
                                         FrameCaptureSettings{}, jpegBytes,
                                         message);
+        },
+        [weakSelf](const Ulid& sourceId, SpeechOnsetReport& report,
+                   std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            return LoadSpeechOnset(
+                (projectPath.parent_path() / ".cutmachine" / "speechonset" /
+                 (sourceId + ".json"))
+                    .string(),
+                report, message);
+        },
+        [weakSelf](const Ulid& sourceId,
+                   const SpeechOnsetSettings& settings,
+                   std::string& resultJson, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            std::string output;
+            const int result = AnalyzeSpeechOnsetCommand(
+                strongSelf.documentPath.UTF8String ?: "", sourceId, output,
+                settings);
+            if (result != 0) {
+                message = output;
+                return false;
+            }
+            resultJson = output;
+            return true;
         });
     self.chatPanelView = [[CMChatPanelView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];

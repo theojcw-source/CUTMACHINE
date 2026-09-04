@@ -2282,8 +2282,35 @@ bool DispatchReadFrame(McpBackend& backend, const IdResolver& resolver,
 bool DispatchListSpeechOnsets(McpBackend& backend, const IdResolver&,
                               const Value& args, std::string& resultJson,
                               std::string& errorName, std::string& message) {
-    if (!CheckKnownKeys(args, {}, "list_speech_onsets", message))
+    static const std::vector<std::string> kAllowed = {
+        "group_gap_ms", "dominant_percentile", "dominance_db",
+        "dominant_sustain_windows"};
+    if (!CheckKnownKeys(args, kAllowed, "list_speech_onsets", message))
         return Fail(errorName, message, message);
+    SpeechOnsetThresholds thresholds;
+    if (!ReadInt64(args, "group_gap_ms", "list_speech_onsets", false,
+                   thresholds.group_gap_milliseconds,
+                   thresholds.group_gap_milliseconds, message) ||
+        !ReadInt64(args, "dominant_percentile", "list_speech_onsets", false,
+                   thresholds.dominant_percentile,
+                   thresholds.dominant_percentile, message) ||
+        !ReadInt64(args, "dominance_db", "list_speech_onsets", false,
+                   thresholds.dominance_db, thresholds.dominance_db,
+                   message) ||
+        !ReadInt64(args, "dominant_sustain_windows", "list_speech_onsets",
+                   false, thresholds.dominant_sustain_windows,
+                   thresholds.dominant_sustain_windows, message))
+        return Fail(errorName, message, message);
+    if (thresholds.group_gap_milliseconds < 20 ||
+        thresholds.group_gap_milliseconds > 60000 ||
+        thresholds.dominant_percentile < 1 ||
+        thresholds.dominant_percentile > 100 || thresholds.dominance_db < 0 ||
+        thresholds.dominance_db > 120 ||
+        thresholds.dominant_sustain_windows < 1 ||
+        thresholds.dominant_sustain_windows > 100000)
+        return Fail(errorName, message,
+                    "speech onset thresholds are outside their documented "
+                    "bounds");
     Document document;
     if (!backend.SnapshotDocument(document, message))
         return Fail(errorName, message, message);
@@ -2299,22 +2326,32 @@ bool DispatchListSpeechOnsets(McpBackend& backend, const IdResolver&,
                 reports.emplace(clip.source_id, std::move(report));
         }
     }
-    resultJson =
-        DescribeSpeechOnsetForAgent(document, reports, SpeechOnsetThresholds{});
+    resultJson = DescribeSpeechOnsetForAgent(document, reports, thresholds);
     return true;
 }
 
 bool DispatchAnalyzeSpeechOnset(McpBackend& backend, const IdResolver& resolver,
                                 const Value& args, std::string& resultJson,
                                 std::string& errorName, std::string& message) {
-    static const std::vector<std::string> kAllowed = {"media_id"};
+    static const std::vector<std::string> kAllowed = {"media_id",
+                                                      "group_gap_ms"};
     if (!CheckKnownKeys(args, kAllowed, "analyze_speech_onset", message))
         return Fail(errorName, message, message);
     Ulid mediaId;
+    SpeechOnsetSettings settings;
     if (!ReadId(args, "media_id", "analyze_speech_onset", resolver, true,
-                mediaId, message))
+                mediaId, message) ||
+        !ReadInt64(args, "group_gap_ms", "analyze_speech_onset", false,
+                   settings.thresholds.group_gap_milliseconds,
+                   settings.thresholds.group_gap_milliseconds, message))
         return Fail(errorName, message, message);
-    return backend.AnalyzeSourceSpeechOnset(mediaId, resultJson, message)
+    if (settings.thresholds.group_gap_milliseconds < 20 ||
+        settings.thresholds.group_gap_milliseconds > 60000)
+        return Fail(errorName, message,
+                    "'analyze_speech_onset.group_gap_ms' must be between 20 "
+                    "and 60000");
+    return backend.AnalyzeSourceSpeechOnset(mediaId, settings, resultJson,
+                                            message)
                ? true
                : Fail(errorName, message, message);
 }
@@ -3384,12 +3421,32 @@ McpToolRegistry::McpToolRegistry() {
         "timestamps opens clips on up to a second of dead air that listeners "
         "hear as hesitation -- which list_disfluencies cannot see, since "
         "those pauses contain no word to remove. Each entry publishes "
+        "the source-domain speech `groups` with their average and peak dBFS, "
+        "plus `dominant_onset`: the first sustained group close to the "
+        "clip's own level, so a quiet interviewer question is not mistaken "
+        "for the subject's answer. "
         "`suggested_trim` in whole sequence frames, pre-roll already "
         "deducted: pass it straight to ripple_trim rather than computing one, "
         "and use `link_group_id` to trim the picture and sound together. "
         "Clips whose source has not been analysed are listed under "
         "\"unanalyzed\" and are not a pass: they are unknown.",
-        SchemaBuilder().Build("list_speech_onsets takes no arguments"),
+        SchemaBuilder()
+            .Field("group_gap_ms",
+                   IntSchema("Silence that separates two speech groups, in "
+                             "milliseconds (default 200)."),
+                   false)
+            .Field("dominant_percentile",
+                   IntSchema("Clip level reference percentile (default 90)."),
+                   false)
+            .Field("dominance_db",
+                   IntSchema("Maximum level difference from that percentile, "
+                             "in dB (default 9)."),
+                   false)
+            .Field("dominant_sustain_windows",
+                   IntSchema("Minimum group duration in 20 ms windows "
+                             "(default 6)."),
+                   false)
+            .Build("list_speech_onsets arguments"),
         DispatchListSpeechOnsets);
 
     add("analyze_speech_onset",
@@ -3398,6 +3455,10 @@ McpToolRegistry::McpToolRegistry() {
         "long-running.",
         SchemaBuilder()
             .Field("media_id", IdSchema("Source media to analyse."), true)
+            .Field("group_gap_ms",
+                   IntSchema("Silence that separates two speech groups, in "
+                             "milliseconds (default 200)."),
+                   false)
             .Build("analyze_speech_onset arguments"),
         DispatchAnalyzeSpeechOnset);
 

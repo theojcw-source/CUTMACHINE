@@ -11,7 +11,9 @@ McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
                                SourceTranscriptCallback readSourceTranscript,
                                SourceShotQualityCallback readSourceShotQuality,
                                AnalyzeShotQualityCallback analyzeShotQuality,
-                               CaptureFrameCallback captureFrame)
+                               CaptureFrameCallback captureFrame,
+                               SourceSpeechOnsetCallback readSourceSpeechOnset,
+                               AnalyzeSpeechOnsetCallback analyzeSpeechOnset)
     : document_(document),
       edit_log_(editLog),
       on_applied_(std::move(onApplied)),
@@ -21,7 +23,9 @@ McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
       read_source_transcript_(std::move(readSourceTranscript)),
       read_source_shot_quality_(std::move(readSourceShotQuality)),
       analyze_shot_quality_(std::move(analyzeShotQuality)),
-      capture_frame_(std::move(captureFrame)) {}
+      capture_frame_(std::move(captureFrame)),
+      read_source_speech_onset_(std::move(readSourceSpeechOnset)),
+      analyze_speech_onset_(std::move(analyzeSpeechOnset)) {}
 
 bool McpLiveBackend::SnapshotDocument(Document& document, std::string&) {
     document = document_;
@@ -91,6 +95,26 @@ bool McpLiveBackend::AnalyzeSourceShotQuality(const Ulid& sourceId,
         return false;
     }
     return analyze_shot_quality_(sourceId, resultJson, message);
+}
+
+bool McpLiveBackend::ReadSourceSpeechOnset(const Ulid& sourceId,
+                                           SpeechOnsetReport& report,
+                                           std::string& message) {
+    if (!read_source_speech_onset_) {
+        message = "the live backend has no speech onset reader";
+        return false;
+    }
+    return read_source_speech_onset_(sourceId, report, message);
+}
+
+bool McpLiveBackend::AnalyzeSourceSpeechOnset(
+    const Ulid& sourceId, const SpeechOnsetSettings& settings,
+    std::string& resultJson, std::string& message) {
+    if (!analyze_speech_onset_) {
+        message = "the live backend cannot run a speech onset analysis";
+        return false;
+    }
+    return analyze_speech_onset_(sourceId, settings, resultJson, message);
 }
 
 bool McpLiveBackend::CaptureSourceFrame(const Ulid& sourceId,

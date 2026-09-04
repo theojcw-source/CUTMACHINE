@@ -29,7 +29,9 @@ public:
                                   std::string& message) override;
     bool ReadSourceSpeechOnset(const Ulid& sourceId, SpeechOnsetReport& report,
                                std::string& message) override;
-    bool AnalyzeSourceSpeechOnset(const Ulid& sourceId, std::string& resultJson,
+    bool AnalyzeSourceSpeechOnset(const Ulid& sourceId,
+                                  const SpeechOnsetSettings& settings,
+                                  std::string& resultJson,
                                   std::string& message) override;
     bool AlignSourceTranscripts(bool apply, std::string& resultJson,
                                 std::string& message) override;

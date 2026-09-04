@@ -219,6 +219,26 @@ public:
         return ok;
     }
 
+    bool ReadSourceSpeechOnset(const Ulid& sourceId, SpeechOnsetReport& report,
+                               std::string& message) override {
+        __block bool ok = false;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          ok = live_.ReadSourceSpeechOnset(sourceId, report, message);
+        });
+        return ok;
+    }
+
+    bool AnalyzeSourceSpeechOnset(
+        const Ulid& sourceId, const SpeechOnsetSettings& settings,
+        std::string& resultJson, std::string& message) override {
+        __block bool ok = false;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          ok = live_.AnalyzeSourceSpeechOnset(sourceId, settings, resultJson,
+                                              message);
+        });
+        return ok;
+    }
+
     bool CaptureSourceFrame(const Ulid& sourceId, const RationalTime& time,
                             std::string& jpegBytes,
                             std::string& message) override {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Export.h"
+#include "SpeechOnset.h"
 
 #include <map>
 #include <string>
@@ -58,9 +59,11 @@ int TimelineStatsCommand(const std::string& projectPath, std::string& output);
 // report publishes the trim in whole frames precisely so a caller never
 // computes one (PHILOSOPHY.md principle 7).
 int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
-                              const std::string& mediaId, std::string& output);
+                              const std::string& mediaId, std::string& output,
+                              const SpeechOnsetSettings& settings = {});
 int SpeechOnsetReportCommand(const std::string& projectPath,
-                             std::string& output);
+                             std::string& output,
+                             const SpeechOnsetThresholds& thresholds = {});
 // ALIGN-2026-08 -- reports which cached word boundaries the speech envelope
 // contradicts, and where each one belongs. Read-only unless `apply`: a
 // transcript is a cache artifact several tools read, and rewriting it under
