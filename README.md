@@ -445,6 +445,8 @@ décodage média :
   '{"type":"TrimClip","clip_id":"01K00000000000000000000003","edge":"Tail","delta":{"value":-1,"rate":25},"exact_clip":null}'
 ./build/cutmachine --apply-project-op ./Film.cutmachine-project/project.cutmachine.json \
   '{"type":"AddProjectTimeline","name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1},"timeline_id":"","video_track_id":"","audio_track_id":"","exact_project_hex":null}'
+./build/cutmachine --apply-project-op ./Film.cutmachine-project/project.cutmachine.json \
+  '[{"type":"RenameProjectItem","item_id":"<timeline-id>","name":"Version courte","exact_project_hex":null},{"type":"SetActiveProjectTimeline","timeline_id":"<timeline-id>","exact_project_hex":null}]'
 ./build/cutmachine --undo-project-op ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --redo-project-op ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --ingest ./Film.cutmachine-project/project.cutmachine.json ./rushes --recursive
@@ -489,6 +491,12 @@ tournure connue de sous-titrage ou d'abonnement ne fait que renforcer ce
 diagnostic et ne suffit jamais à elle seule. Les outils MCP
 `list_disfluencies`, `remove_words` et `create_interview_short` refusent ces
 transcriptions, sauf demande explicite avec `force: true`.
+
+`--apply-project-op` accepte soit une opération canonique, soit un tableau.
+Dans ce second cas, les opérations sont appliquées dans l'ordre et forment un
+seul pas de `--undo-project-op` ; un refus annule le lot entier. Une opération
+projet ne charge plus les journaux des timelines qu'elle ne modifie pas, et la
+sauvegarde préserve leurs octets existants.
 
 ## Import depuis DaVinci Resolve
 
