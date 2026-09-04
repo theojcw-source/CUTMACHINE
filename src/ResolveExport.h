@@ -85,7 +85,8 @@ bool BuildResolveTimelineExport(const Document& document,
 std::string SerializeResolveTimelineExport(
     const ResolveTimelineExport& exported);
 
-// Headless entry point: describes the project's active timeline for the
-// bridge script. Read-only -- nothing about the project changes.
+// Headless entry point: describes an explicit timeline, or the active one
+// when timelineId is empty, for the bridge script. Read-only.
 int ExportResolveTimelineCommand(const std::string& projectPath,
-                                 std::string& output);
+                                 std::string& output,
+                                 const std::string& timelineId = {});

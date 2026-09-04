@@ -447,7 +447,27 @@ décodage média :
 ./build/cutmachine --ingest ./Film.cutmachine-project/project.cutmachine.json ./voix-off.wav
 ./build/cutmachine --import-resolve ./Film.cutmachine-project/project.cutmachine.json ./manifest.json
 ./build/cutmachine --export ./Film.cutmachine-project/project.cutmachine.json ./film.mp4
+./build/cutmachine --export ./Film.cutmachine-project/project.cutmachine.json ./vertical.mp4 \
+  --timeline '<timeline-id>'
+./build/cutmachine --export-srt ./Film.cutmachine-project/project.cutmachine.json \
+  ./film.srt --timeline '<timeline-id>'
+./build/cutmachine --export-resolve-timeline \
+  ./Film.cutmachine-project/project.cutmachine.json --timeline '<timeline-id>'
 ```
+
+Les outils MCP qui modifient une timeline acceptent eux aussi le champ
+optionnel `timeline_id`. Sans ce champ, ils conservent le comportement
+historique et ciblent la timeline active. Pour rendre l'identifiant obligatoire
+sur cette machine — utile aux scripts qui pilotent plusieurs montages — activer
+le garde-fou local puis relancer CUTMACHINE ou `--mcp-serve` :
+
+```sh
+defaults write com.cutmachine.editor CMRequireExplicitTimeline -bool true
+```
+
+Une opération MCP d'édition sans `timeline_id` est alors refusée avec l'erreur
+`TimelineRequired`. Ce réglage reste dans `NSUserDefaults` et n'est jamais
+écrit dans le projet.
 
 ## Import depuis DaVinci Resolve
 

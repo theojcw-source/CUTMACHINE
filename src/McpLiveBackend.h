@@ -66,6 +66,8 @@ public:
         std::function<bool(const Ulid&, SpeechOnsetReport&, std::string&)>;
     using AnalyzeSpeechOnsetCallback = std::function<bool(
         const Ulid&, const SpeechOnsetSettings&, std::string&, std::string&)>;
+    using TimelineSelectCallback =
+        std::function<bool(const Ulid&, std::string&)>;
     // Neither reference is owned; both must outlive this backend. `onApplied`
     // (optional) is invoked after every successful ApplyOperation/Undo/Redo,
     // before the call returns -- main.mm wires it to the same
@@ -85,8 +87,13 @@ public:
                    AnalyzeShotQualityCallback analyzeShotQuality = nullptr,
                    CaptureFrameCallback captureFrame = nullptr,
                    SourceSpeechOnsetCallback readSourceSpeechOnset = nullptr,
-                   AnalyzeSpeechOnsetCallback analyzeSpeechOnset = nullptr);
+                   AnalyzeSpeechOnsetCallback analyzeSpeechOnset = nullptr,
+                   TimelineSelectCallback selectTimeline = nullptr,
+                   bool requireExplicitTimeline = false);
 
+    bool SelectTimelineForEdit(const std::string& timelineId,
+                               std::string& errorName,
+                               std::string& message) override;
     bool SnapshotDocument(Document& document, std::string& message) override;
     bool ApplyOperation(Operation operation, std::string& resultJson,
                         std::string& errorName, std::string& message) override;
@@ -129,4 +136,6 @@ private:
     CaptureFrameCallback capture_frame_;
     SourceSpeechOnsetCallback read_source_speech_onset_;
     AnalyzeSpeechOnsetCallback analyze_speech_onset_;
+    TimelineSelectCallback select_timeline_;
+    bool require_explicit_timeline_ = false;
 };

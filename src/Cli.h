@@ -106,7 +106,8 @@ int DescribeCommand(const std::string& documentPath, std::string& output);
 // heard, not what is on screen -- an overlay laid over someone else's words
 // must not caption itself.
 int ExportSrtCommand(const std::string& projectPath,
-                     const std::string& outputPath, std::string& output);
+                     const std::string& outputPath, std::string& output,
+                     const std::string& timelineId = {});
 // SEQ-2026-08 -- read-only: reports the sequence format the project's rushes
 // imply, without touching the document. Conforming to it is a separate,
 // journalized UpdateSequenceOperation.
@@ -119,8 +120,8 @@ int ProposeSequenceCommand(const std::string& projectPath, std::string& output);
 std::string DescribeDocument(const Document& document);
 std::string DescribeProject(const Project& project);
 int ApplyOperationCommand(const std::string& documentPath,
-                          const std::string& operationJson,
-                          std::string& output);
+                          const std::string& operationJson, std::string& output,
+                          const std::string& timelineId = {});
 int ApplyProjectOperationCommand(const std::string& projectPath,
                                  const std::string& operationJson,
                                  std::string& output);
@@ -135,12 +136,15 @@ int RedoProjectOperationCommand(const std::string& projectPath,
 // triggering undo/redo in the app. There is no CLI flag for these yet; they
 // exist so the MCP server (Operations.h ticket F1.1) can reuse this exact
 // path instead of duplicating EditLog::Undo/Redo call sites.
-int UndoOperationCommand(const std::string& documentPath, std::string& output);
-int RedoOperationCommand(const std::string& documentPath, std::string& output);
+int UndoOperationCommand(const std::string& documentPath, std::string& output,
+                         const std::string& timelineId = {});
+int RedoOperationCommand(const std::string& documentPath, std::string& output,
+                         const std::string& timelineId = {});
 int ExportCommand(const std::string& documentPath,
                   const ExportSettings& settings,
                   const ExportProgressCallback& progress,
-                  const std::atomic_bool* cancel, std::string& output);
+                  const std::atomic_bool* cancel, std::string& output,
+                  const std::string& timelineId = {});
 
 std::string TimelineEditLogPathForProject(const std::string& projectPath,
                                           const std::string& timelineId);

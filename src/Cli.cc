@@ -730,8 +730,8 @@ mcp_json::Value DescribeTimelines(const Project& project) {
         durationValue.Set(
             "frames", mcp_json::Value::MakeInt(duration.to_frames(
                           sequence.frame_rate.num, sequence.frame_rate.den)));
-        durationValue.Set("seconds",
-                          mcp_json::Value::MakeRawNumber(DecimalSeconds(duration)));
+        durationValue.Set("seconds", mcp_json::Value::MakeRawNumber(
+                                         DecimalSeconds(duration)));
         item.Set("duration", std::move(durationValue));
         item.Set("active", mcp_json::Value::MakeBool(
                                sequence.id == project.active_timeline_id));
@@ -820,13 +820,21 @@ bool CommitTextArtifactsAndRemove(
 }
 
 int ExportSrtCommand(const std::string& projectPath,
-                     const std::string& outputPath, std::string& output) {
+                     const std::string& outputPath, std::string& output,
+                     const std::string& timelineId) {
     Project project;
     std::string error;
     if (!LoadStoredProject(projectPath, project, error)) {
         return FailCliCommand("InvalidDocument", error, output);
     }
-    Document document = project.MakeActiveDocument();
+    const Ulid selectedTimeline =
+        timelineId.empty() ? project.active_timeline_id : timelineId;
+    if (!project.FindTimeline(selectedTimeline)) {
+        return FailCliCommand("UnknownSequence",
+                              "unknown timeline_id '" + selectedTimeline + "'",
+                              output);
+    }
+    Document document = project.MakeDocument(selectedTimeline);
     const std::filesystem::path transcriptDirectory =
         std::filesystem::absolute(projectPath).parent_path() / ".cutmachine" /
         "transcripts";
@@ -853,13 +861,21 @@ int ExportSrtCommand(const std::string& projectPath,
 int ExportCommand(const std::string& documentPath,
                   const ExportSettings& settings,
                   const ExportProgressCallback& progress,
-                  const std::atomic_bool* cancel, std::string& output) {
+                  const std::atomic_bool* cancel, std::string& output,
+                  const std::string& timelineId) {
     Project project;
     std::string error;
     if (!LoadStoredProject(documentPath, project, error)) {
         return FailCliCommand("InvalidDocument", error, output);
     }
-    Document document = project.MakeActiveDocument();
+    const Ulid selectedTimeline =
+        timelineId.empty() ? project.active_timeline_id : timelineId;
+    if (!project.FindTimeline(selectedTimeline)) {
+        return FailCliCommand("UnknownSequence",
+                              "unknown timeline_id '" + selectedTimeline + "'",
+                              output);
+    }
+    Document document = project.MakeDocument(selectedTimeline);
     ExportSettings resolvedSettings = settings;
     if (settings.width == 0 && settings.height == 0) {
         resolvedSettings = Exporter::SettingsForPreset(
@@ -1193,8 +1209,7 @@ int TimelineStatsCommand(const std::string& projectPath, std::string& output) {
         output = ErrorJson(EditError::ValidationFailed, error);
         return 1;
     }
-    output = "{\"ok\":true,\"stats\":" +
-             SerializeTimelineStats(stats) + "}\n";
+    output = "{\"ok\":true,\"stats\":" + SerializeTimelineStats(stats) + "}\n";
     return 0;
 }
 
@@ -1291,8 +1306,8 @@ int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
     MediaTaskManager tasks(1);
     const Ulid taskId = tasks.Enqueue(
         MediaTaskKind::SpeechOnset, "Analyse parole " + media->filename,
-        [input, reportPath, mediaId,
-         settings](MediaTaskContext& context, std::string& taskError) {
+        [input, reportPath, mediaId, settings](MediaTaskContext& context,
+                                               std::string& taskError) {
             return GenerateSpeechOnset(input.string(), reportPath.string(),
                                        mediaId, settings, context, taskError);
         });
@@ -1626,8 +1641,8 @@ int ProposeSequenceCommand(const std::string& projectPath,
 }
 
 int ApplyOperationCommand(const std::string& documentPath,
-                          const std::string& operationJson,
-                          std::string& output) {
+                          const std::string& operationJson, std::string& output,
+                          const std::string& timelineId) {
     Operation operation = RemoveClipOperation{};
     EditError error = EditError::None;
     std::string message;
@@ -1641,7 +1656,14 @@ int ApplyOperationCommand(const std::string& documentPath,
         output = ErrorJson(EditError::ParseError, message);
         return 1;
     }
-    Document document = project.MakeActiveDocument();
+    const Ulid selectedTimeline =
+        timelineId.empty() ? project.active_timeline_id : timelineId;
+    if (!project.FindTimeline(selectedTimeline)) {
+        output = ErrorJson(EditError::UnknownSequence,
+                           "unknown timeline_id '" + selectedTimeline + "'");
+        return 1;
+    }
+    Document document = project.MakeDocument(selectedTimeline);
     // DELTA-2026-08 -- the state the caller already knows about. Kept so the
     // result can say what changed instead of making the caller re-read the
     // whole timeline to find out.
@@ -1649,7 +1671,7 @@ int ApplyOperationCommand(const std::string& documentPath,
 
     EditLog log;
     const std::string timelineLogPath =
-        TimelineEditLogPathForProject(documentPath, project.active_timeline_id);
+        TimelineEditLogPathForProject(documentPath, selectedTimeline);
     std::string logPath = timelineLogPath;
     std::error_code existsError;
     bool logExists = std::filesystem::exists(logPath, existsError);
@@ -1678,9 +1700,9 @@ int ApplyOperationCommand(const std::string& documentPath,
 
     const std::string updatedDocument = document.SaveToString();
     std::map<std::string, EditLog> logs;
-    logs[project.active_timeline_id] = log;
+    logs[selectedTimeline] = log;
     ProjectEditLog projectLog;
-    if (!project.CommitActiveDocument(document, message) ||
+    if (!project.CommitDocument(selectedTimeline, document, message) ||
         !CommitStoredProjectAndLogs(documentPath, project, logs, projectLog,
                                     message)) {
         output = ErrorJson(EditError::IoError, message);
@@ -1812,7 +1834,8 @@ namespace {
 // separate from ApplyOperationCommand rather than folded into it so neither
 // entry point grows a branch the other doesn't need.
 int MutateTimelineLogCommand(const std::string& documentPath, bool redo,
-                             std::string& output) {
+                             std::string& output,
+                             const std::string& timelineId) {
     std::string message;
     EditError error = EditError::None;
     Project project;
@@ -1820,14 +1843,21 @@ int MutateTimelineLogCommand(const std::string& documentPath, bool redo,
         output = ErrorJson(EditError::ParseError, message);
         return 1;
     }
-    Document document = project.MakeActiveDocument();
+    const Ulid selectedTimeline =
+        timelineId.empty() ? project.active_timeline_id : timelineId;
+    if (!project.FindTimeline(selectedTimeline)) {
+        output = ErrorJson(EditError::UnknownSequence,
+                           "unknown timeline_id '" + selectedTimeline + "'");
+        return 1;
+    }
+    Document document = project.MakeDocument(selectedTimeline);
     // Undo needs the delta more than anything else does: the caller has no
     // way to guess what a reversal put back.
     const Document before = document;
 
     EditLog log;
-    if (!LoadOptionalTimelineLog(documentPath, project.active_timeline_id, log,
-                                 error, message)) {
+    if (!LoadOptionalTimelineLog(documentPath, selectedTimeline, log, error,
+                                 message)) {
         output = ErrorJson(error, message);
         return 1;
     }
@@ -1841,9 +1871,9 @@ int MutateTimelineLogCommand(const std::string& documentPath, bool redo,
 
     const std::string updatedDocument = document.SaveToString();
     std::map<std::string, EditLog> logs;
-    logs[project.active_timeline_id] = log;
+    logs[selectedTimeline] = log;
     ProjectEditLog projectLog;
-    if (!project.CommitActiveDocument(document, message) ||
+    if (!project.CommitDocument(selectedTimeline, document, message) ||
         !CommitStoredProjectAndLogs(documentPath, project, logs, projectLog,
                                     message)) {
         output = ErrorJson(EditError::IoError, message);
@@ -1858,10 +1888,12 @@ int MutateTimelineLogCommand(const std::string& documentPath, bool redo,
 
 }  // namespace
 
-int UndoOperationCommand(const std::string& documentPath, std::string& output) {
-    return MutateTimelineLogCommand(documentPath, false, output);
+int UndoOperationCommand(const std::string& documentPath, std::string& output,
+                         const std::string& timelineId) {
+    return MutateTimelineLogCommand(documentPath, false, output, timelineId);
 }
 
-int RedoOperationCommand(const std::string& documentPath, std::string& output) {
-    return MutateTimelineLogCommand(documentPath, true, output);
+int RedoOperationCommand(const std::string& documentPath, std::string& output,
+                         const std::string& timelineId) {
+    return MutateTimelineLogCommand(documentPath, true, output, timelineId);
 }

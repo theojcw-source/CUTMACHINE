@@ -13,8 +13,13 @@
 
 class McpProjectBackend : public McpBackend {
 public:
-    explicit McpProjectBackend(std::string projectPath);
+    explicit McpProjectBackend(std::string projectPath,
+                               bool requireExplicitTimeline = false);
 
+    bool SelectTimelineForEdit(const std::string& timelineId,
+                               std::string& errorName,
+                               std::string& message) override;
+    void EndTimelineEdit() override { selected_timeline_id_.clear(); }
     bool SnapshotDocument(Document& document, std::string& message) override;
     bool ApplyOperation(Operation operation, std::string& resultJson,
                         std::string& errorName, std::string& message) override;
@@ -52,4 +57,6 @@ public:
 
 private:
     std::string project_path_;
+    std::string selected_timeline_id_;
+    bool require_explicit_timeline_ = false;
 };

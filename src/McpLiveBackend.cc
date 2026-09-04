@@ -13,7 +13,9 @@ McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
                                AnalyzeShotQualityCallback analyzeShotQuality,
                                CaptureFrameCallback captureFrame,
                                SourceSpeechOnsetCallback readSourceSpeechOnset,
-                               AnalyzeSpeechOnsetCallback analyzeSpeechOnset)
+                               AnalyzeSpeechOnsetCallback analyzeSpeechOnset,
+                               TimelineSelectCallback selectTimeline,
+                               bool requireExplicitTimeline)
     : document_(document),
       edit_log_(editLog),
       on_applied_(std::move(onApplied)),
@@ -25,7 +27,30 @@ McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
       analyze_shot_quality_(std::move(analyzeShotQuality)),
       capture_frame_(std::move(captureFrame)),
       read_source_speech_onset_(std::move(readSourceSpeechOnset)),
-      analyze_speech_onset_(std::move(analyzeSpeechOnset)) {}
+      analyze_speech_onset_(std::move(analyzeSpeechOnset)),
+      select_timeline_(std::move(selectTimeline)),
+      require_explicit_timeline_(requireExplicitTimeline) {}
+
+bool McpLiveBackend::SelectTimelineForEdit(const std::string& timelineId,
+                                           std::string& errorName,
+                                           std::string& message) {
+    if (require_explicit_timeline_ && timelineId.empty()) {
+        errorName = "TimelineRequired";
+        message = "strict timeline editing requires an explicit timeline_id";
+        return false;
+    }
+    if (timelineId.empty() || timelineId == document_.sequence.id) return true;
+    if (!select_timeline_) {
+        errorName = "UnknownSequence";
+        message = "unknown timeline_id '" + timelineId + "'";
+        return false;
+    }
+    if (!select_timeline_(timelineId, message)) {
+        errorName = "UnknownSequence";
+        return false;
+    }
+    return true;
+}
 
 bool McpLiveBackend::SnapshotDocument(Document& document, std::string&) {
     document = document_;

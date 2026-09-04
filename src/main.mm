@@ -60,6 +60,7 @@ extern "C" {
 #include "TimelineView.h"
 #include "Transcription.h"
 #include "TransportBar.h"
+#include "UiPreferences.h"
 #include "UiTheme.h"
 #include "Waveform.h"
 
@@ -4273,14 +4274,12 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             const std::filesystem::path projectPath =
                 std::filesystem::absolute(std::filesystem::path(
                     strongSelf.documentPath.UTF8String ?: ""));
-            return LoadSpeechOnset(
-                (projectPath.parent_path() / ".cutmachine" / "speechonset" /
-                 (sourceId + ".json"))
-                    .string(),
-                report, message);
+            return LoadSpeechOnset((projectPath.parent_path() / ".cutmachine" /
+                                    "speechonset" / (sourceId + ".json"))
+                                       .string(),
+                                   report, message);
         },
-        [weakSelf](const Ulid& sourceId,
-                   const SpeechOnsetSettings& settings,
+        [weakSelf](const Ulid& sourceId, const SpeechOnsetSettings& settings,
                    std::string& resultJson, std::string& message) {
             AppDelegate* strongSelf = weakSelf;
             if (!strongSelf) {
@@ -4297,7 +4296,23 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             }
             resultJson = output;
             return true;
-        });
+        },
+        [weakSelf](const Ulid& timelineId, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            if (![strongSelf
+                    activateTimelineIdentifier:
+                        [NSString stringWithUTF8String:timelineId.c_str()]]) {
+                message = "unknown timeline_id '" + timelineId + "'";
+                return false;
+            }
+            return true;
+        },
+        [[CMUiPreferences sharedPreferences]
+            requiresExplicitTimelineForAgentEdits]);
     self.chatPanelView = [[CMChatPanelView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];
     [self.chatPanelView configureWithBackend:*self.chatBackend];
@@ -5428,7 +5443,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     if (![self applyAndPersistTimelineOperation:Operation {
-            AddCaptionStyleOperation { CaptionStyle{}, -1 }
+            AddCaptionStyleOperation{CaptionStyle{}, -1}
         }
                                           error:error
                                         message:message]) {
@@ -6619,12 +6634,12 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             if (image.image) {
                 image.contentTintColor = nil;
             } else {
-                image.image = SystemSymbol(
-                    offline ? @"exclamationmark.triangle"
-                            : media->has_video ? @"film" : @"waveform",
-                    offline ? @"Média offline"
-                            : media->has_video ? @"Média vidéo"
-                                               : @"Média audio");
+                image.image = SystemSymbol(offline ? @"exclamationmark.triangle"
+                                           : media->has_video ? @"film"
+                                                              : @"waveform",
+                                           offline            ? @"Média offline"
+                                           : media->has_video ? @"Média vidéo"
+                                                              : @"Média audio");
                 image.contentTintColor = offline
                                              ? CMThemeColor(ui::theme::kError)
                                              : CMTextSecondaryColor();
@@ -7208,7 +7223,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     if (![self applyAndPersistTimelineOperation:Operation {
-            RemoveBinOperation { binId, "", "" }
+            RemoveBinOperation{binId, "", ""}
         }
                                           error:error
                                         message:message]) {
@@ -7273,9 +7288,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     std::string message;
     if (bin) {
         if (![self applyAndPersistTimelineOperation:Operation {
-                RenameBinOperation {
-                    identifier.UTF8String ?: "", name.UTF8String ?: ""
-                }
+                RenameBinOperation{identifier.UTF8String ?: "",
+                                   name.UTF8String ?: ""}
             }
                                               error:error
                                             message:message]) {
@@ -10180,8 +10194,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
 - (void)loadOrEnqueueThumbnailForMediaIdentifier:(NSString*)identifier {
     if (!identifier || !self.state || self.mediaThumbnails[identifier]) return;
     const Ulid mediaId(identifier.UTF8String ?: "");
-    const LibraryMedia* media =
-        self.state->document.FindLibraryMedia(mediaId);
+    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     if (media && !media->has_video) return;
     const std::filesystem::path projectPath = std::filesystem::absolute(
         std::filesystem::path(self.documentPath.UTF8String ?: ""));
@@ -10203,8 +10216,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const Ulid mediaId(identifier.UTF8String ?: "");
     const DocumentSource* source = self.state->document.FindSource(mediaId);
     if (!source) return;
-    const LibraryMedia* media =
-        self.state->document.FindLibraryMedia(mediaId);
+    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     if (media && !media->has_video) {
         self.binSummaryLabel.stringValue =
             @"Ce média est audio seul · aucune vignette à générer.";
@@ -10846,8 +10858,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     for (const auto& source : addedSources) {
         const LibraryMedia* media =
             self.state->document.FindLibraryMedia(source.first);
-        if (media)
-            self.state->mediaMetadata[source.first] = *media;
+        if (media) self.state->mediaMetadata[source.first] = *media;
         if (media && !media->has_video) continue;
         auto worker = std::make_unique<DecodeWorker>(
             source.first, *self.state->frameCache,
@@ -12828,10 +12839,10 @@ int main(int argc, char* argv[]) {
         int port = 0;
         if (argc == 5) {
             if (std::string(argv[3]) != "--port") {
-                return failCli("ValidationFailed",
-                               "unknown --mcp-serve option '" +
-                                   std::string(argv[3]) + "'",
-                               2);
+                return failCli(
+                    "ValidationFailed",
+                    "unknown --mcp-serve option '" + std::string(argv[3]) + "'",
+                    2);
             }
             port = std::atoi(argv[4]);
         }
@@ -12850,7 +12861,10 @@ int main(int argc, char* argv[]) {
                            "mcp-serve cannot lock the project: " + lockError,
                            1);
         }
-        McpProjectBackend backend(argv[2]);
+        const bool requireExplicitTimeline =
+            [[CMUiPreferences sharedPreferences]
+                requiresExplicitTimelineForAgentEdits];
+        McpProjectBackend backend(argv[2], requireExplicitTimeline);
         McpServer server(backend);
         std::string startError;
         if (!server.Start(port, startError)) {
@@ -12903,15 +12917,30 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
-    if (argc == 4 && std::string(argv[1]) == "--export-srt") {
+    if ((argc == 4 || argc == 6) && std::string(argv[1]) == "--export-srt") {
+        if (argc == 6 && std::string(argv[4]) != "--timeline") {
+            return failCli(
+                "ValidationFailed",
+                "unknown --export-srt option '" + std::string(argv[4]) + "'",
+                2);
+        }
         std::string output;
-        const int result = ExportSrtCommand(argv[2], argv[3], output);
+        const int result = ExportSrtCommand(argv[2], argv[3], output,
+                                            argc == 6 ? argv[5] : "");
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
-    if (argc == 3 && std::string(argv[1]) == "--export-resolve-timeline") {
+    if ((argc == 3 || argc == 5) &&
+        std::string(argv[1]) == "--export-resolve-timeline") {
+        if (argc == 5 && std::string(argv[3]) != "--timeline") {
+            return failCli("ValidationFailed",
+                           "unknown --export-resolve-timeline option '" +
+                               std::string(argv[3]) + "'",
+                           2);
+        }
         std::string output;
-        const int result = ExportResolveTimelineCommand(argv[2], output);
+        const int result = ExportResolveTimelineCommand(
+            argv[2], output, argc == 5 ? argv[4] : "");
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
@@ -12927,14 +12956,18 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
-    if (argc >= 4 && argc <= 6 && std::string(argv[1]) == "--export") {
+    if (argc >= 4 && argc <= 8 && std::string(argv[1]) == "--export") {
         ExportSettings settings = Exporter::HevcMain10Preset(argv[3]);
+        std::string timelineId;
         for (int index = 4; index < argc; ++index) {
             const std::string option(argv[index]);
             if (option == "--software")
                 settings.encoder = ExportEncoder::HevcSoftware;
             else if (option == "--overwrite")
                 settings.overwrite = true;
+            else if (option == "--timeline" && index + 1 < argc &&
+                     timelineId.empty())
+                timelineId = argv[++index];
             else {
                 return failCli("ValidationFailed",
                                "unknown export option '" + option + "'", 2);
@@ -12956,7 +12989,7 @@ int main(int argc, char* argv[]) {
                     std::fflush(stderr);
                 }
             },
-            nullptr, output);
+            nullptr, output, timelineId);
         if (lastPercent >= 0) std::fputc('\n', stderr);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;

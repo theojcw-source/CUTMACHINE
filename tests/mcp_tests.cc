@@ -140,6 +140,14 @@ int main() {
     // over HTTP, one a reference edited directly through ApplyOperationCommand
     // (the exact function `--apply-op` calls).
     Project mcpProject = Project::FromDocument(Fixture(), "MCP fixture");
+    const Ulid alternateTimelineId = "01K30000000000000000000006";
+    DocumentSequence alternateTimeline = mcpProject.timelines.front();
+    alternateTimeline.id = alternateTimelineId;
+    alternateTimeline.name = "Alternate";
+    alternateTimeline.tracks[0].id = "01K30000000000000000000007";
+    alternateTimeline.tracks[0].clips[0].id = "01K30000000000000000000008";
+    alternateTimeline.tracks[0].clips[1].id = "01K30000000000000000000009";
+    mcpProject.timelines.push_back(alternateTimeline);
     std::string mcpPath;
     Check(CreatePortableProject((directory / "Mcp.cutmachine-project").string(),
                                 mcpProject, mcpPath, error),
@@ -147,6 +155,13 @@ int main() {
 
     Project referenceProject =
         Project::FromDocument(Fixture(), "Reference fixture");
+    DocumentSequence referenceAlternate = referenceProject.timelines.front();
+    referenceAlternate.id = alternateTimelineId;
+    referenceAlternate.name = "Alternate";
+    referenceAlternate.tracks[0].id = "01K30000000000000000000007";
+    referenceAlternate.tracks[0].clips[0].id = "01K30000000000000000000008";
+    referenceAlternate.tracks[0].clips[1].id = "01K30000000000000000000009";
+    referenceProject.timelines.push_back(referenceAlternate);
     std::string referencePath;
     Check(CreatePortableProject(
               (directory / "Reference.cutmachine-project").string(),
@@ -286,6 +301,40 @@ int main() {
     Check(mcpAfterUndo.MakeActiveDocument().SaveToString() ==
               mcpAfterTrim.MakeActiveDocument().SaveToString(),
           "undoing the insert restores the exact post-trim document");
+
+    // ---- B9: an explicit non-active timeline is the sole edit target ----
+    const std::string activeBeforeExplicit =
+        mcpAfterUndo.MakeActiveDocument().SaveToString();
+    const Document alternateBeforeExplicit =
+        mcpAfterUndo.MakeDocument(alternateTimelineId);
+    const std::string explicitTrimRequest =
+        R"({"jsonrpc":"2.0","id":7,"method":"tools/call",)"
+        R"("params":{"name":"trim_clip","arguments":)"
+        R"({"timeline_id":"01K30000000000000000000006",)"
+        R"("clip_id":"01K30000000000000000000008","edge":"Tail",)"
+        R"("delta":{"value":-1,"rate":25}}}})";
+    const std::string explicitTrimResponse =
+        HttpPostJson(server.Port(), "/mcp", explicitTrimRequest);
+    Check(explicitTrimResponse.find("\"isError\":false") != std::string::npos,
+          "an MCP edit accepts an explicit non-active timeline_id");
+    Project afterExplicitTrim;
+    Check(Project::Load(mcpPath, afterExplicitTrim, error),
+          "project reloads after an explicit-timeline edit: " + error);
+    Check(afterExplicitTrim.active_timeline_id ==
+                  mcpAfterUndo.active_timeline_id &&
+              afterExplicitTrim.MakeActiveDocument().SaveToString() ==
+                  activeBeforeExplicit,
+          "an explicit MCP edit preserves the active timeline byte-for-byte");
+    const Document alternateAfterExplicit =
+        afterExplicitTrim.MakeDocument(alternateTimelineId);
+    const DocumentClip* alternateBeforeClip =
+        alternateBeforeExplicit.FindClip("01K30000000000000000000008");
+    const DocumentClip* alternateAfterClip =
+        alternateAfterExplicit.FindClip("01K30000000000000000000008");
+    Check(alternateBeforeClip && alternateAfterClip &&
+              alternateAfterClip->duration == RationalTime{9, 25} &&
+              alternateBeforeClip->duration == RationalTime{10, 25},
+          "the explicit non-active timeline receives the edit");
 
     // ---- error path leaves the project file untouched ----
     const std::string beforeError = Read(mcpPath);

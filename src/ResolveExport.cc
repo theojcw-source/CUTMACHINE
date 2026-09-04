@@ -168,13 +168,21 @@ std::string SerializeResolveTimelineExport(
 }
 
 int ExportResolveTimelineCommand(const std::string& projectPath,
-                                 std::string& output) {
+                                 std::string& output,
+                                 const std::string& timelineId) {
     Project project;
     std::string error;
     if (!LoadStoredProject(projectPath, project, error)) {
         return FailCliCommand("InvalidDocument", error, output);
     }
-    Document document = project.MakeActiveDocument();
+    const Ulid selectedTimeline =
+        timelineId.empty() ? project.active_timeline_id : timelineId;
+    if (!project.FindTimeline(selectedTimeline)) {
+        return FailCliCommand("UnknownSequence",
+                              "unknown timeline_id '" + selectedTimeline + "'",
+                              output);
+    }
+    Document document = project.MakeDocument(selectedTimeline);
     // Media paths are stored relative to the package; the bridge matches them
     // against Resolve's Media Pool, which knows only absolute paths.
     const std::filesystem::path base =

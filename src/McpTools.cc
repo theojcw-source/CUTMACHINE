@@ -62,7 +62,8 @@ std::string PositiveIntSchema(const std::string& description) {
 }
 
 const char kMediaRateSchemaText[] =
-    "{\"type\":\"object\",\"description\":\"Exact positive integer frame rate.\","
+    "{\"type\":\"object\",\"description\":\"Exact positive integer frame "
+    "rate.\","
     "\"properties\":{\"num\":{\"type\":\"integer\",\"minimum\":1},"
     "\"den\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"num\","
     "\"den\"],\"additionalProperties\":false}";
@@ -144,6 +145,65 @@ private:
 // "tool.field[index]") in `message` on failure. None of them throw.
 // ---------------------------------------------------------------------
 
+bool IsTimelineEditingTool(const std::string& name) {
+    static const std::vector<std::string> kNames = {
+        "insert_clip",
+        "remove_clip",
+        "clear_clip",
+        "clear_clips",
+        "trim_clip",
+        "move_clip",
+        "move_clips",
+        "split_clip",
+        "split_at_interval",
+        "delete_gap",
+        "detach_audio",
+        "move_linked_clips",
+        "trim_linked_clips",
+        "shorten_linked_clip",
+        "ripple_trim",
+        "roll_edit",
+        "slip_edit",
+        "remove_linked_clips",
+        "clear_linked_clips",
+        "split_linked_clips",
+        "paste_clips",
+        "add_track",
+        "import_srt",
+        "remove_track",
+        "set_track_lock",
+        "set_track_sync_lock",
+        "set_track_output",
+        "update_sequence",
+        "set_color_management",
+        "add_bin",
+        "remove_bin",
+        "rename_bin",
+        "move_bin",
+        "set_media_bin",
+        "add_marker",
+        "remove_marker",
+        "update_marker",
+        "add_transition",
+        "remove_transition",
+        "update_transition",
+        "set_clip_link",
+        "set_clip_effects",
+        "set_clip_opacity",
+        "add_caption_style",
+        "remove_caption_style",
+        "set_clip_caption",
+        "create_interview_short",
+        "clean_disfluencies",
+        "tighten_pauses",
+        "remove_words",
+        "conform_sequence",
+        "undo",
+        "redo",
+    };
+    return std::find(kNames.begin(), kNames.end(), name) != kNames.end();
+}
+
 bool CheckKnownKeys(const Value& args, const std::vector<std::string>& allowed,
                     const std::string& path, std::string& message) {
     if (!args.IsObject()) {
@@ -151,6 +211,8 @@ bool CheckKnownKeys(const Value& args, const std::vector<std::string>& allowed,
         return false;
     }
     for (const auto& entry : args.AsObject()) {
+        if (entry.first == "timeline_id" && IsTimelineEditingTool(path))
+            continue;
         if (std::find(allowed.begin(), allowed.end(), entry.first) ==
             allowed.end()) {
             message =
@@ -241,20 +303,17 @@ bool ReadMediaRate(const Value& args, const std::string& key,
         message = "'" + path + "." + key + "' must be an object";
         return false;
     }
-    if (!CheckKnownKeys(*value, {"num", "den"}, path + "." + key,
-                        message))
+    if (!CheckKnownKeys(*value, {"num", "den"}, path + "." + key, message))
         return false;
     int64_t num = 0;
     int64_t den = 0;
-    if (!ReadInt64(*value, "num", path + "." + key, true, 0, num,
-                   message) ||
-        !ReadInt64(*value, "den", path + "." + key, true, 0, den,
-                   message))
+    if (!ReadInt64(*value, "num", path + "." + key, true, 0, num, message) ||
+        !ReadInt64(*value, "den", path + "." + key, true, 0, den, message))
         return false;
-    if (num <= 0 || den <= 0 ||
-        num > std::numeric_limits<int32_t>::max() ||
+    if (num <= 0 || den <= 0 || num > std::numeric_limits<int32_t>::max() ||
         den > std::numeric_limits<int32_t>::max()) {
-        message = "'" + path + "." + key + "' must contain positive int32 values";
+        message =
+            "'" + path + "." + key + "' must contain positive int32 values";
         return false;
     }
     rate = {static_cast<int32_t>(num), static_cast<int32_t>(den)};
@@ -1007,11 +1066,10 @@ bool DispatchRippleTrim(McpBackend& backend, const IdResolver& resolver,
     }
     result.Set("also_cut", std::move(alsoCut));
     if (!warningTrackIds.empty()) {
-        result.Set(
-            "warning",
-            Value::MakeString(
-                "sync_track_ids omis : des plans en aval sur d'autres "
-                "pistes n'ont pas ete decales"));
+        result.Set("warning",
+                   Value::MakeString(
+                       "sync_track_ids omis : des plans en aval sur d'autres "
+                       "pistes n'ont pas ete decales"));
         Value tracks = Value::MakeArray();
         for (const Ulid& trackId : warningTrackIds)
             tracks.Push(Value::MakeString(trackId));
@@ -2293,8 +2351,8 @@ bool DispatchListSpeechOnsets(McpBackend& backend, const IdResolver&,
                               const Value& args, std::string& resultJson,
                               std::string& errorName, std::string& message) {
     static const std::vector<std::string> kAllowed = {
-        "group_gap_ms", "group_floor_db", "dominant_percentile",
-        "dominance_db", "dominant_sustain_windows"};
+        "group_gap_ms", "group_floor_db", "dominant_percentile", "dominance_db",
+        "dominant_sustain_windows"};
     if (!CheckKnownKeys(args, kAllowed, "list_speech_onsets", message))
         return Fail(errorName, message, message);
     SpeechOnsetThresholds thresholds;
@@ -2308,8 +2366,7 @@ bool DispatchListSpeechOnsets(McpBackend& backend, const IdResolver&,
                    thresholds.dominant_percentile,
                    thresholds.dominant_percentile, message) ||
         !ReadInt64(args, "dominance_db", "list_speech_onsets", false,
-                   thresholds.dominance_db, thresholds.dominance_db,
-                   message) ||
+                   thresholds.dominance_db, thresholds.dominance_db, message) ||
         !ReadInt64(args, "dominant_sustain_windows", "list_speech_onsets",
                    false, thresholds.dominant_sustain_windows,
                    thresholds.dominant_sustain_windows, message))
@@ -2618,8 +2675,8 @@ bool DispatchRemoveTimeline(McpBackend& backend, const IdResolver&,
     if (!CheckKnownKeys(args, {"timeline_id"}, "remove_timeline", message))
         return Fail(errorName, message, message);
     std::string requested;
-    if (!ReadString(args, "timeline_id", "remove_timeline", true, "",
-                    requested, message))
+    if (!ReadString(args, "timeline_id", "remove_timeline", true, "", requested,
+                    message))
         return Fail(errorName, message, message);
     RemoveProjectTimelineOperation operation;
     if (!ReadProjectTimelineId(backend, requested, operation.timeline_id,
@@ -2637,13 +2694,13 @@ bool DispatchRenameTimeline(McpBackend& backend, const IdResolver&,
         return Fail(errorName, message, message);
     std::string requested;
     RenameProjectItemOperation operation;
-    if (!ReadString(args, "timeline_id", "rename_timeline", true, "",
-                    requested, message) ||
+    if (!ReadString(args, "timeline_id", "rename_timeline", true, "", requested,
+                    message) ||
         !ReadString(args, "name", "rename_timeline", true, "", operation.name,
                     message))
         return Fail(errorName, message, message);
-    if (!ReadProjectTimelineId(backend, requested, operation.item_id,
-                               errorName, message))
+    if (!ReadProjectTimelineId(backend, requested, operation.item_id, errorName,
+                               message))
         return false;
     return backend.ApplyProjectEdit(std::move(operation), resultJson, errorName,
                                     message);
@@ -2670,6 +2727,22 @@ bool DispatchRedo(McpBackend& backend, const IdResolver&, const Value& args,
 McpToolRegistry::McpToolRegistry() {
     const auto add = [&](std::string name, std::string description,
                          std::string schema, McpDispatchFn fn) {
+        if (IsTimelineEditingTool(name)) {
+            const std::string marker = "\"properties\":{";
+            const size_t position = schema.find(marker);
+            if (position != std::string::npos) {
+                const size_t insertion = position + marker.size();
+                const bool hasProperties =
+                    insertion < schema.size() && schema[insertion] != '}';
+                schema.insert(
+                    insertion,
+                    "\"timeline_id\":" +
+                        StringSchema("Timeline to edit; defaults to the "
+                                     "active timeline unless strict mode is "
+                                     "enabled.") +
+                        (hasProperties ? "," : ""));
+            }
+        }
         tools_.push_back(
             {std::move(name), std::move(description), std::move(schema)});
         dispatch_.push_back(std::move(fn));
@@ -3429,7 +3502,8 @@ McpToolRegistry::McpToolRegistry() {
     add("timeline_stats",
         "Calculate exact editorial statistics for the active composited "
         "timeline: duration, visible shots and cuts, shots per minute, "
-        "cutaway share, and the first visible cutaway. Clips hidden underneath a "
+        "cutaway share, and the first visible cutaway. Clips hidden underneath "
+        "a "
         "higher visible video track do not count as visible changes.",
         SchemaBuilder().Build("timeline_stats takes no arguments"),
         DispatchTimelineStats);
@@ -3666,16 +3740,16 @@ McpToolRegistry::McpToolRegistry() {
         "Remove one project timeline through the reversible project edit log. "
         "CUTMACHINE refuses to remove the last remaining timeline.",
         SchemaBuilder()
-            .Field("timeline_id", StringSchema("Full ID or unambiguous prefix."),
-                   true)
+            .Field("timeline_id",
+                   StringSchema("Full ID or unambiguous prefix."), true)
             .Build("remove_timeline arguments"),
         DispatchRemoveTimeline);
 
     add("rename_timeline",
         "Rename one project timeline through the reversible project edit log.",
         SchemaBuilder()
-            .Field("timeline_id", StringSchema("Full ID or unambiguous prefix."),
-                   true)
+            .Field("timeline_id",
+                   StringSchema("Full ID or unambiguous prefix."), true)
             .Field("name", StringSchema("New timeline name."), true)
             .Build("rename_timeline arguments"),
         DispatchRenameTimeline);
@@ -3765,9 +3839,30 @@ McpToolCallOutcome McpToolRegistry::Call(
         return FinalizeOutcome(std::move(outcome));
     }
 
+    const bool timelineEditing = IsTimelineEditingTool(toolName);
+    if (timelineEditing) {
+        std::string timelineId;
+        if (const Value* value = effectiveArguments.Find("timeline_id")) {
+            if (!value->IsString() || value->AsString().empty()) {
+                outcome.ok = false;
+                outcome.error_name = "ValidationFailed";
+                outcome.message =
+                    "'" + toolName + ".timeline_id' must be a non-empty string";
+                return FinalizeOutcome(std::move(outcome));
+            }
+            timelineId = value->AsString();
+        }
+        if (!backend.SelectTimelineForEdit(timelineId, outcome.error_name,
+                                           outcome.message)) {
+            outcome.ok = false;
+            return FinalizeOutcome(std::move(outcome));
+        }
+    }
+
     Document document;
     std::string snapshotError;
     if (!backend.SnapshotDocument(document, snapshotError)) {
+        if (timelineEditing) backend.EndTimelineEdit();
         outcome.ok = false;
         outcome.error_name = "IoError";
         outcome.message = snapshotError;
@@ -3778,5 +3873,6 @@ McpToolCallOutcome McpToolRegistry::Call(
     outcome.ok = dispatch_[toolIndex](backend, resolver, effectiveArguments,
                                       outcome.result_json, outcome.error_name,
                                       outcome.message);
+    if (timelineEditing) backend.EndTimelineEdit();
     return FinalizeOutcome(std::move(outcome));
 }

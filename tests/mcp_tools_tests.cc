@@ -21,8 +21,8 @@
 #include "McpTools.h"
 
 #include "Cli.h"
-#include "Project.h"
 #include "Operations.h"
+#include "Project.h"
 #include "ShotQuality.h"
 #include "SpeechOnset.h"
 #include "Transcription.h"
@@ -58,9 +58,9 @@ void CheckFailureEnvelope(const McpToolCallOutcome& outcome,
                           const std::string& expectedError = std::string()) {
     mcp_json::Value envelope;
     std::string parseError;
-    const bool parsed = mcp_json::Value::Parse(outcome.result_json, envelope,
-                                               parseError) &&
-                        envelope.IsObject();
+    const bool parsed =
+        mcp_json::Value::Parse(outcome.result_json, envelope, parseError) &&
+        envelope.IsObject();
     Check(!outcome.ok, label + " is refused");
     Check(parsed, label + " returns a JSON object: " + parseError);
     if (!parsed) return;
@@ -69,8 +69,7 @@ void CheckFailureEnvelope(const McpToolCallOutcome& outcome,
     const mcp_json::Value* detail = envelope.Find("detail");
     Check(ok != nullptr && ok->IsBool() && !ok->AsBool(),
           label + " returns ok:false");
-    Check(error != nullptr && error->IsString() &&
-              !error->AsString().empty() &&
+    Check(error != nullptr && error->IsString() && !error->AsString().empty() &&
               error->AsString() == outcome.error_name,
           label + " returns its stable error code");
     Check(detail != nullptr && detail->IsString() &&
@@ -140,9 +139,10 @@ public:
     SpeechOnsetSettings speech_onset_settings;
     bool speech_onset_analysis_seen = false;
 
-    bool AnalyzeSourceSpeechOnset(
-        const Ulid&, const SpeechOnsetSettings& settings,
-        std::string& resultJson, std::string&) override {
+    bool AnalyzeSourceSpeechOnset(const Ulid&,
+                                  const SpeechOnsetSettings& settings,
+                                  std::string& resultJson,
+                                  std::string&) override {
         speech_onset_settings = settings;
         speech_onset_analysis_seen = true;
         resultJson = "{\"ok\":true}";
@@ -195,6 +195,21 @@ public:
     }
 
     void FailTranscription() { transcription_fails_ = true; }
+    void RequireExplicitTimeline() { require_explicit_timeline_ = true; }
+
+    bool SelectTimelineForEdit(const std::string& timelineId,
+                               std::string& errorName,
+                               std::string& message) override {
+        if (require_explicit_timeline_ && timelineId.empty()) {
+            errorName = "TimelineRequired";
+            message =
+                "strict timeline editing requires an explicit "
+                "timeline_id";
+            return false;
+        }
+        return McpBackend::SelectTimelineForEdit(timelineId, errorName,
+                                                 message);
+    }
 
     // QC-2026-09 (A1) -- records whether the alignment pass was asked to
     // write, because that boolean is the whole difference between a report
@@ -283,14 +298,16 @@ public:
     }
 
     bool ApplyProjectEdit(ProjectOperation operation, std::string& resultJson,
-                          std::string& errorName, std::string& message) override {
+                          std::string& errorName,
+                          std::string& message) override {
         if (!apply_project_operations_) {
             project_operation_ = std::move(operation);
             resultJson = "{\"ok\":true}";
             return true;
         }
         EditError error = EditError::None;
-        if (!project_log_.Apply(project_, std::move(operation), error, message)) {
+        if (!project_log_.Apply(project_, std::move(operation), error,
+                                message)) {
             errorName = EditErrorName(error);
             return false;
         }
@@ -308,6 +325,7 @@ public:
 
 private:
     bool transcription_fails_ = false;
+    bool require_explicit_timeline_ = false;
     bool apply_project_operations_ = false;
     Document document_;
     EditLog log_;
@@ -386,8 +404,7 @@ int main() {
     {
         McpToolRegistry registry;
         InMemoryBackend backend(fixture);
-        const mcp_json::Value invalidArguments =
-            mcp_json::Value::MakeArray();
+        const mcp_json::Value invalidArguments = mcp_json::Value::MakeArray();
         Check(!registry.Tools().empty(), "the MCP catalog is not empty");
         for (const McpTool& tool : registry.Tools()) {
             const McpToolCallOutcome refused =
@@ -424,6 +441,31 @@ int main() {
             R"({"clip_id":"A1","edge":"Tail","amount":1,"unit":"Frames","preview":true})",
             previewArguments, intentParseError),
         "shorten intent preview arguments parse: " + intentParseError);
+    const auto shortenTool = std::find_if(
+        intentRegistry.Tools().begin(), intentRegistry.Tools().end(),
+        [](const McpTool& tool) { return tool.name == "shorten_linked_clip"; });
+    Check(shortenTool != intentRegistry.Tools().end() &&
+              shortenTool->input_schema_json.find("timeline_id") !=
+                  std::string::npos,
+          "timeline editing schemas publish optional timeline_id");
+    InMemoryBackend strictBackend(fixture);
+    strictBackend.RequireExplicitTimeline();
+    const McpToolCallOutcome strictRefusal = intentRegistry.Call(
+        strictBackend, "shorten_linked_clip", previewArguments);
+    CheckFailureEnvelope(strictRefusal, "strict edit without timeline",
+                         "TimelineRequired");
+    previewArguments.Set("timeline_id",
+                         mcp_json::Value::MakeString(fixture.sequence.id));
+    const McpToolCallOutcome strictExplicit = intentRegistry.Call(
+        strictBackend, "shorten_linked_clip", previewArguments);
+    Check(strictExplicit.ok, "strict edit accepts its explicit timeline: " +
+                                 strictExplicit.message);
+    previewArguments = mcp_json::Value::MakeObject();
+    Check(
+        mcp_json::Value::Parse(
+            R"({"clip_id":"A1","edge":"Tail","amount":1,"unit":"Frames","preview":true})",
+            previewArguments, intentParseError),
+        "shorten preview arguments reset after strict check");
     const std::string intentBefore =
         intentBackend.CurrentDocument().SaveToString();
     const McpToolCallOutcome previewOutcome = intentRegistry.Call(
@@ -487,10 +529,11 @@ int main() {
         McpToolRegistry audioRegistry;
         mcp_json::Value frameArguments;
         std::string frameParseError;
-        Check(mcp_json::Value::Parse(
-                  R"({"media_id":"01K31000000000000000000001","source_in":{"value":0,"rate":48000}})",
-                  frameArguments, frameParseError),
-              "audio-only frame arguments parse: " + frameParseError);
+        Check(
+            mcp_json::Value::Parse(
+                R"({"media_id":"01K31000000000000000000001","source_in":{"value":0,"rate":48000}})",
+                frameArguments, frameParseError),
+            "audio-only frame arguments parse: " + frameParseError);
         const McpToolCallOutcome frameOutcome =
             audioRegistry.Call(audioBackend, "read_frame", frameArguments);
         CheckFailureEnvelope(frameOutcome, "read_frame on audio-only media",
@@ -507,47 +550,51 @@ int main() {
         McpToolRegistry timelineRegistry;
         const McpToolCallOutcome listed = timelineRegistry.Call(
             timelineBackend, "list_timelines", mcp_json::Value::MakeObject());
-        Check(listed.ok && listed.result_json.find("\"width\":1920") !=
-                               std::string::npos &&
-                  listed.result_json.find("\"active\":true") !=
-                               std::string::npos,
-              "list_timelines exposes dimensions and active state");
+        Check(
+            listed.ok &&
+                listed.result_json.find("\"width\":1920") !=
+                    std::string::npos &&
+                listed.result_json.find("\"active\":true") != std::string::npos,
+            "list_timelines exposes dimensions and active state");
         Document liveDocument = fixture;
         EditLog liveLog;
         Project liveProject = Project::FromDocument(fixture);
         bool liveDescriptionUsed = false;
-        McpLiveBackend liveBackend(
-            liveDocument, liveLog, nullptr, nullptr,
-            [&](std::string& json, std::string&) {
-                liveDescriptionUsed = true;
-                json = DescribeProject(liveProject);
-                return true;
-            });
+        McpLiveBackend liveBackend(liveDocument, liveLog, nullptr, nullptr,
+                                   [&](std::string& json, std::string&) {
+                                       liveDescriptionUsed = true;
+                                       json = DescribeProject(liveProject);
+                                       return true;
+                                   });
         const McpToolCallOutcome liveListed = timelineRegistry.Call(
             liveBackend, "list_timelines", mcp_json::Value::MakeObject());
         Check(liveListed.ok && liveDescriptionUsed,
               "the live chat backend lists timelines from its project view");
         mcp_json::Value addArguments;
         std::string timelineParseError;
-        Check(mcp_json::Value::Parse(
-                  R"({"name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1}})",
-                  addArguments, timelineParseError),
-              "add_timeline arguments parse: " + timelineParseError);
-        Check(timelineRegistry.Call(timelineBackend, "add_timeline", addArguments)
-                  .ok,
-              "add_timeline applies an AddProjectTimelineOperation");
+        Check(
+            mcp_json::Value::Parse(
+                R"({"name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1}})",
+                addArguments, timelineParseError),
+            "add_timeline arguments parse: " + timelineParseError);
+        Check(
+            timelineRegistry.Call(timelineBackend, "add_timeline", addArguments)
+                .ok,
+            "add_timeline applies an AddProjectTimelineOperation");
         const ProjectOperation* added = timelineBackend.LastProjectOperation();
-        Check(added && std::holds_alternative<AddProjectTimelineOperation>(*added),
+        Check(added &&
+                  std::holds_alternative<AddProjectTimelineOperation>(*added),
               "add_timeline uses the existing project operation");
-        const Ulid addedId = std::get<AddProjectTimelineOperation>(*added).timeline_id;
+        const Ulid addedId =
+            std::get<AddProjectTimelineOperation>(*added).timeline_id;
         mcp_json::Value renameArguments;
-        Check(mcp_json::Value::Parse(
-                  "{\"timeline_id\":\"" + addedId.substr(0, 10) +
-                      "\",\"name\":\"Portrait\"}",
-                  renameArguments, timelineParseError),
+        Check(mcp_json::Value::Parse("{\"timeline_id\":\"" +
+                                         addedId.substr(0, 10) +
+                                         "\",\"name\":\"Portrait\"}",
+                                     renameArguments, timelineParseError),
               "rename_timeline arguments parse: " + timelineParseError);
-        Check(timelineRegistry.Call(timelineBackend, "rename_timeline",
-                                    renameArguments)
+        Check(timelineRegistry
+                  .Call(timelineBackend, "rename_timeline", renameArguments)
                   .ok,
               "rename_timeline resolves an unambiguous ULID prefix");
         Check(timelineBackend.LastProjectOperation() &&
@@ -558,8 +605,8 @@ int main() {
         Check(mcp_json::Value::Parse("{\"timeline_id\":\"" + addedId + "\"}",
                                      removeArguments, timelineParseError),
               "remove_timeline arguments parse: " + timelineParseError);
-        Check(timelineRegistry.Call(timelineBackend, "remove_timeline",
-                                    removeArguments)
+        Check(timelineRegistry
+                  .Call(timelineBackend, "remove_timeline", removeArguments)
                   .ok,
               "remove_timeline applies a RemoveProjectTimelineOperation");
         Check(timelineBackend.LastProjectOperation() &&
@@ -578,10 +625,10 @@ int main() {
             remainingTimelines && !remainingTimelines->AsArray().empty()
                 ? remainingTimelines->AsArray().front().Find("id")->AsString()
                 : "";
-        Check(mcp_json::Value::Parse("{\"timeline_id\":\"" + remainingId +
-                                     "\"}",
-                                     removeArguments, timelineParseError),
-              "final removal arguments parse: " + timelineParseError);
+        Check(
+            mcp_json::Value::Parse("{\"timeline_id\":\"" + remainingId + "\"}",
+                                   removeArguments, timelineParseError),
+            "final removal arguments parse: " + timelineParseError);
         const McpToolCallOutcome finalRemoval = timelineRegistry.Call(
             timelineBackend, "remove_timeline", removeArguments);
         CheckFailureEnvelope(finalRemoval, "remove final timeline",
@@ -629,8 +676,7 @@ int main() {
         speechBackend.SetSourceSpeechOnset(report);
         McpToolRegistry speechRegistry;
         const McpToolCallOutcome speechList = speechRegistry.Call(
-            speechBackend, "list_speech_onsets",
-            mcp_json::Value::MakeObject());
+            speechBackend, "list_speech_onsets", mcp_json::Value::MakeObject());
         Check(speechList.ok &&
                   speechList.result_json.find("\"groups\":[{") !=
                       std::string::npos &&
@@ -641,20 +687,22 @@ int main() {
 
         mcp_json::Value analyzeArguments;
         std::string analyzeError;
-        Check(mcp_json::Value::Parse(
-                  R"({"media_id":"01K30000000000000000000001","group_gap_ms":300,"group_floor_db":8})",
-                  analyzeArguments, analyzeError),
-              "speech analysis arguments parse: " + analyzeError);
-        Check(speechRegistry
-                  .Call(speechBackend, "analyze_speech_onset",
-                        analyzeArguments)
-                  .ok &&
-                  speechBackend.speech_onset_analysis_seen &&
-                  speechBackend.speech_onset_settings.thresholds
-                          .group_gap_milliseconds == 300 &&
-                  speechBackend.speech_onset_settings.thresholds
-                          .group_floor_db == 8,
-              "analyze_speech_onset forwards configurable group settings");
+        Check(
+            mcp_json::Value::Parse(
+                R"({"media_id":"01K30000000000000000000001","group_gap_ms":300,"group_floor_db":8})",
+                analyzeArguments, analyzeError),
+            "speech analysis arguments parse: " + analyzeError);
+        Check(
+            speechRegistry
+                    .Call(speechBackend, "analyze_speech_onset",
+                          analyzeArguments)
+                    .ok &&
+                speechBackend.speech_onset_analysis_seen &&
+                speechBackend.speech_onset_settings.thresholds
+                        .group_gap_milliseconds == 300 &&
+                speechBackend.speech_onset_settings.thresholds.group_floor_db ==
+                    8,
+            "analyze_speech_onset forwards configurable group settings");
     }
     // Segments are named by span id and resolved by the engine. A caller
     // that could state a source_in could state one landing mid-word, and
@@ -1252,12 +1300,12 @@ int main() {
                 const mcp_json::Value* ok = envelope.Find("ok");
                 const mcp_json::Value* error = envelope.Find("error");
                 const mcp_json::Value* detail = envelope.Find("detail");
-                badTextIsEnvelope =
-                    ok != nullptr && ok->IsBool() && !ok->AsBool() &&
-                    error != nullptr && error->IsString() &&
-                    error->AsString() == "ValidationFailed" &&
-                    detail != nullptr && detail->IsString() &&
-                    !detail->AsString().empty();
+                badTextIsEnvelope = ok != nullptr && ok->IsBool() &&
+                                    !ok->AsBool() && error != nullptr &&
+                                    error->IsString() &&
+                                    error->AsString() == "ValidationFailed" &&
+                                    detail != nullptr && detail->IsString() &&
+                                    !detail->AsString().empty();
             }
         }
     }
@@ -1599,14 +1647,15 @@ int main() {
         const McpToolCallOutcome outOfBoundsSplit =
             call("split_clip", R"({"clip_id":"01K30000000000000000000003",)"
                                R"("source_frame":4000})");
-        Check(!outOfBoundsSplit.ok &&
-                  outOfBoundsSplit.error_name == "InvalidOperation" &&
-                  outOfBoundsSplit.message.find("[101, 109]") !=
-                      std::string::npos &&
-                  outOfBoundsSplit.message.find("got 4000") !=
-                      std::string::npos,
-              "a source-frame cut outside the clip is InvalidOperation with "
-              "its actual bounds and value: " + outOfBoundsSplit.message);
+        Check(
+            !outOfBoundsSplit.ok &&
+                outOfBoundsSplit.error_name == "InvalidOperation" &&
+                outOfBoundsSplit.message.find("[101, 109]") !=
+                    std::string::npos &&
+                outOfBoundsSplit.message.find("got 4000") != std::string::npos,
+            "a source-frame cut outside the clip is InvalidOperation with "
+            "its actual bounds and value: " +
+                outOfBoundsSplit.message);
 
         // A trim reads the same address, with the tail inclusive.
         Check(call("trim_clip", R"({"clip_id":"01K30000000000000000000003",)"
@@ -1814,19 +1863,25 @@ int main() {
         const Ulid groupId = "01K30000000000000000000010";
         Document ripple;
         ripple.sources = {{sourceId, "rush.MP4", {25, 1}, {1000, 25}}};
-        DocumentClip v1{"01K30000000000000000000011", sourceId,
-                        {0, 25}, {10, 25}, {0, 25}};
+        DocumentClip v1{
+            "01K30000000000000000000011", sourceId, {0, 25}, {10, 25}, {0, 25}};
         v1.link_group_id = groupId;
         v1.sync_anchor_clip_id = v1.id;
         DocumentClip v2 = v1;
         v2.id = "01K30000000000000000000012";
         v2.sync_anchor_clip_id = v1.id;
-        DocumentClip v1After{"01K30000000000000000000013", sourceId,
-                             {20, 25}, {10, 25}, {10, 25}};
+        DocumentClip v1After{"01K30000000000000000000013",
+                             sourceId,
+                             {20, 25},
+                             {10, 25},
+                             {10, 25}};
         DocumentClip v2After = v1After;
         v2After.id = "01K30000000000000000000014";
-        DocumentClip a1{"01K30000000000000000000015", sourceId,
-                        {40, 25}, {10, 25}, {10, 25}};
+        DocumentClip a1{"01K30000000000000000000015",
+                        sourceId,
+                        {40, 25},
+                        {10, 25},
+                        {10, 25}};
         const Ulid v1TrackId = "01K30000000000000000000016";
         const Ulid v2TrackId = "01K30000000000000000000017";
         const Ulid a1TrackId = "01K30000000000000000000018";
@@ -1841,31 +1896,32 @@ int main() {
         const auto call = [&](const std::string& argumentsJson) {
             mcp_json::Value arguments;
             std::string parseFailure;
-            Check(mcp_json::Value::Parse(argumentsJson, arguments,
-                                         parseFailure),
-                  "ripple_trim arguments parse: " + parseFailure);
+            Check(
+                mcp_json::Value::Parse(argumentsJson, arguments, parseFailure),
+                "ripple_trim arguments parse: " + parseFailure);
             return registry.Call(backend, "ripple_trim", arguments);
         };
 
         const std::string before = backend.CurrentDocument().SaveToString();
-        const McpToolCallOutcome carried = call(
-            R"({"clip_id":"01K30000000000000000000011","edge":"Tail",)"
-            R"("delta":{"value":5,"rate":25}})");
+        const McpToolCallOutcome carried =
+            call(R"({"clip_id":"01K30000000000000000000011","edge":"Tail",)"
+                 R"("delta":{"value":5,"rate":25}})");
         Check(carried.ok, "ripple_trim carries the linked group by default: " +
-                           carried.message);
+                              carried.message);
         const Document& carriedDocument = backend.CurrentDocument();
-        Check(carriedDocument.FindClip("01K30000000000000000000011")
-                          ->duration == RationalTime{15, 25} &&
-                  carriedDocument.FindClip("01K30000000000000000000012")
-                          ->duration == RationalTime{15, 25},
-              "default ripple trims both V1 and V2");
+        Check(
+            carriedDocument.FindClip("01K30000000000000000000011")->duration ==
+                    RationalTime{15, 25} &&
+                carriedDocument.FindClip("01K30000000000000000000012")
+                        ->duration == RationalTime{15, 25},
+            "default ripple trims both V1 and V2");
         Check(carriedDocument.FindClip("01K30000000000000000000013")
                           ->timeline_in == RationalTime{15, 25} &&
                   carriedDocument.FindClip("01K30000000000000000000014")
                           ->timeline_in == RationalTime{15, 25},
               "default ripple keeps downstream V1/V2 aligned");
         Check(carriedDocument.FindClip("01K30000000000000000000015")
-                          ->timeline_in == RationalTime{10, 25},
+                      ->timeline_in == RationalTime{10, 25},
               "unlisted A1 is not shifted without sync_track_ids");
         mcp_json::Value carriedResult;
         std::string resultError;
@@ -1881,11 +1937,11 @@ int main() {
               "omitting sync_track_ids warns about downstream A1");
         EditError undoError = EditError::None;
         std::string undoMessage;
-        Check(backend.Log().Undo(
-                  const_cast<Document&>(backend.CurrentDocument()), undoError,
-                  undoMessage) &&
-                  backend.CurrentDocument().SaveToString() == before,
-              "default ripple undo restores V1/V2/A1 byte-identically");
+        Check(
+            backend.Log().Undo(const_cast<Document&>(backend.CurrentDocument()),
+                               undoError, undoMessage) &&
+                backend.CurrentDocument().SaveToString() == before,
+            "default ripple undo restores V1/V2/A1 byte-identically");
 
         InMemoryBackend subset(ripple);
         const McpToolCallOutcome explicitSubset = [&] {
@@ -1906,8 +1962,8 @@ int main() {
                           ->duration == RationalTime{10, 25},
               "explicit empty linked_clip_ids preserves a subset");
         mcp_json::Value subsetResult;
-        Check(mcp_json::Value::Parse(explicitSubset.result_json,
-                                     subsetResult, resultError) &&
+        Check(mcp_json::Value::Parse(explicitSubset.result_json, subsetResult,
+                                     resultError) &&
                   subsetResult.Find("also_cut") &&
                   subsetResult.Find("also_cut")->AsArray().empty(),
               "explicit subset reports no linked partner cut");
@@ -1923,14 +1979,13 @@ int main() {
               "aligned ripple arguments parse: " + alignedParseError);
         const McpToolCallOutcome alignment =
             registry.Call(aligned, "ripple_trim", alignedArguments);
-        Check(alignment.ok &&
-                  aligned.CurrentDocument()
-                          .FindClip("01K30000000000000000000015")
-                          ->timeline_in == RationalTime{15, 25},
+        Check(alignment.ok && aligned.CurrentDocument()
+                                      .FindClip("01K30000000000000000000015")
+                                      ->timeline_in == RationalTime{15, 25},
               "explicit sync_track_ids keeps V1/V2/A1 aligned");
         mcp_json::Value alignmentResult;
-        Check(mcp_json::Value::Parse(alignment.result_json,
-                                     alignmentResult, resultError) &&
+        Check(mcp_json::Value::Parse(alignment.result_json, alignmentResult,
+                                     resultError) &&
                   alignmentResult.Find("warning") == nullptr,
               "explicit synchronization suppresses the omission warning");
     }

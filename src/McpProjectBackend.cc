@@ -39,14 +39,42 @@ bool ParseCommandResult(const std::string& output, bool commandSucceeded,
 
 }  // namespace
 
-McpProjectBackend::McpProjectBackend(std::string projectPath)
-    : project_path_(std::move(projectPath)) {}
+McpProjectBackend::McpProjectBackend(std::string projectPath,
+                                     bool requireExplicitTimeline)
+    : project_path_(std::move(projectPath)),
+      require_explicit_timeline_(requireExplicitTimeline) {}
+
+bool McpProjectBackend::SelectTimelineForEdit(const std::string& timelineId,
+                                              std::string& errorName,
+                                              std::string& message) {
+    if (require_explicit_timeline_ && timelineId.empty()) {
+        errorName = "TimelineRequired";
+        message = "strict timeline editing requires an explicit timeline_id";
+        return false;
+    }
+    Project project;
+    if (!LoadStoredProject(project_path_, project, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    selected_timeline_id_ =
+        timelineId.empty() ? project.active_timeline_id : timelineId;
+    if (!project.FindTimeline(selected_timeline_id_)) {
+        errorName = "UnknownSequence";
+        message = "unknown timeline_id '" + selected_timeline_id_ + "'";
+        selected_timeline_id_.clear();
+        return false;
+    }
+    return true;
+}
 
 bool McpProjectBackend::SnapshotDocument(Document& document,
                                          std::string& message) {
     Project project;
     if (!LoadStoredProject(project_path_, project, message)) return false;
-    document = project.MakeActiveDocument();
+    document = selected_timeline_id_.empty()
+                   ? project.MakeActiveDocument()
+                   : project.MakeDocument(selected_timeline_id_);
     return true;
 }
 
@@ -56,8 +84,8 @@ bool McpProjectBackend::ApplyOperation(Operation operation,
                                        std::string& message) {
     const std::string operationJson = SerializeOperation(operation);
     std::string output;
-    const int result =
-        ApplyOperationCommand(project_path_, operationJson, output);
+    const int result = ApplyOperationCommand(project_path_, operationJson,
+                                             output, selected_timeline_id_);
     return ParseCommandResult(output, result == 0, resultJson, errorName,
                               message);
 }
@@ -80,7 +108,9 @@ bool McpProjectBackend::ReadTimelineTranscript(std::string& json,
     const std::filesystem::path projectPath =
         std::filesystem::absolute(project_path_);
     return DescribeTimelineTranscriptForAgent(
-        project.MakeActiveDocument(),
+        selected_timeline_id_.empty()
+            ? project.MakeActiveDocument()
+            : project.MakeDocument(selected_timeline_id_),
         projectPath.parent_path() / ".cutmachine" / "transcripts", json,
         message);
 }
@@ -118,13 +148,12 @@ bool McpProjectBackend::ReadSourceSpeechOnset(const Ulid& sourceId,
     return LoadSpeechOnset(path.string(), report, message);
 }
 
-bool McpProjectBackend::AnalyzeSourceSpeechOnset(const Ulid& sourceId,
-                                                 const SpeechOnsetSettings& settings,
-                                                 std::string& resultJson,
-                                                 std::string& message) {
+bool McpProjectBackend::AnalyzeSourceSpeechOnset(
+    const Ulid& sourceId, const SpeechOnsetSettings& settings,
+    std::string& resultJson, std::string& message) {
     std::string output;
-    const int result = AnalyzeSpeechOnsetCommand(project_path_, sourceId,
-                                                 output, settings);
+    const int result =
+        AnalyzeSpeechOnsetCommand(project_path_, sourceId, output, settings);
     std::string errorName;
     return ParseCommandResult(output, result == 0, resultJson, errorName,
                               message);
@@ -199,7 +228,8 @@ bool McpProjectBackend::CaptureSourceFrame(const Ulid& sourceId,
 bool McpProjectBackend::Undo(std::string& resultJson, std::string& errorName,
                              std::string& message) {
     std::string output;
-    const int result = UndoOperationCommand(project_path_, output);
+    const int result =
+        UndoOperationCommand(project_path_, output, selected_timeline_id_);
     return ParseCommandResult(output, result == 0, resultJson, errorName,
                               message);
 }
@@ -207,7 +237,8 @@ bool McpProjectBackend::Undo(std::string& resultJson, std::string& errorName,
 bool McpProjectBackend::Redo(std::string& resultJson, std::string& errorName,
                              std::string& message) {
     std::string output;
-    const int result = RedoOperationCommand(project_path_, output);
+    const int result =
+        RedoOperationCommand(project_path_, output, selected_timeline_id_);
     return ParseCommandResult(output, result == 0, resultJson, errorName,
                               message);
 }

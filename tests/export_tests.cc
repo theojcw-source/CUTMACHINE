@@ -300,16 +300,37 @@ int main() {
     }
     std::string commandOutput;
     std::string headlessProjectPath;
+    Project headlessProject =
+        Project::FromDocument(document, "Headless export");
+    DocumentSequence emptyTimeline;
+    emptyTimeline.id = GenerateUlid();
+    emptyTimeline.name = "Empty alternate";
+    emptyTimeline.width = document.sequence.width;
+    emptyTimeline.height = document.sequence.height;
+    emptyTimeline.frame_rate = document.sequence.frame_rate;
+    headlessProject.timelines.push_back(emptyTimeline);
     Check(CreatePortableProject(
               (directory / "Headless.cutmachine-project").string(),
-              Project::FromDocument(document, "Headless export"),
-              headlessProjectPath, error),
+              headlessProject, headlessProjectPath, error),
           "headless export project package saves: " + error);
     Check(ExportCommand(headlessProjectPath, invalid, {}, nullptr,
                         commandOutput) == 1 &&
               commandOutput.find("\"error\":\"InvalidExport\"") !=
                   std::string::npos,
           "headless export returns a structured validation error");
+    ExportSettings explicitSettings = Exporter::HevcMain10SoftwarePreset(
+        (directory / "explicit-empty.mp4").string());
+    explicitSettings.ffmpeg_path = FFMPEG_EXECUTABLE;
+    Check(ExportCommand(headlessProjectPath, explicitSettings, {}, nullptr,
+                        commandOutput, emptyTimeline.id) == 1 &&
+              commandOutput.find("cannot export an empty timeline") !=
+                  std::string::npos,
+          "an explicit timeline is selected instead of the active one");
+    Check(ExportCommand(headlessProjectPath, invalid, {}, nullptr,
+                        commandOutput, GenerateUlid()) == 1 &&
+              commandOutput.find("\"error\":\"UnknownSequence\"") !=
+                  std::string::npos,
+          "an unknown explicit export timeline is refused");
 
     const std::filesystem::path sequenceDestination =
         directory / "sequence-size.mp4";

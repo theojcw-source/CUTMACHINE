@@ -44,6 +44,26 @@ public:
     // short IDs (IdResolver) before an operation is constructed.
     virtual bool SnapshotDocument(Document& document, std::string& message) = 0;
 
+    // B9 -- scopes one timeline-editing tool call. The default backend only
+    // owns one document, so it accepts that document's id and rejects any
+    // other explicit timeline. Project/live backends override this to select
+    // another timeline without changing persisted active-project state.
+    virtual bool SelectTimelineForEdit(const std::string& timelineId,
+                                       std::string& errorName,
+                                       std::string& message) {
+        if (timelineId.empty()) return true;
+        Document document;
+        if (!SnapshotDocument(document, message)) {
+            errorName = "IoError";
+            return false;
+        }
+        if (document.sequence.id == timelineId) return true;
+        errorName = "UnknownSequence";
+        message = "unknown timeline_id '" + timelineId + "'";
+        return false;
+    }
+    virtual void EndTimelineEdit() {}
+
     // Applies a freshly constructed (not-yet-applied) operation through the
     // same path as `--apply-op`. On success, resultJson holds the tool
     // result payload to report back over MCP. On failure, errorName is one
@@ -159,8 +179,7 @@ public:
 
     virtual bool AnalyzeSourceSpeechOnset(const Ulid&,
                                           const SpeechOnsetSettings&,
-                                          std::string&,
-                                          std::string& message) {
+                                          std::string&, std::string& message) {
         message = "this backend cannot run a speech onset analysis";
         return false;
     }
