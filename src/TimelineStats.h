@@ -21,6 +21,8 @@ struct TimelineStats {
     TimelineStatsRatio plans_per_minute;
     int64_t cutaway_plans = 0;
     TimelineStatsRatio cutaway_share;
+    // The first visible cutaway, not merely the first edit on the primary
+    // track. This is the editorial "première coupe" measured by A8.
     std::optional<RationalTime> first_cut;
 };
 
@@ -33,4 +35,3 @@ bool CalculateTimelineStats(const Document& document, TimelineStats& output,
 
 // Compact canonical JSON used by both headless surfaces.
 std::string SerializeTimelineStats(const TimelineStats& stats);
-

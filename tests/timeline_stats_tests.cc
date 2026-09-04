@@ -50,7 +50,7 @@ int main() {
     Check(stats.visible_cuts == 1,
           "only the visible transition is a cut");
     Check(stats.first_cut && *stats.first_cut == RationalTime{10, 25},
-          "first visible cut is at the overlay start");
+          "first visible cutaway is at the overlay start");
     Check(stats.plans_per_minute.numerator == 100 &&
               stats.plans_per_minute.denominator == 1,
           "plans per minute is an exact reduced ratio");
@@ -74,6 +74,8 @@ int main() {
     Check(stats.visible_shots == 3 && stats.visible_cuts == 2 &&
               stats.cutaway_plans == 0,
           "hidden tracks do not create visible plans or cutaways");
+    Check(!stats.first_cut,
+          "primary-track edits are not reported as a first cutaway");
 
     Document invalid = document;
     invalid.sequence.tracks[0].clips[0].duration.rate = 0;

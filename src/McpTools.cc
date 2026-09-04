@@ -3210,7 +3210,7 @@ McpToolRegistry::McpToolRegistry() {
     add("timeline_stats",
         "Calculate exact editorial statistics for the active composited "
         "timeline: duration, visible shots and cuts, shots per minute, "
-        "cutaway share, and the first visible cut. Clips hidden underneath a "
+        "cutaway share, and the first visible cutaway. Clips hidden underneath a "
         "higher visible video track do not count as visible changes.",
         SchemaBuilder().Build("timeline_stats takes no arguments"),
         DispatchTimelineStats);

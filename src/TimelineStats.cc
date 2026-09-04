@@ -151,12 +151,13 @@ bool CalculateTimelineStats(const Document& document, TimelineStats& output,
     for (size_t index = 1; index < segments.size(); ++index) {
         if (segments[index - 1].end == segments[index].start) {
             ++output.visible_cuts;
-            if (!output.first_cut)
-                output.first_cut = segments[index].start;
         }
     }
     for (const VisibleSegment& segment : segments) {
-        if (segment.track_index != primaryVideoTrack) ++output.cutaway_plans;
+        if (segment.track_index != primaryVideoTrack) {
+            ++output.cutaway_plans;
+            if (!output.first_cut) output.first_cut = segment.start;
+        }
     }
 
     if (duration.value == 0) {
