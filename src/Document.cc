@@ -779,6 +779,10 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     media.metadata_complete = false;
                 } else {
                     media.codec = codec->string;
+                    if (const JsonValue* value = Optional(
+                            item, "has_video", JsonValue::Type::Boolean,
+                            context))
+                        media.has_video = value->boolean;
                     media.width = Int32(item, "width", context);
                     media.height = Int32(item, "height", context);
                     if (const JsonValue* value =
@@ -1346,7 +1350,9 @@ std::string Document::SaveToString() const {
             output << ",\"proxy_path\":\"" << Escape(media.proxy_path) << "\"";
         if (media.metadata_complete) {
             output << ",\"codec\":\"" << Escape(media.codec)
-                   << "\",\"width\":" << media.width
+                   << "\",\"has_video\":"
+                   << (media.has_video ? "true" : "false")
+                   << ",\"width\":" << media.width
                    << ",\"height\":" << media.height
                    << ",\"rotation_degrees\":" << media.rotation_degrees
                    << ",\"pixel_format\":\"" << Escape(media.pixel_format)
@@ -1540,12 +1546,25 @@ bool Document::Validate(std::string& error) const {
             return false;
         }
         if (media.metadata_complete) {
-            if (media.codec.empty() || media.width <= 0 || media.height <= 0 ||
-                media.rotation_degrees < -180 || media.rotation_degrees > 180 ||
-                (media.orientation != "landscape" &&
-                 media.orientation != "portrait" &&
-                 media.orientation != "square")) {
+            if (media.codec.empty() || (!media.has_video && !media.has_audio)) {
+                error = context + " has no usable audio or video stream";
+                return false;
+            }
+            if (media.has_video &&
+                (media.width <= 0 || media.height <= 0 ||
+                 media.rotation_degrees < -180 ||
+                 media.rotation_degrees > 180 ||
+                 (media.orientation != "landscape" &&
+                  media.orientation != "portrait" &&
+                  media.orientation != "square"))) {
                 error = context + " has invalid video metadata";
+                return false;
+            }
+            if (!media.has_video &&
+                (media.width != 0 || media.height != 0 ||
+                 media.rotation_degrees != 0 ||
+                 media.orientation != "audio")) {
+                error = context + " has picture metadata without video";
                 return false;
             }
             if (media.has_audio &&
@@ -1677,6 +1696,14 @@ bool Document::Validate(std::string& error) const {
             }
             const DocumentSource* source =
                 captionClip ? nullptr : FindSource(clip.source_id);
+            const LibraryMedia* media =
+                captionClip ? nullptr : FindLibraryMedia(clip.source_id);
+            if (media && media->metadata_complete && track.kind == "video" &&
+                !media->has_video) {
+                error = context + " ('" + clip.id +
+                        "') uses audio-only media on a video track";
+                return false;
+            }
             try {
                 if (!captionClip &&
                     clip.source_in.add(clip.duration) > source->duration) {

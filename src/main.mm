@@ -3366,6 +3366,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     for (const DocumentSource& source : self.state->document.sources) {
         const LibraryMedia* media =
             self.state->document.FindLibraryMedia(source.id);
+        if (media && !media->has_video) {
+            self.state->mediaMetadata[source.id] = *media;
+            continue;
+        }
         std::filesystem::path mediaPath(source.path);
         if (mediaPath.is_relative()) mediaPath = baseDirectory / mediaPath;
         LibraryMedia detected;
@@ -3407,6 +3411,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     for (const DocumentSource& source : self.state->document.sources) {
         const LibraryMedia* media =
             self.state->document.FindLibraryMedia(source.id);
+        if (media && !media->has_video) continue;
         std::filesystem::path mediaPath(source.path);
         if (mediaPath.is_relative()) {
             mediaPath = baseDirectory / mediaPath;
@@ -4241,6 +4246,12 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             }
             if (media == nullptr) {
                 message = "unknown media_id '" + sourceId + "'";
+                return false;
+            }
+            if (!media->has_video) {
+                message = "media_id '" + sourceId +
+                          "' is audio-only; read_frame requires a video "
+                          "stream";
                 return false;
             }
             const std::filesystem::path projectPath =
@@ -6609,8 +6620,11 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 image.contentTintColor = nil;
             } else {
                 image.image = SystemSymbol(
-                    offline ? @"exclamationmark.triangle" : @"film",
-                    offline ? @"Média offline" : @"Média vidéo");
+                    offline ? @"exclamationmark.triangle"
+                            : media->has_video ? @"film" : @"waveform",
+                    offline ? @"Média offline"
+                            : media->has_video ? @"Média vidéo"
+                                               : @"Média audio");
                 image.contentTintColor = offline
                                              ? CMThemeColor(ui::theme::kError)
                                              : CMTextSecondaryColor();
@@ -6667,6 +6681,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     else if ([tableColumn.identifier isEqualToString:@"format"])
         label.stringValue =
             self.state->offlineSourceIds.count(media->id) ? @"Média offline"
+            : media->metadata_complete && !media->has_video
+                ? [NSString stringWithFormat:@"Audio · %s · %d ch",
+                                             media->codec.c_str(),
+                                             media->audio_channels]
             : media->metadata_complete
                 ? [NSString stringWithFormat:@"%@%s %dx%d",
                                              media->proxy_path.empty()
@@ -7055,6 +7073,11 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     const DocumentSource* source = self.state->document.FindSource(mediaId);
     if (!media || !source) return;
+    if (!media->has_video) {
+        self.binSummaryLabel.stringValue =
+            @"Ce média est audio seul · aucun proxy vidéo à générer.";
+        return;
+    }
     for (const auto& pending : self.state->pendingProxies) {
         if (pending.second.media_id == mediaId) {
             self.binSummaryLabel.stringValue = @"Un proxy est déjà en cours.";
@@ -9862,6 +9885,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const Ulid mediaId(identifier.UTF8String ?: "");
     const DocumentSource* source = self.state->document.FindSource(mediaId);
     if (!source) return;
+    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     for (const auto& pending : self.state->pendingWaveforms)
         if (pending.second.media_id == mediaId) return;
     const std::filesystem::path projectPath = std::filesystem::absolute(
@@ -9871,7 +9895,6 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (input.is_relative()) input = base / input;
     const std::filesystem::path output =
         base / ".cutmachine" / "waveforms" / (mediaId + ".waveform");
-    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     const std::string label =
         "Waveform " + (media ? media->filename : input.filename().string());
     WaveformSettings settings;
@@ -10157,6 +10180,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
 - (void)loadOrEnqueueThumbnailForMediaIdentifier:(NSString*)identifier {
     if (!identifier || !self.state || self.mediaThumbnails[identifier]) return;
     const Ulid mediaId(identifier.UTF8String ?: "");
+    const LibraryMedia* media =
+        self.state->document.FindLibraryMedia(mediaId);
+    if (media && !media->has_video) return;
     const std::filesystem::path projectPath = std::filesystem::absolute(
         std::filesystem::path(self.documentPath.UTF8String ?: ""));
     const std::filesystem::path output = projectPath.parent_path() /
@@ -10177,6 +10203,13 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const Ulid mediaId(identifier.UTF8String ?: "");
     const DocumentSource* source = self.state->document.FindSource(mediaId);
     if (!source) return;
+    const LibraryMedia* media =
+        self.state->document.FindLibraryMedia(mediaId);
+    if (media && !media->has_video) {
+        self.binSummaryLabel.stringValue =
+            @"Ce média est audio seul · aucune vignette à générer.";
+        return;
+    }
     for (const auto& pending : self.state->pendingThumbnails)
         if (pending.second.media_id == mediaId) return;
     const std::filesystem::path projectPath = std::filesystem::absolute(
@@ -10186,7 +10219,6 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (input.is_relative()) input = base / input;
     const std::filesystem::path output =
         base / ".cutmachine" / "thumbnails" / (mediaId + ".png");
-    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     const std::string label =
         "Thumbnail " + (media ? media->filename : input.filename().string());
     ThumbnailSettings settings;
@@ -10694,6 +10726,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     for (const DocumentSource& source : self.state->document.sources) {
         const LibraryMedia* media =
             self.state->document.FindLibraryMedia(source.id);
+        if (media && !media->has_video) {
+            self.state->frameCache->ClearSource(source.id);
+            continue;
+        }
         std::filesystem::path original(source.path);
         if (original.is_relative()) original = base / original;
         std::filesystem::path selected = original;
@@ -10808,9 +10844,11 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         return;
     }
     for (const auto& source : addedSources) {
-        if (const LibraryMedia* media =
-                self.state->document.FindLibraryMedia(source.first))
+        const LibraryMedia* media =
+            self.state->document.FindLibraryMedia(source.first);
+        if (media)
             self.state->mediaMetadata[source.first] = *media;
+        if (media && !media->has_video) continue;
         auto worker = std::make_unique<DecodeWorker>(
             source.first, *self.state->frameCache,
             *self.state->performanceMetrics);

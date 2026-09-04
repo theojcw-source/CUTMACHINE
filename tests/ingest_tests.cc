@@ -11,6 +11,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -56,6 +57,7 @@ int main() {
     const std::filesystem::path rawPath = root / "raw.mp4";
     const std::filesystem::path variableRatePath = root / "variable-rate.mp4";
     const std::filesystem::path alphaPath = root / "transparent.mov";
+    const std::filesystem::path audioPath = root / "voice.wav";
     const std::filesystem::path videoPath = mediaDirectory / "rotated.mp4";
     std::filesystem::create_directories(mediaDirectory);
 
@@ -97,6 +99,14 @@ int main() {
         Quote(alphaPath);
     Check(std::system(generateAlpha.c_str()) == 0,
           "FFmpeg must generate the transparent video fixture");
+    const std::string generateAudio =
+        Quote(FFMPEG_EXECUTABLE) +
+        " -hide_banner -loglevel error "
+        "-f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=1' "
+        "-c:a pcm_s16le " +
+        Quote(audioPath);
+    Check(std::system(generateAudio.c_str()) == 0,
+          "FFmpeg must generate the audio-only fixture");
     MediaSource alphaSource;
     Check(alphaSource.Open(alphaPath.string()),
           "transparent video decode source opens");
@@ -210,6 +220,81 @@ int main() {
         std::string editMessage;
         Check(ApplyOperation(ingested, insert, inverse, editError, editMessage),
               "an ingested media can be inserted directly: " + editMessage);
+    }
+
+    // B11 -- a precise file path is an ingest root too, and a sound file is
+    // first-class media. Its sample clock becomes the exact source timebase;
+    // no synthetic black video is needed.
+    Check(IngestCommand(documentPath.string(), audioPath.string(), false,
+                        output) == 0,
+          "a single audio file ingests directly: " + output);
+    Check(output.find("\"added\":1") != std::string::npos &&
+              output.find("no video stream") == std::string::npos,
+          "audio-only ingest succeeds instead of reporting a video refusal");
+    Project audioProject;
+    Check(LoadStoredProject(documentPath.string(), audioProject, error),
+          "project with audio-only media loads: " + error);
+    const auto audioMedia = std::find_if(
+        audioProject.rushes.begin(), audioProject.rushes.end(),
+        [&](const LibraryMedia& media) {
+            return media.filename == audioPath.filename().string();
+        });
+    Check(audioMedia != audioProject.rushes.end(),
+          "audio-only media is present in the library");
+    if (audioMedia != audioProject.rushes.end()) {
+        Check(!audioMedia->has_video && audioMedia->has_audio,
+              "audio-only capability is explicit in the library");
+        Check(audioMedia->width == 0 && audioMedia->height == 0 &&
+                  audioMedia->orientation == "audio",
+              "audio-only media carries no fabricated picture metadata");
+        Check(audioMedia->rate.num == 48000 && audioMedia->rate.den == 1 &&
+                  audioMedia->duration == RationalTime{48000, 48000},
+              "audio samples provide the exact rate and duration");
+        const std::string canonical =
+            audioProject.MakeActiveDocument().SaveToString();
+        Check(canonical.find("\"has_video\":false") != std::string::npos,
+              "canonical library JSON exposes has_video false");
+
+        Document audioDocument = audioProject.MakeActiveDocument();
+        audioDocument.sequence.tracks.push_back(
+            {"01K83000000000000000000001", "audio", 0, {}});
+        Operation audioInsert = InsertClipOperation{
+            audioDocument.sequence.tracks.back().id,
+            audioMedia->id,
+            {0, 48000},
+            audioMedia->duration,
+            {0, 48000},
+            {},
+            {}};
+        Operation audioInverse = RemoveClipOperation{};
+        EditError audioEditError = EditError::None;
+        std::string audioEditMessage;
+        Check(ApplyOperation(audioDocument, audioInsert, audioInverse,
+                             audioEditError, audioEditMessage),
+              "audio-only media inserts on an audio track: " +
+                  audioEditMessage);
+        audioDocument.sequence.tracks.push_back(
+            {"01K83000000000000000000002", "video", 1, {}});
+        Operation videoInsert = InsertClipOperation{
+            audioDocument.sequence.tracks.back().id,
+            audioMedia->id,
+            {0, 48000},
+            audioMedia->duration,
+            {0, 48000},
+            {},
+            {}};
+        Check(!ApplyOperation(audioDocument, videoInsert, audioInverse,
+                              audioEditError, audioEditMessage) &&
+                  audioEditError == EditError::InvalidOperation,
+              "audio-only media is refused explicitly on a video track");
+
+        std::string qualityOutput;
+        Check(AnalyzeShotQualityCommand(documentPath.string(), audioMedia->id,
+                                        qualityOutput) == 1 &&
+                  qualityOutput.find("\"error\":\"InvalidOperation\"") !=
+                      std::string::npos &&
+                  qualityOutput.find("audio-only") != std::string::npos,
+              "shot-quality refuses audio-only media before decoding");
     }
 
     // QC-2026-09 A3 -- the case the ticket is about: a mute cutaway. 29 of one

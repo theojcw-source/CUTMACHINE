@@ -132,13 +132,8 @@ inline std::vector<BinNavigationEntry> BinNavigationTree(
 
 // ---- Audio tab -----------------------------------------------------------
 //
-// Ingest.cc's ProbeMediaMetadata rejects any file without a video stream
-// (see its "no video stream" failure) -- this codebase's library has no
-// video-less media entry today, and adding one is new engine capability
-// outside this UI ticket's scope (ROADMAP.md F2.3: "this is a UI ticket").
-// "Audio-only sources" is therefore read here as "library media whose
-// LibraryMedia::has_audio is true" -- the subset of the existing library a
-// user would drag onto an audio track -- rather than a file lacking video.
+// B11 -- audio-only files and files with embedded sound share the same audio
+// tab. Picture capability is deliberately irrelevant to this filter.
 inline bool CarriesAudio(const LibraryMedia& media) { return media.has_audio; }
 
 // Filters `library` down to audio-capable entries within one bin (or all

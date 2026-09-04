@@ -262,10 +262,12 @@ bool Exporter::BuildPlan(const Document& document,
     }
 
     std::map<Ulid, bool> sourceHasAudio;
+    std::map<Ulid, bool> sourceHasVideo;
     for (const DocumentSource& source : document.sources) {
         const LibraryMedia* media = document.FindLibraryMedia(source.id);
         if (media && media->metadata_complete) {
             sourceHasAudio[source.id] = media->has_audio;
+            sourceHasVideo[source.id] = media->has_video;
             continue;
         }
         LibraryMedia detected;
@@ -277,6 +279,7 @@ bool Exporter::BuildPlan(const Document& document,
             return false;
         }
         sourceHasAudio[source.id] = detected.has_audio;
+        sourceHasVideo[source.id] = detected.has_video;
     }
 
     struct InputClip {
@@ -319,6 +322,11 @@ bool Exporter::BuildPlan(const Document& document,
             const bool video = track->kind == "video";
             const bool audio =
                 sourceHasAudio[clip.source_id] && track->kind == "audio";
+            if (video && !sourceHasVideo[clip.source_id]) {
+                error = "audio-only source_id '" + clip.source_id +
+                        "' cannot be exported from a video track";
+                return false;
+            }
             if (!video && !audio) continue;
             InputClip input;
             input.track = track;

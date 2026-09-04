@@ -284,6 +284,16 @@ bool ApplyInsert(Document& candidate, InsertClipOperation& operation,
              "unknown source_id '" + operation.source_id + "'", error, message);
         return false;
     }
+    const LibraryMedia* media =
+        candidate.FindLibraryMedia(operation.source_id);
+    if (track->kind == "video" && media && media->metadata_complete &&
+        !media->has_video) {
+        Fail(EditError::InvalidOperation,
+             "source_id '" + operation.source_id +
+                 "' is audio-only and cannot be inserted on a video track",
+             error, message);
+        return false;
+    }
     if (operation.timeline_in.rate <= 0 || operation.timeline_in.value < 0) {
         Fail(EditError::InvalidTimelineIn,
              "timeline_in must be non-negative with a positive rate", error,
@@ -5833,7 +5843,8 @@ void WriteLibraryMedia(std::ostringstream& output, const LibraryMedia& media) {
     WriteTime(output, media.duration);
     output << ",\"orientation\":";
     WriteString(output, media.orientation);
-    output << ",\"has_audio\":" << (media.has_audio ? 1 : 0)
+    output << ",\"has_video\":" << (media.has_video ? 1 : 0)
+           << ",\"has_audio\":" << (media.has_audio ? 1 : 0)
            << ",\"audio_rate\":" << media.audio_rate
            << ",\"audio_channels\":" << media.audio_channels << ",\"bin_id\":";
     WriteString(output, media.bin_id);
@@ -5875,6 +5886,8 @@ LibraryMedia ReadLibraryMedia(Reader& reader) {
     media.duration = ReadTime(reader);
     reader.Expect(",\"orientation\":");
     media.orientation = reader.String();
+    if (reader.Consume(",\"has_video\":"))
+        media.has_video = reader.Integer() != 0;
     reader.Expect(",\"has_audio\":");
     media.has_audio = reader.Integer() != 0;
     reader.Expect(",\"audio_rate\":");
@@ -5923,9 +5936,12 @@ bool ValidateProjectRelinkCandidate(const Project& project,
         return false;
     }
     const LibraryMedia& replacement = item.replacement;
-    if (!replacement.metadata_complete || replacement.width <= 0 ||
-        replacement.height <= 0) {
-        message = "replacement is not a valid video source";
+    if (!replacement.metadata_complete ||
+        (media->has_video && !replacement.has_video) ||
+        (!media->has_video && !replacement.has_audio)) {
+        message = media->has_video
+                      ? "replacement has no video for existing video media"
+                      : "replacement has no audio for existing audio media";
         return false;
     }
     if (static_cast<int64_t>(replacement.rate.num) * source->rate.den !=

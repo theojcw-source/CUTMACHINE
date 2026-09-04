@@ -462,6 +462,43 @@ int main() {
     InMemoryBackend backend(fixture);
     McpToolRegistry shortRegistry;
 
+    // B11 -- image tools reject audio-only media by capability before a
+    // backend starts FFmpeg and returns a generic I/O failure.
+    {
+        Document audioOnly;
+        LibraryMedia media;
+        media.id = "01K31000000000000000000001";
+        media.path = "voice.wav";
+        media.filename = "voice.wav";
+        media.codec = "pcm_s16le";
+        media.has_video = false;
+        media.width = 0;
+        media.height = 0;
+        media.rate = {48000, 1};
+        media.duration = {48000, 48000};
+        media.orientation = "audio";
+        media.has_audio = true;
+        media.audio_rate = 48000;
+        media.audio_channels = 1;
+        audioOnly.library.push_back(media);
+        audioOnly.sources.push_back(
+            {media.id, media.path, media.rate, media.duration});
+        InMemoryBackend audioBackend(audioOnly);
+        McpToolRegistry audioRegistry;
+        mcp_json::Value frameArguments;
+        std::string frameParseError;
+        Check(mcp_json::Value::Parse(
+                  R"({"media_id":"01K31000000000000000000001","source_in":{"value":0,"rate":48000}})",
+                  frameArguments, frameParseError),
+              "audio-only frame arguments parse: " + frameParseError);
+        const McpToolCallOutcome frameOutcome =
+            audioRegistry.Call(audioBackend, "read_frame", frameArguments);
+        CheckFailureEnvelope(frameOutcome, "read_frame on audio-only media",
+                             "InvalidOperation");
+        Check(frameOutcome.message.find("audio-only") != std::string::npos,
+              "the frame refusal names the missing picture capability");
+    }
+
     // B8 -- timelines are project objects, not an array an MCP client edits.
     // Exercise the tools through a real ProjectEditLog, including the engine's
     // stable refusal for the final timeline.

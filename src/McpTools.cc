@@ -2208,6 +2208,11 @@ bool DispatchReadFrame(McpBackend& backend, const IdResolver& resolver,
                     "'read_frame' takes exactly one of 'clip_id' or "
                     "'media_id'");
 
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
     Ulid sourceId;
     RationalTime time;
     if (hasClip) {
@@ -2222,9 +2227,6 @@ bool DispatchReadFrame(McpBackend& backend, const IdResolver& resolver,
             return Fail(errorName, message,
                         "'read_frame.source_in' belongs with 'media_id'; a "
                         "clip is addressed by 'position' instead");
-        Document document;
-        if (!backend.SnapshotDocument(document, message))
-            return Fail(errorName, message, message);
         const DocumentClip* clip = document.FindClip(clipId);
         if (clip == nullptr) {
             errorName = EditErrorName(EditError::UnknownClip);
@@ -2256,6 +2258,14 @@ bool DispatchReadFrame(McpBackend& backend, const IdResolver& resolver,
                     message) ||
             !ReadTime(args, "source_in", "read_frame", true, time, message))
             return Fail(errorName, message, message);
+    }
+
+    const LibraryMedia* media = document.FindLibraryMedia(sourceId);
+    if (media && media->metadata_complete && !media->has_video) {
+        errorName = EditErrorName(EditError::InvalidOperation);
+        message = "media_id '" + sourceId +
+                  "' is audio-only; read_frame requires a video stream";
+        return false;
     }
 
     std::string jpeg;

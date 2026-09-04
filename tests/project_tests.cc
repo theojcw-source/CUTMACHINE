@@ -159,6 +159,7 @@ int main() {
                       "rush.mov",
                       "rush.mov",
                       "h264",
+                      true,
                       1920,
                       1080,
                       "yuv420p",

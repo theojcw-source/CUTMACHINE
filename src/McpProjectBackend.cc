@@ -183,6 +183,11 @@ bool McpProjectBackend::CaptureSourceFrame(const Ulid& sourceId,
         message = "unknown media_id '" + sourceId + "'";
         return false;
     }
+    if (!media->has_video) {
+        message = "media_id '" + sourceId +
+                  "' is audio-only; read_frame requires a video stream";
+        return false;
+    }
     std::filesystem::path path(media->path);
     if (path.is_relative()) {
         path = std::filesystem::absolute(project_path_).parent_path() / path;

@@ -36,10 +36,10 @@ bool MeasureMediaAudioLevel(const std::string& path,
                             const std::string& ffmpegPath, int64_t& level,
                             std::string& reason);
 
-// Scans media headers, then measures the mean audio level of every media
-// that has an audio stream (see MeasureMediaAudioLevel). No renderer, AppKit,
-// or Metal object is created by this command; the only decoding is that of
-// the audio, through the FFmpeg binary.
+// Scans either one regular file or every file in a directory, then measures
+// the mean audio level of every media that has an audio stream (see
+// MeasureMediaAudioLevel). No renderer, AppKit, or Metal object is created by
+// this command; the only decoding is that of the audio, through FFmpeg.
 int IngestCommand(const std::string& documentPath,
-                  const std::string& directoryPath, bool recursive,
+                  const std::string& mediaPath, bool recursive,
                   std::string& output);

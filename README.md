@@ -444,6 +444,7 @@ décodage média :
 ./build/cutmachine --undo-project-op ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --redo-project-op ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --ingest ./Film.cutmachine-project/project.cutmachine.json ./rushes --recursive
+./build/cutmachine --ingest ./Film.cutmachine-project/project.cutmachine.json ./voix-off.wav
 ./build/cutmachine --import-resolve ./Film.cutmachine-project/project.cutmachine.json ./manifest.json
 ./build/cutmachine --export ./Film.cutmachine-project/project.cutmachine.json ./film.mp4
 ```
@@ -511,14 +512,15 @@ la médiathèque compte dans `skipped` sans figurer dans `errors` — c'est le
 résultat attendu d'un réimport, pas un échec.
 
 ```json
-{"ok":true,"added":405,"skipped":3,"bins_created":22,"bins_reused":0,
- "errors":[{"file":"Ian Post - Electricity.wav","reason":"no video stream"}]}
+{"ok":true,"added":406,"skipped":2,"bins_created":22,"bins_reused":0,
+ "errors":[]}
 ```
 
-Deux motifs de refus reviennent souvent. Le média hors ligne : le volume doit
-être monté au moment de l'import. Et le **fichier audio seul** — musique,
-ambiance, son stock — que la sonde refuse faute de flux vidéo. C'est une limite
-de `ProbeMediaMetadata`, partagée avec `--ingest`, pas de l'import Resolve.
+Un média hors ligne reste refusé : le volume doit être monté au moment de
+l'import. Les fichiers audio seuls — voix off, musique, ambiance, son stock —
+sont en revanche ingérés normalement avec `has_video: false`. Leur cadence
+exacte est celle des échantillons audio ; les commandes d'image (`read_frame`,
+analyse qualité, vignette et proxy vidéo) les refusent explicitement.
 
 Ce qui reste hors périmètre : les timelines Resolve elles-mêmes (seuls les
 rushes traversent), les mots-clés, drapeaux et commentaires de clip, le
@@ -947,7 +949,7 @@ rejeu exact. Exemples canoniques complets (les identifiants sont des ULID) :
 {"type":"SetProjectTimelineBin","timeline_id":"01K00000000000000000000002","bin_id":"01K00000000000000000000003","exact_project_hex":null}
 {"type":"RenameProjectItem","item_id":"01K00000000000000000000002","name":"Montage vertical","exact_project_hex":null}
 {"type":"SetActiveProjectTimeline","timeline_id":"01K00000000000000000000002","exact_project_hex":null}
-{"type":"RelinkProjectMedia","replacements":[{"media_id":"01K00000000000000000000001","replacement":{"id":"01K00000000000000000000001","path":"rushes/interview.mov","filename":"interview.mov","codec":"h264","width":1920,"height":1080,"pixel_format":"yuv420p","color_range":"tv","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709","rotation_degrees":0,"rate":{"num":25,"den":1},"duration":{"value":250,"rate":25},"orientation":"landscape","has_audio":1,"audio_rate":48000,"audio_channels":2,"bin_id":"","proxy_path":"","metadata_complete":1},"stored_path":"rushes/interview.mov"}],"exact_project_hex":null}
+{"type":"RelinkProjectMedia","replacements":[{"media_id":"01K00000000000000000000001","replacement":{"id":"01K00000000000000000000001","path":"rushes/interview.mov","filename":"interview.mov","codec":"h264","width":1920,"height":1080,"pixel_format":"yuv420p","color_range":"tv","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709","rotation_degrees":0,"rate":{"num":25,"den":1},"duration":{"value":250,"rate":25},"orientation":"landscape","has_video":1,"has_audio":1,"audio_rate":48000,"audio_channels":2,"bin_id":"","proxy_path":"","metadata_complete":1},"stored_path":"rushes/interview.mov"}],"exact_project_hex":null}
 ```
 
 ## Agent intégré et clé utilisateur

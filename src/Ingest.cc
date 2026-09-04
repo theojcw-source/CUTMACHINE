@@ -125,95 +125,135 @@ bool ProbeImpl(const std::filesystem::path& absolutePath, LibraryMedia& media,
 
     const int videoIndex = av_find_best_stream(
         context.get(), AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    if (videoIndex < 0) {
-        reason = "no video stream";
-        return false;
-    }
-    AVStream* video = context->streams[videoIndex];
-    const AVCodecParameters* parameters = video->codecpar;
-    if (parameters->width <= 0 || parameters->height <= 0) {
-        reason = "video stream has invalid dimensions";
-        return false;
-    }
-    const AVRational frameRate = video->avg_frame_rate;
-    if (frameRate.num <= 0 || frameRate.den <= 0) {
-        reason = "video stream has no valid avg_frame_rate";
-        return false;
-    }
-
-    int64_t duration = 0;
-    if (video->duration != AV_NOPTS_VALUE && video->duration > 0) {
-        duration = av_rescale_q_rnd(
-            video->duration, video->time_base, AVRational{1, frameRate.num},
-            static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
-    } else if (context->duration != AV_NOPTS_VALUE && context->duration > 0) {
-        duration = av_rescale_q_rnd(
-            context->duration, AVRational{1, AV_TIME_BASE},
-            AVRational{1, frameRate.num},
-            static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
-    }
-    if (duration <= 0) {
-        reason = "video stream has no positive duration";
-        return false;
-    }
-
-    double rotation = 0.0;
-    const uint8_t* displayMatrix = nullptr;
-    size_t displayMatrixSize = 0;
-#if LIBAVFORMAT_VERSION_MAJOR >= 62
-    const AVPacketSideData* matrixSideData = av_packet_side_data_get(
-        parameters->coded_side_data, parameters->nb_coded_side_data,
-        AV_PKT_DATA_DISPLAYMATRIX);
-    if (matrixSideData) {
-        displayMatrix = matrixSideData->data;
-        displayMatrixSize = matrixSideData->size;
-    }
-#else
-    displayMatrix = av_stream_get_side_data(video, AV_PKT_DATA_DISPLAYMATRIX,
-                                            &displayMatrixSize);
-#endif
-    if (displayMatrix && displayMatrixSize >= 9 * sizeof(int32_t)) {
-        const double value = av_display_rotation_get(
-            reinterpret_cast<const int32_t*>(displayMatrix));
-        if (!std::isnan(value)) rotation = value;
-    }
-    media.rotation_degrees = static_cast<int32_t>(std::lround(rotation));
-    const double radians =
-        media.rotation_degrees * 3.14159265358979323846 / 180.0;
-    const double displayedWidth =
-        std::abs(parameters->width * std::cos(radians)) +
-        std::abs(parameters->height * std::sin(radians));
-    const double displayedHeight =
-        std::abs(parameters->width * std::sin(radians)) +
-        std::abs(parameters->height * std::cos(radians));
-
-    media.codec = avcodec_get_name(parameters->codec_id);
-    media.width = parameters->width;
-    media.height = parameters->height;
-    const char* pixelFormat =
-        av_get_pix_fmt_name(static_cast<AVPixelFormat>(parameters->format));
-    const char* colorRange = av_color_range_name(parameters->color_range);
-    const char* colorSpace = av_color_space_name(parameters->color_space);
-    const char* colorTransfer = av_color_transfer_name(parameters->color_trc);
-    const char* colorPrimaries =
-        av_color_primaries_name(parameters->color_primaries);
-    media.pixel_format = pixelFormat ? pixelFormat : "unknown";
-    media.color_range = colorRange ? colorRange : "unknown";
-    media.color_space = colorSpace ? colorSpace : "unknown";
-    media.color_transfer = colorTransfer ? colorTransfer : "unknown";
-    media.color_primaries = colorPrimaries ? colorPrimaries : "unknown";
-    media.rate = {frameRate.num, frameRate.den};
-    media.duration = {duration, frameRate.num};
-    const double scale = std::max(displayedWidth, displayedHeight);
-    if (std::abs(displayedWidth - displayedHeight) <= scale * 1e-9) {
-        media.orientation = "square";
-    } else {
-        media.orientation =
-            displayedWidth > displayedHeight ? "landscape" : "portrait";
-    }
-
     const int audioIndex = av_find_best_stream(
         context.get(), AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (videoIndex < 0 && audioIndex < 0) {
+        reason = "no audio or video stream";
+        return false;
+    }
+
+    media.has_video = videoIndex >= 0;
+    if (media.has_video) {
+        AVStream* video = context->streams[videoIndex];
+        const AVCodecParameters* parameters = video->codecpar;
+        if (parameters->width <= 0 || parameters->height <= 0) {
+            reason = "video stream has invalid dimensions";
+            return false;
+        }
+        const AVRational frameRate = video->avg_frame_rate;
+        if (frameRate.num <= 0 || frameRate.den <= 0) {
+            reason = "video stream has no valid avg_frame_rate";
+            return false;
+        }
+
+        int64_t duration = 0;
+        if (video->duration != AV_NOPTS_VALUE && video->duration > 0) {
+            duration = av_rescale_q_rnd(
+                video->duration, video->time_base,
+                AVRational{1, frameRate.num},
+                static_cast<AVRounding>(AV_ROUND_NEAR_INF |
+                                        AV_ROUND_PASS_MINMAX));
+        } else if (context->duration != AV_NOPTS_VALUE &&
+                   context->duration > 0) {
+            duration = av_rescale_q_rnd(
+                context->duration, AVRational{1, AV_TIME_BASE},
+                AVRational{1, frameRate.num},
+                static_cast<AVRounding>(AV_ROUND_NEAR_INF |
+                                        AV_ROUND_PASS_MINMAX));
+        }
+        if (duration <= 0) {
+            reason = "video stream has no positive duration";
+            return false;
+        }
+
+        double rotation = 0.0;
+        const uint8_t* displayMatrix = nullptr;
+        size_t displayMatrixSize = 0;
+#if LIBAVFORMAT_VERSION_MAJOR >= 62
+        const AVPacketSideData* matrixSideData = av_packet_side_data_get(
+            parameters->coded_side_data, parameters->nb_coded_side_data,
+            AV_PKT_DATA_DISPLAYMATRIX);
+        if (matrixSideData) {
+            displayMatrix = matrixSideData->data;
+            displayMatrixSize = matrixSideData->size;
+        }
+#else
+        displayMatrix = av_stream_get_side_data(
+            video, AV_PKT_DATA_DISPLAYMATRIX, &displayMatrixSize);
+#endif
+        if (displayMatrix && displayMatrixSize >= 9 * sizeof(int32_t)) {
+            const double value = av_display_rotation_get(
+                reinterpret_cast<const int32_t*>(displayMatrix));
+            if (!std::isnan(value)) rotation = value;
+        }
+        media.rotation_degrees = static_cast<int32_t>(std::lround(rotation));
+        const double radians =
+            media.rotation_degrees * 3.14159265358979323846 / 180.0;
+        const double displayedWidth =
+            std::abs(parameters->width * std::cos(radians)) +
+            std::abs(parameters->height * std::sin(radians));
+        const double displayedHeight =
+            std::abs(parameters->width * std::sin(radians)) +
+            std::abs(parameters->height * std::cos(radians));
+
+        media.codec = avcodec_get_name(parameters->codec_id);
+        media.width = parameters->width;
+        media.height = parameters->height;
+        const char* pixelFormat =
+            av_get_pix_fmt_name(static_cast<AVPixelFormat>(parameters->format));
+        const char* colorRange = av_color_range_name(parameters->color_range);
+        const char* colorSpace = av_color_space_name(parameters->color_space);
+        const char* colorTransfer =
+            av_color_transfer_name(parameters->color_trc);
+        const char* colorPrimaries =
+            av_color_primaries_name(parameters->color_primaries);
+        media.pixel_format = pixelFormat ? pixelFormat : "unknown";
+        media.color_range = colorRange ? colorRange : "unknown";
+        media.color_space = colorSpace ? colorSpace : "unknown";
+        media.color_transfer = colorTransfer ? colorTransfer : "unknown";
+        media.color_primaries = colorPrimaries ? colorPrimaries : "unknown";
+        media.rate = {frameRate.num, frameRate.den};
+        media.duration = {duration, frameRate.num};
+        const double scale = std::max(displayedWidth, displayedHeight);
+        if (std::abs(displayedWidth - displayedHeight) <= scale * 1e-9) {
+            media.orientation = "square";
+        } else {
+            media.orientation =
+                displayedWidth > displayedHeight ? "landscape" : "portrait";
+        }
+    } else {
+        AVStream* audioStream = context->streams[audioIndex];
+        const AVCodecParameters* audio = audioStream->codecpar;
+        if (audio->sample_rate <= 0 || audio->ch_layout.nb_channels <= 0) {
+            reason = "audio stream has invalid sample rate or channel count";
+            return false;
+        }
+        int64_t duration = 0;
+        if (audioStream->duration != AV_NOPTS_VALUE &&
+            audioStream->duration > 0) {
+            duration = av_rescale_q_rnd(
+                audioStream->duration, audioStream->time_base,
+                AVRational{1, audio->sample_rate},
+                static_cast<AVRounding>(AV_ROUND_NEAR_INF |
+                                        AV_ROUND_PASS_MINMAX));
+        } else if (context->duration != AV_NOPTS_VALUE &&
+                   context->duration > 0) {
+            duration = av_rescale_q_rnd(
+                context->duration, AVRational{1, AV_TIME_BASE},
+                AVRational{1, audio->sample_rate},
+                static_cast<AVRounding>(AV_ROUND_NEAR_INF |
+                                        AV_ROUND_PASS_MINMAX));
+        }
+        if (duration <= 0) {
+            reason = "audio stream has no positive duration";
+            return false;
+        }
+        media.codec = avcodec_get_name(audio->codec_id);
+        media.rate = {audio->sample_rate, 1};
+        media.duration = {duration, audio->sample_rate};
+        media.orientation = "audio";
+    }
+
     if (audioIndex >= 0) {
         const AVCodecParameters* audio = context->streams[audioIndex]->codecpar;
         if (audio->sample_rate > 0 && audio->ch_layout.nb_channels > 0) {
@@ -311,8 +351,14 @@ bool CollectFiles(const std::filesystem::path& directory, bool recursive,
                   std::vector<std::filesystem::path>& files,
                   std::string& reason) {
     std::error_code error;
+    if (std::filesystem::is_regular_file(directory, error) && !error) {
+        files.push_back(directory);
+        return true;
+    }
+    error.clear();
     if (!std::filesystem::is_directory(directory, error) || error) {
-        reason = error ? error.message() : "path is not a directory";
+        reason = error ? error.message()
+                       : "path is neither a regular file nor a directory";
         return false;
     }
     const auto options = std::filesystem::directory_options::none;
@@ -409,7 +455,7 @@ bool MeasureMediaAudioLevel(const std::string& path,
 }
 
 int IngestCommand(const std::string& documentPath,
-                  const std::string& directoryPath, bool recursive,
+                  const std::string& mediaPath, bool recursive,
                   std::string& output) {
     av_log_set_level(AV_LOG_ERROR);
     Project project;
@@ -425,13 +471,12 @@ int IngestCommand(const std::string& documentPath,
     if (pathError) {
         return FailCliCommand("IoError", pathError.message(), output);
     }
-    const std::filesystem::path resolvedDirectory =
-        Resolved(directoryPath, pathError);
+    const std::filesystem::path resolvedMedia = Resolved(mediaPath, pathError);
     if (pathError) {
         return FailCliCommand("IoError", pathError.message(), output);
     }
     std::vector<std::filesystem::path> files;
-    if (!CollectFiles(resolvedDirectory, recursive, files, reason)) {
+    if (!CollectFiles(resolvedMedia, recursive, files, reason)) {
         return FailCliCommand("IoError", reason, output);
     }
 

@@ -53,6 +53,11 @@ struct LibraryMedia {
     std::string path;
     std::string filename;
     std::string codec;
+    // B11 -- ROADMAP.md. Audio-only media remains first-class library media;
+    // consumers that decode pictures must check this capability explicitly.
+    // True by default keeps pre-B11 documents and hand-built video fixtures
+    // source-compatible when their serialized entry has no has_video field.
+    bool has_video = true;
     int32_t width = 0;
     int32_t height = 0;
     std::string pixel_format;

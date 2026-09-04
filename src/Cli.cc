@@ -652,7 +652,9 @@ std::string Describe(const Document& document) {
                << EscapeJson(media.filename) << "\"";
         if (media.metadata_complete) {
             output << ",\"codec\":\"" << EscapeJson(media.codec)
-                   << "\",\"width\":" << media.width
+                   << "\",\"has_video\":"
+                   << (media.has_video ? "true" : "false")
+                   << ",\"width\":" << media.width
                    << ",\"height\":" << media.height
                    << ",\"rotation_degrees\":" << media.rotation_degrees
                    << ",\"pixel_format\":\"" << EscapeJson(media.pixel_format)
@@ -1091,6 +1093,13 @@ int AnalyzeShotQualityCommand(const std::string& projectPath,
     if (media == project.rushes.end() || source == project.sources.end()) {
         output = ErrorJson(EditError::UnknownMedia,
                            "unknown media_id '" + mediaId + "'");
+        return 1;
+    }
+    if (!media->has_video) {
+        output = ErrorJson(EditError::InvalidOperation,
+                           "media_id '" + mediaId +
+                               "' is audio-only; shot quality requires "
+                               "a video stream");
         return 1;
     }
 
