@@ -12754,6 +12754,14 @@ int main(int argc, char* argv[]) {
         // tool call takes the same load/apply/commit path a human editing
         // through the app or the CLI does. No AppKit/Metal/media decoding is
         // initialized for this path.
+        ProjectSessionLock projectLock;
+        std::string lockOwner;
+        std::string lockError;
+        if (!projectLock.Acquire(argv[2], lockOwner, lockError)) {
+            return failCli("IoError",
+                           "mcp-serve cannot lock the project: " + lockError,
+                           1);
+        }
         McpProjectBackend backend(argv[2]);
         McpServer server(backend);
         std::string startError;
