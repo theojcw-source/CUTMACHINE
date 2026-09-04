@@ -7,6 +7,7 @@
 #include "SequenceFormat.h"
 #include "SourceAddress.h"
 #include "Subtitles.h"
+#include "TimelineStats.h"
 #include "Ulid.h"
 
 #include <algorithm>
@@ -2139,6 +2140,26 @@ bool DispatchListShotQuality(McpBackend& backend, const IdResolver&,
     return true;
 }
 
+// QC-2026-09 (A8) -- count the composited result, not the clips underneath
+// it. The pure calculation is shared with `--timeline-stats`, so an agent and
+// a human checking the same project receive identical arithmetic.
+bool DispatchTimelineStats(McpBackend& backend, const IdResolver&,
+                           const Value& args, std::string& resultJson,
+                           std::string& errorName, std::string& message) {
+    if (!CheckKnownKeys(args, {}, "timeline_stats", message))
+        return Fail(errorName, message, message);
+    Document document;
+    if (!backend.SnapshotDocument(document, message)) {
+        errorName = "IoError";
+        return false;
+    }
+    TimelineStats stats;
+    if (!CalculateTimelineStats(document, stats, message))
+        return Fail(errorName, message, message);
+    resultJson = SerializeTimelineStats(stats);
+    return true;
+}
+
 bool DispatchReadFrame(McpBackend& backend, const IdResolver& resolver,
                        const Value& args, std::string& resultJson,
                        std::string& errorName, std::string& message) {
@@ -3185,6 +3206,14 @@ McpToolRegistry::McpToolRegistry() {
         "timeline never used.",
         SchemaBuilder().Build("list_shot_quality takes no arguments"),
         DispatchListShotQuality);
+
+    add("timeline_stats",
+        "Calculate exact editorial statistics for the active composited "
+        "timeline: duration, visible shots and cuts, shots per minute, "
+        "cutaway share, and the first visible cut. Clips hidden underneath a "
+        "higher visible video track do not count as visible changes.",
+        SchemaBuilder().Build("timeline_stats takes no arguments"),
+        DispatchTimelineStats);
 
     add("list_speech_onsets",
         "Report where the voice actually starts inside every audible clip, "

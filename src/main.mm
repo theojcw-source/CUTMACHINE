@@ -12673,6 +12673,12 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
+    if (argc == 3 && std::string(argv[1]) == "--timeline-stats") {
+        std::string output;
+        const int result = TimelineStatsCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
     if (argc == 5 && std::string(argv[1]) == "--locate-source-frame") {
         std::string output;
         const int result = LocateSourceFrameCommand(

@@ -49,6 +49,10 @@ int AnalyzeShotQualityCommand(const std::string& projectPath,
                               const std::string& mediaId, std::string& output);
 int ShotQualityReportCommand(const std::string& projectPath,
                              std::string& output);
+// QC-2026-09 (A8) -- read-only arithmetic over the active composited
+// timeline. The command publishes exact time and ratio values so callers do
+// not have to count clips or convert frame rates themselves.
+int TimelineStatsCommand(const std::string& projectPath, std::string& output);
 // ONSET-2026-08 -- same shape, and for the same reason: where the voice
 // starts is a measurement, so it has to be reachable without the app. The
 // report publishes the trim in whole frames precisely so a caller never

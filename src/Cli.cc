@@ -16,6 +16,7 @@
 #include "SpeechOnset.h"
 #include "Subtitles.h"
 #include "Timeline.h"
+#include "TimelineStats.h"
 #include "TranscriptAlignment.h"
 #include "Transcription.h"
 #include "Ulid.h"
@@ -1125,6 +1126,23 @@ int ShotQualityReportCommand(const std::string& projectPath,
         DescribeShotQualityForAgent(document, reports, ShotQualityThresholds{},
                                     ShotSegmentationSettings{}) +
         "\n";
+    return 0;
+}
+
+int TimelineStatsCommand(const std::string& projectPath, std::string& output) {
+    Project project;
+    std::string error;
+    if (!LoadStoredProject(projectPath, project, error)) {
+        output = ErrorJson(EditError::ParseError, error);
+        return 1;
+    }
+    TimelineStats stats;
+    if (!CalculateTimelineStats(project.MakeActiveDocument(), stats, error)) {
+        output = ErrorJson(EditError::ValidationFailed, error);
+        return 1;
+    }
+    output = "{\"ok\":true,\"stats\":" +
+             SerializeTimelineStats(stats) + "}\n";
     return 0;
 }
 
