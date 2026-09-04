@@ -42,6 +42,8 @@ class McpLiveBackend : public McpBackend {
 public:
     using ProjectApplyCallback = std::function<bool(
         ProjectOperation, std::string&, std::string&, std::string&)>;
+    using ProjectDescribeCallback =
+        std::function<bool(std::string&, std::string&)>;
     using TranscriptCallback = std::function<bool(std::string&, std::string&)>;
     // Word-level editing needs one clip's own source transcript, which the
     // window resolves against the open project's cache directory -- the same
@@ -72,6 +74,7 @@ public:
     McpLiveBackend(Document& document, EditLog& editLog,
                    std::function<void()> onApplied = nullptr,
                    ProjectApplyCallback applyProject = nullptr,
+                   ProjectDescribeCallback describeProject = nullptr,
                    TranscriptCallback readTranscript = nullptr,
                    SourceTranscriptCallback readSourceTranscript = nullptr,
                    SourceShotQualityCallback readSourceShotQuality = nullptr,
@@ -106,6 +109,7 @@ private:
     EditLog& edit_log_;
     std::function<void()> on_applied_;
     ProjectApplyCallback apply_project_;
+    ProjectDescribeCallback describe_project_;
     TranscriptCallback read_transcript_;
     SourceTranscriptCallback read_source_transcript_;
     SourceShotQualityCallback read_source_shot_quality_;

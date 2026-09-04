@@ -303,7 +303,7 @@ int main() {
           "describe exposes stable marker IDs and aliases");
     Check(firstDescription.find("\"timelines\":[{\"id\":") !=
                   std::string::npos &&
-              firstDescription.find("\"dimensions\":{\"width\":1920,") !=
+              firstDescription.find("\"width\":1920,\"height\":1080,") !=
                   std::string::npos &&
               firstDescription.find("\"frame_rate\":{\"num\":25,") !=
                   std::string::npos &&

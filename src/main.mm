@@ -4158,6 +4158,15 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 message = "the application window is no longer available";
                 return false;
             }
+            json = DescribeProject(strongSelf.state->project);
+            return true;
+        },
+        [weakSelf](std::string& json, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
             const std::filesystem::path projectPath =
                 std::filesystem::absolute(std::filesystem::path(
                     strongSelf.documentPath.UTF8String ?: ""));

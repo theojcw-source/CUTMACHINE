@@ -6,6 +6,7 @@
 McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
                                std::function<void()> onApplied,
                                ProjectApplyCallback applyProject,
+                               ProjectDescribeCallback describeProject,
                                TranscriptCallback readTranscript,
                                SourceTranscriptCallback readSourceTranscript,
                                SourceShotQualityCallback readSourceShotQuality,
@@ -15,6 +16,7 @@ McpLiveBackend::McpLiveBackend(Document& document, EditLog& editLog,
       edit_log_(editLog),
       on_applied_(std::move(onApplied)),
       apply_project_(std::move(applyProject)),
+      describe_project_(std::move(describeProject)),
       read_transcript_(std::move(readTranscript)),
       read_source_transcript_(std::move(readSourceTranscript)),
       read_source_shot_quality_(std::move(readSourceShotQuality)),
@@ -126,7 +128,8 @@ bool McpLiveBackend::Redo(std::string& resultJson, std::string& errorName,
     return true;
 }
 
-bool McpLiveBackend::Describe(std::string& json, std::string&) {
+bool McpLiveBackend::Describe(std::string& json, std::string& message) {
+    if (describe_project_) return describe_project_(json, message);
     json = DescribeDocument(document_);
     return true;
 }

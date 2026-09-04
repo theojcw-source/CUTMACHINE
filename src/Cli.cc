@@ -707,29 +707,35 @@ std::string Describe(const Document& document) {
     return output.str();
 }
 
-std::string DescribeTimelines(const Project& project) {
-    std::ostringstream output;
-    output.imbue(std::locale::classic());
-    output << '[';
-    for (size_t index = 0; index < project.timelines.size(); ++index) {
-        if (index) output << ',';
-        const DocumentSequence& sequence = project.timelines[index];
+// B8 -- ROADMAP.md. Keep project-level metadata structured while composing
+// it with the existing document description; relying on a trailing `}\n`
+// would make an unrelated formatting change silently corrupt describe.
+mcp_json::Value DescribeTimelines(const Project& project) {
+    mcp_json::Value timelines = mcp_json::Value::MakeArray();
+    for (const DocumentSequence& sequence : project.timelines) {
         const RationalTime duration =
             Timeline(project.MakeDocument(sequence.id)).Duration();
-        output << "{\"id\":\"" << EscapeJson(sequence.id)
-               << "\",\"name\":\"" << EscapeJson(sequence.name)
-               << "\",\"dimensions\":{\"width\":" << sequence.width
-               << ",\"height\":" << sequence.height
-               << "},\"frame_rate\":{\"num\":" << sequence.frame_rate.num
-               << ",\"den\":" << sequence.frame_rate.den
-               << "},\"duration\":";
-        WriteTime(output, duration, sequence.frame_rate);
-        output << ",\"active\":"
-               << (sequence.id == project.active_timeline_id ? "true" : "false")
-               << '}';
+        mcp_json::Value item = mcp_json::Value::MakeObject();
+        item.Set("id", mcp_json::Value::MakeString(sequence.id));
+        item.Set("name", mcp_json::Value::MakeString(sequence.name));
+        item.Set("width", mcp_json::Value::MakeInt(sequence.width));
+        item.Set("height", mcp_json::Value::MakeInt(sequence.height));
+        mcp_json::Value frameRate = mcp_json::Value::MakeObject();
+        frameRate.Set("num", mcp_json::Value::MakeInt(sequence.frame_rate.num));
+        frameRate.Set("den", mcp_json::Value::MakeInt(sequence.frame_rate.den));
+        item.Set("frame_rate", std::move(frameRate));
+        mcp_json::Value durationValue = mcp_json::Value::MakeObject();
+        durationValue.Set(
+            "frames", mcp_json::Value::MakeInt(duration.to_frames(
+                          sequence.frame_rate.num, sequence.frame_rate.den)));
+        durationValue.Set("seconds",
+                          mcp_json::Value::MakeRawNumber(DecimalSeconds(duration)));
+        item.Set("duration", std::move(durationValue));
+        item.Set("active", mcp_json::Value::MakeBool(
+                               sequence.id == project.active_timeline_id));
+        timelines.Push(std::move(item));
     }
-    output << ']';
-    return output.str();
+    return timelines;
 }
 
 std::string CanonicalHash(const std::string& json) {
@@ -756,11 +762,15 @@ std::string DescribeDocument(const Document& document) {
 }
 
 std::string DescribeProject(const Project& project) {
-    std::string description = Describe(project.MakeActiveDocument());
-    description.pop_back();
-    description.pop_back();
-    description += ",\"timelines\":" + DescribeTimelines(project) + "}\n";
-    return description;
+    mcp_json::Value description;
+    std::string error;
+    if (!mcp_json::Value::Parse(Describe(project.MakeActiveDocument()),
+                                description, error)) {
+        return "{\"ok\":false,\"error\":\"ParseError\",\"detail\":\"" +
+               EscapeJson(error) + "\"}\n";
+    }
+    description.Set("timelines", DescribeTimelines(project));
+    return description.Dump() + "\n";
 }
 
 std::string TimelineEditLogPathForProject(const std::string& projectPath,

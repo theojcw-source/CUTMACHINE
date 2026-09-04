@@ -2467,18 +2467,28 @@ bool DispatchSetActiveTimeline(McpBackend& backend, const IdResolver& resolver,
 }
 
 bool ReadProjectTimelineId(McpBackend& backend, const std::string& requested,
-                           const std::string& tool, Ulid& timelineId,
+                           Ulid& timelineId, std::string& errorName,
                            std::string& message) {
+    if (requested.empty()) {
+        errorName = "ValidationFailed";
+        message = "'timeline_id' must not be empty";
+        return false;
+    }
     std::string json;
-    if (!backend.Describe(json, message)) return false;
+    if (!backend.Describe(json, message)) {
+        errorName = "IoError";
+        return false;
+    }
     Value description;
     std::string parseError;
     if (!Value::Parse(json, description, parseError)) {
+        errorName = "IoError";
         message = "describe returned invalid JSON: " + parseError;
         return false;
     }
     const Value* timelines = description.Find("timelines");
     if (!timelines || !timelines->IsArray()) {
+        errorName = "UnsupportedOperation";
         message = "this backend does not expose project timelines";
         return false;
     }
@@ -2490,15 +2500,16 @@ bool ReadProjectTimelineId(McpBackend& backend, const std::string& requested,
             matches.push_back(id->AsString());
     }
     if (matches.empty()) {
+        errorName = "UnknownSequence";
         message = "unknown timeline_id '" + requested + "'";
         return false;
     }
     if (matches.size() != 1) {
+        errorName = "ValidationFailed";
         message = "ambiguous timeline_id prefix '" + requested + "'";
         return false;
     }
     timelineId = matches.front();
-    (void)tool;
     return true;
 }
 
@@ -2555,9 +2566,9 @@ bool DispatchRemoveTimeline(McpBackend& backend, const IdResolver&,
                     requested, message))
         return Fail(errorName, message, message);
     RemoveProjectTimelineOperation operation;
-    if (!ReadProjectTimelineId(backend, requested, "remove_timeline",
-                               operation.timeline_id, message))
-        return Fail(errorName, message, message);
+    if (!ReadProjectTimelineId(backend, requested, operation.timeline_id,
+                               errorName, message))
+        return false;
     return backend.ApplyProjectEdit(std::move(operation), resultJson, errorName,
                                     message);
 }
@@ -2573,10 +2584,11 @@ bool DispatchRenameTimeline(McpBackend& backend, const IdResolver&,
     if (!ReadString(args, "timeline_id", "rename_timeline", true, "",
                     requested, message) ||
         !ReadString(args, "name", "rename_timeline", true, "", operation.name,
-                    message) ||
-        !ReadProjectTimelineId(backend, requested, "rename_timeline",
-                               operation.item_id, message))
+                    message))
         return Fail(errorName, message, message);
+    if (!ReadProjectTimelineId(backend, requested, operation.item_id,
+                               errorName, message))
+        return false;
     return backend.ApplyProjectEdit(std::move(operation), resultJson, errorName,
                                     message);
 }

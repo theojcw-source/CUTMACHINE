@@ -16,6 +16,7 @@
 #include "IdResolver.h"
 #include "Json.h"
 #include "McpBackend.h"
+#include "McpLiveBackend.h"
 #include "McpServer.h"
 #include "McpTools.h"
 
@@ -116,8 +117,10 @@ Document Fixture() {
 // `--apply-op` path calls.
 class InMemoryBackend : public McpBackend {
 public:
-    explicit InMemoryBackend(Document document)
-        : project_(Project::FromDocument(std::move(document))) {
+    explicit InMemoryBackend(Document document,
+                             bool applyProjectOperations = false)
+        : project_(Project::FromDocument(std::move(document))),
+          apply_project_operations_(applyProjectOperations) {
         document_ = project_.MakeActiveDocument();
     }
 
@@ -269,6 +272,11 @@ public:
 
     bool ApplyProjectEdit(ProjectOperation operation, std::string& resultJson,
                           std::string& errorName, std::string& message) override {
+        if (!apply_project_operations_) {
+            project_operation_ = std::move(operation);
+            resultJson = "{\"ok\":true}";
+            return true;
+        }
         EditError error = EditError::None;
         if (!project_log_.Apply(project_, std::move(operation), error, message)) {
             errorName = EditErrorName(error);
@@ -288,6 +296,7 @@ public:
 
 private:
     bool transcription_fails_ = false;
+    bool apply_project_operations_ = false;
     Document document_;
     EditLog log_;
     std::optional<ProjectOperation> project_operation_;
@@ -445,15 +454,30 @@ int main() {
     // Exercise the tools through a real ProjectEditLog, including the engine's
     // stable refusal for the final timeline.
     {
-        InMemoryBackend timelineBackend(fixture);
+        InMemoryBackend timelineBackend(fixture, true);
         McpToolRegistry timelineRegistry;
         const McpToolCallOutcome listed = timelineRegistry.Call(
             timelineBackend, "list_timelines", mcp_json::Value::MakeObject());
-        Check(listed.ok && listed.result_json.find("\"dimensions\"") !=
+        Check(listed.ok && listed.result_json.find("\"width\":1920") !=
                                std::string::npos &&
                   listed.result_json.find("\"active\":true") !=
                                std::string::npos,
               "list_timelines exposes dimensions and active state");
+        Document liveDocument = fixture;
+        EditLog liveLog;
+        Project liveProject = Project::FromDocument(fixture);
+        bool liveDescriptionUsed = false;
+        McpLiveBackend liveBackend(
+            liveDocument, liveLog, nullptr, nullptr,
+            [&](std::string& json, std::string&) {
+                liveDescriptionUsed = true;
+                json = DescribeProject(liveProject);
+                return true;
+            });
+        const McpToolCallOutcome liveListed = timelineRegistry.Call(
+            liveBackend, "list_timelines", mcp_json::Value::MakeObject());
+        Check(liveListed.ok && liveDescriptionUsed,
+              "the live chat backend lists timelines from its project view");
         mcp_json::Value addArguments;
         std::string timelineParseError;
         Check(mcp_json::Value::Parse(
@@ -513,6 +537,14 @@ int main() {
             timelineBackend, "remove_timeline", removeArguments);
         CheckFailureEnvelope(finalRemoval, "remove final timeline",
                              "InvalidOperation");
+        Check(mcp_json::Value::Parse(
+                  R"({"timeline_id":"01ZZZZZZZZZZZZZZZZZZZZZZZZ"})",
+                  removeArguments, timelineParseError),
+              "unknown timeline arguments parse: " + timelineParseError);
+        const McpToolCallOutcome unknownTimeline = timelineRegistry.Call(
+            timelineBackend, "remove_timeline", removeArguments);
+        CheckFailureEnvelope(unknownTimeline, "remove unknown timeline",
+                             "UnknownSequence");
     }
     const McpToolCallOutcome transcriptOutcome = shortRegistry.Call(
         backend, "get_timeline_transcript", mcp_json::Value::MakeObject());
