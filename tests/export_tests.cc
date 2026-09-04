@@ -123,6 +123,9 @@ int main() {
 
     Document document = Fixture(media.string());
     document.sequence.tracks[0].clips[0].opacity = {1, 2};
+    document.sequence.tracks[2].clips[0].audio_gain_db = {10, 1};
+    document.sequence.tracks[2].clips[0].audio_fade_in = {2, 25};
+    document.sequence.tracks[2].clips[0].audio_fade_out = {3, 25};
     std::string error;
     Check(document.Save(project.string(), error), "project saves: " + error);
 
@@ -156,6 +159,13 @@ int main() {
     Check(plan.filter_graph.find("colorchannelmixer=aa=(1/2)") !=
               std::string::npos,
           "opaque export composites the clip's exact opacity");
+    Check(plan.filter_graph.find("volume=pow(10\\,(10/1)/20)") !=
+                  std::string::npos &&
+              plan.filter_graph.find("afade=t=in:st=0:d=0.08") !=
+                  std::string::npos &&
+              plan.filter_graph.find("afade=t=out:st=0.28:d=0.12") !=
+                  std::string::npos,
+          "audio export applies exact clip gain and fade envelope");
 
     Document outputStateDocument = Fixture(media.string());
     outputStateDocument.sequence.tracks[1].visible = false;

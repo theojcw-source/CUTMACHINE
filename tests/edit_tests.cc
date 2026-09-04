@@ -1303,8 +1303,12 @@ int main() {
         EditError error = EditError::None;
         std::string message;
         const RippleTrimOperation operation{
-            document.sequence.tracks[0].clips[0].id, TrimEdge::Tail,
-            {1000, 25}, {}, {}, {}};
+            document.sequence.tracks[0].clips[0].id,
+            TrimEdge::Tail,
+            {1000, 25},
+            {},
+            {},
+            {}};
         Check(!log.Apply(document, operation, error, message) &&
                   error == EditError::InvalidOperation,
               "ripple trim beyond the rush is InvalidOperation: " + message);
@@ -1324,8 +1328,10 @@ int main() {
         EditError error = EditError::None;
         std::string message;
         const TrimClipOperation operation{
-            document.sequence.tracks[0].clips[0].id, TrimEdge::Tail,
-            {1000, 25}, std::nullopt};
+            document.sequence.tracks[0].clips[0].id,
+            TrimEdge::Tail,
+            {1000, 25},
+            std::nullopt};
         Check(!log.Apply(document, operation, error, message) &&
                   error == EditError::InvalidOperation,
               "trim beyond the rush is InvalidOperation: " + message);
@@ -1379,10 +1385,8 @@ int main() {
 
         const auto linkedDocument = [&](bool crossingSyncClip) {
             Document document;
-            document.sources = {{"01K20000000000000000000001",
-                                 "A.MP4",
-                                 {25, 1},
-                                 {1000, 25}}};
+            document.sources = {
+                {"01K20000000000000000000001", "A.MP4", {25, 1}, {1000, 25}}};
             const Ulid group = "01K20000000000000000000030";
             DocumentClip video{"01K20000000000000000000031",
                                document.sources[0].id,
@@ -1402,8 +1406,7 @@ int main() {
             DocumentClip followingAudio = followingVideo;
             followingAudio.id = "01K20000000000000000000034";
             const RationalTime syncStart =
-                crossingSyncClip ? RationalTime{0, 25}
-                                 : RationalTime{10, 25};
+                crossingSyncClip ? RationalTime{0, 25} : RationalTime{10, 25};
             DocumentClip synced{"01K20000000000000000000035",
                                 document.sources[0].id,
                                 {300, 25},
@@ -1447,12 +1450,12 @@ int main() {
             Operation parsed = RemoveClipOperation{};
             EditError error = EditError::None;
             std::string message;
-            Check(DeserializeOperation(json, parsed, error, message) &&
-                      std::get<RemoveLinkedClipsOperation>(parsed)
-                              .sync_track_ids ==
-                          std::vector<Ulid>{syncTrackId} &&
-                      SerializeOperation(parsed) == json,
-                  "RemoveLinkedClips sync_track_ids round-trip canonically");
+            Check(
+                DeserializeOperation(json, parsed, error, message) &&
+                    std::get<RemoveLinkedClipsOperation>(parsed)
+                            .sync_track_ids == std::vector<Ulid>{syncTrackId} &&
+                    SerializeOperation(parsed) == json,
+                "RemoveLinkedClips sync_track_ids round-trip canonically");
             Check(log.Undo(document, error, message) &&
                       document.SaveToString() == before,
                   "linked synchronized removal undo restores exact bytes");
@@ -1465,14 +1468,9 @@ int main() {
             const Ulid audioId = document.sequence.tracks[2].clips[0].id;
             const Ulid group = document.FindClip(videoId)->link_group_id;
             EditLog log;
-            SplitLinkedClipsOperation split{group,
-                                            {videoId, audioId},
-                                            {5, 25},
-                                            {},
-                                            {},
-                                            {},
-                                            {syncTrackId},
-                                            {}};
+            SplitLinkedClipsOperation split{
+                group, {videoId, audioId}, {5, 25}, {}, {},
+                {},    {syncTrackId},      {}};
             Check(Apply(log, document, split, "synchronized linked split"),
                   "split_linked_clips accepts a synchronized track");
             Check(document.sequence.tracks[0].clips.size() == 3 &&
@@ -1486,12 +1484,12 @@ int main() {
             Operation parsed = RemoveClipOperation{};
             EditError error = EditError::None;
             std::string message;
-            Check(DeserializeOperation(json, parsed, error, message) &&
-                      std::get<SplitLinkedClipsOperation>(parsed)
-                              .sync_track_ids ==
-                          std::vector<Ulid>{syncTrackId} &&
-                      SerializeOperation(parsed) == json,
-                  "SplitLinkedClips sync_track_ids round-trip canonically");
+            Check(
+                DeserializeOperation(json, parsed, error, message) &&
+                    std::get<SplitLinkedClipsOperation>(parsed)
+                            .sync_track_ids == std::vector<Ulid>{syncTrackId} &&
+                    SerializeOperation(parsed) == json,
+                "SplitLinkedClips sync_track_ids round-trip canonically");
             Check(log.Undo(document, error, message) &&
                       document.SaveToString() == before,
                   "linked synchronized split undo restores exact bytes");
@@ -1550,14 +1548,15 @@ int main() {
         const RollEditOperation operation{
             {{document.sequence.tracks[0].clips[0].id,
               document.sequence.tracks[0].clips[1].id}},
-            {1, 25}, {}};
+            {1, 25},
+            {}};
         Check(!log.Apply(document, operation, error, message) &&
                   error == EditError::InvalidOperation,
               "roll beyond the rush is InvalidOperation: " + message);
-        Check(message.find("within [0/25, 110/25)") != std::string::npos &&
-                  message.find("requested [100/25, 111/25)") !=
-                      std::string::npos,
-              "roll reports the real source bounds and request: " + message);
+        Check(
+            message.find("within [0/25, 110/25)") != std::string::npos &&
+                message.find("requested [100/25, 111/25)") != std::string::npos,
+            "roll reports the real source bounds and request: " + message);
         Check(log.AppliedCount() == 0 && document.SaveToString() == before,
               "rejected roll edit is never journaled");
     });
@@ -1850,6 +1849,70 @@ int main() {
                        EditError::LockedTrack,
                        "clip opacity rejects a locked track");
     });
+
+    Test(
+        "clip audio settings are exact, serializable and byte-exactly "
+        "reversible",
+        [] {
+            Document document = EditDocument();
+            document.sequence.tracks.push_back({"01K20000000000000000000090",
+                                                "audio",
+                                                1,
+                                                {{"01K20000000000000000000091",
+                                                  "01K20000000000000000000001",
+                                                  {100, 25},
+                                                  {10, 25},
+                                                  {0, 25}}}});
+            const Ulid clipId = document.sequence.tracks.back().clips[0].id;
+            const std::string original = document.SaveToString();
+            EditLog log;
+            EditError error = EditError::None;
+            std::string message;
+            Check(
+                Apply(log, document,
+                      SetClipAudioOperation{clipId, {10, 1}, {2, 25}, {3, 25}},
+                      "set clip audio"),
+                "clip audio settings apply");
+            const std::string changed = document.SaveToString();
+            const DocumentClip* clip = document.FindClip(clipId);
+            Check(clip && clip->audio_gain_db.num == 10 &&
+                      clip->audio_fade_in == RationalTime{2, 25} &&
+                      clip->audio_fade_out == RationalTime{3, 25},
+                  "audio gain and exact fade durations are stored");
+            const std::string json =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Operation parsed = RemoveClipOperation{};
+            Check(DeserializeOperation(json, parsed, error, message) &&
+                      SerializeOperation(parsed) == json,
+                  "SetClipAudio JSON round-trips canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "SetClipAudio undo restores byte-identical JSON");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == changed,
+                  "SetClipAudio redo restores byte-identical JSON");
+            ExpectRejected(
+                document,
+                SetClipAudioOperation{clipId, {49, 1}, {0, 1}, {0, 1}},
+                EditError::ValidationFailed,
+                "gain above the supported range is rejected");
+            ExpectRejected(
+                document,
+                SetClipAudioOperation{clipId, {0, 1}, {11, 25}, {0, 1}},
+                EditError::ValidationFailed,
+                "fade longer than clip is rejected");
+            const Ulid videoClip = document.sequence.tracks[0].clips[0].id;
+            ExpectRejected(
+                document,
+                SetClipAudioOperation{videoClip, {0, 1}, {0, 1}, {0, 1}},
+                EditError::InvalidOperation,
+                "audio settings reject a video clip");
+            document.sequence.tracks.back().locked = true;
+            ExpectRejected(
+                document, SetClipAudioOperation{clipId, {1, 1}, {0, 1}, {0, 1}},
+                EditError::LockedTrack,
+                "clip audio settings reject a locked track");
+        });
 
     Test(
         "caption styles and per-clip captions are addressable, "

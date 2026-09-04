@@ -233,9 +233,16 @@ se glisse verticalement pour adapter l’espace de montage.
 
 Les flux audio des sources sont décodés par FFmpeg, puis
 convertis en PCM float stéréo 48 kHz par `libswresample`. Un `AVAudioSourceNode`
-mixte en temps réel uniquement les clips placés sur des pistes audio. Un clip
-vidéo est toujours muet : aucun fallback de lecture ou d'export ne récupère
-son audio. Le callback audio lit un plan immuable construit depuis la
+mixte en temps réel uniquement les clips placés sur des pistes audio. Les clips
+vidéo sont toujours muets : aucun fallback de lecture ou d'export ne récupère
+leur audio. Un clip audio peut porter un gain exact en dB et des fondus
+d'entrée/sortie exacts :
+`SetClipAudioOperation` remplace atomiquement `gain_db`, `fade_in` et
+`fade_out`. Les deux durées sont des `RationalTime`; la même enveloppe est
+appliquée par la lecture et par l'export FFmpeg. Le schéma document v7 les
+sérialise pour chaque clip. Les documents v4 à v6 restent lisibles : ils
+reçoivent sans ambiguïté 0 dB et deux fondus nuls, puis sont réémis en v7.
+Le callback audio lit un plan immuable construit depuis la
 timeline et ne touche jamais directement au document éditable. `Espace` et
 `J/K/L` pilotent simultanément image et son, y compris la navette accélérée
 avant/arrière à 2× et 4× (échantillonnage accéléré, sans correction de pitch) ;
@@ -386,6 +393,7 @@ Media Pool` des NLE classiques.
 `TrimClipOperation`, `MoveClipOperation`, `DeleteGapOperation` et
 `SplitClipOperation`, ainsi que `RippleTrimOperation`, `RollEditOperation`,
 `SlipEditOperation`, les variantes liées de move, trim et remove et
+`SetClipAudioOperation` (gain dB exact et fondus `RationalTime`),
 `AddTrackOperation` pour le
 multipiste. Les marqueurs de projet sont des objets
 adressables persistants ; `AddMarkerOperation`, `RemoveMarkerOperation` et
@@ -443,6 +451,8 @@ décodage média :
 ./build/cutmachine --describe ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --apply-op ./Film.cutmachine-project/project.cutmachine.json \
   '{"type":"TrimClip","clip_id":"01K00000000000000000000003","edge":"Tail","delta":{"value":-1,"rate":25},"exact_clip":null}'
+./build/cutmachine --apply-op ./Film.cutmachine-project/project.cutmachine.json \
+  '{"type":"SetClipAudio","clip_id":"01K00000000000000000000007","gain_db":{"num":10,"den":1},"fade_in":{"value":12,"rate":25},"fade_out":{"value":12,"rate":25}}'
 ./build/cutmachine --apply-project-op ./Film.cutmachine-project/project.cutmachine.json \
   '{"type":"AddProjectTimeline","name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1},"timeline_id":"","video_track_id":"","audio_track_id":"","exact_project_hex":null}'
 ./build/cutmachine --apply-project-op ./Film.cutmachine-project/project.cutmachine.json \

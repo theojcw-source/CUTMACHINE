@@ -1720,6 +1720,30 @@ bool DispatchSetClipOpacity(McpBackend& backend, const IdResolver& resolver,
     return backend.ApplyOperation(op, resultJson, errorName, message);
 }
 
+bool DispatchSetClipAudio(McpBackend& backend, const IdResolver& resolver,
+                          const Value& args, std::string& resultJson,
+                          std::string& errorName, std::string& message) {
+    static const std::vector<std::string> kAllowed = {"clip_id", "gain_db",
+                                                      "fade_in", "fade_out"};
+    if (!CheckKnownKeys(args, kAllowed, "set_clip_audio", message))
+        return Fail(errorName, message, message);
+    SetClipAudioOperation op;
+    if (!ReadId(args, "clip_id", "set_clip_audio", resolver, true, op.clip_id,
+                message))
+        return Fail(errorName, message, message);
+    const Value* gain = args.Find("gain_db");
+    if (!gain ||
+        !ReadFractionValue(*gain, "set_clip_audio.gain_db", op.gain_db.num,
+                           op.gain_db.den, message) ||
+        !ReadTime(args, "fade_in", "set_clip_audio", true, op.fade_in,
+                  message) ||
+        !ReadTime(args, "fade_out", "set_clip_audio", true, op.fade_out,
+                  message)) {
+        return Fail(errorName, message, message);
+    }
+    return backend.ApplyOperation(op, resultJson, errorName, message);
+}
+
 bool DispatchAddCaptionStyle(McpBackend& backend, const IdResolver&,
                              const Value& args, std::string& resultJson,
                              std::string& errorName, std::string& message) {
@@ -3412,6 +3436,16 @@ McpToolRegistry::McpToolRegistry() {
             .Field("opacity", kFractionSchemaText, true)
             .Build("set_clip_opacity arguments"),
         DispatchSetClipOpacity);
+
+    add("set_clip_audio",
+        "Set an audio clip's exact gain in dB and its fade envelope.",
+        SchemaBuilder()
+            .Field("clip_id", IdSchema("Audio clip to update."), true)
+            .Field("gain_db", kFractionSchemaText, true)
+            .Field("fade_in", kTimeSchemaText, true)
+            .Field("fade_out", kTimeSchemaText, true)
+            .Build("set_clip_audio arguments"),
+        DispatchSetClipAudio);
 
     add("add_caption_style", "Add a new caption style to the sequence.",
         SchemaBuilder()

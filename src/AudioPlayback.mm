@@ -172,6 +172,12 @@ struct MixClip {
     int64_t timelineStart = 0;
     int64_t sourceStart = 0;
     int64_t length = 0;
+    // The conversion to an amplitude is deliberately deferred to this
+    // realtime boundary. The document retains exact dB and exact durations;
+    // libm merely turns them into samples for AVAudioEngine.
+    float gain = 1.0f;
+    int64_t fadeInSamples = 0;
+    int64_t fadeOutSamples = 0;
 };
 
 struct MixPlan {
@@ -250,8 +256,23 @@ bool AudioPlayback::Open(const Document& document,
                              sourceSample >=
                                  static_cast<int64_t>(clip.source->left.size()))
                              continue;
-                         left[index] += clip.source->left[sourceSample];
-                         right[index] += clip.source->right[sourceSample];
+                         float envelope = clip.gain;
+                         if (clip.fadeInSamples > 0)
+                             envelope *= std::min(
+                                 1.0f,
+                                 static_cast<float>(offset) /
+                                     static_cast<float>(clip.fadeInSamples));
+                         if (clip.fadeOutSamples > 0) {
+                             const int64_t remaining = clip.length - offset;
+                             envelope *= std::min(
+                                 1.0f,
+                                 static_cast<float>(remaining) /
+                                     static_cast<float>(clip.fadeOutSamples));
+                         }
+                         left[index] +=
+                             clip.source->left[sourceSample] * envelope;
+                         right[index] +=
+                             clip.source->right[sourceSample] * envelope;
                          audible = true;
                      }
                      left[index] = std::clamp(left[index], -1.0f, 1.0f);
@@ -347,6 +368,11 @@ void AudioPlayback::RebuildTimeline(const Document& document) {
             mixed.timelineStart = clip.timeline_in.to_frames(kMixRate);
             mixed.sourceStart = clip.source_in.to_frames(kMixRate);
             mixed.length = clip.duration.to_frames(kMixRate);
+            const float gainDb = static_cast<float>(clip.audio_gain_db.num) /
+                                 static_cast<float>(clip.audio_gain_db.den);
+            mixed.gain = std::pow(10.0f, gainDb / 20.0f);
+            mixed.fadeInSamples = clip.audio_fade_in.to_frames(kMixRate);
+            mixed.fadeOutSamples = clip.audio_fade_out.to_frames(kMixRate);
             if (mixed.length > 0) plan->clips.push_back(std::move(mixed));
         }
     }

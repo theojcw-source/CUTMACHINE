@@ -166,6 +166,13 @@ struct DocumentClip {
     // belongs to the canonical clip rather than to an Inspector preference.
     // Keep it exact until Timeline resolves the render-only float boundary.
     EffectParamValue opacity{1, 1};
+    // QC-2026-09 A7 -- audio processing is part of the edit, not a mixer
+    // preference: a quiet sentence must export and play back identically on
+    // every machine. Gain is an exact number of decibels; the two envelopes
+    // are exact timeline durations, never sample counts guessed by a UI.
+    EffectParamValue audio_gain_db{0, 1};
+    RationalTime audio_fade_in{0, 1};
+    RationalTime audio_fade_out{0, 1};
 };
 
 enum class TransitionAlignment { Center, StartAtCut, EndAtCut };
@@ -247,7 +254,7 @@ struct DocumentSequence {
 
 class Document {
 public:
-    int32_t version = 6;
+    int32_t version = 7;
     DocumentSequence sequence;
     ColorManagementSettings color_management;
     std::vector<LibraryMedia> library;

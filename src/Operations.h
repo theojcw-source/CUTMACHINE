@@ -430,6 +430,16 @@ struct SetClipOpacityOperation {
     EffectParamValue opacity{1, 1};
 };
 
+// QC-2026-09 A7 -- one audible clip setting is one editorial decision. The
+// complete replacement state makes its inverse byte-exact and leaves no
+// partial gain/fade state for a caller to reconcile.
+struct SetClipAudioOperation {
+    Ulid clip_id;
+    EffectParamValue gain_db{0, 1};
+    RationalTime fade_in{0, 1};
+    RationalTime fade_out{0, 1};
+};
+
 struct AddCaptionStyleOperation {
     CaptionStyle style;
     // -1 appends on first application. Exact inverse operations carry the
@@ -522,11 +532,11 @@ using Operation = std::variant<
     MoveBinOperation, SetMediaBinOperation, AddMarkerOperation,
     RemoveMarkerOperation, UpdateMarkerOperation, AddTransitionOperation,
     RemoveTransitionOperation, UpdateTransitionOperation, SetClipLinkOperation,
-    SetClipEffectsOperation, SetClipOpacityOperation, AddCaptionStyleOperation,
-    RemoveCaptionStyleOperation, SetClipCaptionOperation,
-    AddMulticamGroupOperation, RemoveMulticamGroupOperation,
-    SetMulticamActiveAngleOperation, RemoveWordsOperation,
-    SplitClipAtPositionsOperation>;
+    SetClipEffectsOperation, SetClipOpacityOperation, SetClipAudioOperation,
+    AddCaptionStyleOperation, RemoveCaptionStyleOperation,
+    SetClipCaptionOperation, AddMulticamGroupOperation,
+    RemoveMulticamGroupOperation, SetMulticamActiveAngleOperation,
+    RemoveWordsOperation, SplitClipAtPositionsOperation>;
 
 // Turns a repeat spacing into the exact positions to cut `clipId` at:
 // interval, 2*interval, ... for as long as they stay strictly inside the

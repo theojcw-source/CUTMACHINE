@@ -686,36 +686,82 @@ int main() {
               "an angle must reference an existing clip on a video track");
     });
 
-    Test("document schema version 4 migrates clips to opaque", [] {
-        std::string json = ValidDocument().SaveToString();
-        const std::string current = "\"version\": 6";
+    Test("older document schemas migrate audio settings to neutral", [] {
+        const std::string canonical = ValidDocument().SaveToString();
+        std::string json = canonical;
+        const std::string current = "\"version\": 7";
         const size_t versionPosition = json.find(current);
         Check(versionPosition != std::string::npos,
               "canonical fixture contains its schema version");
         json.replace(versionPosition, current.size(), "\"version\": 4");
+        Document document;
+        std::string error;
+        const std::string audioGain =
+            ",\"audio_gain_db\":{\"num\":0,\"den\":1}";
+        const std::string audioFadeIn =
+            ",\"audio_fade_in\":{\"value\":0,\"rate\":1}";
+        const std::string audioFadeOut =
+            ",\"audio_fade_out\":{\"value\":0,\"rate\":1}";
+        for (const std::string& field :
+             {audioGain, audioFadeIn, audioFadeOut}) {
+            size_t position = 0;
+            while ((position = json.find(field, position)) != std::string::npos)
+                json.erase(position, field.size());
+        }
         const std::string opacity = ",\"opacity\":{\"num\":1,\"den\":1}";
         size_t opacityPosition = 0;
         while ((opacityPosition = json.find(opacity, opacityPosition)) !=
-               std::string::npos) {
+               std::string::npos)
             json.erase(opacityPosition, opacity.size());
-        }
-        Document document;
-        std::string error;
         Check(Document::LoadFromString(json, document, error),
-              "version 4 loads through the opacity migration: " + error);
-        Check(document.version == 6,
+              "version 4 loads through neutral audio migration: " + error);
+        Check(document.version == 7,
               "the migrated document uses the current schema version");
-        bool allOpaque = true;
+        bool neutralAudio = true;
         for (const DocumentTrack& track : document.sequence.tracks) {
             for (const DocumentClip& clip : track.clips) {
-                allOpaque =
-                    allOpaque && clip.opacity.num == 1 && clip.opacity.den == 1;
+                neutralAudio = neutralAudio && clip.audio_gain_db.num == 0 &&
+                               clip.audio_gain_db.den == 1 &&
+                               clip.audio_fade_in == RationalTime{0, 1} &&
+                               clip.audio_fade_out == RationalTime{0, 1};
             }
         }
-        Check(allOpaque, "every migrated clip defaults to exact full opacity");
+        Check(neutralAudio,
+              "every migrated clip defaults to neutral exact audio settings");
         Check(
-            document.SaveToString().find("\"version\": 6") != std::string::npos,
-            "saving a migrated document emits canonical version 6");
+            document.SaveToString().find("\"version\": 7") != std::string::npos,
+            "saving a migrated document emits canonical version 7");
+
+        const auto withoutAudioSettings = [&](int version) {
+            std::string legacy = canonical;
+            legacy.replace(versionPosition, current.size(),
+                           "\"version\": " + std::to_string(version));
+            for (const std::string& field :
+                 {audioGain, audioFadeIn, audioFadeOut}) {
+                size_t position = 0;
+                while ((position = legacy.find(field, position)) !=
+                       std::string::npos)
+                    legacy.erase(position, field.size());
+            }
+            return legacy;
+        };
+        Document v5;
+        const std::string v5Json = withoutAudioSettings(5);
+        Check(Document::LoadFromString(v5Json, v5, error) &&
+                  v5.sequence.tracks[0].clips[0].opacity.num == 1 &&
+                  v5.sequence.tracks[0].clips[0].opacity.den == 1 &&
+                  v5.sequence.tracks[0].clips[0].audio_gain_db.num == 0 &&
+                  v5.sequence.tracks[0].clips[0].audio_gain_db.den == 1,
+              "version 5 preserves opacity and adds neutral audio settings: " +
+                  error);
+        Document v6;
+        const std::string v6Json = withoutAudioSettings(6);
+        Check(Document::LoadFromString(v6Json, v6, error) &&
+                  v6.sequence.tracks[0].clips[0].audio_fade_in ==
+                      RationalTime{0, 1} &&
+                  v6.sequence.tracks[0].clips[0].audio_fade_out ==
+                      RationalTime{0, 1},
+              "version 6 adds neutral audio settings: " + error);
     });
 
     // QC-2026-09 A3 -- the measured audio level is a document fact, so it has

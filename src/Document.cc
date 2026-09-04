@@ -679,22 +679,15 @@ bool Document::LoadFromString(const std::string& json, Document& output,
         const JsonValue root = JsonParser(json).Parse();
         Document parsed;
         const int32_t storedVersion = Int32(root, "version", "document");
-        if (storedVersion != 4 && storedVersion != 5 && storedVersion != 6) {
+        if (storedVersion != 4 && storedVersion != 5 && storedVersion != 6 &&
+            storedVersion != 7) {
             throw std::runtime_error("unsupported document version " +
                                      std::to_string(storedVersion));
         }
-        // ALPHA-2026-08 -- v4 clips predate compositing opacity. Loading them
-        // as fully opaque keeps existing projects usable while the next save
-        // emits the canonical v5 representation.
-        //
-        // QC-2026-09 A3 -- v5 library entries predate the measured audio
-        // level. They load as unmeasured, which is the honest reading and
-        // the one `audio_level_measured` exists to express: re-ingesting the
-        // same path fills it in, exactly as it already does for a v1 source
-        // with no technical metadata. Accepted rather than refused because
-        // nothing about an existing edit changes -- this adds a fact about a
-        // file, not a new way to describe a cut.
-        parsed.version = 6;
+        // A7's neutral settings are unambiguous: zero dB is unity and a zero
+        // duration has no envelope. Keep the established v4/v5/v6 migration
+        // policy, then always emit the complete v7 representation on save.
+        parsed.version = 7;
 
         if (const JsonValue* color =
                 Optional(root, "color_management", JsonValue::Type::Object,
@@ -779,9 +772,9 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     media.metadata_complete = false;
                 } else {
                     media.codec = codec->string;
-                    if (const JsonValue* value = Optional(
-                            item, "has_video", JsonValue::Type::Boolean,
-                            context))
+                    if (const JsonValue* value =
+                            Optional(item, "has_video",
+                                     JsonValue::Type::Boolean, context))
                         media.has_video = value->boolean;
                     media.width = Int32(item, "width", context);
                     media.height = Int32(item, "height", context);
@@ -1154,6 +1147,20 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                                 clipContext),
                         clipContext + ".opacity");
                 }
+                if (storedVersion >= 7) {
+                    clip.audio_gain_db = ParseEffectParamValue(
+                        Require(clipValue, "audio_gain_db",
+                                JsonValue::Type::Object, clipContext),
+                        clipContext + ".audio_gain_db");
+                    clip.audio_fade_in =
+                        ParseTime(Require(clipValue, "audio_fade_in",
+                                          JsonValue::Type::Object, clipContext),
+                                  clipContext + ".audio_fade_in");
+                    clip.audio_fade_out =
+                        ParseTime(Require(clipValue, "audio_fade_out",
+                                          JsonValue::Type::Object, clipContext),
+                                  clipContext + ".audio_fade_out");
+                }
                 track.clips.push_back(std::move(clip));
             }
             parsed.sequence.tracks.push_back(std::move(track));
@@ -1287,6 +1294,12 @@ std::string Document::SaveToString() const {
                        << "\"";
             output << ",\"opacity\":";
             WriteEffectParamValue(output, clip.opacity);
+            output << ",\"audio_gain_db\":";
+            WriteEffectParamValue(output, clip.audio_gain_db);
+            output << ",\"audio_fade_in\":";
+            WriteTime(output, clip.audio_fade_in);
+            output << ",\"audio_fade_out\":";
+            WriteTime(output, clip.audio_fade_out);
             output << "}";
         }
         if (!track.clips.empty()) output << '\n';
@@ -1409,7 +1422,7 @@ std::string Document::SaveToString() const {
 }
 
 bool Document::Validate(std::string& error) const {
-    if (version != 6) {
+    if (version != 7) {
         error = "unsupported document version " + std::to_string(version);
         return false;
     }
@@ -1550,20 +1563,18 @@ bool Document::Validate(std::string& error) const {
                 error = context + " has no usable audio or video stream";
                 return false;
             }
-            if (media.has_video &&
-                (media.width <= 0 || media.height <= 0 ||
-                 media.rotation_degrees < -180 ||
-                 media.rotation_degrees > 180 ||
-                 (media.orientation != "landscape" &&
-                  media.orientation != "portrait" &&
-                  media.orientation != "square"))) {
+            if (media.has_video && (media.width <= 0 || media.height <= 0 ||
+                                    media.rotation_degrees < -180 ||
+                                    media.rotation_degrees > 180 ||
+                                    (media.orientation != "landscape" &&
+                                     media.orientation != "portrait" &&
+                                     media.orientation != "square"))) {
                 error = context + " has invalid video metadata";
                 return false;
             }
             if (!media.has_video &&
                 (media.width != 0 || media.height != 0 ||
-                 media.rotation_degrees != 0 ||
-                 media.orientation != "audio")) {
+                 media.rotation_degrees != 0 || media.orientation != "audio")) {
                 error = context + " has picture metadata without video";
                 return false;
             }
@@ -1692,6 +1703,31 @@ bool Document::Validate(std::string& error) const {
                 clip.opacity.num > clip.opacity.den) {
                 error = context + " ('" + clip.id +
                         "') has opacity outside the exact [0, 1] range";
+                return false;
+            }
+            if (clip.audio_gain_db.den <= 0 ||
+                static_cast<int64_t>(clip.audio_gain_db.num) <
+                    -120LL * clip.audio_gain_db.den ||
+                static_cast<int64_t>(clip.audio_gain_db.num) >
+                    48LL * clip.audio_gain_db.den) {
+                error = context + " ('" + clip.id +
+                        "') has gain outside the exact [-120, 48] dB range";
+                return false;
+            }
+            if (clip.audio_fade_in.rate <= 0 || clip.audio_fade_out.rate <= 0 ||
+                clip.audio_fade_in.value < 0 || clip.audio_fade_out.value < 0 ||
+                clip.audio_fade_in > clip.duration ||
+                clip.audio_fade_out > clip.duration) {
+                error = context + " ('" + clip.id +
+                        "') has an invalid audio fade duration";
+                return false;
+            }
+            const bool hasAudioProcessing =
+                clip.audio_gain_db.num != 0 || clip.audio_gain_db.den != 1 ||
+                clip.audio_fade_in.value != 0 || clip.audio_fade_out.value != 0;
+            if (hasAudioProcessing && track.kind != "audio") {
+                error = context + " ('" + clip.id +
+                        "') has audio processing on a non-audio track";
                 return false;
             }
             const DocumentSource* source =

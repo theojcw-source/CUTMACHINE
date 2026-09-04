@@ -102,6 +102,14 @@ Document Fixture() {
            {200, 25},
            {10, 25},
            {20, 25}}}},
+        {"01K30000000000000000000005",
+         "audio",
+         1,
+         {{"01K30000000000000000000006",
+           "01K30000000000000000000001",
+           {100, 25},
+           {10, 25},
+           {5, 25}}}},
     };
     document.sequence.tracks[0].clips[0].link_group_id =
         "01K30000000000000000000005";
@@ -1178,6 +1186,7 @@ int main() {
     bool sawTrimClip = false;
     bool sawSetColorManagement = false;
     bool sawSetClipOpacity = false;
+    bool sawSetClipAudio = false;
     bool sawUndo = false;
     if (toolsField) {
         for (const mcp_json::Value& tool : toolsField->AsArray()) {
@@ -1190,6 +1199,7 @@ int main() {
                 sawSetColorManagement = true;
             if (name->AsString() == "set_clip_opacity")
                 sawSetClipOpacity = true;
+            if (name->AsString() == "set_clip_audio") sawSetClipAudio = true;
             if (name->AsString() == "undo") sawUndo = true;
             // Multicam operations are stubbed pending F1.5; must not be
             // offered as a working tool.
@@ -1203,6 +1213,7 @@ int main() {
     Check(sawTrimClip, "tools/list includes trim_clip");
     Check(sawSetColorManagement, "tools/list includes set_color_management");
     Check(sawSetClipOpacity, "tools/list includes set_clip_opacity");
+    Check(sawSetClipAudio, "tools/list includes set_clip_audio");
     Check(sawUndo, "tools/list includes undo");
 
     // ---- tools/call: trim_clip, compared against a direct EditLog::Apply ----
@@ -1328,6 +1339,25 @@ int main() {
               expectedMessage);
     Check(backend.CurrentDocument().SaveToString() == expected.SaveToString(),
           "set_clip_opacity matches a direct operation");
+
+    const std::string audioRequest =
+        std::string(R"({"jsonrpc":"2.0","id":12,"method":"tools/call",)") +
+        R"("params":{"name":"set_clip_audio","arguments":{"clip_id":")" +
+        R"(01K30000000000000000000006","gain_db":{"num":10,"den":1},)"
+        R"("fade_in":{"value":2,"rate":25},"fade_out":{"value":3,"rate":25}}}})";
+    const std::string audioResponse =
+        HttpPostJson(server.Port(), "/mcp", audioRequest);
+    Check(audioResponse.find("\"isError\":false") != std::string::npos,
+          "tools/call set_clip_audio is not an error");
+    Check(
+        expectedLog.Apply(
+            expected,
+            SetClipAudioOperation{
+                "01K30000000000000000000006", {10, 1}, {2, 25}, {3, 25}},
+            expectedError, expectedMessage),
+        "reference direct EditLog::Apply(audio) succeeds: " + expectedMessage);
+    Check(backend.CurrentDocument().SaveToString() == expected.SaveToString(),
+          "set_clip_audio matches a direct operation");
 
     // ---- tools/call: project color state through the shared operation ----
     const std::string colorRequest =
@@ -1728,9 +1758,9 @@ int main() {
               "its result is JSON: " + viewError);
         const mcp_json::Value* matches = view.Find("matches");
         Check(matches != nullptr && matches->IsArray() &&
-                  matches->AsArray().size() == 1,
-              "one clip of the fixture plays that frame");
-        if (matches != nullptr && matches->AsArray().size() == 1) {
+                  matches->AsArray().size() == 2,
+              "the linked video and audio clips play that frame");
+        if (matches != nullptr && matches->AsArray().size() == 2) {
             const mcp_json::Value* position =
                 matches->AsArray()[0].Find("timeline_position");
             const mcp_json::Value* value =
