@@ -26,6 +26,21 @@ struct ColorManagementSettings {
     std::string output_transfer = "rec709";
 };
 
+// QC-2026-09 A3 -- audio levels carried as integers: an RMS amplitude as a
+// fraction of full scale, times this scale. Amplitude rather than decibels,
+// and integer rather than float, for the reason SpeechOnset.h's identical
+// convention gives -- a logarithm cannot be taken exactly in integers, and
+// no float literal may reach a canonical document. -60 dBFS is 1000 here,
+// -74 dBFS (a silent cutaway, measured) is 200, ordinary speech is tens of
+// thousands.
+constexpr int64_t kAudioLevelScale = 1000000;
+
+// Below this, a media carries no speech worth transcribing: it is a mute
+// cutaway, and Whisper on it costs eleven times its own runtime to produce
+// nothing. -60 dBFS, which sits far above the -74 dBFS the silent rushes of
+// ADS213_ITW_Findetudefevr26 measured and far below any usable dialogue.
+constexpr int64_t kSilentMediaAudioLevel = 1000;
+
 struct DocumentSource {
     Ulid id = GenerateUlid();
     std::string path;
@@ -38,6 +53,11 @@ struct LibraryMedia {
     std::string path;
     std::string filename;
     std::string codec;
+    // B11 -- ROADMAP.md. Audio-only media remains first-class library media;
+    // consumers that decode pictures must check this capability explicitly.
+    // True by default keeps pre-B11 documents and hand-built video fixtures
+    // source-compatible when their serialized entry has no has_video field.
+    bool has_video = true;
     int32_t width = 0;
     int32_t height = 0;
     std::string pixel_format;
@@ -53,6 +73,19 @@ struct LibraryMedia {
     bool has_audio = false;
     int32_t audio_rate = 0;
     int32_t audio_channels = 0;
+    // QC-2026-09 A3 -- mean level of the whole audio stream, in the scale
+    // above. A document fact like the frame rate and the duration, and
+    // recorded for the same reason: it is a property of the file that every
+    // surface needs and nobody should have to measure twice. Measured at
+    // ingest, which is why it is here and not in a cache -- a cache entry
+    // would be one more thing to be missing at the moment a decision depends
+    // on it.
+    //
+    // `audio_level_measured` distinguishes "not measured" from "digital
+    // silence", which are the same zero and are not the same fact: one is an
+    // unknown a caller can act on, the other is an answer.
+    bool audio_level_measured = false;
+    int64_t audio_level = 0;
     // Empty means the project root. Bins organize library media only and do
     // not change source or clip identity.
     Ulid bin_id;
@@ -129,6 +162,17 @@ struct DocumentClip {
     Ulid caption_group_id;
     // This clip's slice of the caption run's text.
     std::string caption_text;
+    // ALPHA-2026-08 -- compositing changes the rendered project, so opacity
+    // belongs to the canonical clip rather than to an Inspector preference.
+    // Keep it exact until Timeline resolves the render-only float boundary.
+    EffectParamValue opacity{1, 1};
+    // QC-2026-09 A7 -- audio processing is part of the edit, not a mixer
+    // preference: a quiet sentence must export and play back identically on
+    // every machine. Gain is an exact number of decibels; the two envelopes
+    // are exact timeline durations, never sample counts guessed by a UI.
+    EffectParamValue audio_gain_db{0, 1};
+    RationalTime audio_fade_in{0, 1};
+    RationalTime audio_fade_out{0, 1};
 };
 
 enum class TransitionAlignment { Center, StartAtCut, EndAtCut };
@@ -210,7 +254,7 @@ struct DocumentSequence {
 
 class Document {
 public:
-    int32_t version = 4;
+    int32_t version = 7;
     DocumentSequence sequence;
     ColorManagementSettings color_management;
     std::vector<LibraryMedia> library;

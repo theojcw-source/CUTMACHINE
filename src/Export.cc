@@ -68,31 +68,6 @@ std::string TemporaryOutputPath(const std::filesystem::path& destination) {
     return (destination.parent_path() / filename).string();
 }
 
-std::string BuildColorLut(const ColorManagementSettings& settings) {
-    constexpr int kSize = 65;
-    std::ostringstream output;
-    output.imbue(std::locale::classic());
-    output << "TITLE \"CUTMACHINE display transform\"\n"
-           << "LUT_3D_SIZE " << kSize << "\n"
-           << "DOMAIN_MIN 0.0 0.0 0.0\n"
-           << "DOMAIN_MAX 1.0 1.0 1.0\n"
-           << std::fixed << std::setprecision(10);
-    // .cube ordering increments red first, then green, then blue.
-    for (int blue = 0; blue < kSize; ++blue) {
-        for (int green = 0; green < kSize; ++green) {
-            for (int red = 0; red < kSize; ++red) {
-                const RgbColor transformed = TransformColorForOutput(
-                    settings, {static_cast<double>(red) / (kSize - 1),
-                               static_cast<double>(green) / (kSize - 1),
-                               static_cast<double>(blue) / (kSize - 1)});
-                output << transformed.red << ' ' << transformed.green << ' '
-                       << transformed.blue << '\n';
-            }
-        }
-    }
-    return output.str();
-}
-
 void AppendTail(std::string& destination, const char* bytes, size_t count) {
     constexpr size_t kMaximumErrorBytes = 32768;
     destination.append(bytes, count);
@@ -190,8 +165,15 @@ ExportSettings Exporter::SettingsForPreset(ExportPresetId preset,
 }
 
 ExportSettings Exporter::HevcMain10Preset(const std::string& outputPath) {
-    return SettingsForPreset(ExportPresetId::HevcHighQuality, outputPath, 1920,
-                             1080, {25, 1});
+    ExportSettings settings = SettingsForPreset(
+        ExportPresetId::HevcHighQuality, outputPath, 1920, 1080, {25, 1});
+    // The headless preset has no document at construction time. Zero is a
+    // deliberate deferred value resolved by ExportCommand from the active
+    // sequence, matching the UI's "Format de séquence" preset.
+    settings.width = 0;
+    settings.height = 0;
+    settings.frame_rate = {0, 1};
+    return settings;
 }
 
 ExportSettings Exporter::HevcMain10SoftwarePreset(
@@ -280,10 +262,12 @@ bool Exporter::BuildPlan(const Document& document,
     }
 
     std::map<Ulid, bool> sourceHasAudio;
+    std::map<Ulid, bool> sourceHasVideo;
     for (const DocumentSource& source : document.sources) {
         const LibraryMedia* media = document.FindLibraryMedia(source.id);
         if (media && media->metadata_complete) {
             sourceHasAudio[source.id] = media->has_audio;
+            sourceHasVideo[source.id] = media->has_video;
             continue;
         }
         LibraryMedia detected;
@@ -295,6 +279,7 @@ bool Exporter::BuildPlan(const Document& document,
             return false;
         }
         sourceHasAudio[source.id] = detected.has_audio;
+        sourceHasVideo[source.id] = detected.has_video;
     }
 
     struct InputClip {
@@ -305,6 +290,9 @@ bool Exporter::BuildPlan(const Document& document,
         RationalTime duration;
         RationalTime timeline_in;
         std::optional<RationalTime> fade_in;
+        RationalTime audio_fade_in{0, 1};
+        RationalTime audio_fade_out{0, 1};
+        EffectParamValue audio_gain_db{0, 1};
         int input_index = -1;
         bool video = false;
         bool audio = false;
@@ -323,6 +311,7 @@ bool Exporter::BuildPlan(const Document& document,
 
     std::vector<InputClip> inputs;
     for (const DocumentTrack* track : tracks) {
+        if (track->kind == "caption") continue;
         if ((track->kind == "video" && !track->visible) ||
             (track->kind == "audio" &&
              (track->muted || (hasAudioSolo && !track->solo))))
@@ -336,6 +325,11 @@ bool Exporter::BuildPlan(const Document& document,
             const bool video = track->kind == "video";
             const bool audio =
                 sourceHasAudio[clip.source_id] && track->kind == "audio";
+            if (video && !sourceHasVideo[clip.source_id]) {
+                error = "audio-only source_id '" + clip.source_id +
+                        "' cannot be exported from a video track";
+                return false;
+            }
             if (!video && !audio) continue;
             InputClip input;
             input.track = track;
@@ -344,6 +338,9 @@ bool Exporter::BuildPlan(const Document& document,
             input.source_in = clip.source_in;
             input.duration = clip.duration;
             input.timeline_in = clip.timeline_in;
+            input.audio_gain_db = clip.audio_gain_db;
+            input.audio_fade_in = clip.audio_fade_in;
+            input.audio_fade_out = clip.audio_fade_out;
             input.input_index = static_cast<int>(inputs.size());
             input.video = video;
             input.audio = audio;
@@ -415,14 +412,20 @@ bool Exporter::BuildPlan(const Document& document,
               << ",scale=" << settings.width << ':' << settings.height
               << ":force_original_aspect_ratio=decrease:flags=lanczos"
               << ",setsar=1";
+        const bool translucent =
+            input.clip->opacity.num != input.clip->opacity.den;
+        if (input.fade_in || translucent) graph << ",format=yuva444p10le";
+        if (translucent)
+            graph << ",colorchannelmixer=aa=(" << input.clip->opacity.num << '/'
+                  << input.clip->opacity.den << ')';
         if (input.fade_in)
-            graph << ",format=yuva444p10le,fade=t=in:st=0:d="
-                  << FilterSeconds(*input.fade_in) << ":alpha=1";
+            graph << ",fade=t=in:st=0:d=" << FilterSeconds(*input.fade_in)
+                  << ":alpha=1";
         graph << ",setpts=PTS-STARTPTS+" << position << "/TB[v" << videoOrdinal
               << "];" << "[base" << videoOrdinal << "][v" << videoOrdinal
-              << "]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=pass:repeatlast=0:"
-                 "shortest=0:enable=between(t\\,"
-              << position << "\\," << position << '+' << clipDuration
+              << "]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=repeat:repeatlast=1:"
+                 "shortest=0:enable=gte(t\\,"
+              << position << ")*lt(t\\," << position << '+' << clipDuration
               << ")[base" << (videoOrdinal + 1) << "];";
         ++videoOrdinal;
     }
@@ -431,7 +434,11 @@ bool Exporter::BuildPlan(const Document& document,
         output.temporary_lut_path = (std::filesystem::temp_directory_path() /
                                      ("cutmachine-" + GenerateUlid() + ".cube"))
                                         .string();
-        output.color_lut = BuildColorLut(document.color_management);
+        if (!BuildOpenColorIoCube(document.color_management, output.color_lut,
+                                  error)) {
+            error = "unable to build OpenColorIO export transform: " + error;
+            return false;
+        }
         graph << "scale=";
         bool hasInputOption = false;
         if (document.color_management.input_range != "auto") {
@@ -452,7 +459,7 @@ bool Exporter::BuildPlan(const Document& document,
         if (hasInputOption) graph << ':';
         graph << "out_range=full,format=gbrp16le,lut3d=file='"
               << output.temporary_lut_path
-              << "':interp=tetrahedral,scale=out_range=tv:out_color_matrix="
+              << "':interp=trilinear,scale=out_range=tv:out_color_matrix="
               << (document.color_management.output_gamut == "rec2020" ? "bt2020"
                                                                       : "bt709")
               << ',';
@@ -488,9 +495,18 @@ bool Exporter::BuildPlan(const Document& document,
               << ":a:0]atrim=duration=" << Decimal(input.duration)
               << ",asetpts=PTS-STARTPTS,aresample="
               << settings.audio_sample_rate
-              << ",aformat=sample_fmts=fltp:"
-                 "channel_layouts=stereo,adelay="
-              << delaySamples << "S:all=1[a" << audioOrdinal << "];";
+              << ",aformat=sample_fmts=fltp:channel_layouts=stereo";
+        if (input.audio_gain_db.num != 0)
+            graph << ",volume=pow(10\\,(" << input.audio_gain_db.num << '/'
+                  << input.audio_gain_db.den << ")/20)";
+        if (input.audio_fade_in.value != 0)
+            graph << ",afade=t=in:st=0:d=" << Decimal(input.audio_fade_in);
+        if (input.audio_fade_out.value != 0)
+            graph << ",afade=t=out:st="
+                  << Decimal(input.duration.sub(input.audio_fade_out))
+                  << ":d=" << Decimal(input.audio_fade_out);
+        graph << ",adelay=" << delaySamples << "S:all=1[a" << audioOrdinal
+              << "];";
         ++audioOrdinal;
     }
     if (audioOrdinal == 0) {
@@ -500,7 +516,8 @@ bool Exporter::BuildPlan(const Document& document,
         for (size_t index = 0; index < audioOrdinal; ++index)
             graph << "[a" << index << ']';
         graph << "amix=inputs=" << audioOrdinal
-              << ":duration=longest:normalize=0,alimiter=limit=1:latency=1,"
+              << ":duration=longest:normalize=0,"
+                 "alimiter=limit=0.668344:level=0:latency=1,"
                  "apad,atrim="
               << "duration=" << Decimal(duration) << "[audio]";
     }
@@ -714,7 +731,31 @@ bool Exporter::Run(const ExportPlan& plan,
         // siblings, so the hard-link commit cannot cross filesystems.
         if (link(plan.temporary_output_path.c_str(),
                  plan.settings.output_path.c_str()) != 0) {
-            renameError = std::error_code(errno, std::generic_category());
+            // exFAT has no hard links at all, and an external delivery drive
+            // is routinely formatted that way -- the same constraint that
+            // shaped ProjectStorage's exFAT support. Without this fallback a
+            // fully rendered export is destroyed by removeTemporaryFiles at
+            // the very last step, which is the worst possible moment to fail.
+            // Checking then renaming cannot be atomic, so it stays a fallback
+            // and never the first choice: the race it opens is narrower than
+            // the cost of discarding a finished render.
+            const int linkErrno = errno;
+            if (linkErrno == ENOTSUP || linkErrno == EPERM ||
+                linkErrno == EXDEV) {
+                std::error_code existsError;
+                if (std::filesystem::exists(plan.settings.output_path,
+                                            existsError) ||
+                    existsError) {
+                    renameError = std::make_error_code(std::errc::file_exists);
+                } else {
+                    std::filesystem::rename(plan.temporary_output_path,
+                                            plan.settings.output_path,
+                                            renameError);
+                }
+            } else {
+                renameError =
+                    std::error_code(linkErrno, std::generic_category());
+            }
         } else {
             std::error_code ignored;
             std::filesystem::remove(plan.temporary_output_path, ignored);

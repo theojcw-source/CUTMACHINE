@@ -51,6 +51,8 @@ struct PresentationParameters {
     int inputGamut;
     int inputTransfer;
     int useAcescct;
+    int inputIsRgb;
+    int hasSourceAlpha;
     float redFromCr;
     float greenFromCb;
     float greenFromCr;
@@ -60,7 +62,6 @@ struct PresentationParameters {
     float yScale;
     float chromaOffset;
     float chromaScale;
-    float2 padding;
 };
 
 float3 decodeTransfer(float3 signal, int transfer) {
@@ -155,14 +156,13 @@ float3 mapLinearOutputToDisplay(float3 color, int outputGamut,
     const bool hlg = outputTransfer == 1;
     const float maximum = hlg ? (1.0 / 0.2944028442) : 1.0;
     const float knee = hlg ? 0.9 : 0.72;
-    const float3 weights = outputGamut == 1
-                               ? float3(0.2627, 0.6780, 0.0593)
-                               : float3(0.2126, 0.7152, 0.0722);
+    const float3 weights = outputGamut == 1 ? float3(0.2627, 0.6780, 0.0593)
+                                            : float3(0.2126, 0.7152, 0.0722);
     const float luminance = dot(color, weights);
     if (luminance > knee) {
         const float shoulder =
-            maximum - (maximum - knee) *
-                          exp(-(luminance - knee) / (maximum - knee));
+            maximum -
+            (maximum - knee) * exp(-(luminance - knee) / (maximum - knee));
         color *= shoulder / luminance;
     }
 
@@ -170,16 +170,16 @@ float3 mapLinearOutputToDisplay(float3 color, int outputGamut,
     const float positiveRoom = max(maximum - mappedLuminance, 1e-9);
     const float negativeRoom = max(mappedLuminance, 1e-9);
     const float3 chroma = color - mappedLuminance;
-    const float3 excursion = select(-chroma / negativeRoom,
-                                    chroma / positiveRoom, chroma >= 0.0);
+    const float3 excursion =
+        select(-chroma / negativeRoom, chroma / positiveRoom, chroma >= 0.0);
     const float ratio = max(excursion.r, max(excursion.g, excursion.b));
     constexpr float chromaKnee = 0.75;
     constexpr float chromaLimit = 0.98;
     if (ratio > chromaKnee) {
         const float compressed =
-            chromaKnee + (chromaLimit - chromaKnee) *
-                              (1.0 - exp(-(ratio - chromaKnee) /
-                                         (chromaLimit - chromaKnee)));
+            chromaKnee +
+            (chromaLimit - chromaKnee) *
+                (1.0 - exp(-(ratio - chromaKnee) / (chromaLimit - chromaKnee)));
         color = mappedLuminance + chroma * (compressed / ratio);
     }
     return clamp(color, 0.0, maximum);
@@ -396,10 +396,17 @@ bool presentationUV(float2 outputUV, float left, float top, float width,
     return true;
 }
 
+float3 ocioLutCoordinates(float3 value) {
+    constexpr float edge = 65.0;
+    return (clamp(value, 0.0, 1.0) * (edge - 1.0) + 0.5) / edge;
+}
+
 fragment float4 fragment_working(VertexOut in [[stage_in]],
                                  texture2d<float> yTexture [[texture(0)]],
                                  texture2d<float> uTexture [[texture(1)]],
                                  texture2d<float> vTexture [[texture(2)]],
+                                 texture2d<float> alphaTexture [[texture(3)]],
+                                 texture3d<float> ocioInputLut [[texture(4)]],
                                  sampler planeSampler [[sampler(0)]],
                                  constant PresentationParameters& parameters
                                  [[buffer(0)]],
@@ -410,14 +417,26 @@ fragment float4 fragment_working(VertexOut in [[stage_in]],
                         parameters.width, parameters.height,
                         parameters.quarterTurns, codedUV))
         return float4(0.0);
-    float3 color = sampleYUV(
-        codedUV, yTexture, uTexture, vTexture, planeSampler,
-        parameters.redFromCr, parameters.greenFromCb, parameters.greenFromCr,
-        parameters.blueFromCb, parameters.sampleScale, parameters.yOffset,
-        parameters.yScale, parameters.chromaOffset, parameters.chromaScale);
+    float3 color;
+    if (parameters.inputIsRgb != 0) {
+        color = float3(yTexture.sample(planeSampler, codedUV).r,
+                       uTexture.sample(planeSampler, codedUV).r,
+                       vTexture.sample(planeSampler, codedUV).r) *
+                parameters.sampleScale;
+    } else {
+        color = sampleYUV(
+            codedUV, yTexture, uTexture, vTexture, planeSampler,
+            parameters.redFromCr, parameters.greenFromCb,
+            parameters.greenFromCr, parameters.blueFromCb,
+            parameters.sampleScale, parameters.yOffset, parameters.yScale,
+            parameters.chromaOffset, parameters.chromaScale);
+    }
     if (parameters.colorManagementEnabled != 0) {
-        color = sourceToAP1(decodeTransfer(color, parameters.inputTransfer),
-                            parameters.inputGamut);
+        // COLOR-2026-08 -- OCIO samples are stored with red, green, then blue
+        // as the texture x/y/z coordinates. The LUT output is the selected
+        // linear working space (ACEScg for the ACEScct grading path).
+        color =
+            ocioInputLut.sample(planeSampler, ocioLutCoordinates(color)).rgb;
         if (parameters.useAcescct != 0) {
             // Creative operations belong between these two calls. Composite
             // storage remains scene-linear AP1 so alpha blending is correct.
@@ -438,7 +457,13 @@ fragment float4 fragment_working(VertexOut in [[stage_in]],
         // with ColorManagementSettings::enabled at its default of false.
         color = clamp(applyColorGrade(color, grade), 0.0, 1.0);
     }
-    return float4(color, clamp(parameters.opacity, 0.0, 1.0));
+    const float sourceAlpha =
+        parameters.hasSourceAlpha != 0
+            ? alphaTexture.sample(planeSampler, codedUV).r *
+                  parameters.sampleScale
+            : 1.0;
+    return float4(color,
+                  clamp(sourceAlpha * parameters.opacity, 0.0, 1.0));
 }
 
 struct OutputParameters {
@@ -449,17 +474,16 @@ struct OutputParameters {
     uint drawableWidth;
     uint drawableHeight;
     uint scopeSampleStep;
-    uint padding;
+    uint useAcescct;
 };
 
-float3 displaySignal(float3 working, constant OutputParameters& parameters) {
-    if (parameters.colorManagementEnabled == 0)
-        return clamp(working, 0.0, 1.0);
-    float3 output = ap1ToOutput(working, parameters.outputGamut);
-    output = mapLinearOutputToDisplay(output, parameters.outputGamut,
-                                      parameters.outputTransfer);
-    if (parameters.outputTransfer == 1) output *= 0.2944028442;
-    return encodeOutput(output, parameters.outputTransfer);
+float3 displaySignal(float3 working, constant OutputParameters& parameters,
+                     texture3d<float> ocioOutputLut, sampler textureSampler) {
+    if (parameters.colorManagementEnabled == 0) return clamp(working, 0.0, 1.0);
+    const float3 lutInput =
+        parameters.useAcescct != 0 ? linearAP1ToACEScct(working) : working;
+    return ocioOutputLut.sample(textureSampler, ocioLutCoordinates(lutInput))
+        .rgb;
 }
 
 constant uint kScopeWaveformWidth = 256;
@@ -468,41 +492,44 @@ constant uint kScopeParadeWidth = 128;
 constant uint kScopeParadeHeight = 128;
 constant uint kScopeVectorSize = 256;
 
-kernel void compute_video_scope(
-    texture2d<float, access::read> workingTexture [[texture(0)]],
-    device atomic_uint* histogram [[buffer(0)]],
-    constant OutputParameters& parameters [[buffer(1)]],
-    uint2 gid [[thread_position_in_grid]]) {
+kernel void compute_video_scope(texture2d<float, access::read> workingTexture
+                                [[texture(0)]],
+                                texture3d<float> ocioOutputLut [[texture(1)]],
+                                sampler textureSampler [[sampler(0)]],
+                                device atomic_uint* histogram [[buffer(0)]],
+                                constant OutputParameters& parameters
+                                [[buffer(1)]],
+                                uint2 gid [[thread_position_in_grid]]) {
     const uint2 source = gid * parameters.scopeSampleStep;
     if (source.x >= parameters.drawableWidth ||
         source.y >= parameters.drawableHeight || parameters.scopeMode == 0)
         return;
-    const float3 signal = displaySignal(workingTexture.read(source).rgb,
-                                        parameters);
+    const float3 signal =
+        displaySignal(workingTexture.read(source).rgb, parameters,
+                      ocioOutputLut, textureSampler);
     if (parameters.scopeMode == 1) {
         const float3 weights = parameters.outputGamut == 1
                                    ? float3(0.2627, 0.6780, 0.0593)
                                    : float3(0.2126, 0.7152, 0.0722);
-        const uint x = min(kScopeWaveformWidth - 1,
-                           source.x * kScopeWaveformWidth /
-                               max(parameters.drawableWidth, 1u));
+        const uint x =
+            min(kScopeWaveformWidth - 1, source.x * kScopeWaveformWidth /
+                                             max(parameters.drawableWidth, 1u));
         const uint y = min(kScopeWaveformHeight - 1,
                            uint(clamp(dot(signal, weights), 0.0, 1.0) *
                                 float(kScopeWaveformHeight - 1)));
-        atomic_fetch_add_explicit(
-            &histogram[y * kScopeWaveformWidth + x], 1u,
-            memory_order_relaxed);
+        atomic_fetch_add_explicit(&histogram[y * kScopeWaveformWidth + x], 1u,
+                                  memory_order_relaxed);
     } else if (parameters.scopeMode == 2) {
-        const uint x = min(kScopeParadeWidth - 1,
-                           source.x * kScopeParadeWidth /
-                               max(parameters.drawableWidth, 1u));
+        const uint x =
+            min(kScopeParadeWidth - 1, source.x * kScopeParadeWidth /
+                                           max(parameters.drawableWidth, 1u));
         for (uint channel = 0; channel < 3; ++channel) {
             const uint y = min(kScopeParadeHeight - 1,
                                uint(clamp(signal[channel], 0.0, 1.0) *
                                     float(kScopeParadeHeight - 1)));
-            const uint index = channel * kScopeParadeWidth *
-                                   kScopeParadeHeight +
-                               y * kScopeParadeWidth + x;
+            const uint index =
+                channel * kScopeParadeWidth * kScopeParadeHeight +
+                y * kScopeParadeWidth + x;
             atomic_fetch_add_explicit(&histogram[index], 1u,
                                       memory_order_relaxed);
         }
@@ -513,15 +540,14 @@ kernel void compute_video_scope(
         const float y = dot(signal, weights);
         const float cb = (signal.b - y) / (2.0 * (1.0 - weights.b));
         const float cr = (signal.r - y) / (2.0 * (1.0 - weights.r));
-        const uint xBin = min(kScopeVectorSize - 1,
-                              uint(clamp(cb + 0.5, 0.0, 1.0) *
-                                   float(kScopeVectorSize - 1)));
-        const uint yBin = min(kScopeVectorSize - 1,
-                              uint(clamp(cr + 0.5, 0.0, 1.0) *
-                                   float(kScopeVectorSize - 1)));
-        atomic_fetch_add_explicit(
-            &histogram[yBin * kScopeVectorSize + xBin], 1u,
-            memory_order_relaxed);
+        const uint xBin =
+            min(kScopeVectorSize - 1,
+                uint(clamp(cb + 0.5, 0.0, 1.0) * float(kScopeVectorSize - 1)));
+        const uint yBin =
+            min(kScopeVectorSize - 1,
+                uint(clamp(cr + 0.5, 0.0, 1.0) * float(kScopeVectorSize - 1)));
+        atomic_fetch_add_explicit(&histogram[yBin * kScopeVectorSize + xBin],
+                                  1u, memory_order_relaxed);
     }
 }
 
@@ -529,9 +555,8 @@ float scopeGrid(float2 uv, int mode) {
     if (mode == 3) {
         const float radius = length((uv - 0.5) * 2.0);
         const float circle = 1.0 - smoothstep(0.008, 0.018, abs(radius - 0.75));
-        const float axes =
-            max(1.0 - smoothstep(0.002, 0.006, abs(uv.x - 0.5)),
-                1.0 - smoothstep(0.002, 0.006, abs(uv.y - 0.5)));
+        const float axes = max(1.0 - smoothstep(0.002, 0.006, abs(uv.x - 0.5)),
+                               1.0 - smoothstep(0.002, 0.006, abs(uv.y - 0.5)));
         return max(circle, axes) * 0.18;
     }
     const float horizontal =
@@ -541,13 +566,12 @@ float scopeGrid(float2 uv, int mode) {
     return horizontal * 0.16;
 }
 
-float4 scopeOverlay(float4 base, float2 pixel,
-                    device atomic_uint* histogram,
+float4 scopeOverlay(float4 base, float2 pixel, device atomic_uint* histogram,
                     constant OutputParameters& parameters) {
     if (parameters.scopeMode == 0) return base;
     const float panelWidth = min(float(parameters.drawableWidth) * 0.42, 520.0);
-    const float panelHeight = min(float(parameters.drawableHeight) * 0.38,
-                                  panelWidth * 0.62);
+    const float panelHeight =
+        min(float(parameters.drawableHeight) * 0.38, panelWidth * 0.62);
     const float2 origin =
         float2(12.0, float(parameters.drawableHeight) - panelHeight - 12.0);
     if (pixel.x < origin.x || pixel.y < origin.y ||
@@ -558,20 +582,19 @@ float4 scopeOverlay(float4 base, float2 pixel,
     if (parameters.scopeMode == 1) {
         const uint x = min(kScopeWaveformWidth - 1,
                            uint(uv.x * float(kScopeWaveformWidth)));
-        const uint y = min(kScopeWaveformHeight - 1,
-                           uint((1.0 - uv.y) *
-                                float(kScopeWaveformHeight - 1)));
+        const uint y =
+            min(kScopeWaveformHeight - 1,
+                uint((1.0 - uv.y) * float(kScopeWaveformHeight - 1)));
         const uint count = atomic_load_explicit(
             &histogram[y * kScopeWaveformWidth + x], memory_order_relaxed);
         trace = float3(1.0 - exp(-float(count) * 0.18));
     } else if (parameters.scopeMode == 2) {
         const uint channel = min(2u, uint(uv.x * 3.0));
         const float localX = fract(uv.x * 3.0);
-        const uint x = min(kScopeParadeWidth - 1,
-                           uint(localX * float(kScopeParadeWidth)));
+        const uint x =
+            min(kScopeParadeWidth - 1, uint(localX * float(kScopeParadeWidth)));
         const uint y = min(kScopeParadeHeight - 1,
-                           uint((1.0 - uv.y) *
-                                float(kScopeParadeHeight - 1)));
+                           uint((1.0 - uv.y) * float(kScopeParadeHeight - 1)));
         const uint index = channel * kScopeParadeWidth * kScopeParadeHeight +
                            y * kScopeParadeWidth + x;
         const float intensity =
@@ -580,14 +603,13 @@ float4 scopeOverlay(float4 base, float2 pixel,
                       0.18);
         trace[channel] = intensity;
     } else {
-        const uint x = min(kScopeVectorSize - 1,
-                           uint(uv.x * float(kScopeVectorSize)));
+        const uint x =
+            min(kScopeVectorSize - 1, uint(uv.x * float(kScopeVectorSize)));
         const uint y = min(kScopeVectorSize - 1,
                            uint((1.0 - uv.y) * float(kScopeVectorSize - 1)));
         const uint count = atomic_load_explicit(
             &histogram[y * kScopeVectorSize + x], memory_order_relaxed);
-        trace = float3(0.65, 1.0, 0.78) *
-                (1.0 - exp(-float(count) * 0.12));
+        trace = float3(0.65, 1.0, 0.78) * (1.0 - exp(-float(count) * 0.12));
     }
     const float grid = scopeGrid(uv, parameters.scopeMode);
     const float3 panel = max(trace, float3(grid));
@@ -596,13 +618,15 @@ float4 scopeOverlay(float4 base, float2 pixel,
 
 fragment float4 fragment_output(VertexOut in [[stage_in]],
                                 texture2d<float> workingTexture [[texture(0)]],
+                                texture3d<float> ocioOutputLut [[texture(1)]],
                                 sampler textureSampler [[sampler(0)]],
                                 device atomic_uint* histogram [[buffer(1)]],
                                 constant OutputParameters& parameters
                                 [[buffer(0)]]) {
     float4 working = workingTexture.sample(textureSampler, in.uv);
-    const float4 output =
-        float4(displaySignal(working.rgb, parameters), working.a);
+    const float4 output = float4(
+        displaySignal(working.rgb, parameters, ocioOutputLut, textureSampler),
+        working.a);
     return scopeOverlay(output, in.position.xy, histogram, parameters);
 }
 

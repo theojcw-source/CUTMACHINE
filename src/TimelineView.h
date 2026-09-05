@@ -24,6 +24,14 @@ struct TimelineViewport {
     std::vector<double> TickXs(double width) const;
 };
 
+// UI-2026-08 -- a practical lower bound must still allow long-form projects
+// to fit. Four pixels per second capped an ordinary editor pane at roughly
+// three minutes, making the zoom bar and FitDuration misleadingly stop early.
+// Numerical safety floor only: at this scale an ordinary editor pane spans
+// decades, so navigation has no user-visible zoom-out limit.
+constexpr double kTimelineMinPixelsPerSecond = 0.000001;
+constexpr double kTimelineMaxPixelsPerSecond = 4000.0;
+
 // UI-2026-08 -- Keep device-specific NSEvent details out of the viewport.
 // AppKit only reports whether deltas are precise and which modifiers are
 // active; this portable policy decides whether the same gesture pans or

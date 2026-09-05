@@ -59,6 +59,15 @@ jamais lorsqu'il est reclassé.
 `parent_id` est omis lors de la sauvegarde pour les chutiers racine afin de
 rester compatible avec les documents existants.
 
+## Import depuis Resolve
+
+`--import-resolve` reproduit l'arborescence du Media Pool d'un projet DaVinci
+Resolve Studio ouvert, à partir du manifeste produit par
+`sidecar/resolve_bridge.py`. Les chutiers passent par `AddBinOperation` et les
+rushes par `SetMediaBinOperation`, donc l'import est annulable et rejouable
+comme n'importe quelle autre mutation. Voir la section « Import depuis DaVinci
+Resolve » du `README.md`.
+
 ## Suite prévue
 
 1. Glisser-déposer de médias et de chutiers dans l'arborescence, via une

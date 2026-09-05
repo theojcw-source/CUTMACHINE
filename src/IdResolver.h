@@ -19,6 +19,7 @@
 #include "Ulid.h"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 class Document;
@@ -26,14 +27,16 @@ class Document;
 class IdResolver {
 public:
     // Builds the resolver over every stable ID currently addressable in
-    // `document`: sequence, tracks, clips, sources, library media, bins,
-    // markers, transitions, caption styles, multicam groups and angles.
+    // `document`: sequence, tracks, clips, A/V link groups, sources, library
+    // media, bins, markers, transitions, caption styles, multicam groups and
+    // angles.
     explicit IdResolver(const Document& document);
 
-    // `input` may be a full ID (checked first, as an exact match) or a
-    // non-empty prefix of exactly one known ID. Returns false with a
-    // human-readable `error` naming `fieldName` when `input` is empty,
-    // matches nothing, or matches more than one ID -- never guesses.
+    // `input` may be one of DescribeDocument's visible aliases, a full ID
+    // (checked first, as an exact match), or a non-empty prefix of exactly one
+    // known ID. Returns false with a human-readable `error` naming
+    // `fieldName` when `input` is empty, matches nothing, or matches more than
+    // one object -- never guesses.
     bool Resolve(const std::string& fieldName, const std::string& input,
                  Ulid& output, std::string& error) const;
 
@@ -46,6 +49,7 @@ public:
 
 private:
     std::vector<Ulid> universe_;
+    std::vector<std::pair<std::string, Ulid>> aliases_;
     Ulid sequence_id_;
 };
 

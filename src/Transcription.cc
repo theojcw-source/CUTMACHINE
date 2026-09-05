@@ -1,5 +1,6 @@
 #include "Transcription.h"
 
+#include "LocalEnv.h"
 #include "whisper.h"
 
 #include <poll.h>
@@ -16,9 +17,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
 extern char** environ;
@@ -34,20 +38,15 @@ void AppendTail(std::string& tail, const char* bytes, size_t count) {
 // Decodes `inputPath`'s audio to mono 16 kHz float32 PCM -- whisper.cpp's
 // required input format -- using the same FFmpeg subprocess pipeline
 // Waveform.cc's GenerateAudioWaveform already uses for its own decode.
-bool DecodeMonoPcm16k(const std::string& inputPath,
-                      const std::string& ffmpegPath, MediaTaskContext& context,
-                      std::vector<float>& samples, std::string& error) {
-    std::vector<std::string> storage = {
-        ffmpegPath,  "-hide_banner",
-        "-loglevel", "error",
-        "-nostdin",  "-i",
-        inputPath,   "-map",
-        "0:a:0",     "-vn",
-        "-ac",       "1",
-        "-ar",       std::to_string(WHISPER_SAMPLE_RATE),
-        "-f",        "f32le",
-        "pipe:1",
-    };
+bool DecodePcm16k(const std::string& ffmpegPath,
+                  const std::vector<std::string>& ffmpegArguments,
+                  MediaTaskContext& context, std::vector<float>& samples,
+                  std::string& error) {
+    std::vector<std::string> storage;
+    storage.reserve(ffmpegArguments.size() + 1);
+    storage.push_back(ffmpegPath);
+    storage.insert(storage.end(), ffmpegArguments.begin(),
+                   ffmpegArguments.end());
     std::vector<char*> argv;
     argv.reserve(storage.size() + 1);
     for (std::string& value : storage) argv.push_back(value.data());
@@ -167,6 +166,17 @@ bool DecodeMonoPcm16k(const std::string& inputPath,
     return true;
 }
 
+bool DecodeMonoPcm16k(const std::string& inputPath,
+                      const std::string& ffmpegPath, MediaTaskContext& context,
+                      std::vector<float>& samples, std::string& error) {
+    return DecodePcm16k(
+        ffmpegPath,
+        {"-hide_banner", "-loglevel", "error", "-nostdin", "-i", inputPath,
+         "-map", "0:a:0", "-vn", "-ac", "1", "-ar",
+         std::to_string(WHISPER_SAMPLE_RATE), "-f", "f32le", "pipe:1"},
+        context, samples, error);
+}
+
 // Groups whisper.cpp's per-token output into words and rounds each word's
 // boundary onto the source's exact frame grid (Transcription.h's single
 // explicit rounding rule). Whisper's tokenizer marks the start of a new word
@@ -176,6 +186,66 @@ bool DecodeMonoPcm16k(const std::string& inputPath,
 // before it, which is the intended behavior for cutting whole words cleanly.
 // Special/timestamp tokens (id >= whisper_token_eot) carry no real text and
 // are skipped, mirroring whisper.cpp's own examples/cli/cli.cpp filter.
+// SUBTITLE-2026-09 -- whisper.cpp offers two token timestamps and they are not
+// of the same quality. `token_timestamps` reads the probability of the
+// timestamp token the decoder emits after each sub-word; Whisper was never
+// trained to emit one after every word, so it emits them every few words and
+// the rest is interpolation. The DTW timestamps come from the cross-attention
+// alignment -- the method WhisperX and stable-ts use -- and they are the ones
+// worth having.
+//
+// Measured on the Fanny montage of LISAASTR136, against DaVinci Resolve's own
+// word-by-word transcription of the same assembled audio (143 words matched):
+// the heuristic start of a word sits 4 images early at the median, 57 % of
+// words are off by more than 3. It never shows on a cut; it shows on every
+// subtitle.
+//
+// The alignment heads are model-specific and whisper.cpp refuses to load a
+// mismatched pair, so an unrecognised model keeps the old behaviour rather
+// than guessing a preset.
+whisper_alignment_heads_preset AlignmentHeadsForModel(const std::string& path) {
+    std::string name = std::filesystem::path(path).filename().string();
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const auto has = [&](const char* needle) {
+        return name.find(needle) != std::string::npos;
+    };
+    // Ordered longest-match first: "large-v3-turbo" also contains "large-v3".
+    if (has("large-v3-turbo") || has("large-v3_turbo"))
+        return WHISPER_AHEADS_LARGE_V3_TURBO;
+    if (has("large-v3")) return WHISPER_AHEADS_LARGE_V3;
+    if (has("large-v2")) return WHISPER_AHEADS_LARGE_V2;
+    if (has("large-v1")) return WHISPER_AHEADS_LARGE_V1;
+    if (has("medium.en")) return WHISPER_AHEADS_MEDIUM_EN;
+    if (has("medium")) return WHISPER_AHEADS_MEDIUM;
+    if (has("small.en")) return WHISPER_AHEADS_SMALL_EN;
+    if (has("small")) return WHISPER_AHEADS_SMALL;
+    if (has("base.en")) return WHISPER_AHEADS_BASE_EN;
+    if (has("base")) return WHISPER_AHEADS_BASE;
+    if (has("tiny.en")) return WHISPER_AHEADS_TINY_EN;
+    if (has("tiny")) return WHISPER_AHEADS_TINY;
+    return WHISPER_AHEADS_NONE;
+}
+
+// Loads the model with cross-attention alignment when the heads are known,
+// and without it otherwise. A refusal here is not fatal: the heuristic
+// timestamps are worse, not unusable, and a transcription is worth more than
+// an exact one that never runs.
+whisper_context* OpenWhisperModel(const std::string& path) {
+    const whisper_alignment_heads_preset preset = AlignmentHeadsForModel(path);
+    if (preset != WHISPER_AHEADS_NONE) {
+        whisper_context_params params = whisper_context_default_params();
+        params.dtw_token_timestamps = true;
+        params.dtw_aheads_preset = preset;
+        if (whisper_context* ctx =
+                whisper_init_from_file_with_params(path.c_str(), params))
+            return ctx;
+    }
+    whisper_context_params params = whisper_context_default_params();
+    return whisper_init_from_file_with_params(path.c_str(), params);
+}
+
 std::vector<TranscriptWord> GroupWordsFromWhisper(whisper_context* ctx,
                                                   const MediaRate& frameRate) {
     std::vector<TranscriptWord> words;
@@ -184,17 +254,34 @@ std::vector<TranscriptWord> GroupWordsFromWhisper(whisper_context* ctx,
     std::string currentText;
     int64_t currentStartCentis = 0;
     int64_t currentEndCentis = 0;
+    // -1 is whisper.cpp's own sentinel for "no DTW timestamp on this token"
+    // (see the whisper_token_data initialiser); it is what a model loaded
+    // without alignment heads leaves behind, so it also selects the fallback.
+    int64_t currentStartDtw = -1;
     const auto flush = [&]() {
         if (currentText.empty()) return;
         std::string text = currentText;
         if (!text.empty() && text.front() == ' ') text.erase(text.begin());
         if (!text.empty()) {
-            const RationalTime start{currentStartCentis, 100};
-            const RationalTime end{currentEndCentis, 100};
+            // The DTW timestamp is one instant per token -- the moment the
+            // token was emitted -- not a span, so it can only place the word,
+            // not measure it. Keeping whisper's own duration and moving the
+            // pair together corrects what is wrong (where the word sits)
+            // without inventing what is not measured (how long it lasts).
+            int64_t startCentis = currentStartCentis;
+            int64_t endCentis = currentEndCentis;
+            if (currentStartDtw >= 0) {
+                endCentis =
+                    currentStartDtw + (currentEndCentis - currentStartCentis);
+                startCentis = currentStartDtw;
+            }
+            const RationalTime start{startCentis, 100};
+            const RationalTime end{endCentis, 100};
             words.push_back({text, RoundToSourceFrame(start, frameRate, false),
                              RoundToSourceFrame(end, frameRate, true)});
         }
         currentText.clear();
+        currentStartDtw = -1;
     };
     for (int segment = 0; segment < segmentCount; ++segment) {
         const int tokenCount = whisper_full_n_tokens(ctx, segment);
@@ -206,13 +293,88 @@ std::vector<TranscriptWord> GroupWordsFromWhisper(whisper_context* ctx,
             if (!text || !*text) continue;
             const bool startsNewWord = currentText.empty() || text[0] == ' ';
             if (startsNewWord && !currentText.empty()) flush();
-            if (currentText.empty()) currentStartCentis = data.t0;
+            if (currentText.empty()) {
+                currentStartCentis = data.t0;
+                currentStartDtw = data.t_dtw;
+            }
             currentText += text;
             currentEndCentis = data.t1;
         }
     }
     flush();
     return words;
+}
+
+bool AppendWordText(std::string& destination, const std::string& text) {
+    if (text.empty()) return false;
+    constexpr std::string_view kPunctuation = ".,!?;:%)]}";
+    if (!destination.empty() &&
+        kPunctuation.find(text.front()) == std::string_view::npos)
+        destination.push_back(' ');
+    destination += text;
+    return true;
+}
+
+// Outward frame rounding can make neighboring words share one source frame,
+// and Whisper occasionally emits a zero-centisecond token. Keep the text in
+// order while assigning only representable, non-overlapping frame spans.
+// Words too short to own a frame join the next representable word (or the
+// preceding one at EOF); this is preferable to caching an artifact our exact
+// time model must reject later.
+// Where the words being normalized come from. whisper.cpp's token
+// timestamps are only *locally* monotonic: a temperature fallback re-decodes
+// a window and can restart it slightly before the previous window's last
+// token. That is documented decoder behaviour, not corruption, so it is
+// absorbed at the boundary with whisper.cpp. A stored cache is held to the
+// stricter rule -- there, out of order can only mean a damaged or
+// hand-edited sidecar, and silently repairing it would hide the damage.
+enum class WordSource { Decoder, StoredCache };
+
+bool NormalizeTranscriptWords(std::vector<TranscriptWord>& words,
+                              std::string& error,
+                              WordSource source = WordSource::StoredCache) {
+    std::vector<TranscriptWord> normalized;
+    normalized.reserve(words.size());
+    std::string pendingText;
+    RationalTime previousRawStart{-1, 1};
+    bool first = true;
+    for (TranscriptWord& word : words) {
+        if (word.text.empty()) {
+            error = "transcript word is empty";
+            return false;
+        }
+        if (!first && word.start < previousRawStart) {
+            if (source == WordSource::StoredCache) {
+                error = "transcript words are not in chronological order";
+                return false;
+            }
+            word.start = previousRawStart;
+            if (word.end < word.start) word.end = word.start;
+        }
+        previousRawStart = word.start;
+        first = false;
+        if (!normalized.empty() && word.start < normalized.back().end)
+            word.start = normalized.back().end;
+        if (word.end <= word.start) {
+            AppendWordText(pendingText, word.text);
+            continue;
+        }
+        if (!pendingText.empty()) {
+            AppendWordText(pendingText, word.text);
+            word.text = std::move(pendingText);
+            pendingText.clear();
+        }
+        normalized.push_back(std::move(word));
+    }
+    if (!pendingText.empty()) {
+        if (normalized.empty()) {
+            error = "transcript contains no frame-representable words";
+            return false;
+        }
+        AppendWordText(normalized.back().text, pendingText);
+    }
+    words = std::move(normalized);
+    return true;
 }
 
 void WriteJsonString(std::ostringstream& output, const std::string& value) {
@@ -252,6 +414,13 @@ void WriteTime(std::ostringstream& output, const RationalTime& time) {
     output << "{\"value\":" << time.value << ",\"rate\":" << time.rate << "}";
 }
 
+// One whisper window. Verbatim decoding re-enters whisper.cpp once per
+// window so the filler prompt sits in front of each of them.
+constexpr int kVerbatimWindowMs = 30000;
+
+constexpr char kVerbatimPrompt[] =
+    "Euh, heu, hum, mmh, eh bien, enfin, donc... je, je veux dire... ";
+
 bool SaveTranscript(const std::filesystem::path& destination,
                     const Transcript& transcript, std::string& error) {
     std::error_code filesystemError;
@@ -270,6 +439,22 @@ bool SaveTranscript(const std::filesystem::path& destination,
     WriteJsonString(output, transcript.media_id);
     output << ",\"whisper_model\":";
     WriteJsonString(output, transcript.whisper_model);
+    output << ",\"language\":";
+    WriteJsonString(output, transcript.language);
+    output << ",\"verbatim\":" << (transcript.verbatim ? "true" : "false");
+    // Written only when set, so a transcript that has never been through the
+    // alignment pass keeps the exact bytes it had before this field existed.
+    if (transcript.speech_aligned) output << ",\"speech_aligned\":true";
+    if (transcript.speech_assessed) {
+        output << ",\"speech_assessed\":true,\"measured_speech_duration\":";
+        WriteTime(output, transcript.measured_speech_duration);
+        output << ",\"likely_hallucinated\":"
+               << (transcript.likely_hallucinated ? "true" : "false")
+               << ",\"likely_incomplete\":"
+               << (transcript.likely_incomplete ? "true" : "false")
+               << ",\"known_hallucination_phrase\":"
+               << (transcript.known_hallucination_phrase ? "true" : "false");
+    }
     output << ",\"source_rate\":{\"num\":" << transcript.source_rate.num
            << ",\"den\":" << transcript.source_rate.den << "},\"words\":[";
     for (size_t index = 0; index < transcript.words.size(); ++index) {
@@ -397,6 +582,13 @@ public:
         return static_cast<int64_t>(value);
     }
 
+    bool Boolean() {
+        if (Consume("true")) return true;
+        if (Consume("false")) return false;
+        throw std::runtime_error("expected boolean at byte " +
+                                 std::to_string(position_));
+    }
+
     void Finish() {
         Skip();
         if (position_ != input_.size())
@@ -440,24 +632,33 @@ RationalTime RoundToSourceFrame(const RationalTime& time,
                         frameRate.num};
 }
 
-bool GenerateAudioTranscript(const std::string& inputPath,
-                             const std::string& outputPath,
-                             const std::string& mediaId,
-                             const MediaRate& sourceRate,
-                             const WhisperSettings& settings,
-                             MediaTaskContext& context, std::string& error) {
+namespace {
+
+// QC-2026-09 A3 -- one media, against a model already in memory. Split out of
+// GenerateAudioTranscript so a batch loads the model once: the load measured
+// about 8 s, which on the 43 spoken rushes of one project was nearly six
+// minutes spent doing the same thing forty-three times. Nothing else about
+// the pass changed when it moved here.
+//
+// Sharing the context across media does not leak one rush's words into the
+// next one's decoding: whisper_full_default_params sets no_context, and
+// whisper.cpp clears prompt_past at the top of every whisper_full call. The
+// verbatim path's per-window prompt seeding below is unaffected for the same
+// reason -- it was always per call, never per context.
+bool TranscribeSamplesWithModel(whisper_context* ctx,
+                                const std::vector<float>& samples,
+                                const std::string& outputPath,
+                                const std::string& mediaId,
+                                const MediaRate& sourceRate,
+                                const WhisperSettings& settings,
+                                MediaTaskContext& context, std::string& error) {
     error.clear();
     if (sourceRate.num <= 0 || sourceRate.den <= 0) {
         error = "invalid source frame rate";
         return false;
     }
-    if (settings.whisper_model_path.empty()) {
-        error = "a local whisper.cpp model path is required";
-        return false;
-    }
-    std::vector<float> samples;
-    if (!DecodeMonoPcm16k(inputPath, settings.ffmpeg_path, context, samples,
-                          error)) {
+    if (samples.empty()) {
+        error = "audio stream produced no samples to transcribe";
         return false;
     }
     if (context.Cancelled()) {
@@ -465,14 +666,6 @@ bool GenerateAudioTranscript(const std::string& inputPath,
         return false;
     }
 
-    whisper_context_params contextParams = whisper_context_default_params();
-    whisper_context* ctx = whisper_init_from_file_with_params(
-        settings.whisper_model_path.c_str(), contextParams);
-    if (!ctx) {
-        error = "unable to load local whisper.cpp model '" +
-                settings.whisper_model_path + "'";
-        return false;
-    }
     context.SetProgress(0.5, "Transcription");
     whisper_full_params params =
         whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
@@ -483,39 +676,222 @@ bool GenerateAudioTranscript(const std::string& inputPath,
     params.translate = false;
     params.token_timestamps = true;
     params.single_segment = false;
+    params.initial_prompt = settings.verbatim ? kVerbatimPrompt : nullptr;
+    // ALPHA-2026-08 -- whisper.cpp conditions every 30 s window on the text
+    // decoded so far (its prompt_past, consulted only while n_max_text_ctx is
+    // above zero). On a rush, speech is a minority of the runtime: one
+    // caption credit hallucinated over music or room tone is fed back as
+    // context and then repeats to the end of the media. Measured on a 7 min
+    // 35 interview, large-v3 emitted "Sous-titrage Societe Radio-Canada" 32
+    // times and not one real sentence. Cross-window coherence is worth less
+    // than never poisoning the remainder of the transcript.
+    //
+    // The verbatim pass cannot take that shortcut: the filler prompt reaches
+    // the decoder through the very same prompt_past, so it needs
+    // conditioning switched on. It buys back the safety by walking the media
+    // one window per call (see kVerbatimWindowMs below), which bounds any
+    // hallucination to the window that produced it.
+    params.n_max_text_ctx = settings.verbatim ? 16384 : 0;
+    // Caption furniture (">>", musical notes, brackets) is never a spoken
+    // word. Suppressing those tokens removes at the source the artifacts the
+    // editorial layer would otherwise have to recognise and filter.
+    params.suppress_nst = true;
     params.language =
         settings.language.empty() ? "auto" : settings.language.c_str();
     params.n_threads =
         static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 
-    const int result = whisper_full(ctx, params, samples.data(),
-                                    static_cast<int>(samples.size()));
-    if (result != 0) {
-        whisper_free(ctx);
-        error = "local whisper.cpp inference failed with code " +
-                std::to_string(result);
-        return false;
-    }
-    if (context.Cancelled()) {
-        whisper_free(ctx);
-        error = "transcription cancelled";
-        return false;
+    // whisper.cpp seeds prompt_past from initial_prompt once per call, then
+    // overwrites it with each decoded segment (its own "update prompt_past").
+    // A single call therefore biases only the first window toward fillers --
+    // measured: identical words and timecodes with and without --verbatim
+    // over a 7 min media. Advancing one window per call is what makes the
+    // prompt reach every window. Boundaries land on whisper's own segment
+    // ends rather than on a fixed grid, so no word is cut in half.
+    const int64_t totalCentis =
+        static_cast<int64_t>(samples.size()) * 100 / WHISPER_SAMPLE_RATE;
+    std::vector<TranscriptWord> words;
+    int64_t cursorCentis = 0;
+    while (true) {
+        params.offset_ms = static_cast<int>(cursorCentis * 10);
+        params.duration_ms = settings.verbatim ? kVerbatimWindowMs : 0;
+        const int result = whisper_full(ctx, params, samples.data(),
+                                        static_cast<int>(samples.size()));
+        if (result != 0) {
+            error = "local whisper.cpp inference failed with code " +
+                    std::to_string(result);
+            return false;
+        }
+        if (context.Cancelled()) {
+            error = "transcription cancelled";
+            return false;
+        }
+        std::vector<TranscriptWord> pass =
+            GroupWordsFromWhisper(ctx, sourceRate);
+        words.insert(words.end(), std::make_move_iterator(pass.begin()),
+                     std::make_move_iterator(pass.end()));
+        if (!settings.verbatim) break;
+
+        const int segmentCount = whisper_full_n_segments(ctx);
+        // Whisper stops a window on the last token it decoded, not on the
+        // window's nominal end. Resuming there is what keeps a sentence
+        // whole; a window that decoded nothing usable falls back to a fixed
+        // step so the loop always terminates.
+        const int64_t decodedEnd =
+            segmentCount > 0
+                ? whisper_full_get_segment_t1(ctx, segmentCount - 1)
+                : 0;
+        cursorCentis = decodedEnd > cursorCentis
+                           ? decodedEnd
+                           : cursorCentis + kVerbatimWindowMs / 10;
+        if (cursorCentis + 100 >= totalCentis) break;
+        if (totalCentis > 0) {
+            context.SetProgress(0.5 + 0.5 * static_cast<double>(cursorCentis) /
+                                          static_cast<double>(totalCentis),
+                                "Transcription");
+        }
     }
 
     Transcript transcript;
     transcript.media_id = mediaId;
     transcript.whisper_model =
         std::filesystem::path(settings.whisper_model_path).filename().string();
+    transcript.language =
+        settings.language.empty() ? "auto" : settings.language;
+    transcript.verbatim = settings.verbatim;
     transcript.source_rate = sourceRate;
-    transcript.words = GroupWordsFromWhisper(ctx, sourceRate);
-    whisper_free(ctx);
+    transcript.words = std::move(words);
 
     if (transcript.words.empty()) {
         error = "transcription produced no words";
         return false;
     }
+    if (!NormalizeTranscriptWords(transcript.words, error, WordSource::Decoder))
+        return false;
     context.SetProgress(1.0, "Transcript prêt");
     return SaveTranscript(outputPath, transcript, error);
+}
+
+}  // namespace
+
+bool GenerateAudioTranscripts(const std::vector<TranscriptionJob>& jobs,
+                              const WhisperSettings& settings,
+                              MediaTaskContext& context,
+                              std::vector<TranscriptionOutcome>& outcomes,
+                              std::string& error) {
+    error.clear();
+    outcomes.clear();
+    if (jobs.empty()) {
+        error = "no media to transcribe";
+        return false;
+    }
+    if (settings.whisper_model_path.empty()) {
+        error = "a local whisper.cpp model path is required";
+        return false;
+    }
+    whisper_context* ctx = OpenWhisperModel(settings.whisper_model_path);
+    if (!ctx) {
+        error = "unable to load local whisper.cpp model '" +
+                settings.whisper_model_path + "'";
+        return false;
+    }
+    // One media's failure is not the batch's: a rush that will not decode
+    // should not cost the model load for the forty that would have. Each
+    // outcome carries its own reason, and the caller decides what to do
+    // with a partial result.
+    for (const TranscriptionJob& job : jobs) {
+        TranscriptionOutcome outcome;
+        outcome.media_id = job.media_id;
+        std::string jobError;
+        std::vector<float> samples;
+        outcome.ok = DecodeMonoPcm16k(job.input_path, settings.ffmpeg_path,
+                                      context, samples, jobError) &&
+                     TranscribeSamplesWithModel(ctx, samples, job.output_path,
+                                                job.media_id, job.source_rate,
+                                                settings, context, jobError);
+        outcome.error = outcome.ok ? std::string() : jobError;
+        if (outcome.ok) {
+            Transcript written;
+            std::string readError;
+            if (LoadAudioTranscript(job.output_path, written, readError))
+                outcome.words = written.words.size();
+        }
+        outcomes.push_back(std::move(outcome));
+        if (context.Cancelled()) break;
+    }
+    whisper_free(ctx);
+    return true;
+}
+
+bool DecodeFfmpegAudioToPcm16k(const std::string& ffmpegPath,
+                               const std::vector<std::string>& ffmpegArguments,
+                               MediaTaskContext& context,
+                               std::vector<float>& samples,
+                               std::string& error) {
+    return DecodePcm16k(ffmpegPath, ffmpegArguments, context, samples, error);
+}
+
+bool GenerateAudioTranscriptFromPcm(const std::vector<float>& samples,
+                                    const std::string& outputPath,
+                                    const std::string& mediaId,
+                                    const MediaRate& sourceRate,
+                                    const WhisperSettings& settings,
+                                    MediaTaskContext& context,
+                                    std::string& error) {
+    error.clear();
+    if (settings.whisper_model_path.empty()) {
+        error = "a local whisper.cpp model path is required";
+        return false;
+    }
+    whisper_context* ctx = OpenWhisperModel(settings.whisper_model_path);
+    if (!ctx) {
+        error = "unable to load local whisper.cpp model '" +
+                settings.whisper_model_path + "'";
+        return false;
+    }
+    const bool result =
+        TranscribeSamplesWithModel(ctx, samples, outputPath, mediaId,
+                                   sourceRate, settings, context, error);
+    whisper_free(ctx);
+    return result;
+}
+
+bool GenerateAudioTranscript(const std::string& inputPath,
+                             const std::string& outputPath,
+                             const std::string& mediaId,
+                             const MediaRate& sourceRate,
+                             const WhisperSettings& settings,
+                             MediaTaskContext& context, std::string& error) {
+    std::vector<TranscriptionOutcome> outcomes;
+    if (!GenerateAudioTranscripts(
+            {{mediaId, inputPath, outputPath, sourceRate}}, settings, context,
+            outcomes, error))
+        return false;
+    if (outcomes.empty()) {
+        error = "transcription produced no outcome";
+        return false;
+    }
+    error = outcomes.front().error;
+    return outcomes.front().ok;
+}
+
+bool SaveAudioTranscript(const std::string& path, const Transcript& transcript,
+                         std::string& error) {
+    error.clear();
+    return SaveTranscript(std::filesystem::path(path), transcript, error);
+}
+
+bool TranscriptCacheMatches(const Transcript& transcript,
+                            const std::string& mediaId,
+                            const WhisperSettings& settings) {
+    const std::string model =
+        std::filesystem::path(settings.whisper_model_path).filename().string();
+    const std::string language =
+        settings.language.empty() ? "auto" : settings.language;
+    return transcript.media_id == mediaId &&
+           transcript.whisper_model == model &&
+           transcript.language == language &&
+           transcript.verbatim == settings.verbatim;
 }
 
 bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
@@ -544,6 +920,26 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
         parsed.media_id = reader.String();
         reader.Expect(",\"whisper_model\":");
         parsed.whisper_model = reader.String();
+        if (reader.Consume(",\"language\":")) parsed.language = reader.String();
+        if (reader.Consume(",\"verbatim\":"))
+            parsed.verbatim = reader.Boolean();
+        if (reader.Consume(",\"speech_aligned\":"))
+            parsed.speech_aligned = reader.Boolean();
+        if (reader.Consume(",\"speech_assessed\":")) {
+            parsed.speech_assessed = reader.Boolean();
+            reader.Expect(",\"measured_speech_duration\":");
+            parsed.measured_speech_duration = ReadTime(reader);
+            reader.Expect(",\"likely_hallucinated\":");
+            parsed.likely_hallucinated = reader.Boolean();
+            if (reader.Consume(",\"likely_incomplete\":"))
+                parsed.likely_incomplete = reader.Boolean();
+            reader.Expect(",\"known_hallucination_phrase\":");
+            parsed.known_hallucination_phrase = reader.Boolean();
+            if (!parsed.speech_assessed) {
+                throw std::runtime_error(
+                    "transcript speech assessment marker must be true");
+            }
+        }
         reader.Expect(",\"source_rate\":{\"num\":");
         const int64_t num = reader.Integer();
         reader.Expect(",\"den\":");
@@ -556,8 +952,6 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
         parsed.source_rate = {static_cast<int32_t>(num),
                               static_cast<int32_t>(den)};
         if (!reader.Consume("]")) {
-            RationalTime previousEnd{-1, 1};
-            bool first = true;
             while (true) {
                 TranscriptWord word;
                 reader.Expect("{\"text\":");
@@ -567,16 +961,6 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
                 reader.Expect(",\"end\":");
                 word.end = ReadTime(reader);
                 reader.Expect("}");
-                if (word.text.empty() || word.start >= word.end) {
-                    throw std::runtime_error(
-                        "transcript word has a non-positive duration");
-                }
-                if (!first && word.start < previousEnd) {
-                    throw std::runtime_error(
-                        "transcript words are not in chronological order");
-                }
-                previousEnd = word.end;
-                first = false;
                 parsed.words.push_back(std::move(word));
                 if (reader.Consume("]")) break;
                 reader.Expect(",");
@@ -584,12 +968,251 @@ bool LoadAudioTranscript(const std::string& path, Transcript& transcript,
         }
         reader.Expect("}");
         reader.Finish();
+        if (!NormalizeTranscriptWords(parsed.words, error)) return false;
         transcript = std::move(parsed);
         return true;
     } catch (const std::exception& exception) {
         error = exception.what();
         return false;
     }
+}
+
+namespace {
+
+// Folds one transcript token down to the bare letters that identify it:
+// lowercase, unaccented, punctuation and spacing dropped. Whisper glues
+// punctuation to the word it follows ("partiel,") and now and then emits two
+// words inside one token ("? Donc"), so comparing raw text would miss most
+// repetitions. Only the Latin-1 accented letters French actually uses are
+// folded; anything else is skipped rather than guessed at.
+std::string FoldWordText(const std::string& text) {
+    std::string folded;
+    folded.reserve(text.size());
+    for (size_t index = 0; index < text.size(); ++index) {
+        const unsigned char byte = static_cast<unsigned char>(text[index]);
+        if (byte >= 'A' && byte <= 'Z') {
+            folded.push_back(static_cast<char>(byte - 'A' + 'a'));
+            continue;
+        }
+        if (byte >= 'a' && byte <= 'z') {
+            folded.push_back(static_cast<char>(byte));
+            continue;
+        }
+        if (byte != 0xC3 || index + 1 >= text.size()) continue;
+        const unsigned char accented =
+            static_cast<unsigned char>(text[index + 1]) | 0x20;
+        ++index;
+        switch (accented) {
+            case 0xA0:
+            case 0xA1:
+            case 0xA2:
+            case 0xA3:
+            case 0xA4:
+            case 0xA5:
+                folded.push_back('a');
+                break;
+            case 0xA7:
+                folded.push_back('c');
+                break;
+            case 0xA8:
+            case 0xA9:
+            case 0xAA:
+            case 0xAB:
+                folded.push_back('e');
+                break;
+            case 0xAC:
+            case 0xAD:
+            case 0xAE:
+            case 0xAF:
+                folded.push_back('i');
+                break;
+            case 0xB2:
+            case 0xB3:
+            case 0xB4:
+            case 0xB5:
+            case 0xB6:
+                folded.push_back('o');
+                break;
+            case 0xB9:
+            case 0xBA:
+            case 0xBB:
+            case 0xBC:
+                folded.push_back('u');
+                break;
+            default:
+                break;
+        }
+    }
+    return folded;
+}
+
+// "euuuh" and "euh" are the same hesitation held for different lengths, and
+// whisper spells them both ways, so runs of one letter collapse before the
+// lexicon is consulted.
+std::string CollapseRepeatedLetters(const std::string& folded) {
+    std::string collapsed;
+    collapsed.reserve(folded.size());
+    for (const char letter : folded)
+        if (collapsed.empty() || collapsed.back() != letter)
+            collapsed.push_back(letter);
+    return collapsed;
+}
+
+// Deliberately short. Every entry here is a syllable that is not a French
+// word, so removing it can never remove meaning. "eu" is absent on purpose:
+// collapsing "euu" lands on it, but it is also the past participle of
+// "avoir" -- the kind of false positive that would cut a real word out of a
+// sentence.
+bool IsFillerWord(const std::string& folded) {
+    static const std::set<std::string> kFillers = {
+        "euh", "heu", "hum", "hm", "mh", "ben", "bah", "beh", "hein"};
+    return kFillers.count(CollapseRepeatedLetters(folded)) != 0;
+}
+
+bool ContainsKnownHallucinationPhrase(
+    const std::vector<TranscriptWord>& words) {
+    std::string compact;
+    for (const TranscriptWord& word : words) compact += FoldWordText(word.text);
+    static const std::vector<std::string> kKnownPhrases = {
+        "soustitragesocieteradiocanada",
+        "soustitrespar",
+        "abonnezvous",
+        "noubliezpasdevousabonner",
+        "subscribe",
+        "mercidavoirregarde",
+        "generiquedefin",
+    };
+    return std::any_of(kKnownPhrases.begin(), kKnownPhrases.end(),
+                       [&](const std::string& phrase) {
+                           return compact.find(phrase) != std::string::npos;
+                       });
+}
+
+}  // namespace
+
+bool AssessTranscriptAgainstSpeech(const Transcript& transcript,
+                                   const SpeechOnsetReport& envelope,
+                                   TranscriptSpeechAssessment& assessment,
+                                   std::string& error) {
+    assessment = TranscriptSpeechAssessment{};
+    if (transcript.media_id != envelope.media_id) {
+        error = "speech envelope media_id does not match transcript media_id";
+        return false;
+    }
+    if (envelope.windows_per_second == 0) {
+        error = "speech envelope has no valid analysis rate";
+        return false;
+    }
+    RationalTime duration{0, static_cast<int32_t>(envelope.windows_per_second)};
+    RationalTime previousEnd{0,
+                             static_cast<int32_t>(envelope.windows_per_second)};
+    for (const SpeechGroup& group : envelope.groups) {
+        const RationalTime start = group.start.rescale(duration.rate);
+        const RationalTime end = group.end.rescale(duration.rate);
+        if (start < previousEnd || end <= start) {
+            error = "speech envelope contains invalid or overlapping groups";
+            return false;
+        }
+        duration = duration.add(end.sub(start));
+        previousEnd = end;
+    }
+    assessment.word_count = transcript.words.size();
+    assessment.measured_speech_duration = duration;
+    assessment.known_hallucination_phrase =
+        ContainsKnownHallucinationPhrase(transcript.words);
+    // The phrase list is deliberately not part of the decision. It only
+    // raises the evidence level shown to the caller. A voiced interview about
+    // subtitles must remain usable; words over zero measured speech cannot.
+    assessment.likely_hallucinated =
+        assessment.word_count > 0 && duration.value == 0;
+    const bool enoughSpeech =
+        duration.value >=
+        static_cast<int64_t>(duration.rate) * kSparseTranscriptMinSpeechSeconds;
+    const __int128 wordsPerMinuteLeft =
+        static_cast<__int128>(assessment.word_count) * 60 * duration.rate;
+    const __int128 minimumWordsRight =
+        static_cast<__int128>(kSparseTranscriptMinWordsPerMinute) *
+        duration.value;
+    assessment.likely_incomplete =
+        enoughSpeech && wordsPerMinuteLeft < minimumWordsRight;
+    error.clear();
+    return true;
+}
+
+void ApplyTranscriptSpeechAssessment(
+    Transcript& transcript, const TranscriptSpeechAssessment& assessment) {
+    transcript.speech_assessed = true;
+    transcript.measured_speech_duration = assessment.measured_speech_duration;
+    transcript.likely_hallucinated = assessment.likely_hallucinated;
+    transcript.likely_incomplete = assessment.likely_incomplete;
+    transcript.known_hallucination_phrase =
+        assessment.known_hallucination_phrase;
+}
+
+std::vector<Disfluency> FindDisfluencies(
+    const std::vector<TranscriptWord>& words) {
+    std::vector<std::string> folded;
+    folded.reserve(words.size());
+    for (const TranscriptWord& word : words)
+        folded.push_back(FoldWordText(word.text));
+
+    const auto textOf = [&](size_t from, size_t to) {
+        std::string text;
+        for (size_t index = from; index <= to; ++index) {
+            if (!text.empty()) text.push_back(' ');
+            text += words[index].text;
+        }
+        return text;
+    };
+
+    std::vector<Disfluency> found;
+    size_t index = 0;
+    while (index < words.size()) {
+        if (folded[index].empty()) {
+            ++index;
+            continue;
+        }
+        if (IsFillerWord(folded[index])) {
+            size_t last = index;
+            while (last + 1 < words.size() && IsFillerWord(folded[last + 1]))
+                ++last;
+            found.push_back(
+                {{index, last}, DisfluencyKind::Filler, textOf(index, last)});
+            index = last + 1;
+            continue;
+        }
+        // A stutter is the same word said twice in a row. The last occurrence
+        // is the one kept: it is the one that runs into the word that
+        // follows, so closing the cut before it leaves the sentence's own
+        // rhythm intact.
+        size_t last = index;
+        while (last + 1 < words.size() && folded[last + 1] == folded[index])
+            ++last;
+        if (last > index) {
+            found.push_back({{index, last - 1},
+                             DisfluencyKind::Repetition,
+                             textOf(index, last - 1)});
+            index = last;
+            continue;
+        }
+        ++index;
+    }
+    return found;
+}
+
+std::vector<Disfluency> FindDisfluenciesInClip(const DocumentClip& clip,
+                                               const Transcript& transcript) {
+    const RationalTime clipEnd = clip.source_in.add(clip.duration);
+    std::vector<Disfluency> kept;
+    for (Disfluency& item : FindDisfluencies(transcript.words)) {
+        const TranscriptWord& first =
+            transcript.words[item.range.start_word_index];
+        const TranscriptWord& last =
+            transcript.words[item.range.end_word_index];
+        if (first.start < clip.source_in || clipEnd < last.end) continue;
+        kept.push_back(std::move(item));
+    }
+    return kept;
 }
 
 bool ResolveWordRemoval(const DocumentClip& clip, const Transcript& transcript,
@@ -627,7 +1250,32 @@ bool ResolveWordRemoval(const DocumentClip& clip, const Transcript& transcript,
         previousEndIndex = range.end_word_index;
         first = false;
     }
-    operation = RemoveWordsOperation{
-        clip.id, std::move(ranges), gapPadding, syncTrackIds, {}};
+    // linked_clip_ids stays empty here: this function resolves *which
+    // frames*, and which other clips share the cut is a document-shape
+    // question its caller answers (see McpTools.cc's clean_disfluencies,
+    // which fills it from the clip's link group).
+    operation = RemoveWordsOperation{clip.id, std::move(ranges), gapPadding,
+                                     {},      syncTrackIds,      {}};
+    return true;
+}
+
+bool ResolveConfiguredWhisperModel(std::string& path, std::string& reason) {
+    const std::string configured = local_env::Value("CUTMACHINE_WHISPER_MODEL");
+    const std::string file = local_env::LocalEnvFilePath();
+    if (configured.empty()) {
+        reason =
+            "no Whisper model configured: set CUTMACHINE_WHISPER_MODEL "
+            "to a local ggml model file, either in the environment or in "
+            "'" +
+            file + "'";
+        return false;
+    }
+    if (!std::filesystem::is_regular_file(configured)) {
+        reason = "CUTMACHINE_WHISPER_MODEL does not name a regular file: '" +
+                 configured + "' (configured in '" + file + "')";
+        return false;
+    }
+    path = configured;
+    reason.clear();
     return true;
 }

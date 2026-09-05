@@ -41,7 +41,7 @@ enum class ChatEntryKind {
 struct ChatTranscriptEntry {
     ChatEntryKind kind = ChatEntryKind::UserMessage;
     std::string text;            // UserMessage/AssistantText/Error text;
-                                 // ToolResult's result JSON or "Name: detail"
+                                 // ToolResult's success or refusal JSON
     std::string tool_name;       // ToolCall/ToolResult only
     std::string tool_args_json;  // ToolCall only, for display
     bool tool_ok = false;        // ToolResult only

@@ -8,7 +8,7 @@ duration)`. Un trou ne déclenche aucun décodage et est rendu en noir.
 ## Build et tests
 
 Prérequis : macOS, CMake 3.24+, pkg-config et FFmpeg (`libavformat`,
-`libavcodec`, `libavutil`, `libswresample`).
+`libavcodec`, `libavutil`, `libswresample`, `libswscale`).
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -31,7 +31,14 @@ ctest --test-dir build -R cutmachine_ui_smoke_tests --output-on-failure
 
 La compilation produit une application macOS dans `build/CUTMACHINE.app`.
 Ouvrez-la par double-clic dans le Finder, depuis Spotlight après l’avoir copiée
-dans Applications, ou avec :
+dans Applications, ou compilez-la si nécessaire puis lancez-la avec la cible
+`run-app` :
+
+```sh
+cmake --build build --target run-app -j
+```
+
+Pour ouvrir directement un bundle déjà compilé :
 
 ```sh
 open build/CUTMACHINE.app
@@ -112,6 +119,10 @@ pas au répertoire courant du processus.
   temps ne transite en `double` pour cette quantification.
 - Les pistes vidéo sont classées par leur champ `index` et compositées du bas
   vers le haut. Un trou sur une piste supérieure révèle les pistes inférieures.
+- Les médias vidéo portant un canal alpha sont composités dans Metal. Chaque
+  clip vidéo possède aussi une opacité exacte `num/den`, modifiable dans
+  l’Inspecteur ou par l’opération `SetClipOpacity`; les fondus multiplient cette
+  valeur et l’export opaque en tient compte.
 
 ## Timeline graphique
 
@@ -222,9 +233,16 @@ se glisse verticalement pour adapter l’espace de montage.
 
 Les flux audio des sources sont décodés par FFmpeg, puis
 convertis en PCM float stéréo 48 kHz par `libswresample`. Un `AVAudioSourceNode`
-mixte en temps réel uniquement les clips placés sur des pistes audio. Un clip
-vidéo est toujours muet : aucun fallback de lecture ou d'export ne récupère
-son audio. Le callback audio lit un plan immuable construit depuis la
+mixte en temps réel uniquement les clips placés sur des pistes audio. Les clips
+vidéo sont toujours muets : aucun fallback de lecture ou d'export ne récupère
+leur audio. Un clip audio peut porter un gain exact en dB et des fondus
+d'entrée/sortie exacts :
+`SetClipAudioOperation` remplace atomiquement `gain_db`, `fade_in` et
+`fade_out`. Les deux durées sont des `RationalTime`; la même enveloppe est
+appliquée par la lecture et par l'export FFmpeg. Le schéma document v7 les
+sérialise pour chaque clip. Les documents v4 à v6 restent lisibles : ils
+reçoivent sans ambiguïté 0 dB et deux fondus nuls, puis sont réémis en v7.
+Le callback audio lit un plan immuable construit depuis la
 timeline et ne touche jamais directement au document éditable. `Espace` et
 `J/K/L` pilotent simultanément image et son, y compris la navette accélérée
 avant/arrière à 2× et 4× (échantillonnage accéléré, sans correction de pitch) ;
@@ -375,6 +393,7 @@ Media Pool` des NLE classiques.
 `TrimClipOperation`, `MoveClipOperation`, `DeleteGapOperation` et
 `SplitClipOperation`, ainsi que `RippleTrimOperation`, `RollEditOperation`,
 `SlipEditOperation`, les variantes liées de move, trim et remove et
+`SetClipAudioOperation` (gain dB exact et fondus `RationalTime`),
 `AddTrackOperation` pour le
 multipiste. Les marqueurs de projet sont des objets
 adressables persistants ; `AddMarkerOperation`, `RemoveMarkerOperation` et
@@ -406,16 +425,522 @@ Ces commandes s'exécutent avant toute initialisation d'AppKit, de Metal ou du
 décodage média :
 
 ```sh
+./build/cutmachine --create-project ./Film.cutmachine-project "Film"
+./build/cutmachine --transcribe \
+  ./Film.cutmachine-project/project.cutmachine.json '<media-id>[,<media-id>…]' \
+  ./models/ggml-large-v3.bin fr --verbatim
+./build/cutmachine --transcribe-timeline \
+  ./Film.cutmachine-project/project.cutmachine.json \
+  --timeline '<timeline-id>' --language fr --verbatim
+./build/cutmachine --srt-from-media ./film.mp4 ./film.srt --language fr
+./build/cutmachine --align-transcripts \
+  ./Film.cutmachine-project/project.cutmachine.json --write
+./build/cutmachine --tighten-pauses \
+  ./Film.cutmachine-project/project.cutmachine.json '<clip-id>' 400 6
+./build/cutmachine --trim-boundary-air \
+  ./Film.cutmachine-project/project.cutmachine.json '<clip-id>' 3 300
+./build/cutmachine --close-junction-air \
+  ./Film.cutmachine-project/project.cutmachine.json \
+  '<clip-gauche-id>' '<clip-droit-id>' 3 300
+./build/cutmachine --locate-source-frame \
+  ./Film.cutmachine-project/project.cutmachine.json '<media-id>' 1412
+./build/cutmachine --disfluencies \
+  ./Film.cutmachine-project/project.cutmachine.json '<clip-id>'
+./build/cutmachine --remove-words \
+  ./Film.cutmachine-project/project.cutmachine.json '<clip-id>' \
+  '[{"start_word_index":40,"end_word_index":40}]'
+./build/cutmachine --shot-quality \
+  ./Film.cutmachine-project/project.cutmachine.json '<media-id>'
+./build/cutmachine --shot-quality-report \
+  ./Film.cutmachine-project/project.cutmachine.json
+./build/cutmachine --contact-sheet \
+  ./Film.cutmachine-project/project.cutmachine.json ./contacts.jpg \
+  --timeline '<timeline-id>' --max-images 24
+./build/cutmachine --cut-sheet \
+  ./Film.cutmachine-project/project.cutmachine.json ./raccords.jpg \
+  --timeline '<timeline-id>' --max-images 24
 ./build/cutmachine --describe ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --apply-op ./Film.cutmachine-project/project.cutmachine.json \
   '{"type":"TrimClip","clip_id":"01K00000000000000000000003","edge":"Tail","delta":{"value":-1,"rate":25},"exact_clip":null}'
+./build/cutmachine --apply-op ./Film.cutmachine-project/project.cutmachine.json \
+  '{"type":"SetClipAudio","clip_id":"01K00000000000000000000007","gain_db":{"num":10,"den":1},"fade_in":{"value":12,"rate":25},"fade_out":{"value":12,"rate":25}}'
 ./build/cutmachine --apply-project-op ./Film.cutmachine-project/project.cutmachine.json \
   '{"type":"AddProjectTimeline","name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1},"timeline_id":"","video_track_id":"","audio_track_id":"","exact_project_hex":null}'
+./build/cutmachine --apply-project-op ./Film.cutmachine-project/project.cutmachine.json \
+  '[{"type":"RenameProjectItem","item_id":"<timeline-id>","name":"Version courte","exact_project_hex":null},{"type":"SetActiveProjectTimeline","timeline_id":"<timeline-id>","exact_project_hex":null}]'
 ./build/cutmachine --undo-project-op ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --redo-project-op ./Film.cutmachine-project/project.cutmachine.json
 ./build/cutmachine --ingest ./Film.cutmachine-project/project.cutmachine.json ./rushes --recursive
+./build/cutmachine --ingest ./Film.cutmachine-project/project.cutmachine.json ./voix-off.wav
+./build/cutmachine --import-resolve ./Film.cutmachine-project/project.cutmachine.json ./manifest.json
 ./build/cutmachine --export ./Film.cutmachine-project/project.cutmachine.json ./film.mp4
+./build/cutmachine --export ./Film.cutmachine-project/project.cutmachine.json ./vertical.mp4 \
+  --timeline '<timeline-id>'
+./build/cutmachine --export-srt ./Film.cutmachine-project/project.cutmachine.json \
+  ./film.srt --timeline '<timeline-id>'
+./build/cutmachine --export-resolve-timeline \
+  ./Film.cutmachine-project/project.cutmachine.json --timeline '<timeline-id>'
 ```
+
+Les outils MCP qui modifient une timeline acceptent eux aussi le champ
+optionnel `timeline_id`. Sans ce champ, ils conservent le comportement
+historique et ciblent la timeline active. Pour rendre l'identifiant obligatoire
+sur cette machine — utile aux scripts qui pilotent plusieurs montages — activer
+le garde-fou local puis relancer CUTMACHINE ou `--mcp-serve` :
+
+```sh
+defaults write com.cutmachine.editor CMRequireExplicitTimeline -bool true
+```
+
+Une opération MCP d'édition sans `timeline_id` est alors refusée avec l'erreur
+`TimelineRequired`. Ce réglage reste dans `NSUserDefaults` et n'est jamais
+écrit dans le projet.
+
+`transcribe_timeline` décode directement les plages source des plans audio,
+les replace sur leur grille temporelle exacte et transmet le PCM assemblé à
+Whisper sans export vidéo intermédiaire. Son cache dépend de l'identité de la
+timeline, des bornes et positions de ses plans audibles, du modèle, de la
+langue et du mode verbatim : une coupe audio ne peut donc pas réutiliser un
+texte périmé. `--srt-from-media` emploie le même chemin de transcription pour
+produire un SRT depuis un livrable sans créer de projet jetable.
+
+Lorsqu'une enveloppe de parole B1 est disponible, le cache de transcription
+indique `speech_assessed`, `measured_speech_duration`,
+`likely_hallucinated`, `likely_incomplete` et
+`known_hallucination_phrase`. Des mots sans aucun
+groupe de parole mesuré sont signalés comme probablement inventés ; une
+tournure connue de sous-titrage ou d'abonnement ne fait que renforcer ce
+diagnostic et ne suffit jamais à elle seule. Les outils MCP
+`list_disfluencies`, `remove_words` et `create_interview_short` refusent ces
+transcriptions, sauf demande explicite avec `force: true`.
+À l'inverse, au moins dix secondes de parole mesurée sous le plancher
+conservateur de 30 mots/minute déclenchent `likely_incomplete` : le texte ne
+doit alors pas être interprété comme la preuve que le rush ne dit rien.
+
+`--apply-project-op` accepte soit une opération canonique, soit un tableau.
+Dans ce second cas, les opérations sont appliquées dans l'ordre et forment un
+seul pas de `--undo-project-op` ; un refus annule le lot entier. Une opération
+projet ne charge plus les journaux des timelines qu'elle ne modifie pas, et la
+sauvegarde préserve leurs octets existants.
+
+## Import depuis DaVinci Resolve
+
+Un chutier Resolve n'est pas un fichier : il vit dans la base du projet, et un
+`.drp` est une archive opaque. Il n'y a donc rien à analyser — la seule entrée
+honnête est de faire parler Resolve.
+
+### Depuis Resolve, en un clic
+
+```sh
+tools/resolve-plugin/install.sh
+```
+
+Puis dans Resolve : `Workspace → Scripts → Utility → CUTMACHINE`. La fenêtre
+importe les chutiers du projet ouvert et sait interroger le moteur
+(`--describe`) pour montrer ce que verra l'agent. Voir
+[`tools/resolve-plugin/README.md`](tools/resolve-plugin/README.md).
+
+C'est le chemin recommandé : le script tourne **dans** Resolve, donc il ne
+réclame pas le scripting externe réservé à Resolve Studio, et n'a besoin
+d'aucun interpréteur Python.
+
+### Depuis un terminal
+
+```sh
+# 1. Resolve Studio est lancé, le projet ouvert. Le pont lit le Media Pool.
+python3 -m sidecar.resolve_bridge -o manifest.json
+
+# 2. CUTMACHINE reproduit l'arborescence et ingère les rushes.
+./build/cutmachine --import-resolve \
+  ./Film.cutmachine-project/project.cutmachine.json ./manifest.json
+```
+
+Cette voie-là exige **DaVinci Resolve Studio** : la version gratuite n'exécute
+des scripts que depuis l'application. En échange, elle s'automatise.
+
+Les deux producteurs écrivent le même schéma de manifeste et passent par le
+même importeur — vérifié sur un projet de 408 rushes, où les deux manifestes
+sont équivalents. Ni l'un ni l'autre ne modifie le projet Resolve : ils lisent
+le Media Pool.
+
+Le manifeste ne transporte **que l'identité et l'organisation** — chemin, nom,
+chutier. Aucune métadonnée technique : Resolve renvoie sa cadence en flottant,
+et un flottant ne devient jamais un `RationalTime`. C'est la sonde FFmpeg de
+`--ingest` qui fait autorité sur la cadence et la durée, si bien qu'un rush
+importé depuis Resolve est identique au même rush ingéré depuis un dossier.
+
+Les chutiers sont créés par `AddBinOperation` et les rushes classés par
+`SetMediaBinOperation` : l'import complet s'annule par `Cmd+Z`, chutier par
+chutier. Réimporter le même manifeste ne duplique rien — les chutiers sont
+appariés par nom et par parent, les rushes par chemin absolu résolu. Un Media
+Pool qui grossit se réimporte donc en n'ajoutant que le nouveau. Attention :
+un rush déjà présent est reclassé dans son chutier Resolve, donc un
+réimport écrase le classement fait à la main dans CUTMACHINE.
+
+Les entrées sans fichier — timelines, clips composés, générateurs — sont
+écartées par le pont et rapportées dans son `skipped`. Côté import, tout rush
+refusé est **nommé avec son motif** dans le tableau `errors`, comme pour
+`--ingest` : sur un Media Pool de plusieurs centaines de rushes, un simple
+compteur obligerait à comparer le chutier à la main. Un rush déjà présent dans
+la médiathèque compte dans `skipped` sans figurer dans `errors` — c'est le
+résultat attendu d'un réimport, pas un échec.
+
+```json
+{"ok":true,"added":406,"skipped":2,"bins_created":22,"bins_reused":0,
+ "errors":[]}
+```
+
+Un média hors ligne reste refusé : le volume doit être monté au moment de
+l'import. Les fichiers audio seuls — voix off, musique, ambiance, son stock —
+sont en revanche ingérés normalement avec `has_video: false`. Leur cadence
+exacte est celle des échantillons audio ; les commandes d'image (`read_frame`,
+analyse qualité, vignette et proxy vidéo) les refusent explicitement.
+
+Ce qui reste hors périmètre : les timelines Resolve elles-mêmes (seuls les
+rushes traversent), les mots-clés, drapeaux et commentaires de clip, le
+timecode de départ — `LibraryMedia` n'a pas de champ pour l'accueillir — et le
+trajet retour vers Resolve, qui demande une sortie interopérable (voir
+`ROADMAP.md`).
+
+## Format de séquence
+
+Une séquence neuve est en 1920×1080 à 25 i/s. Ce n'est presque jamais le
+format des rushes, et le corriger à la main demande de savoir une chose que
+les fichiers cachent : **un tournage vertical est stocké en paysage** avec un
+drapeau de rotation. Lire `3840×2160` dans les métadonnées et le recopier dans
+la séquence donne un montage couché.
+
+`--propose-sequence` déduit le format des rushes du projet, sans rien modifier :
+
+```sh
+./build/cutmachine --propose-sequence ./Film.cutmachine-project/project.cutmachine.json
+```
+
+```json
+{"ok":true,
+ "chosen":{"width":2160,"height":3840,"frame_rate":{"num":25,"den":1},"media_count":365},
+ "unanimous":false,"media_considered":405,"media_ignored":0,
+ "candidates":[{"width":2160,"height":3840,"frame_rate":{"num":25,"den":1},"media_count":365},
+               {"width":2160,"height":3840,"frame_rate":{"num":50,"den":1},"media_count":40}]}
+```
+
+La règle est la majorité, et elle est entièrement déterministe : à égalité de
+comptes c'est la plus grande image qui tranche, puis la cadence la plus haute,
+puis les champs bruts — le même projet donne toujours la même réponse, quel que
+soit l'ordre de la médiathèque. Les formats minoritaires sont **rapportés**, pas
+escamotés : un tournage à cadences mixtes doit se voir. Les médias sans image
+exploitable (son seul, rotation qui n'est pas un angle droit) sont comptés à
+part plutôt que rattachés de force.
+
+Côté agent, l'outil MCP `conform_sequence` applique ce format en une
+`UpdateSequenceOperation` réversible, et retourne ce qu'il a choisi et ce qu'il
+a écarté. `preview: true` calcule sans appliquer. Une séquence déjà conforme est
+signalée sans être réécrite, pour ne pas encombrer l'historique d'une opération
+nulle.
+
+C'est la division du travail du principe 7 : l'appelant nomme l'intention
+(« que la séquence corresponde aux rushes »), le moteur calcule les nombres.
+`update_sequence` reste disponible pour poser un format arbitraire.
+
+## Transcription verbatim et nettoyage des hésitations
+
+### Configurer le modèle
+
+Le chemin du modèle Whisper est un **réglage local de la machine**, jamais une
+donnée de projet : un chemin enregistré dans le projet n'existerait pas sur un
+autre Mac, et le même montage doit s'ouvrir partout. Il se pose une fois, dans
+`~/.config/cutmachine/.env` — le même fichier que la clé API du panneau chat :
+
+```sh
+echo 'CUTMACHINE_WHISPER_MODEL=/chemin/vers/ggml-large-v3.bin' \
+  >> ~/.config/cutmachine/.env
+```
+
+La variable d'environnement l'emporte sur le fichier, donc un essai ponctuel
+se fait en la préfixant à la commande, sans rien modifier.
+
+Une fois posé, le réglage sert les trois surfaces à l'identique : `--transcribe`
+sans chemin explicite, l'outil MCP `transcribe_media`, et l'application. Tant
+qu'il n'est pas posé, les trois refusent de la même façon, en nommant la
+variable et le fichier à éditer.
+
+`transcribe_media` est ce qui rend le travail sur les mots atteignable par un
+agent : `list_disfluencies`, `remove_words` et le montage d'interview lisent
+tous un transcript, et aucun d'eux ne pouvait le faire exister. Il faut
+`verbatim: true` pour pouvoir retirer les hésitations ensuite — le décodage par
+défaut les supprime silencieusement, donc elles ne sont plus là pour être
+coupées.
+
+### Le reste
+
+`--transcribe` accepte une langue explicite et un mode `--verbatim`. Le chemin
+du modèle y reste facultatif : donné, il l'emporte ; omis, c'est le réglage
+local qui s'applique.
+
+Il accepte aussi **plusieurs `media-id` séparés par des virgules** (MCP :
+`media_ids`), et ne charge alors le modèle qu'une fois. Le chargement mesure
+~8 s ; sur les 43 rushes parlés d'un projet réel, c'était près de six minutes
+passées à relire le même fichier, contre 11 min d'inférence utile. Les médias
+dont le document dit qu'ils sont muets sont **sautés et signalés** plutôt que
+transcrits — 29 des 71 rushes du même projet étaient des plans de coupe à
+−74 dBFS, tous passés à Whisper à 11× le temps réel pour ne rien produire.
+`--include-silent` (MCP : `include_silent`) force le passage.
+
+Ce niveau vient de `--ingest`, qui mesure désormais le niveau audio moyen de
+chaque média et l'enregistre dans le document (`audio_level`), au même titre
+que la cadence et la durée. C'est un décodage audio, donc un coût réel :
+mesuré à 0,3 s sur un rush 4K de 268 Mo. Une entrée de bibliothèque écrite
+avant ce champ se relit « non mesurée » — jamais « silencieuse » ; un
+ré-`--ingest` la remplit.
+
+L'auto-détection de langue se trompe sur un rush long et majoritairement non
+parlé (mesuré : gallois détecté sur une interview française). Nomme la langue.
+
+Sans `--verbatim`, Whisper nettoie ce qu'il entend : sur une interview de
+7 min 35 il n'a conservé que 3 tics sur les 20 réellement prononcés. Le mode
+verbatim place devant chaque fenêtre de 30 s un prompt qui biaise le décodage
+vers les hésitations, les répétitions et les faux départs — d'où 607 mots
+transcrits au lieu de 390, et les « euh », « heu », « ben » et « bah »
+présents dans le cache. Le drapeau fait partie de l'identité du transcript :
+une transcription verbatim n'est jamais réutilisée à la place d'une
+transcription standard, ni l'inverse.
+
+Le nettoyage se fait ensuite en deux temps, et jamais par un modèle :
+
+1. `--disfluencies` (MCP : `list_disfluencies`) liste ce qui est *prouvable* —
+   les syllabes qui ne sont pas des mots français, et les mots répétés
+   immédiatement — sous forme d'index de mots, avec leur texte pour relecture.
+   Ce qui relève du jugement (« ce "donc" est-il un tic ? ») n'est
+   volontairement pas proposé.
+2. `--remove-words` (MCP : `remove_words`) applique la coupe. Il ne prend que
+   des **index de mots** : c'est `ResolveWordRemoval` qui calcule les images,
+   jamais l'appelant. La coupe est une seule `RemoveWordsOperation`,
+   réversible, qui referme la timeline.
+
+Un modèle peut donc proposer une sélection et la justifier, sans jamais
+calculer un timecode.
+
+`clean_disfluencies` (MCP) réunit les deux étapes en une seule intention :
+CUTMACHINE détecte, calcule les images et applique **une** opération
+réversible pour tout le plan. Le modèle n'énumère rien. Les répétitions ne
+sont retirées que si `include_repetitions` est demandé — un mot répété peut
+être une insistance voulue, une syllabe d'hésitation jamais.
+
+### Recaler les mots sur le signal, et refermer les silences
+
+`--speech-onset` met aussi en cache les groupes de parole séparés par au
+moins 200 ms de creux. `--speech-onset-report` (MCP :
+`list_speech_onsets`) publie pour chaque groupe ses bornes source, son niveau
+moyen et sa crête en dBFS. Le champ `dominant_onset` désigne le premier groupe
+tenu au moins six fenêtres de 20 ms et situé à moins de 9 dB du 90e centile du
+plan. Une question faible hors micro reste donc visible dans `groups`, mais
+n'est plus confondue avec l'entrée du sujet équipé d'un micro-cravate. Le
+seuil séparant les groupes et leur plancher au-dessus du bruit sont
+paramétrables dans les outils MCP (`group_gap_ms`, `group_floor_db`).
+
+Les horodatages de Whisper sont excellents la plupart du temps et
+occasionnellement faux d'une seconde. `--align-transcripts` (MCP :
+`align_transcript`) compare chaque frontière de mot à l'enveloppe d'énergie
+produite par `--speech-onset`, corrige celles qui tombent dans le silence, et
+**refuse** les autres plutôt que de les déplacer au jugé — une frontière
+ambiguë, sans front de parole à portée, ou qui demanderait un déplacement
+au-delà du plafond est signalée et laissée où elle est. Sans `--write`, c'est
+un rapport ; avec, la correction est écrite dans le cache de transcription que
+lisent `remove_words`, `clean_disfluencies` et le montage d'interview. C'est
+ce qui rend une coupe par mot fiable ; sans ça, la seule façon de vérifier une
+borne était d'extraire un fragment et de le retranscrire.
+
+`--tighten-pauses` (MCP : `tighten_pauses`) referme les silences **internes**
+d'un plan sans lire un seul mot : il cherche les creux de l'enveloppe d'au
+moins `min_gap` millisecondes, ramène chacun à `keep` images (réparties entre
+les deux bords, pour que le raccord tombe au plus profond du silence), et
+referme en ripple. Une seule `RemoveWordsOperation`, donc un seul `undo`, et
+la paire A/V liée est emportée avec. L'air de tête et de queue n'est pas
+touché : c'est un rognage, la question de `--speech-onset`, et il est publié
+dans le rapport plutôt que coupé en douce.
+
+`--trim-boundary-air` (MCP : `trim_boundary_air`) ferme précisément ces
+silences de tête et de queue. Les deux nombres optionnels sont, dans l'ordre,
+les images source conservées près de la parole (3 par défaut) et la durée
+minimale d'air traitée en millisecondes (300 par défaut). Les bornes viennent
+des groupes de parole mesurés par `--speech-onset`, jamais des mots Whisper.
+La paire A/V et les autres pistes en sync-lock suivent dans une seule
+`TrimBoundaryAirOperation`, donc un seul `undo`.
+
+À une coupe, utiliser `--close-junction-air` (MCP :
+`close_junction_air`) avec le plan sortant puis le plan entrant. Le moteur
+additionne l'air de queue du premier et l'air de tête du second avant de
+comparer le seuil, puis rogne les deux côtés atomiquement. Ainsi deux moitiés
+de 280 ms sont bien reconnues comme un creux audible de 560 ms, et une seconde
+passe ne déplace plus la jonction. Les outils MCP acceptent en plus
+`sync_track_ids` pour remplacer explicitement les pistes sync-lock déduites.
+
+### Adresser la timeline par le rush
+
+Une décision de montage se prend dans le rush (« couper juste après le nom »,
+« cette prise commence à 1412 »), mais toutes les opérations prennent une
+position **timeline**. La conversion est une soustraction et une addition —
+c'est-à-dire exactement ce qu'on rate une fois sur dix.
+
+`--locate-source-frame` (MCP : `locate_source_frame`) répond « où joue
+l'image N de ce rush » : quel plan, quelle piste, quelle position. Une même
+image peut être sur la timeline plusieurs fois — l'image et son son détaché,
+ou un rush utilisé deux fois — donc toutes les correspondances sont rendues,
+jamais une choisie.
+
+Et les outils de coupe et de rognage acceptent la même adresse :
+`split_clip`, `trim_clip` et `ripple_trim` prennent `source_frame` **à la
+place** de `timeline_position` ou de `delta` — jamais les deux, refus explicite
+sinon. Sur un rognage, `Head` veut dire « le plan démarre sur cette image » et
+`Tail` « c'est la dernière image jouée » : la borne est inclusive, parce que
+c'est ce qu'un numéro d'image veut dire pour un monteur, et le +1 appartient au
+moteur.
+
+Une paire A/V liée est coupée des deux côtés dans la **même** opération.
+`RemoveWordsOperation` porte un champ `linked_clip_ids` : chaque clip nommé
+perd exactement les mêmes images source et referme sa propre piste. Sans ça,
+nettoyer le son d'une interview raccourcirait la bande et laisserait l'image,
+et un seul `undo` ne suffirait plus à revenir en arrière. Les outils
+`clean_disfluencies` et `remove_words` résolvent eux-mêmes les membres du
+groupe de liaison qui couvrent réellement la coupe ; l'opération, elle, reste
+stricte — un clip nommé explicitement qui ne contient pas les plages est
+refusé (`SourceOutOfBounds`), jamais coupé à moitié.
+
+## Contrôle qualité des plans
+
+Un plan flou ou bougé ne se juge pas, il se mesure. `--shot-quality` analyse
+un média image par image et écrit un cache dans
+`.cutmachine/shotquality/<media-id>.json` ; `--shot-quality-report` (MCP :
+`list_shot_quality`) note chaque clip de la timeline active.
+
+Deux mesures, aucune inférence :
+
+- **Netteté** — variance du laplacien sur le plan de luminance, notée par
+  rapport à la médiane du média lui-même. Le relatif est volontaire : la
+  variance du laplacien n'a pas de sens absolu d'un contenu à l'autre, alors
+  qu'à l'intérieur d'un même rush, même caméra et même optique, la comparaison
+  tient. Le prix de ce choix est énoncé plutôt que caché — un média flou de
+  bout en bout note tous ses plans « Sharp », d'où la publication des médianes
+  absolues à côté de la note.
+- **Bougé** — différence absolue moyenne de luminance entre deux échantillons,
+  notée en absolu : la grandeur veut dire la même chose sur n'importe quel
+  rush.
+
+Le grade porte sur le **décile le plus mauvais**, pas sur la médiane : un plan
+qui perd le point à mi-course reste sain en médiane et reste inutilisable.
+
+Mesuré sur une prise réelle (interview à la main, Sony FX30, 6,72 s, quatre
+échantillons par seconde, 1,7 s d'analyse) : le corps du plan tient entre
+4 055 et 4 481 de netteté, et les cinq derniers échantillons s'effondrent à
+3 499, 3 691, 2 616, 1 461 puis 336 pendant que le bougé passe de 5 000–36 000
+à 67 624. Vérifié à l'image : la caméra quitte le sujet en fin de prise, le
+cadre part sur un mur et la dernière image n'est plus qu'une bouillie. C'est
+exactement ce que la mesure doit attraper. Un clip posé sur cette fin est noté
+`Blurry` / `Shaky`, celui posé sur le corps `Sharp` / `Steady`.
+
+Les seuils de bougé sont calés sur cette prise unique. C'est un point
+d'ancrage, pas un étalonnage : chaque note est publiée avec le nombre qui l'a
+produite, précisément pour qu'ils se déplacent sur preuve.
+
+Un média jamais analysé apparaît sous `unanalyzed`, jamais parmi les plans
+propres. L'absence de mesure n'est pas un feu vert : `analyze_shot_quality`
+(MCP) lance l'analyse depuis l'agent, sans passer par la ligne de commande.
+
+La note tient compte du recouvrement. Un plan mou entièrement caché par une
+illustration posée au-dessus n'est pas un défaut à corriger, puisque personne
+ne le voit — chaque entrée porte donc sa note (`clean`, ce qui est mesuré), sa
+durée encore visible (`visible`, ce que dit le document) et `needs_attention`,
+qui est la conjonction des deux. Sans ça, la vue réclamait de recouper des
+plans invisibles.
+
+### Découper un rush en plans
+
+Noter ce qui est déjà monté est une chose ; savoir ce que les rushes
+contiennent en est une autre. Un fichier sorti de la caméra en une seule prise
+peut tenir six prises, et tant qu'elles ne sont pas nommées il n'y a rien à
+sélectionner, à noter ou à décrire d'autre que le fichier entier.
+
+`--shot-quality-report` publie donc, à côté de la liste des clips, un tableau
+`sources` : pour chaque média analysé, les plans détectés à l'intérieur, avec
+leur début, leur fin et l'échantillon le plus net — l'image à extraire quand
+une seule doit représenter le plan. Les temps sont dans le domaine temporel de
+la source, donc utilisables tels quels comme `source_in`.
+
+Reste une mesure, sans modèle : une coupe est une discontinuité de l'image.
+Une troisième grandeur par échantillon s'ajoute aux deux précédentes, la
+**distance d'histogramme de luma** — la fraction des pixels ayant changé de
+casier de luminance. Le cache passe en version 3 ; les anciens sont refusés et
+réanalysés plutôt que complétés par une valeur jamais mesurée.
+
+L'idée de départ était qu'un panoramique déplace l'image sans changer sa
+distribution, contrairement à une coupe. **Mesurée, cette idée est fausse.**
+Sur la prise réelle ci-dessus, l'instant où la caméra quitte le sujet atteint
+70 433 de bougé et 292 944 de distance d'histogramme ; une vraie coupe montée
+dans la même matière mesure 48 489 et 30 900. Le mouvement de caméra note
+*plus haut que la coupe sur les deux grandeurs*. Aucun couple de seuils
+absolus ne les sépare.
+
+Ce qui les sépare n'est pas l'amplitude du changement mais sa forme. Une
+caméra a de l'inertie : un mouvement s'étale sur plusieurs échantillons. Une
+coupe est instantanée : elle tombe sur un seul. Rapportés à la médiane de leur
+voisinage, les mêmes événements se rangent — les mouvements de caméra montent
+à 153 %, 194 %, 201 %, 202 %, 210 %, 232 % et 299 %, les deux coupes réelles à
+408 % et 3 956 %. Le seuil est à 350 %, à égale distance des deux, et 162 des
+combinaisons balayées autour de ce point donnent le même résultat sur les
+quatre fixtures : la règle est sur un plateau, pas sur une arête.
+
+Les limites sont connues et énoncées : un fondu enchaîné n'est pas trouvé,
+puisqu'il n'a aucun échantillon isolé sur lequel piquer ; une coupe entre deux
+plans réellement semblables peut passer sous les planchers absolus ; et
+l'étalonnage repose sur quatre fixtures dont une seule est de la vraie matière.
+Élargir ce corpus est ce qui ferait cesser d'être provisoires les nombres
+ci-dessus.
+
+## Regarder un plan
+
+Mesurer ne suffit pas, et le manque s'est constaté sur un vrai montage : un
+plan noté `Sharp` / `Steady` — donc parfaitement propre — était inutilisable
+en coupe parce qu'il montrait quelqu'un **en train de parler**. Le spectateur
+voyait une bouche articuler autre chose que ce qu'il entendait. Aucun seuil
+sur la variance du laplacien n'attrape ça ; un monteur l'attrape d'un coup
+d'œil.
+
+`read_frame` (MCP) renvoie donc l'image elle-même, en JPEG, à côté de sa
+réponse texte. Soit `clip_id` avec une `position` (`Start`, `Middle`, `End`
+— jamais un timecode, le moteur résout l'image), soit `media_id` avec un
+`source_in` exact pour inspecter un rush qui n'est pas encore monté.
+
+Le partage du travail reste le même que partout ailleurs : ce qui est
+**prouvable** est décidé par le code ([`ShotQuality.h`](src/ShotQuality.h)),
+ce qui demande un regard reçoit une image
+([`FrameCapture.h`](src/FrameCapture.h)). Rien dans `FrameCapture` ne décide,
+il rend.
+
+Côté transport, l'image traverse MCP comme un bloc `image` à côté du bloc
+`text`, et le chat intégré la fait suivre au modèle dans le `tool_result`.
+Elle n'est transmise qu'aux fournisseurs dont l'API accepte une image dans un
+résultat d'outil ; ailleurs le texte passe et l'image est écartée, plutôt que
+remplacée par une description que le modèle prendrait pour une observation.
+
+## Regarder le montage en planches
+
+Une image isolée ne permet pas de juger le rythme ou la continuité d'un
+montage. `--contact-sheet` (MCP : `contact_sheet`) rend donc les milieux des
+plans réellement visibles, après occultation par les pistes vidéo supérieures.
+`--cut-sheet` (MCP : `cut_sheet`) place côte à côte, pour chaque raccord
+visible retenu, la dernière image avant la coupe et la première image après.
+
+Les deux commandes produisent un JPEG et un JSON qui relie chaque cellule à
+son `clip_id`, son `source_id`, sa position timeline et son `source_in`, tous
+exprimés en `RationalTime`. Elles passent par la vue SDR du pipeline couleur du
+document : un rush log est présenté comme dans le moniteur, pas comme une image
+délavée tirée directement du fichier. Aucune donnée du projet n'est modifiée.
+
+Par défaut, une planche contient au plus 24 images. Si le montage en offre
+davantage, le moteur échantillonne uniformément du début à la fin ; une planche
+de raccords ne casse jamais une paire. `--max-images` ajuste la borne en CLI,
+et `max_images` l'ajuste en MCP (1 à 64 pour `contact_sheet`, 2 à 64 pour
+`cut_sheet`).
 
 ## Export vidéo final
 
@@ -442,10 +967,10 @@ L’export compose les pistes vidéo dans leur ordre, conserve les zones noires,
 respecte les rotations et le ratio des sources, puis mixe les clips audio sans
 normalisation automatique. Il écrit d’abord un fichier temporaire voisin et ne
 remplace la destination qu’après un encodage réussi. Pour les projets Sony,
-l’export construit une LUT 3D 65³ à partir des mêmes fonctions de transfert et
-matrices que le shader Metal : S-Log3/S-Gamut3.Cine → AP1 → Rec.2020 HLG. Le
-flux HEVC Main10 est marqué explicitement BT.2020 non constant, ARIB STD-B67 et
-plage légale.
+l’export construit avec OpenColorIO une LUT 3D 65³ issue de la configuration
+ACES Studio intégrée : S-Log3/S-Gamut3.Cine → ACEScg/ACEScct → Rec.2020 HLG.
+Le flux HEVC Main10 est marqué explicitement BT.2020 non constant,
+ARIB STD-B67 et plage légale.
 
 ## Séquence
 
@@ -493,13 +1018,22 @@ espace wide gamut de grading et une sortie Rec.2020/HLG. La plage et la matrice
 peuvent aussi suivre automatiquement les métadonnées FFmpeg de chaque frame.
 
 Chaque frame YUV planaire 8 à 16 bits est d'abord normalisée selon sa profondeur
-et sa plage, puis l'IDT l'amène en ACES AP1. Le point de grading est encodé en
-ACEScct ; la composition des pistes se fait ensuite en AP1 linéaire dans
-une texture flottante 16 bits. L'export conserve la transformation de sortie du
-projet, notamment Rec.2020/HLG. Les moniteurs de montage en dérivent une vue
-locale Rec.709/SDR afin que macOS ne présente pas le master HLG comme une couche
-EDR au milieu de l'interface. Cette préférence d'affichage ne modifie ni le
-document ni le rendu exporté.
+et sa plage. OpenColorIO 2.5.2 applique ensuite les transformations de la
+configuration intégrée et figée
+`studio-config-v2.2.0_aces-v1.3_ocio-v2.4` : aucune variable `$OCIO` ni aucun
+fichier externe n'intervient dans le rendu. Le player échantillonne les
+processeurs OCIO en deux LUT 3D 65³ mises en cache par Metal, avant et après le
+grading ACEScct ; la composition des pistes reste en AP1 linéaire dans une
+texture flottante 16 bits. L'export utilise le même processeur OCIO sous forme
+de LUT `.cube`. Les moniteurs de montage dérivent une vue locale Rec.709/SDR du
+réglage de livraison afin que macOS ne présente pas le master HLG comme une
+couche EDR au milieu de l'interface. Cette préférence d'affichage ne modifie ni
+le document ni le rendu exporté.
+
+Les réglages passent par l'opération réversible `SetColorManagement`, disponible
+également via `--apply-op` et l'outil MCP `set_color_management`. Une combinaison
+gamut/courbe d'entrée absente de la configuration intégrée est refusée avant le
+rendu plutôt que remplacée silencieusement.
 
 `--apply-op`
 réutilise le format canonique de `SerializeOperation`, remplace le document de
@@ -511,6 +1045,72 @@ modifiés.
 de métadonnées de chutier et de relink. Son historique distinct est conservé
 dans `<document>.project-editlog.json` et les commandes `--undo-project-op` et
 `--redo-project-op` le parcourent sans initialiser l’interface graphique.
+
+Les objets passés à `--apply-project-op` doivent reprendre exactement l’ordre
+et tous les champs produits par `SerializeProjectOperation`. `exact_project_hex`
+vaut `null` pour une nouvelle intention ; il est rempli par le journal pour un
+rejeu exact. Exemples canoniques complets (les identifiants sont des ULID) :
+
+```json
+{"type":"AddProjectTimeline","name":"Vertical","width":1080,"height":1920,"frame_rate":{"num":25,"den":1},"timeline_id":"","video_track_id":"","audio_track_id":"","exact_project_hex":null}
+{"type":"CreateProjectTimelineFromSegments","name":"Extrait","width":1920,"height":1080,"frame_rate":{"num":25,"den":1},"segments":[{"source_id":"01K00000000000000000000001","source_in":{"value":0,"rate":25},"duration":{"value":50,"rate":25},"video_clip_id":"","audio_clip_id":"","link_group_id":""}],"timeline_id":"","video_track_id":"","audio_track_id":"","make_active":true,"exact_project_hex":null}
+{"type":"RemoveProjectTimeline","timeline_id":"01K00000000000000000000002","exact_project_hex":null}
+{"type":"SetProjectBinMetadata","item_id":"01K00000000000000000000001","metadata":{"description":"Interview retenue","rating":5,"tags":["interview"],"insert_order":0,"display_name":"Interview principale"},"exact_project_hex":null}
+{"type":"SetProjectTimelineBin","timeline_id":"01K00000000000000000000002","bin_id":"01K00000000000000000000003","exact_project_hex":null}
+{"type":"RenameProjectItem","item_id":"01K00000000000000000000002","name":"Montage vertical","exact_project_hex":null}
+{"type":"SetActiveProjectTimeline","timeline_id":"01K00000000000000000000002","exact_project_hex":null}
+{"type":"RelinkProjectMedia","replacements":[{"media_id":"01K00000000000000000000001","replacement":{"id":"01K00000000000000000000001","path":"rushes/interview.mov","filename":"interview.mov","codec":"h264","width":1920,"height":1080,"pixel_format":"yuv420p","color_range":"tv","color_space":"bt709","color_transfer":"bt709","color_primaries":"bt709","rotation_degrees":0,"rate":{"num":25,"den":1},"duration":{"value":250,"rate":25},"orientation":"landscape","has_video":1,"has_audio":1,"audio_rate":48000,"audio_channels":2,"bin_id":"","proxy_path":"","metadata_complete":1},"stored_path":"rushes/interview.mov"}],"exact_project_hex":null}
+```
+
+## Agent intégré et clé utilisateur
+
+Le panneau **Agent** contacte directement soit l’API Messages d’Anthropic, soit
+l’API locale native d’Ollama. Le bouton **Configurer le moteur
+IA…**, placé sous la conversation, permet de choisir le fournisseur, le modèle,
+l’URL de base et la clé API. Le même dialogue est disponible dans **CUTMACHINE
+→ Moteur IA…**.
+
+Pour utiliser le modèle Qwen Coder déjà installé sur la machine, choisissez
+**Ollama local**. Le dialogue préremplit le modèle `qwen2.5-coder:7b` et l’URL
+`http://localhost:11434`. Ollama local ne
+nécessite aucune clé API. Les appels d’outils restent disponibles : le modèle
+peut donc observer et modifier le montage via les mêmes opérations réversibles
+que le moteur Anthropic.
+
+Le transport Ollama utilise `/api/chat` et demande un contexte de 32K tokens.
+Avant de renvoyer `describe` au modèle local, l’app conserve la timeline, les
+sources utilisées, les aliases de médiathèque, les chutiers et les marqueurs,
+mais retire les métadonnées média redondantes. Pour les modèles anciens qui
+écrivent un appel sous la forme JSON `{name, arguments}` au lieu d’un vrai
+`tool_calls`, ce format n’est exécuté que si l’objet est strict et désigne un
+outil réellement publié par CUTMACHINE.
+
+Pour monter une interview, `get_timeline_transcript` renvoie des spans
+sélectionnables et `create_interview_short` **n'accepte que leurs `span_id`**.
+Le modèle ne recopie aucun temps : c'est le moteur qui résout chaque
+identifiant en position exacte, ce qui rend une coupe au milieu d'un mot
+inexprimable au lieu de simplement déconseillée. Si un mot chevauche une coupe,
+il n'apparaît qu'une fois, du côté qui en joue la plus grande part, et son span
+porte `straddles_cut: true` pour signaler que son rendu peut être approximatif.
+Quand une idée dépasse un span — ils sont découpés pour la lisibilité d'un
+sous-titre, environ
+42 caractères, ce qui n'est pas une unité de montage — `span_id` et
+`end_span_id` désignent un intervalle contigu que le moteur fusionne en une
+seule plage. Un intervalle qui enjambe un silence ou change de source est
+refusé, jamais recousu en silence.
+
+Pour les raccourcissements A/V courants, l’outil MCP
+`shorten_linked_clip` reçoit seulement un clip, un bord et une quantité en
+images ou secondes. CUTMACHINE résout lui-même tous les membres liés, le signe
+du trim et le `RationalTime` exact, puis applique une seule opération atomique.
+Avec `preview=true`, la même opération est validée sur une copie via `EditLog`
+et renvoyée sans modifier le projet.
+
+Le modèle et l’URL sont des préférences locales `NSUserDefaults`. La clé est
+conservée séparément dans le Trousseau macOS : elle n’est écrite ni dans le
+document projet, ni dans son journal, ni dans les préférences. Les variables
+`ANTHROPIC_API_KEY`, `CUTMACHINE_ANTHROPIC_MODEL` et
+`CUTMACHINE_ANTHROPIC_URL` restent utilisables comme valeurs de repli.
 
 ## Sidecar conversationnel
 
@@ -559,3 +1159,13 @@ python3 -m sidecar.eval --backend all
 
 Le rapport affiche chaque comparaison et le taux de réussite séparément pour
 chaque backend. Une évaluation parfaite retourne 0 ; toute divergence retourne 1.
+
+## Licence
+
+CUTMACHINE est distribué sous la GNU Affero General Public License, version 3
+ou toute version ultérieure (`AGPL-3.0-or-later`). Consultez [LICENSE](LICENSE)
+pour les conditions complètes.
+
+Cette licence s'applique à compter de la version qui contient ce changement.
+Les versions antérieures publiées sous Apache License 2.0 restent disponibles
+selon les droits déjà accordés par cette licence.

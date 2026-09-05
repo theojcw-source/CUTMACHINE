@@ -5,15 +5,25 @@
 
 Timeline::Timeline(const Document& document) : document_(document) {}
 
+namespace {
+
+float ClipOpacity(const DocumentClip& clip) {
+    return static_cast<float>(clip.opacity.num) /
+           static_cast<float>(clip.opacity.den);
+}
+
+}  // namespace
+
 std::vector<TrackResolution> Timeline::Resolve(RationalTime position) const {
     if (position.rate <= 0) {
         throw std::invalid_argument("timeline position rate must be positive");
     }
     std::vector<TrackResolution> result;
     result.reserve(document_.sequence.tracks.size());
-    for (const DocumentTrack& track : document_.sequence.tracks) {
-        result.push_back({track.id, ResolveInTrack(track, position)});
-    }
+    for (const DocumentTrack& track : document_.sequence.tracks)
+        result.push_back({track.id, track.kind == "caption"
+                                        ? std::optional<ResolvedFrame>{}
+                                        : ResolveInTrack(track, position)});
     return result;
 }
 
@@ -26,7 +36,8 @@ std::optional<ResolvedFrame> Timeline::ResolveTrack(
     if (!track) {
         throw std::invalid_argument("unknown track ID '" + trackId + "'");
     }
-    return ResolveInTrack(*track, position);
+    return track->kind == "caption" ? std::optional<ResolvedFrame>{}
+                                    : ResolveInTrack(*track, position);
 }
 
 ResolvedFrame Timeline::ResolveClipAt(const DocumentClip& clip,
@@ -45,6 +56,7 @@ std::vector<ResolvedLayer> Timeline::ResolveTrackLayers(
     const DocumentTrack* track = document_.FindTrack(trackId);
     if (!track)
         throw std::invalid_argument("unknown track ID '" + trackId + "'");
+    if (track->kind == "caption") return {};
     for (const DocumentTransition& transition :
          document_.sequence.transitions) {
         if (transition.track_id != trackId) continue;
@@ -85,12 +97,15 @@ std::vector<ResolvedLayer> Timeline::ResolveTrackLayers(
             transition.duration.rate;
         const float progress = static_cast<float>(
             std::clamp<long double>(elapsed / total, 0.0L, 1.0L));
-        return {{ResolveClipAt(*left, leftTime), 1.0f},
-                {ResolveClipAt(*right, rightTime), progress}};
+        return {
+            {ResolveClipAt(*left, leftTime), ClipOpacity(*left)},
+            {ResolveClipAt(*right, rightTime), progress * ClipOpacity(*right)}};
     }
     const std::optional<ResolvedFrame> frame = ResolveInTrack(*track, position);
-    return frame ? std::vector<ResolvedLayer>{{*frame, 1.0f}}
-                 : std::vector<ResolvedLayer>{};
+    if (!frame) return {};
+    const DocumentClip* clip = document_.FindClip(frame->clip_id);
+    return clip ? std::vector<ResolvedLayer>{{*frame, ClipOpacity(*clip)}}
+                : std::vector<ResolvedLayer>{};
 }
 
 std::optional<ResolvedFrame> Timeline::ResolveInTrack(

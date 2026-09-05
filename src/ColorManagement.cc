@@ -2,10 +2,16 @@
 
 #include "Document.h"
 
+#include <OpenColorIO/OpenColorIO.h>
+
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+
+namespace OCIO = OCIO_NAMESPACE;
 
 YuvCodeParameters BuildYuvCodeParameters(int bitDepth, bool fullRange) {
     if (bitDepth < 8 || bitDepth > 16)
@@ -269,4 +275,206 @@ ColorManagementSettings ColorManagementForSdrPreview(
     preview.output_gamut = "rec709";
     preview.output_transfer = "rec709";
     return preview;
+}
+
+namespace {
+
+const char* OpenColorIoSourceSpace(const ColorManagementSettings& settings) {
+    if (settings.input_transfer == "sony_slog3" &&
+        settings.input_gamut == "sony_sgamut3_cine")
+        return "S-Log3 S-Gamut3.Cine";
+    if (settings.input_transfer == "sony_slog3" &&
+        settings.input_gamut == "sony_sgamut3")
+        return "S-Log3 S-Gamut3";
+    if (settings.input_transfer == "rec709" && settings.input_gamut == "rec709")
+        return "Camera Rec.709";
+    if (settings.input_transfer == "linear" && settings.input_gamut == "rec709")
+        return "Linear Rec.709 (sRGB)";
+    if (settings.input_transfer == "linear" &&
+        settings.input_gamut == "rec2020")
+        return "Linear Rec.2020";
+    throw std::runtime_error(
+        "unsupported OCIO input gamut/transfer combination");
+}
+
+const char* OpenColorIoWorkingSpace(const ColorManagementSettings& settings) {
+    if (settings.working_gamut == "acescct") return "ACEScg";
+    if (settings.working_gamut == "rec709") return "Linear Rec.709 (sRGB)";
+    if (settings.working_gamut == "rec2020") return "Linear Rec.2020";
+    throw std::runtime_error("unsupported OCIO working gamut");
+}
+
+struct OpenColorIoDisplayView {
+    const char* display;
+    const char* view;
+};
+
+OpenColorIoDisplayView ResolveOpenColorIoDisplayView(
+    const ColorManagementSettings& settings) {
+    if (settings.output_transfer == "hlg") {
+        if (settings.output_gamut != "rec2020")
+            throw std::runtime_error("HLG output requires Rec.2020");
+        return {"Rec.2100-HLG - Display",
+                "ACES 1.1 - HDR Video (1000 nits & Rec.2020 lim)"};
+    }
+    if (settings.output_gamut == "rec2020")
+        return {"Rec.1886 Rec.2020 - Display", "ACES 1.0 - SDR Video"};
+    return {"Rec.1886 Rec.709 - Display", "ACES 1.0 - SDR Video"};
+}
+
+OCIO::ConstConfigRcPtr OpenColorIoConfig() {
+    static const OCIO::ConstConfigRcPtr config =
+        OCIO::Config::CreateFromBuiltinConfig(kOpenColorIoConfig);
+    return config;
+}
+
+OCIO::Lut1DTransformRcPtr Rec709DecodeTransform() {
+    constexpr unsigned long kLength = 4096;
+    OCIO::Lut1DTransformRcPtr transform =
+        OCIO::Lut1DTransform::Create(kLength, false);
+    transform->setInterpolation(OCIO::INTERP_LINEAR);
+    for (unsigned long index = 0; index < kLength; ++index) {
+        const float signal = static_cast<float>(index) / (kLength - 1);
+        const float linear = static_cast<float>(DecodeRec709(signal));
+        transform->setValue(index, linear, linear, linear);
+    }
+    return transform;
+}
+
+bool NeedsRec2020Rec709InputTransform(const ColorManagementSettings& settings) {
+    return settings.input_gamut == "rec2020" &&
+           settings.input_transfer == "rec709";
+}
+
+OCIO::ConstProcessorRcPtr OpenColorIoInputProcessor(
+    const ColorManagementSettings& settings) {
+    const OCIO::ConstConfigRcPtr config = OpenColorIoConfig();
+    if (!NeedsRec2020Rec709InputTransform(settings)) {
+        return config->getProcessor(OpenColorIoSourceSpace(settings),
+                                    OpenColorIoWorkingSpace(settings));
+    }
+    // COLOR-2026-08 -- the ACES studio config has linear Rec.2020 but no
+    // camera Rec.2020 alias. Preserve the legacy document combination by
+    // decoding its Rec.709 transfer before the named gamut conversion.
+    OCIO::GroupTransformRcPtr group = OCIO::GroupTransform::Create();
+    group->appendTransform(Rec709DecodeTransform());
+    OCIO::ColorSpaceTransformRcPtr gamut = OCIO::ColorSpaceTransform::Create();
+    gamut->setSrc("Linear Rec.2020");
+    gamut->setDst(OpenColorIoWorkingSpace(settings));
+    group->appendTransform(gamut);
+    return config->getProcessor(group);
+}
+
+void SampleOpenColorIoProcessor(const OCIO::ConstProcessorRcPtr& processor,
+                                OpenColorIoLut3D& output) {
+    output.edge = kOpenColorIoLutEdge;
+    const size_t texelCount =
+        static_cast<size_t>(output.edge) * output.edge * output.edge;
+    output.rgba.resize(texelCount * 4);
+    const OCIO::ConstCPUProcessorRcPtr cpu =
+        processor->getDefaultCPUProcessor();
+    for (int32_t blue = 0; blue < output.edge; ++blue) {
+        for (int32_t green = 0; green < output.edge; ++green) {
+            for (int32_t red = 0; red < output.edge; ++red) {
+                float pixel[4] = {static_cast<float>(red) / (output.edge - 1),
+                                  static_cast<float>(green) / (output.edge - 1),
+                                  static_cast<float>(blue) / (output.edge - 1),
+                                  1.0f};
+                cpu->applyRGBA(pixel);
+                const size_t offset =
+                    (static_cast<size_t>(blue * output.edge * output.edge +
+                                         green * output.edge + red)) *
+                    4;
+                std::copy(pixel, pixel + 4, output.rgba.begin() + offset);
+            }
+        }
+    }
+}
+
+OCIO::ConstProcessorRcPtr OpenColorIoOutputProcessor(
+    const ColorManagementSettings& settings) {
+    const OpenColorIoDisplayView displayView =
+        ResolveOpenColorIoDisplayView(settings);
+    const char* lutInputSpace = settings.working_gamut == "acescct"
+                                    ? "ACEScct"
+                                    : OpenColorIoWorkingSpace(settings);
+    return OpenColorIoConfig()->getProcessor(lutInputSpace, displayView.display,
+                                             displayView.view,
+                                             OCIO::TRANSFORM_DIR_FORWARD);
+}
+
+OCIO::ConstProcessorRcPtr OpenColorIoCombinedProcessor(
+    const ColorManagementSettings& settings) {
+    const OpenColorIoDisplayView displayView =
+        ResolveOpenColorIoDisplayView(settings);
+    if (NeedsRec2020Rec709InputTransform(settings)) {
+        OCIO::GroupTransformRcPtr group = OCIO::GroupTransform::Create();
+        group->appendTransform(Rec709DecodeTransform());
+        OCIO::DisplayViewTransformRcPtr display =
+            OCIO::DisplayViewTransform::Create();
+        display->setSrc("Linear Rec.2020");
+        display->setDisplay(displayView.display);
+        display->setView(displayView.view);
+        group->appendTransform(display);
+        return OpenColorIoConfig()->getProcessor(group);
+    }
+    return OpenColorIoConfig()->getProcessor(
+        OpenColorIoSourceSpace(settings), displayView.display, displayView.view,
+        OCIO::TRANSFORM_DIR_FORWARD);
+}
+
+}  // namespace
+
+bool BuildOpenColorIoLuts(const ColorManagementSettings& settings,
+                          OpenColorIoLutPair& output, std::string& error) {
+    output = {};
+    error.clear();
+    try {
+        SampleOpenColorIoProcessor(OpenColorIoInputProcessor(settings),
+                                   output.input_to_working);
+        SampleOpenColorIoProcessor(OpenColorIoOutputProcessor(settings),
+                                   output.working_to_display);
+        return true;
+    } catch (const OCIO::Exception& exception) {
+        error = exception.what();
+    } catch (const std::exception& exception) {
+        error = exception.what();
+    }
+    output = {};
+    return false;
+}
+
+bool BuildOpenColorIoCube(const ColorManagementSettings& settings,
+                          std::string& output, std::string& error) {
+    output.clear();
+    error.clear();
+    try {
+        OpenColorIoLut3D lut;
+        SampleOpenColorIoProcessor(OpenColorIoCombinedProcessor(settings), lut);
+        std::ostringstream stream;
+        stream.imbue(std::locale::classic());
+        stream << "TITLE \"CUTMACHINE OpenColorIO display transform\"\n"
+               << "LUT_3D_SIZE " << lut.edge << '\n'
+               << "DOMAIN_MIN 0.0 0.0 0.0\n"
+               << "DOMAIN_MAX 1.0 1.0 1.0\n"
+               << std::fixed << std::setprecision(10);
+        for (size_t offset = 0; offset < lut.rgba.size(); offset += 4)
+            stream << lut.rgba[offset] << ' ' << lut.rgba[offset + 1] << ' '
+                   << lut.rgba[offset + 2] << '\n';
+        output = stream.str();
+        return true;
+    } catch (const OCIO::Exception& exception) {
+        error = exception.what();
+    } catch (const std::exception& exception) {
+        error = exception.what();
+    }
+    return false;
+}
+
+std::string OpenColorIoCacheKey(const ColorManagementSettings& settings) {
+    std::ostringstream output;
+    output << kOpenColorIoConfig << '|' << settings.input_gamut << '|'
+           << settings.input_transfer << '|' << settings.working_gamut << '|'
+           << settings.output_gamut << '|' << settings.output_transfer;
+    return output.str();
 }

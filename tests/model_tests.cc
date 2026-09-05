@@ -335,6 +335,24 @@ int main() {
                   loaded.color_management.output_transfer == "hlg",
               "all color pipeline stages must round-trip");
 
+        OpenColorIoLutPair luts;
+        Check(BuildOpenColorIoLuts(document.color_management, luts, error),
+              "embedded OCIO config must build Metal LUTs: " + error);
+        const size_t expectedValues = static_cast<size_t>(kOpenColorIoLutEdge) *
+                                      kOpenColorIoLutEdge *
+                                      kOpenColorIoLutEdge * 4;
+        Check(luts.input_to_working.edge == kOpenColorIoLutEdge &&
+                  luts.working_to_display.edge == kOpenColorIoLutEdge &&
+                  luts.input_to_working.rgba.size() == expectedValues &&
+                  luts.working_to_display.rgba.size() == expectedValues,
+              "OCIO LUTs use deterministic 65^3 RGBA storage");
+
+        ColorManagementSettings legacyRec2020 = document.color_management;
+        legacyRec2020.input_gamut = "rec2020";
+        legacyRec2020.input_transfer = "rec709";
+        Check(BuildOpenColorIoLuts(legacyRec2020, luts, error),
+              "legacy Rec.2020/Rec.709 input builds through OCIO: " + error);
+
         loaded.color_management.output_gamut = "rec709";
         Check(!loaded.Validate(error) && error.find("HLG") != std::string::npos,
               "HLG with a non-Rec.2020 gamut must be rejected");
@@ -343,6 +361,11 @@ int main() {
         Check(!loaded.Validate(error) &&
                   error.find("color_management") != std::string::npos,
               "unknown transfer functions must be rejected");
+        loaded = document;
+        loaded.color_management.input_gamut = "rec2020";
+        Check(!loaded.Validate(error) &&
+                  error.find("OpenColorIO") != std::string::npos,
+              "unsupported OCIO gamut/transfer pairs are rejected early");
     });
 
     Test("timeline resolution", [] {
@@ -381,6 +404,8 @@ int main() {
         "cross dissolve persists, validates handles and resolves two layers",
         [] {
             Document document = ValidDocument();
+            document.sequence.tracks[0].clips[0].opacity = {4, 5};
+            document.sequence.tracks[0].clips[1].opacity = {3, 5};
             document.sequence.transitions = {{
                 "01K00000000000000000000008",
                 document.sequence.tracks[0].id,
@@ -406,17 +431,20 @@ int main() {
             Check(beforeCut.size() == 2 &&
                       beforeCut[0].frame.source_frame == 101 &&
                       beforeCut[1].frame.source_frame == 9 &&
+                      std::abs(beforeCut[0].opacity - 0.8f) < 0.0001f &&
                       beforeCut[1].opacity == 0.0f,
                   "transition begins with outgoing image and incoming head "
                   "handle");
             const auto atCut = timeline.ResolveTrackLayers(track, {2, 25});
             Check(atCut.size() == 2 && atCut[0].frame.source_frame == 102 &&
                       atCut[1].frame.source_frame == 10 &&
-                      std::abs(atCut[1].opacity - 0.5f) < 0.0001f,
+                      std::abs(atCut[0].opacity - 0.8f) < 0.0001f &&
+                      std::abs(atCut[1].opacity - 0.3f) < 0.0001f,
                   "cut center resolves both source handles at 50 percent");
             const auto after = timeline.ResolveTrackLayers(track, {3, 25});
             Check(
-                after.size() == 1 && after[0].frame.source_frame == 11,
+                after.size() == 1 && after[0].frame.source_frame == 11 &&
+                    std::abs(after[0].opacity - 0.6f) < 0.0001f,
                 "transition end is half-open and returns to normal resolution");
 
             document.sequence.tracks[0].clips[1].source_in = {0, 25};
@@ -658,21 +686,141 @@ int main() {
               "an angle must reference an existing clip on a video track");
     });
 
-    Test("document schema version 3 is rejected without migration", [] {
-        const std::string json =
-            "{\"version\":3,\"sequence\":{\"id\":"
-            "\"01K92000000000000000000001\",\"name\":\"Legacy sequence\","
-            "\"width\":1920,\"height\":1080,\"frame_rate\":{\"num\":25,"
-            "\"den\":1}},\"library\":[],\"bins\":[],\"markers\":[],"
-            "\"transitions\":[],\"tracks\":[],\"sources\":[]}";
+    Test("older document schemas migrate audio settings to neutral", [] {
+        const std::string canonical = ValidDocument().SaveToString();
+        std::string json = canonical;
+        const std::string current = "\"version\": 7";
+        const size_t versionPosition = json.find(current);
+        Check(versionPosition != std::string::npos,
+              "canonical fixture contains its schema version");
+        json.replace(versionPosition, current.size(), "\"version\": 4");
         Document document;
         std::string error;
-        Check(!Document::LoadFromString(json, document, error) &&
-                  error.find("unsupported document version 3") !=
-                      std::string::npos,
-              "version 3 (pre-effects/caption/multicam schema) must be "
-              "rejected explicitly, like v1 and v2");
+        const std::string audioGain =
+            ",\"audio_gain_db\":{\"num\":0,\"den\":1}";
+        const std::string audioFadeIn =
+            ",\"audio_fade_in\":{\"value\":0,\"rate\":1}";
+        const std::string audioFadeOut =
+            ",\"audio_fade_out\":{\"value\":0,\"rate\":1}";
+        for (const std::string& field :
+             {audioGain, audioFadeIn, audioFadeOut}) {
+            size_t position = 0;
+            while ((position = json.find(field, position)) != std::string::npos)
+                json.erase(position, field.size());
+        }
+        const std::string opacity = ",\"opacity\":{\"num\":1,\"den\":1}";
+        size_t opacityPosition = 0;
+        while ((opacityPosition = json.find(opacity, opacityPosition)) !=
+               std::string::npos)
+            json.erase(opacityPosition, opacity.size());
+        Check(Document::LoadFromString(json, document, error),
+              "version 4 loads through neutral audio migration: " + error);
+        Check(document.version == 7,
+              "the migrated document uses the current schema version");
+        bool neutralAudio = true;
+        for (const DocumentTrack& track : document.sequence.tracks) {
+            for (const DocumentClip& clip : track.clips) {
+                neutralAudio = neutralAudio && clip.audio_gain_db.num == 0 &&
+                               clip.audio_gain_db.den == 1 &&
+                               clip.audio_fade_in == RationalTime{0, 1} &&
+                               clip.audio_fade_out == RationalTime{0, 1};
+            }
+        }
+        Check(neutralAudio,
+              "every migrated clip defaults to neutral exact audio settings");
+        Check(
+            document.SaveToString().find("\"version\": 7") != std::string::npos,
+            "saving a migrated document emits canonical version 7");
+
+        const auto withoutAudioSettings = [&](int version) {
+            std::string legacy = canonical;
+            legacy.replace(versionPosition, current.size(),
+                           "\"version\": " + std::to_string(version));
+            for (const std::string& field :
+                 {audioGain, audioFadeIn, audioFadeOut}) {
+                size_t position = 0;
+                while ((position = legacy.find(field, position)) !=
+                       std::string::npos)
+                    legacy.erase(position, field.size());
+            }
+            return legacy;
+        };
+        Document v5;
+        const std::string v5Json = withoutAudioSettings(5);
+        Check(Document::LoadFromString(v5Json, v5, error) &&
+                  v5.sequence.tracks[0].clips[0].opacity.num == 1 &&
+                  v5.sequence.tracks[0].clips[0].opacity.den == 1 &&
+                  v5.sequence.tracks[0].clips[0].audio_gain_db.num == 0 &&
+                  v5.sequence.tracks[0].clips[0].audio_gain_db.den == 1,
+              "version 5 preserves opacity and adds neutral audio settings: " +
+                  error);
+        Document v6;
+        const std::string v6Json = withoutAudioSettings(6);
+        Check(Document::LoadFromString(v6Json, v6, error) &&
+                  v6.sequence.tracks[0].clips[0].audio_fade_in ==
+                      RationalTime{0, 1} &&
+                  v6.sequence.tracks[0].clips[0].audio_fade_out ==
+                      RationalTime{0, 1},
+              "version 6 adds neutral audio settings: " + error);
     });
+
+    // QC-2026-09 A3 -- the measured audio level is a document fact, so it has
+    // to survive the canonical round trip, and a v5 library entry that never
+    // saw it has to load as unmeasured rather than as digital silence. Those
+    // are the same zero and not the same statement.
+    Test("a measured audio level round-trips, and its absence stays unknown",
+         [] {
+             Document document = ValidDocument();
+             LibraryMedia media;
+             media.id = document.sources[0].id;
+             media.path = document.sources[0].path;
+             media.filename = "A.MP4";
+             media.codec = "h264";
+             media.width = 1920;
+             media.height = 1080;
+             media.pixel_format = "yuv420p";
+             media.orientation = "landscape";
+             media.rate = document.sources[0].rate;
+             media.duration = document.sources[0].duration;
+             media.has_audio = true;
+             media.audio_rate = 48000;
+             media.audio_channels = 2;
+             media.audio_level_measured = true;
+             media.audio_level = 200;  // -74 dBFS: a mute cutaway.
+             document.library = {media};
+
+             std::string error;
+             Check(document.Validate(error),
+                   "a measured level validates: " + error);
+             const std::string json = document.SaveToString();
+             Check(json.find("\"audio_level\":200") != std::string::npos,
+                   "the level reaches the canonical bytes");
+             Document reloaded;
+             Check(Document::LoadFromString(json, reloaded, error) &&
+                       reloaded.library.size() == 1 &&
+                       reloaded.library[0].audio_level_measured &&
+                       reloaded.library[0].audio_level == 200,
+                   "and reads back unchanged: " + error);
+             Check(reloaded.SaveToString() == json,
+                   "a second save is byte-identical");
+
+             document.library[0].audio_level_measured = false;
+             document.library[0].audio_level = 0;
+             const std::string silent = document.SaveToString();
+             Check(silent.find("audio_level") == std::string::npos,
+                   "an unmeasured entry keeps the bytes it had before the "
+                   "field existed");
+             Document legacy;
+             Check(Document::LoadFromString(silent, legacy, error) &&
+                       !legacy.library[0].audio_level_measured,
+                   "and loads back as unknown, not as silence: " + error);
+
+             document.library[0].audio_level_measured = true;
+             document.library[0].audio_level = kAudioLevelScale + 1;
+             Check(!document.Validate(error) &&
+                       error.find("audio level") != std::string::npos,
+                   "a level above full scale is refused rather than stored");
+         });
 
     Test("track lock state persists", [] {
         Document document = ValidDocument();

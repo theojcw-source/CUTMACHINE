@@ -27,6 +27,12 @@ const char* MediaTaskKindName(MediaTaskKind kind) {
             return "Relink";
         case MediaTaskKind::Beat:
             return "Beat";
+        case MediaTaskKind::Transcription:
+            return "Transcription";
+        case MediaTaskKind::ShotQuality:
+            return "ShotQuality";
+        case MediaTaskKind::SpeechOnset:
+            return "SpeechOnset";
     }
     return "Probe";
 }

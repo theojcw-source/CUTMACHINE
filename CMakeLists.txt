@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 project(CUTMACHINE LANGUAGES C CXX OBJC OBJCXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ language standard" FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD 17)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,7 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavcodec
     libavutil
     libswresample
+    libswscale
 )
 # The MCP server (HttpServer.cc/McpServer.cc) uses std::thread for its
 # accept loop.
@@ -20,8 +21,8 @@ find_package(Threads REQUIRED)
 # F1.4 -- local transcription. Fetched, not vendored, following this
 # project's general preference for build-time dependencies over committed
 # third-party source. whisper.cpp is MIT licensed (compatible with this
-# project's Apache-2.0) and runs entirely on-device: pulling it in does not
-# touch PHILOSOPHY.md's "pas de service central" guard-rail, since inference
+# project's AGPL-3.0-or-later) and runs entirely on-device: pulling it in does
+# not touch PHILOSOPHY.md's "pas de service central" guard-rail, since inference
 # still happens against a local model file the caller supplies, never a
 # network call. Examples/tests/server and the GPU backends this project's
 # target platform (macOS/Apple Silicon) does not use are disabled; GGML_METAL
@@ -41,6 +42,32 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(whispercpp)
+
+# COLOR-2026-08 -- OpenColorIO owns the project color transforms rather than
+# keeping a second, hand-written approximation in the player and exporter.
+# Pin both the library and the built-in config selected in ColorManagement.cc:
+# upgrading either changes rendered pixels and therefore needs an explicit
+# project decision. Only the C++ core is built; CUTMACHINE neither ships nor
+# needs OCIO's applications, language bindings, plug-ins, or own test suite.
+set(OCIO_BUILD_APPS OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_GPU_TESTS OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_JAVA OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_NUKE OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_OPENFX OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+set(OCIO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(OCIO_INSTALL_EXT_PACKAGES ALL CACHE STRING "" FORCE)
+FetchContent_Declare(
+    opencolorio
+    GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/OpenColorIO.git
+    GIT_TAG        v2.5.2
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(opencolorio)
+set(OCIO_LICENSE_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/OpenColorIO-LICENSE")
+configure_file("${opencolorio_SOURCE_DIR}/LICENSE" "${OCIO_LICENSE_RESOURCE}"
+    COPYONLY)
 
 # Treat whisper.cpp's headers as system headers. Without this they are
 # ordinary includes, so every translation unit that pulls in whisper.h
@@ -98,6 +125,7 @@ add_custom_target(cutmachine_ui_icons DEPENDS ${CUTMACHINE_ICON_PNGS})
 
 add_library(cutmachine_model
     src/BeatDetection.cc
+    src/BoundaryAir.cc
     src/ChatLlmClient.cc
     src/ChatSession.cc
     src/Cli.cc
@@ -107,24 +135,40 @@ add_library(cutmachine_model
     src/HttpServer.cc
     src/IdResolver.cc
     src/Ingest.cc
+    src/InterviewShort.cc
     src/Json.cc
+    src/LocalEnv.cc
     src/MediaTaskManager.cc
     src/EditLog.cc
     src/Export.cc
+    src/FrameCapture.cc
     src/Keyframes.cc
     src/McpLiveBackend.cc
     src/McpProjectBackend.cc
     src/McpServer.cc
     src/McpTools.cc
     src/Operations.cc
+    src/PauseTightening.cc
     src/Project.cc
     src/ProjectBin.cc
     src/ProjectRecovery.cc
     src/ProjectStorage.cc
     src/Proxy.cc
     src/Relink.cc
+    src/ResolveExport.cc
+    src/ResolveImport.cc
+    src/SequenceFormat.cc
+    src/SourceAddress.cc
+    src/DocumentDelta.cc
+    src/ShotQuality.cc
+    src/TranscriptAlignment.cc
+    src/SpeechOnset.cc
+    src/Subtitles.cc
     src/Thumbnail.cc
     src/Timeline.cc
+    src/TimelineSheets.cc
+    src/TimelineTranscription.cc
+    src/TimelineStats.cc
     src/TimelineView.cc
     src/Transcription.cc
     src/Ulid.cc
@@ -132,7 +176,12 @@ add_library(cutmachine_model
     src/Waveform.cc
 )
 target_include_directories(cutmachine_model PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(cutmachine_model PUBLIC PkgConfig::FFMPEG whisper Threads::Threads)
+target_link_libraries(cutmachine_model PUBLIC
+    PkgConfig::FFMPEG
+    OpenColorIO
+    whisper
+    Threads::Threads
+)
 
 set(CUTMACHINE_APP_SOURCES
     src/main.mm
@@ -180,6 +229,7 @@ target_link_libraries(cutmachine PRIVATE
     "-framework Foundation"
     "-framework Metal"
     "-framework QuartzCore"
+    "-framework Security"
     "-framework UniformTypeIdentifiers"
 )
 
@@ -190,6 +240,7 @@ add_executable(cutmachine_app MACOSX_BUNDLE
     src/shader.metal
     ${CUTMACHINE_ICON_PNGS}
     assets/icons/LICENSE
+    ${OCIO_LICENSE_RESOURCE}
 )
 set_source_files_properties(src/shader.metal PROPERTIES
     MACOSX_PACKAGE_LOCATION Resources
@@ -199,6 +250,9 @@ set_source_files_properties(${CUTMACHINE_ICON_PNGS} PROPERTIES
 )
 set_source_files_properties(assets/icons/LICENSE PROPERTIES
     MACOSX_PACKAGE_LOCATION Resources/icons
+)
+set_source_files_properties(${OCIO_LICENSE_RESOURCE} PROPERTIES
+    MACOSX_PACKAGE_LOCATION Resources/licenses
 )
 add_dependencies(cutmachine_app cutmachine_ui_icons)
 set_target_properties(cutmachine_app PROPERTIES
@@ -225,7 +279,17 @@ target_link_libraries(cutmachine_app PRIVATE
     "-framework Foundation"
     "-framework Metal"
     "-framework QuartzCore"
+    "-framework Security"
     "-framework UniformTypeIdentifiers"
+)
+
+# DEV-2026-08 -- keep the build-and-launch path in CMake so every generator
+# opens the exact bundle it just produced, including non-default build dirs.
+add_custom_target(run-app
+    COMMAND /usr/bin/open "$<TARGET_BUNDLE_DIR:cutmachine_app>"
+    DEPENDS cutmachine_app
+    COMMENT "Launching CUTMACHINE.app"
+    VERBATIM
 )
 
 include(CTest)
@@ -252,6 +316,22 @@ if(BUILD_TESTING)
                           PRIVATE cutmachine_model)
     add_test(NAME cutmachine_timeline_view_tests
              COMMAND cutmachine_timeline_view_tests)
+
+    add_executable(cutmachine_timeline_stats_tests
+                   tests/timeline_stats_tests.cc)
+    target_link_libraries(cutmachine_timeline_stats_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_timeline_stats_tests
+             COMMAND cutmachine_timeline_stats_tests)
+
+    add_executable(cutmachine_timeline_sheets_tests
+                   tests/timeline_sheets_tests.cc)
+    target_link_libraries(cutmachine_timeline_sheets_tests
+                          PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_timeline_sheets_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_timeline_sheets_tests
+             COMMAND cutmachine_timeline_sheets_tests)
 
     add_executable(cutmachine_cli_tests tests/cli_tests.cc)
     target_link_libraries(cutmachine_cli_tests PRIVATE cutmachine_model)
@@ -307,12 +387,26 @@ if(BUILD_TESTING)
     target_link_libraries(cutmachine_project_tests PRIVATE cutmachine_model)
     add_test(NAME cutmachine_project_tests COMMAND cutmachine_project_tests)
 
+    add_executable(cutmachine_interview_short_tests
+                   tests/interview_short_tests.cc)
+    target_link_libraries(cutmachine_interview_short_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_interview_short_tests
+             COMMAND cutmachine_interview_short_tests)
+
     add_executable(cutmachine_project_storage_tests
                    tests/project_storage_tests.cc)
     target_link_libraries(cutmachine_project_storage_tests
                           PRIVATE cutmachine_model)
     add_test(NAME cutmachine_project_storage_tests
              COMMAND cutmachine_project_storage_tests)
+
+    add_executable(cutmachine_sequence_format_tests
+        tests/sequence_format_tests.cc)
+    target_link_libraries(cutmachine_sequence_format_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_sequence_format_tests
+             COMMAND cutmachine_sequence_format_tests)
 
     add_executable(cutmachine_project_bin_tests tests/project_bin_tests.cc)
     target_link_libraries(cutmachine_project_bin_tests PRIVATE cutmachine_model)
@@ -325,11 +419,32 @@ if(BUILD_TESTING)
     )
     add_test(NAME cutmachine_export_tests COMMAND cutmachine_export_tests)
 
-    add_executable(cutmachine_ingest_tests tests/ingest_tests.cc)
+    add_executable(cutmachine_ingest_tests
+        tests/ingest_tests.cc
+        src/MediaSource.mm
+    )
     target_link_libraries(cutmachine_ingest_tests PRIVATE cutmachine_model)
     target_compile_definitions(cutmachine_ingest_tests PRIVATE
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
     add_test(NAME cutmachine_ingest_tests COMMAND cutmachine_ingest_tests)
+
+    add_executable(cutmachine_resolve_export_tests
+        tests/resolve_export_tests.cc)
+    target_link_libraries(cutmachine_resolve_export_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_resolve_export_tests
+             COMMAND cutmachine_resolve_export_tests)
+
+    add_executable(cutmachine_resolve_import_tests
+        tests/resolve_import_tests.cc
+        src/MediaSource.mm
+    )
+    target_link_libraries(cutmachine_resolve_import_tests
+                          PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_resolve_import_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_resolve_import_tests
+             COMMAND cutmachine_resolve_import_tests)
 
     add_executable(cutmachine_media_task_manager_tests
         tests/media_task_manager_tests.cc
@@ -357,6 +472,66 @@ if(BUILD_TESTING)
         FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
     add_test(NAME cutmachine_transcription_tests
              COMMAND cutmachine_transcription_tests)
+
+    add_executable(cutmachine_frame_capture_tests tests/frame_capture_tests.cc)
+    target_link_libraries(cutmachine_frame_capture_tests PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_frame_capture_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_frame_capture_tests
+             COMMAND cutmachine_frame_capture_tests)
+
+    add_executable(cutmachine_shot_quality_tests tests/shot_quality_tests.cc)
+    target_link_libraries(cutmachine_shot_quality_tests PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_shot_quality_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_shot_quality_tests
+             COMMAND cutmachine_shot_quality_tests)
+
+    add_executable(cutmachine_document_delta_tests
+        tests/document_delta_tests.cc)
+    target_link_libraries(cutmachine_document_delta_tests
+        PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_document_delta_tests
+             COMMAND cutmachine_document_delta_tests)
+
+    add_executable(cutmachine_transcript_alignment_tests
+        tests/transcript_alignment_tests.cc)
+    target_link_libraries(cutmachine_transcript_alignment_tests
+        PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_transcript_alignment_tests
+             COMMAND cutmachine_transcript_alignment_tests)
+
+    add_executable(cutmachine_source_address_tests
+        tests/source_address_tests.cc)
+    target_link_libraries(cutmachine_source_address_tests
+        PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_source_address_tests
+             COMMAND cutmachine_source_address_tests)
+
+    add_executable(cutmachine_pause_tightening_tests
+        tests/pause_tightening_tests.cc)
+    target_link_libraries(cutmachine_pause_tightening_tests
+        PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_pause_tightening_tests
+             COMMAND cutmachine_pause_tightening_tests)
+
+    add_executable(cutmachine_boundary_air_tests
+        tests/boundary_air_tests.cc)
+    target_link_libraries(cutmachine_boundary_air_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_boundary_air_tests
+             COMMAND cutmachine_boundary_air_tests)
+
+    add_executable(cutmachine_speech_onset_tests tests/speech_onset_tests.cc)
+    target_link_libraries(cutmachine_speech_onset_tests PRIVATE cutmachine_model)
+    target_compile_definitions(cutmachine_speech_onset_tests PRIVATE
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}")
+    add_test(NAME cutmachine_speech_onset_tests
+             COMMAND cutmachine_speech_onset_tests)
+
+    add_executable(cutmachine_subtitle_tests tests/subtitle_tests.cc)
+    target_link_libraries(cutmachine_subtitle_tests PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_subtitle_tests COMMAND cutmachine_subtitle_tests)
 
     add_executable(cutmachine_thumbnail_tests tests/thumbnail_tests.cc)
     target_link_libraries(cutmachine_thumbnail_tests PRIVATE cutmachine_model)
@@ -482,6 +657,7 @@ if(BUILD_TESTING)
         "-framework Foundation"
         "-framework Metal"
         "-framework QuartzCore"
+        "-framework Security"
         "-framework UniformTypeIdentifiers"
     )
     add_test(NAME cutmachine_ui_smoke_tests
@@ -495,4 +671,63 @@ if(BUILD_TESTING)
     set_tests_properties(cutmachine_sidecar_tests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
+
+    # QC-2026-08 -- these regression suites were delivered as detached
+    # artifacts under "Test copilot/". Register them here so exact-time,
+    # stateful edit-log and storage-failure properties run with the normal
+    # local CTest gate instead of existing only as unaudited source files.
+    add_executable(cutmachine_rational_time_property_tests
+                   tests/rational_time_property_tests.cc)
+    target_link_libraries(cutmachine_rational_time_property_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_rational_time_property_tests
+             COMMAND cutmachine_rational_time_property_tests)
+
+    add_executable(cutmachine_edit_sequence_tests
+                   tests/edit_sequence_tests.cc)
+    target_link_libraries(cutmachine_edit_sequence_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_edit_sequence_tests
+             COMMAND cutmachine_edit_sequence_tests)
+
+    add_executable(cutmachine_storage_fault_injection_tests
+                   tests/storage_fault_injection_tests.cc)
+    target_link_libraries(cutmachine_storage_fault_injection_tests
+                          PRIVATE cutmachine_model)
+    add_test(NAME cutmachine_storage_fault_injection_tests
+             COMMAND cutmachine_storage_fault_injection_tests)
+
+    set_tests_properties(
+        cutmachine_rational_time_property_tests
+        cutmachine_edit_sequence_tests
+        cutmachine_storage_fault_injection_tests
+        PROPERTIES LABELS "portable;regression"
+    )
+    set_tests_properties(
+        cutmachine_storage_fault_injection_tests
+        cutmachine_project_recovery_tests
+        cutmachine_project_storage_tests
+        PROPERTIES LABELS "storage"
+    )
+
+    # The Resolve plugin's pure core is Lua, so its tests run under fuscript,
+    # the Lua 5.1 interpreter DaVinci Resolve ships. Registered only where
+    # Resolve is installed: this is a tool test, not a reason to fail a build
+    # on a machine without it.
+    #
+    # fuscript ALWAYS exits 0 -- on os.exit(1) and on an uncaught Lua error
+    # alike -- so the verdict has to come from its output. Without
+    # PASS_REGULAR_EXPRESSION this test would pass while asserting nothing.
+    set(RESOLVE_FUSCRIPT "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fuscript")
+    if(EXISTS "${RESOLVE_FUSCRIPT}")
+        add_test(
+            NAME cutmachine_resolve_plugin_tests
+            COMMAND "${RESOLVE_FUSCRIPT}" -l lua
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/resolve-plugin/tests/test_cutmachine_lua.lua"
+        )
+        set_tests_properties(cutmachine_resolve_plugin_tests PROPERTIES
+            PASS_REGULAR_EXPRESSION "plugin resolve : tests passés"
+            TIMEOUT 30
+        )
+    endif()
 endif()

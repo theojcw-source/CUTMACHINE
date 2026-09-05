@@ -28,11 +28,14 @@ struct Renderer::Impl {
     id<MTLSamplerState> sampler = nil;
     MetalUiAtlas uiAtlas;
     id<MTLTexture> workingTexture = nil;
+    id<MTLTexture> ocioInputLut = nil;
+    id<MTLTexture> ocioOutputLut = nil;
+    std::string ocioLutKey;
     id<MTLBuffer> scopeHistogram = nil;
     size_t scopeHistogramBins = 0;
-    std::vector<std::array<id<MTLTexture>, 3>> planes;
-    std::vector<std::array<int, 3>> textureWidths;
-    std::vector<std::array<int, 3>> textureHeights;
+    std::vector<std::array<id<MTLTexture>, 4>> planes;
+    std::vector<std::array<int, 4>> textureWidths;
+    std::vector<std::array<int, 4>> textureHeights;
     std::vector<int> textureFormats;
     CGColorSpaceRef sdrColorSpace = nullptr;
     CGColorSpaceRef hlgColorSpace = nullptr;
@@ -42,6 +45,39 @@ struct Renderer::Impl {
         if (hlgColorSpace) CGColorSpaceRelease(hlgColorSpace);
     }
 };
+
+namespace {
+
+id<MTLTexture> UploadOpenColorIoLut(id<MTLDevice> device,
+                                    const OpenColorIoLut3D& lut) {
+    if (!device || lut.edge <= 1 ||
+        lut.rgba.size() !=
+            static_cast<size_t>(lut.edge) * lut.edge * lut.edge * 4)
+        return nil;
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
+    descriptor.textureType = MTLTextureType3D;
+    descriptor.pixelFormat = MTLPixelFormatRGBA32Float;
+    descriptor.width = static_cast<NSUInteger>(lut.edge);
+    descriptor.height = static_cast<NSUInteger>(lut.edge);
+    descriptor.depth = static_cast<NSUInteger>(lut.edge);
+    descriptor.mipmapLevelCount = 1;
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+    if (!texture) return nil;
+    const NSUInteger bytesPerRow =
+        static_cast<NSUInteger>(lut.edge) * 4 * sizeof(float);
+    [texture
+        replaceRegion:MTLRegionMake3D(0, 0, 0, lut.edge, lut.edge, lut.edge)
+          mipmapLevel:0
+                slice:0
+            withBytes:lut.rgba.data()
+          bytesPerRow:bytesPerRow
+        bytesPerImage:bytesPerRow * static_cast<NSUInteger>(lut.edge)];
+    return texture;
+}
+
+}  // namespace
 
 Renderer::Renderer() : impl_(new Impl()) {}
 Renderer::~Renderer() { delete impl_; }
@@ -237,11 +273,11 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
         const AVPixFmtDescriptor* pixel = av_pix_fmt_desc_get(pixelFormat);
         if (frame->width <= 0 || frame->height <= 0 || !pixel ||
             pixel->nb_components < 3 ||
-            (pixel->flags &
-             (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL |
-              AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_HWACCEL)) ||
-            pixel->comp[0].plane != 0 || pixel->comp[1].plane != 1 ||
-            pixel->comp[2].plane != 2 ||
+            (pixel->flags & (AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BITSTREAM |
+                             AV_PIX_FMT_FLAG_HWACCEL)) ||
+            pixel->comp[0].plane == pixel->comp[1].plane ||
+            pixel->comp[0].plane == pixel->comp[2].plane ||
+            pixel->comp[1].plane == pixel->comp[2].plane ||
             pixel->comp[0].depth != pixel->comp[1].depth ||
             pixel->comp[0].depth != pixel->comp[2].depth ||
             pixel->comp[0].depth < 8 || pixel->comp[0].depth > 16 ||
@@ -252,16 +288,26 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
                          name ? name : "unknown");
             return false;
         }
-        std::array<int, 3> planeWidths = {
+        const bool hasAlpha =
+            pixel->nb_components >= 4 && (pixel->flags & AV_PIX_FMT_FLAG_ALPHA);
+        if (hasAlpha && (pixel->comp[3].plane < 0 || pixel->comp[3].plane > 3 ||
+                         pixel->comp[3].depth != pixel->comp[0].depth ||
+                         !frame->data[pixel->comp[3].plane])) {
+            std::fprintf(stderr,
+                         "Unsupported alpha plane passed to renderer\n");
+            return false;
+        }
+        std::array<int, 4> planeWidths = {
             frame->width, AV_CEIL_RSHIFT(frame->width, pixel->log2_chroma_w),
-            AV_CEIL_RSHIFT(frame->width, pixel->log2_chroma_w)};
-        std::array<int, 3> planeHeights = {
+            AV_CEIL_RSHIFT(frame->width, pixel->log2_chroma_w), frame->width};
+        std::array<int, 4> planeHeights = {
             frame->height, AV_CEIL_RSHIFT(frame->height, pixel->log2_chroma_h),
-            AV_CEIL_RSHIFT(frame->height, pixel->log2_chroma_h)};
+            AV_CEIL_RSHIFT(frame->height, pixel->log2_chroma_h), frame->height};
         if (impl_->textureWidths[frameIndex] != planeWidths ||
             impl_->textureHeights[frameIndex] != planeHeights ||
             impl_->textureFormats[frameIndex] != frame->format) {
-            for (int plane = 0; plane < 3; ++plane) {
+            const int planeCount = hasAlpha ? 4 : 3;
+            for (int plane = 0; plane < planeCount; ++plane) {
                 MTLTextureDescriptor* textureDescriptor = [MTLTextureDescriptor
                     texture2DDescriptorWithPixelFormat:
                         pixel->comp[0].depth > 8 ? MTLPixelFormatR16Unorm
@@ -285,7 +331,8 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             impl_->textureFormats[frameIndex] = frame->format;
         }
 
-        for (int plane = 0; plane < 3; ++plane) {
+        const int planeCount = hasAlpha ? 4 : 3;
+        for (int plane = 0; plane < planeCount; ++plane) {
             if (frame->linesize[plane] <= 0) {
                 std::fprintf(stderr,
                              "Unsupported negative/zero linesize for layer %zu "
@@ -307,6 +354,31 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
         timeline.display_sdr_preview
             ? ColorManagementForSdrPreview(timeline.color_management)
             : timeline.color_management;
+    if (presentationColor.enabled) {
+        const std::string lutKey = OpenColorIoCacheKey(presentationColor);
+        if (lutKey != impl_->ocioLutKey) {
+            OpenColorIoLutPair luts;
+            std::string error;
+            if (!BuildOpenColorIoLuts(presentationColor, luts, error)) {
+                std::fprintf(stderr,
+                             "Unable to prepare OpenColorIO Metal LUTs: %s\n",
+                             error.c_str());
+                return false;
+            }
+            id<MTLTexture> inputLut =
+                UploadOpenColorIoLut(impl_->device, luts.input_to_working);
+            id<MTLTexture> outputLut =
+                UploadOpenColorIoLut(impl_->device, luts.working_to_display);
+            if (!inputLut || !outputLut) {
+                std::fprintf(stderr,
+                             "Unable to allocate OpenColorIO Metal LUTs\n");
+                return false;
+            }
+            impl_->ocioInputLut = inputLut;
+            impl_->ocioOutputLut = outputLut;
+            impl_->ocioLutKey = lutKey;
+        }
+    }
     const bool hlgOutput =
         presentationColor.enabled && presentationColor.output_transfer == "hlg";
     impl_->layer.colorspace =
@@ -375,6 +447,8 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             int32_t inputGamut;
             int32_t inputTransfer;
             int32_t useAcescct;
+            int32_t inputIsRgb;
+            int32_t hasSourceAlpha;
             float redFromCr;
             float greenFromCb;
             float greenFromCr;
@@ -384,7 +458,6 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             float yScale;
             float chromaOffset;
             float chromaScale;
-            float padding[2];
         } parameters = {};
         const auto gamut = [](const std::string& value) -> int32_t {
             if (value == "sony_sgamut3_cine") return 1;
@@ -420,6 +493,13 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             const AVPixFmtDescriptor* pixel =
                 av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
             const int depth = pixel->comp[0].depth;
+            parameters.inputIsRgb =
+                (pixel->flags & AV_PIX_FMT_FLAG_RGB) != 0 ? 1 : 0;
+            parameters.hasSourceAlpha =
+                pixel->nb_components >= 4 &&
+                        (pixel->flags & AV_PIX_FMT_FLAG_ALPHA)
+                    ? 1
+                    : 0;
             bool fullRange = presentationColor.input_range == "full";
             if (presentationColor.input_range == "auto") {
                 fullRange = frame->color_range == AVCOL_RANGE_JPEG ||
@@ -443,10 +523,19 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             parameters.greenFromCb = matrix.green_from_cb;
             parameters.greenFromCr = matrix.green_from_cr;
             parameters.blueFromCb = matrix.blue_from_cb;
-            for (NSUInteger plane = 0; plane < 3; ++plane)
+            for (NSUInteger component = 0; component < 3; ++component)
                 [workingEncoder
-                    setFragmentTexture:impl_->planes[frameIndex][plane]
-                               atIndex:plane];
+                    setFragmentTexture:
+                        impl_->planes[frameIndex][pixel->comp[component].plane]
+                               atIndex:component];
+            id<MTLTexture> alphaTexture =
+                parameters.hasSourceAlpha
+                    ? impl_->planes[frameIndex][pixel->comp[3].plane]
+                    : nil;
+            [workingEncoder setFragmentTexture:alphaTexture atIndex:3];
+            if (presentationColor.enabled)
+                [workingEncoder setFragmentTexture:impl_->ocioInputLut
+                                           atIndex:4];
             const int32_t degrees =
                 frameIndex < timeline.video_rotation_degrees.size()
                     ? timeline.video_rotation_degrees[frameIndex]
@@ -658,7 +747,7 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
         static_cast<uint32_t>(drawable.texture.width),
         static_cast<uint32_t>(drawable.texture.height),
         2,
-        0,
+        presentationColor.working_gamut == "acescct" ? 1u : 0u,
     };
 
     id<MTLBlitCommandEncoder> scopeClear = [commandBuffer blitCommandEncoder];
@@ -671,6 +760,9 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
             [commandBuffer computeCommandEncoder];
         [scopeEncoder setComputePipelineState:impl_->scopePipeline];
         [scopeEncoder setTexture:impl_->workingTexture atIndex:0];
+        if (presentationColor.enabled)
+            [scopeEncoder setTexture:impl_->ocioOutputLut atIndex:1];
+        [scopeEncoder setSamplerState:impl_->sampler atIndex:0];
         [scopeEncoder setBuffer:impl_->scopeHistogram offset:0 atIndex:0];
         [scopeEncoder setBytes:&outputParameters
                         length:sizeof(outputParameters)
@@ -707,6 +799,8 @@ bool Renderer::RenderFrames(const std::vector<AVFrame*>& frames,
                                 0.0, 1.0}];
     [encoder setRenderPipelineState:impl_->outputPipeline];
     [encoder setFragmentTexture:impl_->workingTexture atIndex:0];
+    if (presentationColor.enabled)
+        [encoder setFragmentTexture:impl_->ocioOutputLut atIndex:1];
     [encoder setFragmentSamplerState:impl_->sampler atIndex:0];
     [encoder setFragmentBuffer:impl_->scopeHistogram offset:0 atIndex:1];
     [encoder setFragmentBytes:&outputParameters

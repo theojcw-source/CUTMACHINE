@@ -122,6 +122,10 @@ int main() {
     Check(std::system(generate.c_str()) == 0, "source fixture is generated");
 
     Document document = Fixture(media.string());
+    document.sequence.tracks[0].clips[0].opacity = {1, 2};
+    document.sequence.tracks[2].clips[0].audio_gain_db = {10, 1};
+    document.sequence.tracks[2].clips[0].audio_fade_in = {2, 25};
+    document.sequence.tracks[2].clips[0].audio_fade_out = {3, 25};
     std::string error;
     Check(document.Save(project.string(), error), "project saves: " + error);
 
@@ -140,9 +144,28 @@ int main() {
     Check(plan.filter_graph.find("overlay=") != std::string::npos &&
               plan.filter_graph.find("amix=inputs=1") != std::string::npos,
           "plan contains video composition and audio mixing");
+    Check(plan.filter_graph.find("alimiter=limit=0.668344:level=0:latency=1") !=
+              std::string::npos,
+          "AAC export keeps codec headroom without automatic makeup gain");
+    Check(plan.filter_graph.find("eof_action=repeat:repeatlast=1") !=
+                  std::string::npos &&
+              plan.filter_graph.find("enable=gte(t\\,") != std::string::npos &&
+              plan.filter_graph.find(")*lt(t\\,") != std::string::npos,
+          "video clips hold their final decoded frame only inside their "
+          "half-open timeline range");
     Check(plan.filter_graph.find("setpts=PTS-STARTPTS+(5/25)/TB") !=
               std::string::npos,
           "clip placement remains rational in the filter graph");
+    Check(plan.filter_graph.find("colorchannelmixer=aa=(1/2)") !=
+              std::string::npos,
+          "opaque export composites the clip's exact opacity");
+    Check(plan.filter_graph.find("volume=pow(10\\,(10/1)/20)") !=
+                  std::string::npos &&
+              plan.filter_graph.find("afade=t=in:st=0:d=0.08") !=
+                  std::string::npos &&
+              plan.filter_graph.find("afade=t=out:st=0.28:d=0.12") !=
+                  std::string::npos,
+          "audio export applies exact clip gain and fade envelope");
 
     Document outputStateDocument = Fixture(media.string());
     outputStateDocument.sequence.tracks[1].visible = false;
@@ -287,16 +310,64 @@ int main() {
     }
     std::string commandOutput;
     std::string headlessProjectPath;
+    Project headlessProject =
+        Project::FromDocument(document, "Headless export");
+    DocumentSequence emptyTimeline;
+    emptyTimeline.id = GenerateUlid();
+    emptyTimeline.name = "Empty alternate";
+    emptyTimeline.width = document.sequence.width;
+    emptyTimeline.height = document.sequence.height;
+    emptyTimeline.frame_rate = document.sequence.frame_rate;
+    headlessProject.timelines.push_back(emptyTimeline);
     Check(CreatePortableProject(
               (directory / "Headless.cutmachine-project").string(),
-              Project::FromDocument(document, "Headless export"),
-              headlessProjectPath, error),
+              headlessProject, headlessProjectPath, error),
           "headless export project package saves: " + error);
     Check(ExportCommand(headlessProjectPath, invalid, {}, nullptr,
                         commandOutput) == 1 &&
               commandOutput.find("\"error\":\"InvalidExport\"") !=
                   std::string::npos,
           "headless export returns a structured validation error");
+    ExportSettings explicitSettings = Exporter::HevcMain10SoftwarePreset(
+        (directory / "explicit-empty.mp4").string());
+    explicitSettings.ffmpeg_path = FFMPEG_EXECUTABLE;
+    Check(ExportCommand(headlessProjectPath, explicitSettings, {}, nullptr,
+                        commandOutput, emptyTimeline.id) == 1 &&
+              commandOutput.find("cannot export an empty timeline") !=
+                  std::string::npos,
+          "an explicit timeline is selected instead of the active one");
+    Check(ExportCommand(headlessProjectPath, invalid, {}, nullptr,
+                        commandOutput, GenerateUlid()) == 1 &&
+              commandOutput.find("\"error\":\"UnknownSequence\"") !=
+                  std::string::npos,
+          "an unknown explicit export timeline is refused");
+
+    const std::filesystem::path sequenceDestination =
+        directory / "sequence-size.mp4";
+    ExportSettings sequenceSettings =
+        Exporter::HevcMain10SoftwarePreset(sequenceDestination.string());
+    sequenceSettings.ffmpeg_path = FFMPEG_EXECUTABLE;
+    Check(ExportCommand(headlessProjectPath, sequenceSettings, {}, nullptr,
+                        commandOutput) == 0,
+          "headless high-quality preset follows the sequence format: " +
+              commandOutput);
+    AVFormatContext* sequenceFormat = nullptr;
+    Check(avformat_open_input(&sequenceFormat, sequenceDestination.c_str(),
+                              nullptr, nullptr) >= 0 &&
+              avformat_find_stream_info(sequenceFormat, nullptr) >= 0,
+          "sequence-sized headless export can be probed");
+    if (sequenceFormat) {
+        const AVCodecParameters* video = nullptr;
+        for (unsigned int index = 0; index < sequenceFormat->nb_streams;
+             ++index)
+            if (sequenceFormat->streams[index]->codecpar->codec_type ==
+                AVMEDIA_TYPE_VIDEO)
+                video = sequenceFormat->streams[index]->codecpar;
+        Check(video && video->width == document.sequence.width &&
+                  video->height == document.sequence.height,
+              "headless export dimensions match the active sequence");
+        avformat_close_input(&sequenceFormat);
+    }
 
     std::filesystem::remove_all(directory);
     if (failures != 0) {

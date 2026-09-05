@@ -40,6 +40,37 @@
 
 class McpLiveBackend : public McpBackend {
 public:
+    using ProjectApplyCallback = std::function<bool(
+        ProjectOperation, std::string&, std::string&, std::string&)>;
+    using ProjectDescribeCallback =
+        std::function<bool(std::string&, std::string&)>;
+    using TranscriptCallback = std::function<bool(std::string&, std::string&)>;
+    // Word-level editing needs one clip's own source transcript, which the
+    // window resolves against the open project's cache directory -- the same
+    // place the transcribe action writes it.
+    using SourceTranscriptCallback =
+        std::function<bool(const Ulid&, Transcript&, std::string&)>;
+    // Picture-quality reports live beside the transcripts, in the open
+    // project's cache directory, and are resolved by the window for the same
+    // reason: this backend holds a Document, not a project path.
+    using SourceShotQualityCallback =
+        std::function<bool(const Ulid&, ShotQualityReport&, std::string&)>;
+    // Producing the analysis, as opposed to reading it back. Held as a
+    // callback for the same reason: this backend has a Document, and the
+    // media path and cache directory belong to the open project.
+    using AnalyzeShotQualityCallback =
+        std::function<bool(const Ulid&, std::string&, std::string&)>;
+    using CaptureFrameCallback = std::function<bool(
+        const Ulid&, const RationalTime&, std::string&, std::string&)>;
+    using CaptureSheetCallback = std::function<bool(
+        const TimelineSheetPlan&, const TimelineSheetSettings&, std::string&,
+        std::string&)>;
+    using SourceSpeechOnsetCallback =
+        std::function<bool(const Ulid&, SpeechOnsetReport&, std::string&)>;
+    using AnalyzeSpeechOnsetCallback = std::function<bool(
+        const Ulid&, const SpeechOnsetSettings&, std::string&, std::string&)>;
+    using TimelineSelectCallback =
+        std::function<bool(const Ulid&, std::string&)>;
     // Neither reference is owned; both must outlive this backend. `onApplied`
     // (optional) is invoked after every successful ApplyOperation/Undo/Redo,
     // before the call returns -- main.mm wires it to the same
@@ -50,11 +81,50 @@ public:
     // whatever thread calls ApplyOperation/Undo/Redo -- see ChatPanelView.mm
     // for why that is always the main thread.
     McpLiveBackend(Document& document, EditLog& editLog,
-                   std::function<void()> onApplied = nullptr);
+                   std::function<void()> onApplied = nullptr,
+                   ProjectApplyCallback applyProject = nullptr,
+                   ProjectDescribeCallback describeProject = nullptr,
+                   TranscriptCallback readTranscript = nullptr,
+                   SourceTranscriptCallback readSourceTranscript = nullptr,
+                   SourceShotQualityCallback readSourceShotQuality = nullptr,
+                   AnalyzeShotQualityCallback analyzeShotQuality = nullptr,
+                   CaptureFrameCallback captureFrame = nullptr,
+                   SourceSpeechOnsetCallback readSourceSpeechOnset = nullptr,
+                   AnalyzeSpeechOnsetCallback analyzeSpeechOnset = nullptr,
+                   TimelineSelectCallback selectTimeline = nullptr,
+                   bool requireExplicitTimeline = false,
+                   CaptureSheetCallback captureSheet = nullptr);
 
+    bool SelectTimelineForEdit(const std::string& timelineId,
+                               std::string& errorName,
+                               std::string& message) override;
     bool SnapshotDocument(Document& document, std::string& message) override;
     bool ApplyOperation(Operation operation, std::string& resultJson,
                         std::string& errorName, std::string& message) override;
+    bool ApplyProjectEdit(ProjectOperation operation, std::string& resultJson,
+                          std::string& errorName,
+                          std::string& message) override;
+    bool ReadTimelineTranscript(std::string& json,
+                                std::string& message) override;
+    bool ReadSourceTranscript(const Ulid& sourceId, Transcript& transcript,
+                              std::string& message) override;
+    bool ReadSourceShotQuality(const Ulid& sourceId, ShotQualityReport& report,
+                               std::string& message) override;
+    bool AnalyzeSourceShotQuality(const Ulid& sourceId, std::string& resultJson,
+                                  std::string& message) override;
+    bool ReadSourceSpeechOnset(const Ulid& sourceId, SpeechOnsetReport& report,
+                               std::string& message) override;
+    bool AnalyzeSourceSpeechOnset(const Ulid& sourceId,
+                                  const SpeechOnsetSettings& settings,
+                                  std::string& resultJson,
+                                  std::string& message) override;
+    bool CaptureSourceFrame(const Ulid& sourceId, const RationalTime& time,
+                            std::string& jpegBytes,
+                            std::string& message) override;
+    bool CaptureTimelineSheet(const TimelineSheetPlan& plan,
+                              const TimelineSheetSettings& settings,
+                              std::string& jpegBytes,
+                              std::string& message) override;
     bool Undo(std::string& resultJson, std::string& errorName,
               std::string& message) override;
     bool Redo(std::string& resultJson, std::string& errorName,
@@ -65,4 +135,16 @@ private:
     Document& document_;
     EditLog& edit_log_;
     std::function<void()> on_applied_;
+    ProjectApplyCallback apply_project_;
+    ProjectDescribeCallback describe_project_;
+    TranscriptCallback read_transcript_;
+    SourceTranscriptCallback read_source_transcript_;
+    SourceShotQualityCallback read_source_shot_quality_;
+    AnalyzeShotQualityCallback analyze_shot_quality_;
+    CaptureFrameCallback capture_frame_;
+    CaptureSheetCallback capture_sheet_;
+    SourceSpeechOnsetCallback read_source_speech_onset_;
+    AnalyzeSpeechOnsetCallback analyze_speech_onset_;
+    TimelineSelectCallback select_timeline_;
+    bool require_explicit_timeline_ = false;
 };

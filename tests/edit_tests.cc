@@ -103,6 +103,36 @@ void ExpectRejected(Document document, Operation operation, EditError expected,
 }  // namespace
 
 int main() {
+    Test("color management is serializable and byte-exact on undo", [] {
+        Document document = EditDocument();
+        const std::string before = document.SaveToString();
+        ColorManagementSettings settings;
+        settings.enabled = true;
+        settings.input_gamut = "sony_sgamut3_cine";
+        settings.input_transfer = "sony_slog3";
+        settings.input_ycbcr_matrix = "bt709";
+        settings.input_range = "full";
+        settings.working_gamut = "acescct";
+        settings.output_gamut = "rec2020";
+        settings.output_transfer = "hlg";
+        EditLog log;
+        Check(Apply(log, document, SetColorManagementOperation{settings},
+                    "set color management"),
+              "color operation applies");
+        const std::string operationJson =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        EditError error = EditError::None;
+        std::string message;
+        Check(DeserializeOperation(operationJson, parsed, error, message) &&
+                  std::holds_alternative<SetColorManagementOperation>(parsed) &&
+                  SerializeOperation(parsed) == operationJson,
+              "SetColorManagement JSON is canonical");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "color operation undo restores byte-identical document");
+    });
+
     Test("transition operations are exact, serializable and undoable", [] {
         Document document = EditDocument();
         document.sequence.tracks[0].clips[1].timeline_in = {10, 25};
@@ -204,6 +234,39 @@ int main() {
                   RationalTime{40, 25},
               "remove restores every following position");
     });
+
+    Test("arbitrary multi-clip move is atomic, serializable and reversible",
+         [] {
+             Document document = EditDocument();
+             const std::string before = document.SaveToString();
+             const Ulid trackId = document.sequence.tracks[0].id;
+             const Ulid firstId = document.sequence.tracks[0].clips[0].id;
+             const Ulid secondId = document.sequence.tracks[0].clips[1].id;
+             EditLog log;
+             MoveClipsOperation move{
+                 {{firstId, trackId, {50, 25}}, {secondId, trackId, {70, 25}}},
+                 {}};
+             Check(Apply(log, document, move, "multi-clip move"),
+                   "multi-clip move applies as one entry");
+             Check(document.FindClip(firstId)->timeline_in ==
+                           RationalTime{50, 25} &&
+                       document.FindClip(secondId)->timeline_in ==
+                           RationalTime{70, 25} &&
+                       log.AppliedCount() == 1,
+                   "every selected clip keeps its ID and relative spacing");
+             const std::string json =
+                 SerializeOperation(log.AppliedEntries().back().op);
+             Operation parsed = RemoveClipOperation{};
+             EditError error = EditError::None;
+             std::string message;
+             Check(DeserializeOperation(json, parsed, error, message) &&
+                       std::holds_alternative<MoveClipsOperation>(parsed) &&
+                       SerializeOperation(parsed) == json,
+                   "MoveClips canonical JSON round-trips");
+             Check(log.Undo(document, error, message) &&
+                       document.SaveToString() == before,
+                   "multi-clip move undo restores byte-identical state");
+         });
 
     Test("clear and ripple delete are distinct operations", [] {
         Document document = EditDocument();
@@ -369,11 +432,20 @@ int main() {
               "canonical paste contains its overwrite field");
         if (appendedAt != std::string::npos)
             legacyPaste.erase(appendedAt, appendedField.size());
+        const std::string opacityField = ",\"opacity\":{\"num\":1,\"den\":1}";
+        size_t opacityAt = 0;
+        while ((opacityAt = legacyPaste.find(opacityField, opacityAt)) !=
+               std::string::npos) {
+            legacyPaste.erase(opacityAt, opacityField.size());
+        }
         Operation parsedLegacy = RemoveClipOperation{};
         Check(DeserializeOperation(legacyPaste, parsedLegacy, error, message) &&
                   std::holds_alternative<PasteClipsOperation>(parsedLegacy) &&
-                  !std::get<PasteClipsOperation>(parsedLegacy).overwrite,
-              "legacy PasteClips logs without overwrite remain readable");
+                  !std::get<PasteClipsOperation>(parsedLegacy).overwrite &&
+                  SerializeOperation(parsedLegacy).find(opacityField) !=
+                      std::string::npos,
+              "legacy PasteClips logs without overwrite or opacity remain "
+              "readable");
         Check(log.Undo(document, error, message) &&
                   document.SaveToString() == before,
               "paste undo restores byte-identical document JSON");
@@ -594,7 +666,7 @@ int main() {
                               TrimEdge::Head,
                               {-101, 25},
                               std::nullopt},
-            EditError::SourceOutOfBounds, "head trim before source start");
+            EditError::InvalidOperation, "head trim before source start");
 
         Document tailOverlap = base;
         tailOverlap.sequence.tracks[0].clips[1].timeline_in = {11, 25};
@@ -1224,6 +1296,209 @@ int main() {
                        "ripple cannot shift a locked sync track");
     });
 
+    Test("ripple trim refuses a source range outside the real rush bounds", [] {
+        Document document = EditDocument();
+        const std::string before = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const RippleTrimOperation operation{
+            document.sequence.tracks[0].clips[0].id,
+            TrimEdge::Tail,
+            {1000, 25},
+            {},
+            {},
+            {}};
+        Check(!log.Apply(document, operation, error, message) &&
+                  error == EditError::InvalidOperation,
+              "ripple trim beyond the rush is InvalidOperation: " + message);
+        Check(message.find("within [0/25, 1000/25)") != std::string::npos &&
+                  message.find("requested [100/25, 1110/25)") !=
+                      std::string::npos,
+              "ripple trim reports the real source bounds and request: " +
+                  message);
+        Check(log.AppliedCount() == 0 && document.SaveToString() == before,
+              "rejected ripple trim is never journaled");
+    });
+
+    Test("trim clip refuses a source range outside the real rush bounds", [] {
+        Document document = EditDocument();
+        const std::string before = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const TrimClipOperation operation{
+            document.sequence.tracks[0].clips[0].id,
+            TrimEdge::Tail,
+            {1000, 25},
+            std::nullopt};
+        Check(!log.Apply(document, operation, error, message) &&
+                  error == EditError::InvalidOperation,
+              "trim beyond the rush is InvalidOperation: " + message);
+        Check(message.find("within [0/25, 1000/25)") != std::string::npos &&
+                  message.find("requested [100/25, 1110/25)") !=
+                      std::string::npos,
+              "trim reports the real source bounds and request: " + message);
+        Check(log.AppliedCount() == 0 && document.SaveToString() == before,
+              "rejected trim is never journaled");
+    });
+
+    Test("A5 synchronized ripple and cuts are exact and reversible", [] {
+        const Ulid syncTrackId = "01K20000000000000000000020";
+        {
+            Document document = EditDocument();
+            DocumentTrack synced{syncTrackId,
+                                 "video",
+                                 1,
+                                 {{"01K20000000000000000000021",
+                                   document.sources[0].id,
+                                   {400, 25},
+                                   {10, 25},
+                                   {20, 25}}}};
+            document.sequence.tracks.push_back(synced);
+            const std::string before = document.SaveToString();
+            EditLog log;
+            RemoveClipOperation remove{
+                document.sequence.tracks[0].clips[0].id, {syncTrackId}, {}};
+            Check(Apply(log, document, remove, "synchronized remove"),
+                  "remove_clip accepts a synchronized track");
+            Check(document.sequence.tracks[0].clips[0].timeline_in ==
+                          RationalTime{10, 25} &&
+                      document.sequence.tracks[1].clips[0].timeline_in ==
+                          RationalTime{10, 25},
+                  "remove_clip ripples every named track by the same exact "
+                  "duration");
+            const std::string json =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Operation parsed = RemoveClipOperation{};
+            EditError error = EditError::None;
+            std::string message;
+            Check(DeserializeOperation(json, parsed, error, message) &&
+                      std::get<RemoveClipOperation>(parsed).sync_track_ids ==
+                          std::vector<Ulid>{syncTrackId} &&
+                      SerializeOperation(parsed) == json,
+                  "RemoveClip sync_track_ids round-trip canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == before,
+                  "RemoveClip synchronized undo restores exact bytes");
+        }
+
+        const auto linkedDocument = [&](bool crossingSyncClip) {
+            Document document;
+            document.sources = {
+                {"01K20000000000000000000001", "A.MP4", {25, 1}, {1000, 25}}};
+            const Ulid group = "01K20000000000000000000030";
+            DocumentClip video{"01K20000000000000000000031",
+                               document.sources[0].id,
+                               {100, 25},
+                               {10, 25},
+                               {0, 25}};
+            video.link_group_id = group;
+            video.sync_anchor_clip_id = video.id;
+            DocumentClip audio = video;
+            audio.id = "01K20000000000000000000032";
+            audio.sync_anchor_clip_id = video.id;
+            DocumentClip followingVideo{"01K20000000000000000000033",
+                                        document.sources[0].id,
+                                        {200, 25},
+                                        {10, 25},
+                                        {10, 25}};
+            DocumentClip followingAudio = followingVideo;
+            followingAudio.id = "01K20000000000000000000034";
+            const RationalTime syncStart =
+                crossingSyncClip ? RationalTime{0, 25} : RationalTime{10, 25};
+            DocumentClip synced{"01K20000000000000000000035",
+                                document.sources[0].id,
+                                {300, 25},
+                                {10, 25},
+                                syncStart};
+            document.sequence.tracks = {
+                {"01K20000000000000000000036",
+                 "video",
+                 0,
+                 {video, followingVideo}},
+                {syncTrackId, "video", 1, {synced}},
+                {"01K20000000000000000000037",
+                 "audio",
+                 2,
+                 {audio, followingAudio}},
+            };
+            return document;
+        };
+
+        {
+            Document document = linkedDocument(false);
+            const std::string before = document.SaveToString();
+            const Ulid videoId = document.sequence.tracks[0].clips[0].id;
+            const Ulid audioId = document.sequence.tracks[2].clips[0].id;
+            const Ulid group = document.FindClip(videoId)->link_group_id;
+            EditLog log;
+            RemoveLinkedClipsOperation remove{
+                group, {videoId, audioId}, {syncTrackId}, {}};
+            Check(Apply(log, document, remove, "synchronized linked remove"),
+                  "remove_linked_clips accepts a synchronized track");
+            Check(document.sequence.tracks[0].clips[0].timeline_in ==
+                          RationalTime{0, 25} &&
+                      document.sequence.tracks[1].clips[0].timeline_in ==
+                          RationalTime{0, 25} &&
+                      document.sequence.tracks[2].clips[0].timeline_in ==
+                          RationalTime{0, 25},
+                  "linked removal leaves all three downstream tracks "
+                  "aligned");
+            const std::string json =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Operation parsed = RemoveClipOperation{};
+            EditError error = EditError::None;
+            std::string message;
+            Check(
+                DeserializeOperation(json, parsed, error, message) &&
+                    std::get<RemoveLinkedClipsOperation>(parsed)
+                            .sync_track_ids == std::vector<Ulid>{syncTrackId} &&
+                    SerializeOperation(parsed) == json,
+                "RemoveLinkedClips sync_track_ids round-trip canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == before,
+                  "linked synchronized removal undo restores exact bytes");
+        }
+
+        {
+            Document document = linkedDocument(true);
+            const std::string before = document.SaveToString();
+            const Ulid videoId = document.sequence.tracks[0].clips[0].id;
+            const Ulid audioId = document.sequence.tracks[2].clips[0].id;
+            const Ulid group = document.FindClip(videoId)->link_group_id;
+            EditLog log;
+            SplitLinkedClipsOperation split{
+                group, {videoId, audioId}, {5, 25}, {}, {},
+                {},    {syncTrackId},      {}};
+            Check(Apply(log, document, split, "synchronized linked split"),
+                  "split_linked_clips accepts a synchronized track");
+            Check(document.sequence.tracks[0].clips.size() == 3 &&
+                      document.sequence.tracks[1].clips.size() == 2 &&
+                      document.sequence.tracks[2].clips.size() == 3,
+                  "linked split cuts the crossing clip on the synchronized "
+                  "track too");
+            const std::string after = document.SaveToString();
+            const std::string json =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Operation parsed = RemoveClipOperation{};
+            EditError error = EditError::None;
+            std::string message;
+            Check(
+                DeserializeOperation(json, parsed, error, message) &&
+                    std::get<SplitLinkedClipsOperation>(parsed)
+                            .sync_track_ids == std::vector<Ulid>{syncTrackId} &&
+                    SerializeOperation(parsed) == json,
+                "SplitLinkedClips sync_track_ids round-trip canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == before,
+                  "linked synchronized split undo restores exact bytes");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == after,
+                  "linked synchronized split redo restores generated IDs");
+        }
+    });
+
     Test("roll edit moves one contiguous cut without changing total duration",
          [] {
              Document document = EditDocument();
@@ -1258,6 +1533,33 @@ int main() {
                        document.SaveToString() == before,
                    "one undo restores both sides of the roll edit");
          });
+
+    Test("roll edit refuses a source range outside the real rush bounds", [] {
+        Document document = EditDocument();
+        document.sources.push_back(
+            {"01K20000000000000000000022", "short.MP4", {25, 1}, {110, 25}});
+        document.sequence.tracks[0].clips[0].source_id =
+            "01K20000000000000000000022";
+        document.sequence.tracks[0].clips[1].timeline_in = {10, 25};
+        const std::string before = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        const RollEditOperation operation{
+            {{document.sequence.tracks[0].clips[0].id,
+              document.sequence.tracks[0].clips[1].id}},
+            {1, 25},
+            {}};
+        Check(!log.Apply(document, operation, error, message) &&
+                  error == EditError::InvalidOperation,
+              "roll beyond the rush is InvalidOperation: " + message);
+        Check(
+            message.find("within [0/25, 110/25)") != std::string::npos &&
+                message.find("requested [100/25, 111/25)") != std::string::npos,
+            "roll reports the real source bounds and request: " + message);
+        Check(log.AppliedCount() == 0 && document.SaveToString() == before,
+              "rejected roll edit is never journaled");
+    });
 
     Test("slip edit changes only the source window and is reversible", [] {
         Document document = EditDocument();
@@ -1512,6 +1814,104 @@ int main() {
             document.sequence.tracks[0].locked = true;
             ExpectRejected(document, setEffects, EditError::LockedTrack,
                            "clip effects reject a locked track");
+        });
+
+    Test("clip opacity is exact, addressable and byte-exactly reversible", [] {
+        Document document = EditDocument();
+        const Ulid clipId = document.sequence.tracks[0].clips[0].id;
+        const std::string original = document.SaveToString();
+        EditLog log;
+        EditError error = EditError::None;
+        std::string message;
+        Check(Apply(log, document, SetClipOpacityOperation{clipId, {425, 1000}},
+                    "set clip opacity"),
+              "clip opacity applies");
+        const std::string changed = document.SaveToString();
+        Check(document.FindClip(clipId)->opacity.num == 425,
+              "exact opacity is stored on the addressed clip");
+        const std::string json =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(json, parsed, error, message) &&
+                  SerializeOperation(parsed) == json,
+              "SetClipOpacity JSON round-trips canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == original,
+              "SetClipOpacity undo restores byte-identical JSON");
+        Check(log.Redo(document, error, message) &&
+                  document.SaveToString() == changed,
+              "SetClipOpacity redo restores byte-identical JSON");
+        ExpectRejected(document, SetClipOpacityOperation{clipId, {11, 10}},
+                       EditError::ValidationFailed,
+                       "opacity above one is rejected");
+        document.sequence.tracks[0].locked = true;
+        ExpectRejected(document, SetClipOpacityOperation{clipId, {1, 2}},
+                       EditError::LockedTrack,
+                       "clip opacity rejects a locked track");
+    });
+
+    Test(
+        "clip audio settings are exact, serializable and byte-exactly "
+        "reversible",
+        [] {
+            Document document = EditDocument();
+            document.sequence.tracks.push_back({"01K20000000000000000000090",
+                                                "audio",
+                                                1,
+                                                {{"01K20000000000000000000091",
+                                                  "01K20000000000000000000001",
+                                                  {100, 25},
+                                                  {10, 25},
+                                                  {0, 25}}}});
+            const Ulid clipId = document.sequence.tracks.back().clips[0].id;
+            const std::string original = document.SaveToString();
+            EditLog log;
+            EditError error = EditError::None;
+            std::string message;
+            Check(
+                Apply(log, document,
+                      SetClipAudioOperation{clipId, {10, 1}, {2, 25}, {3, 25}},
+                      "set clip audio"),
+                "clip audio settings apply");
+            const std::string changed = document.SaveToString();
+            const DocumentClip* clip = document.FindClip(clipId);
+            Check(clip && clip->audio_gain_db.num == 10 &&
+                      clip->audio_fade_in == RationalTime{2, 25} &&
+                      clip->audio_fade_out == RationalTime{3, 25},
+                  "audio gain and exact fade durations are stored");
+            const std::string json =
+                SerializeOperation(log.AppliedEntries().back().op);
+            Operation parsed = RemoveClipOperation{};
+            Check(DeserializeOperation(json, parsed, error, message) &&
+                      SerializeOperation(parsed) == json,
+                  "SetClipAudio JSON round-trips canonically");
+            Check(log.Undo(document, error, message) &&
+                      document.SaveToString() == original,
+                  "SetClipAudio undo restores byte-identical JSON");
+            Check(log.Redo(document, error, message) &&
+                      document.SaveToString() == changed,
+                  "SetClipAudio redo restores byte-identical JSON");
+            ExpectRejected(
+                document,
+                SetClipAudioOperation{clipId, {49, 1}, {0, 1}, {0, 1}},
+                EditError::ValidationFailed,
+                "gain above the supported range is rejected");
+            ExpectRejected(
+                document,
+                SetClipAudioOperation{clipId, {0, 1}, {11, 25}, {0, 1}},
+                EditError::ValidationFailed,
+                "fade longer than clip is rejected");
+            const Ulid videoClip = document.sequence.tracks[0].clips[0].id;
+            ExpectRejected(
+                document,
+                SetClipAudioOperation{videoClip, {0, 1}, {0, 1}, {0, 1}},
+                EditError::InvalidOperation,
+                "audio settings reject a video clip");
+            document.sequence.tracks.back().locked = true;
+            ExpectRejected(
+                document, SetClipAudioOperation{clipId, {1, 1}, {0, 1}, {0, 1}},
+                EditError::LockedTrack,
+                "clip audio settings reject a locked track");
         });
 
     Test(

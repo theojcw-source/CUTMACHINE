@@ -475,10 +475,25 @@ bool CommitStoredProjectAndLogs(
             {(timelines / (timeline.id + ".json")).string(),
              StandaloneTimelineDocument(project, timeline).SaveToString()});
         const auto log = timelineLogs.find(timeline.id);
-        artifacts.push_back(
-            {TimelineEditLogPathForProject(projectPath, timeline.id),
-             (log == timelineLogs.end() ? EditLog{} : log->second)
-                 .Serialize()});
+        const std::string logPath =
+            TimelineEditLogPathForProject(projectPath, timeline.id);
+        if (log != timelineLogs.end()) {
+            artifacts.push_back({logPath, log->second.Serialize()});
+        } else {
+            // B10 -- ROADMAP.md. An absent map entry means "not loaded", not
+            // "replace this history with an empty one". Only a timeline that
+            // has no journal yet (normally a newly added timeline) needs a
+            // default artifact.
+            std::error_code existsError;
+            const bool logExists = fs::exists(logPath, existsError);
+            if (existsError) {
+                error = "unable to inspect timeline history: " +
+                        existsError.message();
+                return false;
+            }
+            if (!logExists)
+                artifacts.push_back({logPath, EditLog{}.Serialize()});
+        }
     }
     artifacts.push_back(
         {ProjectEditLogPathForProject(projectPath), projectLog.Serialize()});
@@ -488,9 +503,17 @@ bool CommitStoredProjectAndLogs(
     std::vector<std::string> removals;
     for (fs::directory_iterator item(timelines, directoryError), end;
          !directoryError && item != end; item.increment(directoryError)) {
+        // A stale timeline is a file this code itself could have written, so
+        // it is named <ULID>.json and nothing else. Requiring a valid ULID
+        // rather than merely a .json extension keeps the transaction off
+        // files it does not own -- notably the AppleDouble "._<name>"
+        // sidecars macOS creates for every file on exFAT and FAT volumes,
+        // which cannot be renamed on their own and made every save to a
+        // project stored on such a drive fail.
+        const std::string stem = item->path().stem().string();
         if (item->is_regular_file(directoryError) &&
-            item->path().extension() == ".json" &&
-            !activeTimelineIds.count(item->path().stem().string()))
+            item->path().extension() == ".json" && IsValidUlid(stem) &&
+            !activeTimelineIds.count(stem))
             removals.push_back(item->path().string());
         directoryError.clear();
     }

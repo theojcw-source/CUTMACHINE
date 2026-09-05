@@ -4,8 +4,10 @@
 .env
 
 # Claude Code agent worktree scratch space (per-agent repo checkouts,
-# not project history)
-.claude/
+# not project history). Les skills font exception : ce sont des procédures
+# de projet, que l'agent suivant doit retrouver dans le dépôt.
+.claude/*
+!.claude/skills/
 
 # CMake build trees
 build/

@@ -21,10 +21,35 @@ std::string JsonRpcError(const Value& id, int code, const std::string& text) {
            Esc(text) + "\"}}";
 }
 
+// DELTA-2026-08 -- a delta nobody is told about is dead weight. This is the
+// one place the protocol lets the server explain how to use its own results,
+// and it is what stops a caller re-reading the whole timeline after every
+// edit the way one did before the delta existed.
+const char* kServerInstructions =
+    "Read the timeline once with `describe`, then keep your own model of it. "
+    "Every mutating tool returns a `delta` describing exactly what changed, "
+    "so patch that model instead of calling `describe` again -- a full "
+    "snapshot costs hundreds of kilobytes and cannot tell a change you caused "
+    "from one you did not.\n\n"
+    "Delta vocabulary: `clips` is the resulting state of every clip created "
+    "or changed, each with its track and exact times (`created` marks one "
+    "that did not exist before); `shifted` is a ripple stated as a rule -- on "
+    "`track_id`, every clip at or after `from` moved by `by`, `count` of "
+    "them -- and is only emitted when it explains that whole stretch, so it "
+    "can be applied literally; `removed_clip_ids`, `created_tracks` and "
+    "`removed_track_ids` say what appeared and disappeared; `duration` is the "
+    "timeline's new length. Empty sections are omitted, and "
+    "`sequence_changed` means re-read the sequence header only. `undo` and "
+    "`redo` return a delta too, which is the only way to learn what a "
+    "reversal put back.\n\n"
+    "Re-read with `describe` only after a failure that suggests your model is "
+    "stale, or when something changed outside this session.";
+
 std::string InitializeResultJson(const std::string& protocolVersion) {
     return "{\"protocolVersion\":\"" + Esc(protocolVersion) +
            "\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":"
-           "\"cutmachine\",\"version\":\"0.1.0\"}}";
+           "\"cutmachine\",\"version\":\"0.1.0\"},\"instructions\":\"" +
+           Esc(kServerInstructions) + "\"}";
 }
 
 std::string ToolsListResultJson(const McpToolRegistry& registry) {
@@ -42,11 +67,18 @@ std::string ToolsListResultJson(const McpToolRegistry& registry) {
 }
 
 std::string ToolCallResultJson(const McpToolCallOutcome& outcome) {
-    const std::string text =
-        outcome.ok ? outcome.result_json
-                   : (outcome.error_name + ": " + outcome.message);
-    return "{\"content\":[{\"type\":\"text\",\"text\":\"" + Esc(text) +
-           "\"}],\"isError\":" + (outcome.ok ? "false" : "true") + "}";
+    std::string content =
+        "{\"type\":\"text\",\"text\":\"" + Esc(outcome.result_json) + "\"}";
+    // A tool that returned a picture contributes a second content block, in
+    // the shape the MCP specification gives image results. The text block
+    // stays first so a client that ignores images still gets the answer.
+    if (!outcome.image_base64.empty() && !outcome.image_mime.empty()) {
+        content += ",{\"type\":\"image\",\"data\":\"" +
+                   Esc(outcome.image_base64) + "\",\"mimeType\":\"" +
+                   Esc(outcome.image_mime) + "\"}";
+    }
+    return "{\"content\":[" + content +
+           "],\"isError\":" + (outcome.ok ? "false" : "true") + "}";
 }
 
 }  // namespace

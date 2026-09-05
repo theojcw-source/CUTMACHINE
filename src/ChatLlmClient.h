@@ -1,14 +1,13 @@
 #pragma once
 
-// Anthropic Messages API client for the chat panel (ROADMAP.md F2.4).
+// LLM client for the chat panel (ROADMAP.md F2.4).
 //
 // PHILOSOPHY.md's "pas de service central" non-but, unchanged by the F2.x
 // amendment: CUTMACHINE never runs or proxies a model backend. This talks
-// directly to https://api.anthropic.com (or an override, for a
-// self-hosted-compatible endpoint) using a key the user supplies -- never a
-// CUTMACHINE-operated account or credit balance. Mirrors
-// sidecar/planner.py's AnthropicPlanner conventions exactly, so a key or
-// override already set up for the Python sidecar works here unchanged:
+// directly to Anthropic or an OpenAI-compatible endpoint such as a local
+// Ollama server -- never a CUTMACHINE-operated account or credit balance.
+// The Anthropic mode mirrors sidecar/planner.py's conventions, so a key or
+// override already set up for the Python sidecar works unchanged:
 // ANTHROPIC_API_KEY, CUTMACHINE_ANTHROPIC_MODEL (falling back to the
 // sidecar's generic CUTMACHINE_MODEL), CUTMACHINE_ANTHROPIC_URL. See
 // ChatLlmConfig::FromEnvironment.
@@ -17,9 +16,8 @@
 // AppKit, no sockets). The actual HTTPS request/response is an injected
 // `ChatHttpTransport` function, so the request-building and response-
 // parsing logic here is unit-testable against a fake transport without a
-// network or a real API key (tests/chat_llm_client_tests.cc, run directly
-// with g++ -- see that file's header comment). The one real transport --
-// NSURLSession-backed, since this project has no other outbound-HTTPS
+// network or a real API key (tests/chat_llm_client_tests.cc). The one real
+// transport -- NSURLSession-backed, since this project has no other outbound
 // dependency to reach for -- lives in ChatPanelView.mm and is AppKit-only,
 // not exercised at runtime yet like the rest of this project's AppKit
 // surface.
@@ -33,6 +31,8 @@
 #include <vector>
 
 namespace chat {
+
+enum class ChatLlmProvider { AnthropicMessages, OpenAiCompatible, Ollama };
 
 // One HTTPS POST request/response pair. Deliberately just strings and a
 // status code -- everything about *how* the bytes get there (TLS, sockets,
@@ -61,8 +61,8 @@ using ChatHttpTransport =
 
 enum class ChatBlockType { Text, ToolUse, ToolResult };
 
-// One block of an Anthropic `content` array. A given instance only ever
-// populates the fields its `type` uses; the rest stay at their defaults.
+// Provider-neutral content block. A given instance only ever populates the
+// fields its `type` uses; the rest stay at their defaults.
 struct ChatContentBlock {
     ChatBlockType type = ChatBlockType::Text;
     std::string text;         // Text; also ToolResult's textual content
@@ -70,12 +70,22 @@ struct ChatContentBlock {
     std::string tool_name;    // ToolUse only
     mcp_json::Value tool_input;  // ToolUse only -- the tool call's arguments
     bool tool_is_error = false;  // ToolResult only
+    // ToolResult only: a picture the tool returned alongside its text, as
+    // base64 with its MIME type. Empty for every tool but read_frame.
+    // Serialised only for providers whose API accepts an image inside a tool
+    // result -- see SendMessages; elsewhere the text still goes through and
+    // the picture is dropped rather than faked into a description.
+    std::string tool_image_base64;
+    std::string tool_image_mime;
 
     static ChatContentBlock MakeText(std::string text);
     static ChatContentBlock MakeToolUse(std::string id, std::string name,
                                         mcp_json::Value input);
     static ChatContentBlock MakeToolResult(std::string toolUseId,
-                                           std::string text, bool isError);
+                                           std::string text, bool isError,
+                                           std::string toolName = {},
+                                           std::string imageBase64 = {},
+                                           std::string imageMime = {});
 };
 
 // One turn of the conversation. `role` is "user" or "assistant", matching
@@ -87,11 +97,13 @@ struct ChatMessage {
 };
 
 struct ChatLlmConfig {
+    ChatLlmProvider provider = ChatLlmProvider::AnthropicMessages;
     std::string model = "claude-sonnet-4-5";
     std::string api_key;
     std::string base_url = "https://api.anthropic.com";
     std::string anthropic_version = "2023-06-01";
     int max_tokens = 4096;
+    int context_tokens = 32768;
     double timeout_seconds = 120.0;
 
     // Reads ANTHROPIC_API_KEY, CUTMACHINE_ANTHROPIC_MODEL (falling back to

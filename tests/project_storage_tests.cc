@@ -180,6 +180,23 @@ int main() {
               !fs::exists(TimelineEditLogPathForProject(result.project_path,
                                                         transientTimeline.id)),
           "obsolete timeline state and history are removed atomically");
+
+    // macOS writes an AppleDouble "._<name>" sidecar next to every file on an
+    // exFAT or FAT volume -- the format of most shared media drives. Those
+    // sidecars cannot be renamed on their own, so treating one as an obsolete
+    // timeline made every save to a project stored on such a drive fail.
+    const fs::path sidecar = destination / "Timelines" /
+                             ("._" + collected.timelines.front().id + ".json");
+    const fs::path stranger = destination / "Timelines" / "notes.json";
+    Write(sidecar, "apple-double");
+    Write(stranger, "{}");
+    Check(CommitStoredProject(result.project_path, collected, error),
+          "a package holding AppleDouble sidecars still commits: " + error);
+    Check(fs::exists(sidecar) && Read(sidecar) == "apple-double" &&
+              fs::exists(stranger),
+          "the transaction never touches files it did not write");
+    fs::remove(sidecar);
+    fs::remove(stranger);
     Check(MediaManifestSection(Read(destination / "manifest.json")) ==
               collectedMediaManifest,
           "timeline commits preserve collected-media paths and fingerprints");

@@ -678,11 +678,16 @@ bool Document::LoadFromString(const std::string& json, Document& output,
     try {
         const JsonValue root = JsonParser(json).Parse();
         Document parsed;
-        parsed.version = Int32(root, "version", "document");
-        if (parsed.version != 4) {
+        const int32_t storedVersion = Int32(root, "version", "document");
+        if (storedVersion != 4 && storedVersion != 5 && storedVersion != 6 &&
+            storedVersion != 7) {
             throw std::runtime_error("unsupported document version " +
-                                     std::to_string(parsed.version));
+                                     std::to_string(storedVersion));
         }
+        // A7's neutral settings are unambiguous: zero dB is unity and a zero
+        // duration has no envelope. Keep the established v4/v5/v6 migration
+        // policy, then always emit the complete v7 representation on save.
+        parsed.version = 7;
 
         if (const JsonValue* color =
                 Optional(root, "color_management", JsonValue::Type::Object,
@@ -767,6 +772,10 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                     media.metadata_complete = false;
                 } else {
                     media.codec = codec->string;
+                    if (const JsonValue* value =
+                            Optional(item, "has_video",
+                                     JsonValue::Type::Boolean, context))
+                        media.has_video = value->boolean;
                     media.width = Int32(item, "width", context);
                     media.height = Int32(item, "height", context);
                     if (const JsonValue* value =
@@ -804,6 +813,14 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                         media.audio_rate = Int32(item, "audio_rate", context);
                         media.audio_channels =
                             Int32(item, "audio_channels", context);
+                        if (Optional(item, "audio_level",
+                                     JsonValue::Type::Number, context)) {
+                            media.audio_level_measured = true;
+                            media.audio_level =
+                                Require(item, "audio_level",
+                                        JsonValue::Type::Number, context)
+                                    .number;
+                        }
                     }
                 }
                 const JsonValue& rate =
@@ -1119,10 +1136,30 @@ bool Document::LoadFromString(const std::string& json, Document& output,
                         Optional(clipValue, "caption_group_id",
                                  JsonValue::Type::String, clipContext)) {
                     clip.caption_group_id = captionGroup->string;
-                    clip.caption_text =
-                        Require(clipValue, "caption_text",
-                                JsonValue::Type::String, clipContext)
-                            .string;
+                }
+                if (const JsonValue* captionText =
+                        Optional(clipValue, "caption_text",
+                                 JsonValue::Type::String, clipContext))
+                    clip.caption_text = captionText->string;
+                if (storedVersion >= 5) {
+                    clip.opacity = ParseEffectParamValue(
+                        Require(clipValue, "opacity", JsonValue::Type::Object,
+                                clipContext),
+                        clipContext + ".opacity");
+                }
+                if (storedVersion >= 7) {
+                    clip.audio_gain_db = ParseEffectParamValue(
+                        Require(clipValue, "audio_gain_db",
+                                JsonValue::Type::Object, clipContext),
+                        clipContext + ".audio_gain_db");
+                    clip.audio_fade_in =
+                        ParseTime(Require(clipValue, "audio_fade_in",
+                                          JsonValue::Type::Object, clipContext),
+                                  clipContext + ".audio_fade_in");
+                    clip.audio_fade_out =
+                        ParseTime(Require(clipValue, "audio_fade_out",
+                                          JsonValue::Type::Object, clipContext),
+                                  clipContext + ".audio_fade_out");
                 }
                 track.clips.push_back(std::move(clip));
             }
@@ -1251,9 +1288,18 @@ std::string Document::SaveToString() const {
             output << "]";
             if (!clip.caption_group_id.empty())
                 output << ",\"caption_group_id\":\""
-                       << Escape(clip.caption_group_id)
-                       << "\",\"caption_text\":\"" << Escape(clip.caption_text)
+                       << Escape(clip.caption_group_id) << "\"";
+            if (!clip.caption_text.empty())
+                output << ",\"caption_text\":\"" << Escape(clip.caption_text)
                        << "\"";
+            output << ",\"opacity\":";
+            WriteEffectParamValue(output, clip.opacity);
+            output << ",\"audio_gain_db\":";
+            WriteEffectParamValue(output, clip.audio_gain_db);
+            output << ",\"audio_fade_in\":";
+            WriteTime(output, clip.audio_fade_in);
+            output << ",\"audio_fade_out\":";
+            WriteTime(output, clip.audio_fade_out);
             output << "}";
         }
         if (!track.clips.empty()) output << '\n';
@@ -1317,7 +1363,9 @@ std::string Document::SaveToString() const {
             output << ",\"proxy_path\":\"" << Escape(media.proxy_path) << "\"";
         if (media.metadata_complete) {
             output << ",\"codec\":\"" << Escape(media.codec)
-                   << "\",\"width\":" << media.width
+                   << "\",\"has_video\":"
+                   << (media.has_video ? "true" : "false")
+                   << ",\"width\":" << media.width
                    << ",\"height\":" << media.height
                    << ",\"rotation_degrees\":" << media.rotation_degrees
                    << ",\"pixel_format\":\"" << Escape(media.pixel_format)
@@ -1337,6 +1385,11 @@ std::string Document::SaveToString() const {
             if (media.has_audio) {
                 output << ",\"audio_rate\":" << media.audio_rate
                        << ",\"audio_channels\":" << media.audio_channels;
+                // Written only when measured, so an entry that has never
+                // been through an ingest that measures keeps the bytes it
+                // had before this field existed.
+                if (media.audio_level_measured)
+                    output << ",\"audio_level\":" << media.audio_level;
             }
         }
         output << "}";
@@ -1369,7 +1422,7 @@ std::string Document::SaveToString() const {
 }
 
 bool Document::Validate(std::string& error) const {
-    if (version != 4) {
+    if (version != 7) {
         error = "unsupported document version " + std::to_string(version);
         return false;
     }
@@ -1405,6 +1458,24 @@ bool Document::Validate(std::string& error) const {
         color_management.output_gamut != "rec2020") {
         error = "HLG output requires the rec2020 output gamut";
         return false;
+    }
+    if (color_management.enabled) {
+        const bool supportedInput =
+            (color_management.input_transfer == "sony_slog3" &&
+             (color_management.input_gamut == "sony_sgamut3_cine" ||
+              color_management.input_gamut == "sony_sgamut3")) ||
+            (color_management.input_transfer == "rec709" &&
+             (color_management.input_gamut == "rec709" ||
+              color_management.input_gamut == "rec2020")) ||
+            (color_management.input_transfer == "linear" &&
+             (color_management.input_gamut == "rec709" ||
+              color_management.input_gamut == "rec2020"));
+        if (!supportedInput) {
+            error =
+                "color_management input gamut/transfer combination is "
+                "not available in the embedded OpenColorIO config";
+            return false;
+        }
     }
 
     std::set<Ulid> ids;
@@ -1488,17 +1559,34 @@ bool Document::Validate(std::string& error) const {
             return false;
         }
         if (media.metadata_complete) {
-            if (media.codec.empty() || media.width <= 0 || media.height <= 0 ||
-                media.rotation_degrees < -180 || media.rotation_degrees > 180 ||
-                (media.orientation != "landscape" &&
-                 media.orientation != "portrait" &&
-                 media.orientation != "square")) {
+            if (media.codec.empty() || (!media.has_video && !media.has_audio)) {
+                error = context + " has no usable audio or video stream";
+                return false;
+            }
+            if (media.has_video && (media.width <= 0 || media.height <= 0 ||
+                                    media.rotation_degrees < -180 ||
+                                    media.rotation_degrees > 180 ||
+                                    (media.orientation != "landscape" &&
+                                     media.orientation != "portrait" &&
+                                     media.orientation != "square"))) {
                 error = context + " has invalid video metadata";
+                return false;
+            }
+            if (!media.has_video &&
+                (media.width != 0 || media.height != 0 ||
+                 media.rotation_degrees != 0 || media.orientation != "audio")) {
+                error = context + " has picture metadata without video";
                 return false;
             }
             if (media.has_audio &&
                 (media.audio_rate <= 0 || media.audio_channels <= 0)) {
                 error = context + " has invalid audio metadata";
+                return false;
+            }
+            if (media.audio_level_measured &&
+                (!media.has_audio || media.audio_level < 0 ||
+                 media.audio_level > kAudioLevelScale)) {
+                error = context + " has an out-of-range audio level";
                 return false;
             }
         }
@@ -1577,7 +1665,14 @@ bool Document::Validate(std::string& error) const {
                         "') has an incomplete link synchronization state";
                 return false;
             }
-            if (sourceIds.find(clip.source_id) == sourceIds.end()) {
+            const bool captionClip = track.kind == "caption";
+            if (captionClip && !clip.source_id.empty()) {
+                error = context + " ('" + clip.id +
+                        "') caption clip must not reference media";
+                return false;
+            }
+            if (!captionClip &&
+                sourceIds.find(clip.source_id) == sourceIds.end()) {
                 error = context + " ('" + clip.id +
                         "') references unknown source_id '" + clip.source_id +
                         "'";
@@ -1604,9 +1699,50 @@ bool Document::Validate(std::string& error) const {
                         "') has timeline_in before zero";
                 return false;
             }
-            const DocumentSource* source = FindSource(clip.source_id);
+            if (clip.opacity.den <= 0 || clip.opacity.num < 0 ||
+                clip.opacity.num > clip.opacity.den) {
+                error = context + " ('" + clip.id +
+                        "') has opacity outside the exact [0, 1] range";
+                return false;
+            }
+            if (clip.audio_gain_db.den <= 0 ||
+                static_cast<int64_t>(clip.audio_gain_db.num) <
+                    -120LL * clip.audio_gain_db.den ||
+                static_cast<int64_t>(clip.audio_gain_db.num) >
+                    48LL * clip.audio_gain_db.den) {
+                error = context + " ('" + clip.id +
+                        "') has gain outside the exact [-120, 48] dB range";
+                return false;
+            }
+            if (clip.audio_fade_in.rate <= 0 || clip.audio_fade_out.rate <= 0 ||
+                clip.audio_fade_in.value < 0 || clip.audio_fade_out.value < 0 ||
+                clip.audio_fade_in > clip.duration ||
+                clip.audio_fade_out > clip.duration) {
+                error = context + " ('" + clip.id +
+                        "') has an invalid audio fade duration";
+                return false;
+            }
+            const bool hasAudioProcessing =
+                clip.audio_gain_db.num != 0 || clip.audio_gain_db.den != 1 ||
+                clip.audio_fade_in.value != 0 || clip.audio_fade_out.value != 0;
+            if (hasAudioProcessing && track.kind != "audio") {
+                error = context + " ('" + clip.id +
+                        "') has audio processing on a non-audio track";
+                return false;
+            }
+            const DocumentSource* source =
+                captionClip ? nullptr : FindSource(clip.source_id);
+            const LibraryMedia* media =
+                captionClip ? nullptr : FindLibraryMedia(clip.source_id);
+            if (media && media->metadata_complete && track.kind == "video" &&
+                !media->has_video) {
+                error = context + " ('" + clip.id +
+                        "') uses audio-only media on a video track";
+                return false;
+            }
             try {
-                if (clip.source_in.add(clip.duration) > source->duration) {
+                if (!captionClip &&
+                    clip.source_in.add(clip.duration) > source->duration) {
                     error = context + " ('" + clip.id +
                             "') has source_in + duration outside source bounds";
                     return false;
@@ -1628,6 +1764,11 @@ bool Document::Validate(std::string& error) const {
             } catch (const std::exception& exception) {
                 error = context + " has invalid rational time arithmetic: " +
                         exception.what();
+                return false;
+            }
+            if (captionClip && clip.caption_text.empty()) {
+                error = context + " ('" + clip.id +
+                        "') caption text must not be empty";
                 return false;
             }
             for (size_t effectIndex = 0; effectIndex < clip.effects.size();

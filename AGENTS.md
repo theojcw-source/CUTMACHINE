@@ -18,11 +18,11 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-**Aucun job de CI ne lance `ctest`.** `build.yml` et `sanitize.yml` se
-contentent de compiler (le second le documente explicitement : il n'existe pas
-de chemin headless pour faire tourner un binaire instrumenté). Une suite qui
-casse ne sera donc signalée par personne d'autre que toi. Lance `ctest`
-localement avant de rendre, systématiquement.
+Le workflow `ctest.yml` lance désormais la suite complète sur macOS et un
+sous-ensemble sans AppKit sous ASan/UBSan. `build.yml` et `sanitize.yml`
+restent des garde-fous de compilation séparés. Lance quand même `ctest`
+localement avant de rendre, systématiquement : la CI n'est pas une boucle de
+développement.
 
 La CI vérifie en revanche le formatage (`clang-format-18 -style=file`, sur les
 fichiers modifiés seulement) et `clang-tidy -p build` sur les `.cc`/`.mm`

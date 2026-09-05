@@ -46,6 +46,10 @@ bool LoadStoredProject(const std::string& projectPath, Project& project,
                        std::string& error);
 bool CommitStoredProject(const std::string& projectPath, const Project& project,
                          std::string& error);
+// B10 -- ROADMAP.md. timelineLogs is a partial write set: an omitted existing
+// journal stays byte-identical on disk, while a newly added timeline receives
+// an empty journal. This lets project-only edits avoid reading every timeline
+// history before an otherwise unrelated commit.
 bool CommitStoredProjectAndLogs(
     const std::string& projectPath, const Project& project,
     const std::map<std::string, EditLog>& timelineLogs,

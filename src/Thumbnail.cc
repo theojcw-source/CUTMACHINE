@@ -66,6 +66,26 @@ bool GenerateMediaThumbnail(const std::string& inputPath,
         "-loglevel",
         "error",
         "-nostdin",
+        // HW-2026-08 -- VideoToolbox decodes the poster frame instead of
+        // the CPU. Measured on a 4K H.264 4:2:2 10-bit rush, warm cache, three
+        // runs: same wall time (~0.4 s), CPU down from 0.85 s to 0.33 s, for a
+        // byte-identical JPEG. The win is CPU headroom, not speed -- worth it
+        // here because thumbnails are generated for a whole library at once,
+        // in the background, while the user expects the app to stay
+        // responsive.
+        //
+        // Deliberately NOT applied to ShotQuality.cc: that command decodes
+        // every frame and downscales it, so the hardware path has to copy each
+        // 4K frame back to system memory for the filter chain. Measured there:
+        // 1.5x SLOWER in wall time for 45% less CPU, which is the wrong trade
+        // for a batch analysis over a whole library.
+        //
+        // On a codec VideoToolbox cannot take, FFmpeg prints one line to
+        // stderr and decodes in software anyway -- verified on mpeg4, same
+        // bytes out, exit status 0. Success is decided by the exit status,
+        // never by stderr content, so that warning is harmless.
+        "-hwaccel",
+        "videotoolbox",
         "-y",
         "-ss",
         std::to_string(seek),

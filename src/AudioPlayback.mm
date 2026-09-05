@@ -172,6 +172,12 @@ struct MixClip {
     int64_t timelineStart = 0;
     int64_t sourceStart = 0;
     int64_t length = 0;
+    // The conversion to an amplitude is deliberately deferred to this
+    // realtime boundary. The document retains exact dB and exact durations;
+    // libm merely turns them into samples for AVAudioEngine.
+    float gain = 1.0f;
+    int64_t fadeInSamples = 0;
+    int64_t fadeOutSamples = 0;
 };
 
 struct MixPlan {
@@ -183,6 +189,7 @@ struct MixPlan {
 struct AudioPlayback::Impl {
     AVAudioEngine* engine = nil;
     AVAudioSourceNode* sourceNode = nil;
+    std::filesystem::path baseDirectory;
     std::map<Ulid, std::shared_ptr<const PCMSource>> sources;
     std::shared_ptr<const MixPlan> plan = std::make_shared<MixPlan>();
     std::atomic<int64_t> cursor{0};
@@ -205,30 +212,7 @@ AudioPlayback::~AudioPlayback() {
 bool AudioPlayback::Open(const Document& document,
                          const std::string& baseDirectory, std::string& error) {
     impl_->sources.clear();
-    // AudioPlayback owns the decoded PCM for the active timeline, not a cache
-    // for the whole media library. Decoding unused rushes here made launch
-    // time and memory scale with every imported file.
-    std::set<Ulid> audibleSourceIds;
-    for (const DocumentTrack& track : document.sequence.tracks) {
-        if (track.kind != "audio") continue;
-        for (const DocumentClip& clip : track.clips)
-            audibleSourceIds.insert(clip.source_id);
-    }
-    for (const DocumentSource& source : document.sources) {
-        if (audibleSourceIds.count(source.id) == 0) continue;
-        std::filesystem::path path(source.path);
-        if (path.is_relative())
-            path = std::filesystem::path(baseDirectory) / path;
-        auto decoded = std::make_shared<PCMSource>();
-        std::string decodeError;
-        if (DecodeSource(path.lexically_normal().string(), *decoded,
-                         decodeError)) {
-            impl_->sources[source.id] = std::move(decoded);
-        } else if (decodeError != "no audio stream") {
-            std::fprintf(stderr, "Audio disabled for %s: %s\n",
-                         path.string().c_str(), decodeError.c_str());
-        }
-    }
+    impl_->baseDirectory = baseDirectory;
     RebuildTimeline(document);
 
     impl_->engine = [[AVAudioEngine alloc] init];
@@ -272,8 +256,23 @@ bool AudioPlayback::Open(const Document& document,
                              sourceSample >=
                                  static_cast<int64_t>(clip.source->left.size()))
                              continue;
-                         left[index] += clip.source->left[sourceSample];
-                         right[index] += clip.source->right[sourceSample];
+                         float envelope = clip.gain;
+                         if (clip.fadeInSamples > 0)
+                             envelope *= std::min(
+                                 1.0f,
+                                 static_cast<float>(offset) /
+                                     static_cast<float>(clip.fadeInSamples));
+                         if (clip.fadeOutSamples > 0) {
+                             const int64_t remaining = clip.length - offset;
+                             envelope *= std::min(
+                                 1.0f,
+                                 static_cast<float>(remaining) /
+                                     static_cast<float>(clip.fadeOutSamples));
+                         }
+                         left[index] +=
+                             clip.source->left[sourceSample] * envelope;
+                         right[index] +=
+                             clip.source->right[sourceSample] * envelope;
                          audible = true;
                      }
                      left[index] = std::clamp(left[index], -1.0f, 1.0f);
@@ -319,6 +318,39 @@ bool AudioPlayback::Open(const Document& document,
 }
 
 void AudioPlayback::RebuildTimeline(const Document& document) {
+    // Keep decoded PCM scoped to sources used by the active timeline. Sources
+    // can become audible after Open when a rush is dropped onto an audio
+    // track, so synchronizing the cache belongs to every rebuild.
+    std::set<Ulid> audibleSourceIds;
+    for (const DocumentTrack& track : document.sequence.tracks) {
+        if (track.kind != "audio") continue;
+        for (const DocumentClip& clip : track.clips)
+            audibleSourceIds.insert(clip.source_id);
+    }
+    for (auto source = impl_->sources.begin();
+         source != impl_->sources.end();) {
+        if (audibleSourceIds.count(source->first) == 0)
+            source = impl_->sources.erase(source);
+        else
+            ++source;
+    }
+    for (const DocumentSource& source : document.sources) {
+        if (audibleSourceIds.count(source.id) == 0 ||
+            impl_->sources.count(source.id) != 0)
+            continue;
+        std::filesystem::path path(source.path);
+        if (path.is_relative()) path = impl_->baseDirectory / path;
+        auto decoded = std::make_shared<PCMSource>();
+        std::string decodeError;
+        if (DecodeSource(path.lexically_normal().string(), *decoded,
+                         decodeError)) {
+            impl_->sources[source.id] = std::move(decoded);
+        } else if (decodeError != "no audio stream") {
+            std::fprintf(stderr, "Audio disabled for %s: %s\n",
+                         path.string().c_str(), decodeError.c_str());
+        }
+    }
+
     auto plan = std::make_shared<MixPlan>();
     const bool hasSolo = std::any_of(
         document.sequence.tracks.begin(), document.sequence.tracks.end(),
@@ -336,6 +368,11 @@ void AudioPlayback::RebuildTimeline(const Document& document) {
             mixed.timelineStart = clip.timeline_in.to_frames(kMixRate);
             mixed.sourceStart = clip.source_in.to_frames(kMixRate);
             mixed.length = clip.duration.to_frames(kMixRate);
+            const float gainDb = static_cast<float>(clip.audio_gain_db.num) /
+                                 static_cast<float>(clip.audio_gain_db.den);
+            mixed.gain = std::pow(10.0f, gainDb / 20.0f);
+            mixed.fadeInSamples = clip.audio_fade_in.to_frames(kMixRate);
+            mixed.fadeOutSamples = clip.audio_fade_out.to_frames(kMixRate);
             if (mixed.length > 0) plan->clips.push_back(std::move(mixed));
         }
     }

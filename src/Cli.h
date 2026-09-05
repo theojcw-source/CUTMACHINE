@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Export.h"
+#include "SpeechOnset.h"
 
 #include <map>
 #include <string>
@@ -12,18 +13,150 @@ class EditLog;
 class ProjectEditLog;
 class Project;
 
+// B2 -- ROADMAP.md. Every headless surface uses this serializer for a
+// refusal, including commands implemented outside Cli.cc. Keeping the exit
+// status beside the JSON construction prevents a caller from receiving a
+// non-zero status with a success-shaped or free-form payload.
+int FailCliCommand(const std::string& errorCode, const std::string& detail,
+                   std::string& output, int exitStatus = 1);
+
 // Headless command entry points. These functions depend only on the model
 // library and never initialize AppKit, Metal, media decoding, or rendering.
+int CreateProjectCommand(const std::string& packagePath,
+                         const std::string& projectName, std::string& output);
+// ALPHA-2026-08 -- automation must be able to produce the same local
+// transcript cache the AppKit action consumes; otherwise an agent can read a
+// transcript but cannot complete the workflow that creates it.
+// An empty `whisperModelPath` resolves the model configured locally
+// (Transcription.h's ResolveConfiguredWhisperModel), which is how every
+// caller that is not a human typing a path reaches this.
+// QC-2026-09 A3 -- takes several media because the Whisper model load costs
+// about 8 s and used to be paid once per call. Media whose measured audio
+// level (Document.h, recorded at ingest) says they are mute are skipped and
+// reported rather than sent to the model; `includeSilent` overrides that.
+int TranscribeMediaCommand(const std::string& projectPath,
+                           const std::vector<std::string>& mediaIds,
+                           const std::string& whisperModelPath,
+                           const std::string& language, bool verbatim,
+                           bool includeSilent, std::string& output);
+// B7 -- ROADMAP.md. Transcribes the audio arrangement a timeline actually
+// plays. The cache belongs to the project but is keyed by exact audible clip
+// bounds, model and language, never by a temporary exported media file.
+int TranscribeTimelineCommand(const std::string& projectPath,
+                              const std::string& timelineId,
+                              const std::string& language, bool verbatim,
+                              std::string& output);
+// B7 -- transcribe a delivered media file directly into SRT. This is the same
+// local decode/Whisper path as timeline transcription, without constructing a
+// disposable project merely to make a file addressable as LibraryMedia.
+int SrtFromMediaCommand(const std::string& mediaPath,
+                        const std::string& outputPath,
+                        const std::string& language, bool verbatim,
+                        std::string& output);
+// ALPHA-2026-08 -- the reason these take word indices and never a timecode
+// is PHILOSOPHY.md principle 7: the caller (agent or human) names *which
+// words*, CUTMACHINE resolves *which frames*. A caller that could pass a
+// time would be a caller that could invent one.
+// QC-2026-08 -- picture quality is measured, never judged, so the analysis
+// has to be reachable without the app: an agent that can read a grade but
+// cannot produce one has half a workflow. Mirrors TranscribeMediaCommand.
+int AnalyzeShotQualityCommand(const std::string& projectPath,
+                              const std::string& mediaId, std::string& output);
+int ShotQualityReportCommand(const std::string& projectPath,
+                             std::string& output);
+// QC-2026-09 (A8) -- read-only arithmetic over the active composited
+// timeline. The command publishes exact time and ratio values so callers do
+// not have to count clips or convert frame rates themselves.
+int TimelineStatsCommand(const std::string& projectPath, std::string& output);
+// QC-2026-09 (A6) -- render the same deterministic timeline sampling exposed
+// to MCP. The JPEG is written to outputPath and exact cell metadata is
+// returned in the ordinary CLI envelope.
+int ContactSheetCommand(const std::string& projectPath,
+                        const std::string& outputPath,
+                        const std::string& timelineId, int32_t maximumImages,
+                        std::string& output);
+int CutSheetCommand(const std::string& projectPath,
+                    const std::string& outputPath,
+                    const std::string& timelineId, int32_t maximumImages,
+                    std::string& output);
+// ONSET-2026-08 -- same shape, and for the same reason: where the voice
+// starts is a measurement, so it has to be reachable without the app. The
+// report publishes the trim in whole frames precisely so a caller never
+// computes one (PHILOSOPHY.md principle 7).
+int AnalyzeSpeechOnsetCommand(const std::string& projectPath,
+                              const std::string& mediaId, std::string& output,
+                              const SpeechOnsetSettings& settings = {});
+int SpeechOnsetReportCommand(const std::string& projectPath,
+                             std::string& output,
+                             const SpeechOnsetThresholds& thresholds = {});
+// ALIGN-2026-08 -- reports which cached word boundaries the speech envelope
+// contradicts, and where each one belongs. Read-only unless `apply`: a
+// transcript is a cache artifact several tools read, and rewriting it under
+// them is a decision for the caller, not for a report.
+//
+// QC-2026-09 (A1) -- `apply` is that decision. Without it the correction
+// exists only in a report, and every tool that cuts on words keeps cutting on
+// the boundaries the signal contradicts; the measured cost of that was some
+// forty probe round trips in one session. The document is never touched
+// either way -- this rewrites a cache file, which a re-transcription
+// regenerates.
+int AlignTranscriptsCommand(const std::string& projectPath, bool apply,
+                            std::string& output);
+int ListDisfluenciesCommand(const std::string& projectPath,
+                            const std::string& clipId, std::string& output);
+int RemoveWordsCommand(const std::string& projectPath,
+                       const std::string& clipId, const std::string& rangesJson,
+                       std::string& output);
+// QC-2026-09 A2 -- closes the silences inside one clip, from the speech
+// envelope alone. Applies one reversible RemoveWordsOperation carrying the
+// clip's A/V pair, and reports which pauses it closed. Needs a cached
+// speech onset analysis for the clip's source; it needs no transcript,
+// which is the point -- tightening a take should not wait on Whisper.
+int TightenPausesCommand(const std::string& projectPath,
+                         const std::string& clipId, int64_t minimumGapMs,
+                         int64_t keepFrames, std::string& output);
+// B4 -- ROADMAP.md. Closes measured head/tail air without consulting word
+// timestamps. The junction form measures both sides before applying one
+// atomic operation, so it cannot oscillate over successive passes.
+int TrimBoundaryAirCommand(const std::string& projectPath,
+                           const std::string& clipId, int64_t keepFrames,
+                           int64_t minimumAirMs, std::string& output);
+int CloseJunctionAirCommand(const std::string& projectPath,
+                            const std::string& leftClipId,
+                            const std::string& rightClipId, int64_t keepFrames,
+                            int64_t minimumAirMs, std::string& output);
+// QC-2026-09 A4 -- read-only. Reports which clips of the active timeline play
+// a given frame of a given rush, and where. The conversion it performs is the
+// one every hand-computed timeline position in a measured session got wrong
+// at least once.
+int LocateSourceFrameCommand(const std::string& projectPath,
+                             const std::string& mediaId, int64_t sourceFrame,
+                             std::string& output);
 int DescribeCommand(const std::string& documentPath, std::string& output);
+// SRT-2026-08 -- read-only. Subtitles were reachable only from the app: the
+// cue builder and SaveSrt both had their single caller in main.mm, so a
+// headless montage could be transcribed but never subtitled, against
+// AGENTS.md's rule that what only the mouse can reach does not exist. Cues
+// come from the audible audio tracks, because subtitles follow what is
+// heard, not what is on screen -- an overlay laid over someone else's words
+// must not caption itself.
+int ExportSrtCommand(const std::string& projectPath,
+                     const std::string& outputPath, std::string& output,
+                     const std::string& timelineId = {});
+// SEQ-2026-08 -- read-only: reports the sequence format the project's rushes
+// imply, without touching the document. Conforming to it is a separate,
+// journalized UpdateSequenceOperation.
+int ProposeSequenceCommand(const std::string& projectPath, std::string& output);
 
 // The same JSON view DescribeCommand produces (sequence/tracks/library/bins/
 // markers, with the A1/A2.../K1... aliases the MCP tool catalog's ID
 // resolver and the chat panel both key off), computed directly from an
 // in-memory Document instead of a project file path. See McpLiveBackend.h.
 std::string DescribeDocument(const Document& document);
+std::string DescribeProject(const Project& project);
 int ApplyOperationCommand(const std::string& documentPath,
-                          const std::string& operationJson,
-                          std::string& output);
+                          const std::string& operationJson, std::string& output,
+                          const std::string& timelineId = {});
 int ApplyProjectOperationCommand(const std::string& projectPath,
                                  const std::string& operationJson,
                                  std::string& output);
@@ -38,12 +171,15 @@ int RedoProjectOperationCommand(const std::string& projectPath,
 // triggering undo/redo in the app. There is no CLI flag for these yet; they
 // exist so the MCP server (Operations.h ticket F1.1) can reuse this exact
 // path instead of duplicating EditLog::Undo/Redo call sites.
-int UndoOperationCommand(const std::string& documentPath, std::string& output);
-int RedoOperationCommand(const std::string& documentPath, std::string& output);
+int UndoOperationCommand(const std::string& documentPath, std::string& output,
+                         const std::string& timelineId = {});
+int RedoOperationCommand(const std::string& documentPath, std::string& output,
+                         const std::string& timelineId = {});
 int ExportCommand(const std::string& documentPath,
                   const ExportSettings& settings,
                   const ExportProgressCallback& progress,
-                  const std::atomic_bool* cancel, std::string& output);
+                  const std::atomic_bool* cancel, std::string& output,
+                  const std::string& timelineId = {});
 
 std::string TimelineEditLogPathForProject(const std::string& projectPath,
                                           const std::string& timelineId);

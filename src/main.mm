@@ -27,6 +27,7 @@ extern "C" {
 #include <vector>
 
 #include "AudioPlayback.h"
+#include "BoundaryAir.h"
 #include "Cli.h"
 #include "ColorEffects.h"
 #include "DecodeWorker.h"
@@ -36,12 +37,14 @@ extern "C" {
 #include "FrameCache.h"
 #include "Ingest.h"
 #include "InspectorGradeControls.h"
+#include "InterviewShort.h"
 #include "McpLiveBackend.h"
 #include "McpProjectBackend.h"
 #include "McpServer.h"
 #include "MediaPanelModel.h"
 #include "MediaTaskManager.h"
 #include "PanelLayout.h"
+#include "PauseTightening.h"
 #include "PerformanceMetrics.h"
 #include "Project.h"
 #include "ProjectRecovery.h"
@@ -49,11 +52,16 @@ extern "C" {
 #include "Proxy.h"
 #include "Relink.h"
 #include "Renderer.h"
+#include "ResolveExport.h"
+#include "ResolveImport.h"
+#include "Subtitles.h"
 #include "Thumbnail.h"
 #include "Timecode.h"
 #include "Timeline.h"
 #include "TimelineView.h"
+#include "Transcription.h"
 #include "TransportBar.h"
+#include "UiPreferences.h"
 #include "UiTheme.h"
 #include "Waveform.h"
 
@@ -75,6 +83,8 @@ constexpr size_t kGlobalCacheBudget = 2000000000ULL;  // 2.0 GB, all sources.
 constexpr double kAddTrackRowHeight = 22.0;
 NSPasteboardType const kCutmachineMediaPasteboardType =
     @"com.cutmachine.library-media";
+NSPasteboardType const kCutmachineMediaSelectionPasteboardType =
+    @"com.cutmachine.library-media-selection";
 NSPasteboardType const kCutmachineBinPasteboardType = @"com.cutmachine.bin";
 NSPasteboardType const kCutmachineTimelinePasteboardType =
     @"com.cutmachine.timeline";
@@ -85,6 +95,7 @@ constexpr NSDragOperation kMediaLocalDragOperations =
     NSDragOperationCopy | NSDragOperationMove;
 NSString* const kAutomaticProxyGenerationDefaultsKey =
     @"CUTMACHINEAutomaticProxyGeneration";
+NSString* const kWhisperModelPathDefaultsKey = @"CUTMACHINEWhisperModelPath";
 NSString* const kProgramVideoScopeDefaultsKey = @"CUTMACHINEProgramVideoScope";
 
 #if defined(CUTMACHINE_UI_SMOKE_TEST)
@@ -92,6 +103,7 @@ bool gUiSmokeTesting = false;
 int gUiSmokeFailures = 0;
 bool gUiSmokeIconMouseDown = false;
 bool gUiSmokeIconDragSession = false;
+NSUInteger gUiSmokeMediaDragCount = 0;
 int gUiSmokeDecodeReloads = 0;
 std::filesystem::path gUiSmokeRoot;
 std::string gUiSmokeProjectPath;
@@ -327,6 +339,20 @@ struct PendingThumbnail {
     std::filesystem::path absolute_path;
 };
 
+struct PendingTranscription {
+    Ulid media_id;
+    Ulid timeline_id;
+    Ulid batch_id;
+    std::filesystem::path absolute_path;
+};
+
+struct PendingTimelineTranscription {
+    Ulid timeline_id;
+    std::set<Ulid> task_ids;
+    std::map<Ulid, std::filesystem::path> transcript_paths;
+    std::string error;
+};
+
 struct RelinkProbeResult {
     LibraryMedia media;
     std::string error;
@@ -502,6 +528,8 @@ struct AppState {
     std::map<Ulid, PendingProxy> pendingProxies;
     std::map<Ulid, PendingWaveform> pendingWaveforms;
     std::map<Ulid, PendingThumbnail> pendingThumbnails;
+    std::map<Ulid, PendingTranscription> pendingTranscriptions;
+    std::map<Ulid, PendingTimelineTranscription> pendingTimelineTranscriptions;
     std::map<Ulid, PendingRelink> pendingRelinks;
     std::map<Ulid, PendingBatchRelink> pendingBatchRelinks;
     std::map<Ulid, AudioWaveform> waveforms;
@@ -686,7 +714,8 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)timelineMagnify:(NSEvent*)event;
 - (BOOL)timelineKeyDown:(NSEvent*)event;
 - (void)timelineKeyUp:(NSEvent*)event;
-- (BOOL)timelineDropMedia:(NSString*)mediaId atViewPoint:(NSPoint)point;
+- (BOOL)timelineDropMediaIds:(NSArray<NSString*>*)mediaIds
+                 atViewPoint:(NSPoint)point;
 - (NSMenu*)timelineMenuForEvent:(NSEvent*)event;
 @end
 
@@ -726,7 +755,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
 }
 - (instancetype)initWithFrame:(NSRect)frame {
     if ((self = [super initWithFrame:frame]))
-        [self registerForDraggedTypes:@[ kCutmachineMediaPasteboardType ]];
+        [self registerForDraggedTypes:@[
+            kCutmachineMediaPasteboardType,
+            kCutmachineMediaSelectionPasteboardType
+        ]];
     return self;
 }
 - (BOOL)acceptsFirstResponder {
@@ -800,18 +832,25 @@ DeleteGapOperation GapDeleteOperationForSelection(
     return [self.eventTarget timelineMenuForEvent:event];
 }
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
-    return [[sender draggingPasteboard]
-               availableTypeFromArray:@[ kCutmachineMediaPasteboardType ]]
+    return [[sender draggingPasteboard] availableTypeFromArray:@[
+        kCutmachineMediaSelectionPasteboardType, kCutmachineMediaPasteboardType
+    ]]
                ? NSDragOperationCopy
                : NSDragOperationNone;
 }
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
-    NSString* mediaId = [[sender draggingPasteboard]
-        stringForType:kCutmachineMediaPasteboardType];
-    if (!mediaId) return NO;
+    NSPasteboard* pasteboard = sender.draggingPasteboard;
+    NSArray<NSString*>* mediaIds = [pasteboard
+        propertyListForType:kCutmachineMediaSelectionPasteboardType];
+    if (![mediaIds isKindOfClass:NSArray.class] || mediaIds.count == 0) {
+        NSString* mediaId =
+            [pasteboard stringForType:kCutmachineMediaPasteboardType];
+        mediaIds = mediaId ? @[ mediaId ] : @[];
+    }
+    if (mediaIds.count == 0) return NO;
     const NSPoint point = [self convertPoint:sender.draggingLocation
                                     fromView:nil];
-    return [self.eventTarget timelineDropMedia:mediaId atViewPoint:point];
+    return [self.eventTarget timelineDropMediaIds:mediaIds atViewPoint:point];
 }
 @end
 
@@ -954,6 +993,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, weak) id doubleClickTarget;
 @property(nonatomic) SEL doubleClickAction;
 @property(nonatomic, strong) NSIndexPath* forwardedMouseDownPath;
+@property(nonatomic, strong) NSIndexPath* rangeSelectionAnchor;
 @end
 @implementation ContextCollectionView
 - (NSIndexPath*)iconIndexPathAtPoint:(NSPoint)point {
@@ -1003,9 +1043,29 @@ DeleteGapOperation GapDeleteOperationForSelection(
     const BOOL renameClick =
         event.clickCount == 1 && [self point:point isInLabelAtIndexPath:path];
     NSSet<NSIndexPath*>* previous = self.selectionIndexPaths;
+    const BOOL commandPressed =
+        (event.modifierFlags & NSEventModifierFlagCommand) != 0;
+    const BOOL shiftPressed =
+        (event.modifierFlags & NSEventModifierFlagShift) != 0;
+    const BOOL deferSingleSelection = !commandPressed && !shiftPressed &&
+                                      previous.count > 1 &&
+                                      [previous containsObject:path];
     NSSet<NSIndexPath*>* selection = [NSSet setWithObject:path];
-    if ((event.modifierFlags & NSEventModifierFlagCommand) != 0 &&
-        self.allowsMultipleSelection) {
+    if (deferSingleSelection) {
+        // Keep the group intact until AppKit distinguishes a click from a
+        // drag. A plain mouse-up still collapses to the clicked item.
+        selection = previous;
+    } else if (shiftPressed && self.allowsMultipleSelection &&
+               (self.rangeSelectionAnchor || previous.count > 0)) {
+        NSIndexPath* anchor = self.rangeSelectionAnchor ?: previous.anyObject;
+        const NSUInteger first = std::min(anchor.item, path.item);
+        const NSUInteger last = std::max(anchor.item, path.item);
+        NSMutableSet<NSIndexPath*>* range =
+            commandPressed ? [previous mutableCopy] : [NSMutableSet set];
+        for (NSUInteger item = first; item <= last; ++item)
+            [range addObject:[NSIndexPath indexPathForItem:item inSection:0]];
+        selection = range;
+    } else if (commandPressed && self.allowsMultipleSelection) {
         NSMutableSet<NSIndexPath*>* toggled = [previous mutableCopy];
         if ([toggled containsObject:path])
             [toggled removeObject:path];
@@ -1014,6 +1074,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
         selection = toggled;
     }
     self.selectionIndexPaths = selection;
+    if (!shiftPressed) self.rangeSelectionAnchor = path;
     NSSet<NSIndexPath*>* added = [selection
         objectsPassingTest:^BOOL(NSIndexPath* candidate, BOOL* stop) {
           (void)stop;
@@ -1029,6 +1090,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
     while (true) {
         NSEvent* next = [self.window nextEventMatchingMask:trackingMask];
         if (!next || next.type == NSEventTypeLeftMouseUp) {
+            if (deferSingleSelection) {
+                self.selectionIndexPaths = [NSSet setWithObject:path];
+                self.rangeSelectionAnchor = path;
+            }
             if (renameClick) {
                 NSCollectionViewItem* item = [self itemAtIndexPath:path];
                 if (item.textField.editable) [item.textField selectText:self];
@@ -1057,6 +1122,34 @@ DeleteGapOperation GapDeleteOperationForSelection(
         id<NSPasteboardWriting> writer = [self.delegate collectionView:self
                                     pasteboardWriterForItemAtIndexPath:path];
         if (!writer) continue;
+        if ([writer isKindOfClass:NSPasteboardItem.class] &&
+            selection.count > 1) {
+            NSArray<NSIndexPath*>* ordered = [selection.allObjects
+                sortedArrayUsingComparator:^NSComparisonResult(
+                    NSIndexPath* left, NSIndexPath* right) {
+                  if (left.item < right.item) return NSOrderedAscending;
+                  if (left.item > right.item) return NSOrderedDescending;
+                  return NSOrderedSame;
+                }];
+            NSMutableArray<NSString*>* mediaIds = [NSMutableArray array];
+            for (NSIndexPath* selectedPath in ordered) {
+                id<NSPasteboardWriting> selectedWriter =
+                    [self.delegate collectionView:self
+                        pasteboardWriterForItemAtIndexPath:selectedPath];
+                if (![selectedWriter isKindOfClass:NSPasteboardItem.class])
+                    continue;
+                NSString* identifier = [(NSPasteboardItem*)selectedWriter
+                    stringForType:kCutmachineMediaPasteboardType];
+                if (identifier) [mediaIds addObject:identifier];
+            }
+            if (mediaIds.count > 1)
+                [(NSPasteboardItem*)writer
+                    setPropertyList:mediaIds
+                            forType:kCutmachineMediaSelectionPasteboardType];
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+            if (gUiSmokeTesting) gUiSmokeMediaDragCount = mediaIds.count;
+#endif
+        }
         NSCollectionViewItem* collectionItem = [self itemAtIndexPath:path];
         if (!collectionItem) continue;
         NSDraggingItem* draggingItem =
@@ -1302,6 +1395,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 @property(nonatomic, strong) NSTextField* sourceMonitorTitleLabel;
 @property(nonatomic, strong) NSTextField* sourceMonitorZoneLabel;
 @property(nonatomic, strong) NSTextField* programMonitorTitleLabel;
+@property(nonatomic, strong) NSTextField* programSubtitleLabel;
 @property(nonatomic, strong) NSPopUpButton* sourceMonitorZoomPopup;
 @property(nonatomic, strong) NSPopUpButton* programMonitorZoomPopup;
 @property(nonatomic, strong) NSPopUpButton* programVideoScopePopup;
@@ -1363,6 +1457,10 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)createTimelinePressed:(id)sender;
 - (void)createTimelineFromSelectedMedia:(id)sender;
 - (void)saveProjectPressed:(id)sender;
+- (void)transcribeSelectedMedia:(id)sender;
+- (void)transcribeTimeline:(id)sender;
+- (void)chooseWhisperModel:(id)sender;
+- (NSString*)requestWhisperModelPath;
 - (void)openIconBin:(NSClickGestureRecognizer*)recognizer;
 - (void)openIconItem:(id)sender;
 - (void)requestSourcePosition:(RationalTime)position;
@@ -1374,6 +1472,7 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)processCompletedMediaProxies;
 - (void)processCompletedMediaWaveforms;
 - (void)processCompletedMediaThumbnails;
+- (void)processCompletedMediaTranscriptions;
 - (void)processCompletedMediaRelinks;
 - (void)processCompletedBatchRelinks;
 - (void)reloadDecodeWorkers;
@@ -1384,6 +1483,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)enqueueWaveformForMediaIdentifier:(NSString*)identifier;
 - (void)loadOrEnqueueThumbnailForMediaIdentifier:(NSString*)identifier;
 - (void)enqueueThumbnailForMediaIdentifier:(NSString*)identifier;
+- (Ulid)enqueueTranscriptionForMediaIdentifier:(NSString*)identifier
+                                     modelPath:(NSString*)modelPath
+                                       batchId:(const Ulid&)batchId;
 #if defined(CUTMACHINE_UI_SMOKE_TEST)
 - (void)runUiSmokeTests;
 #endif
@@ -1435,14 +1537,16 @@ static void ClickControlThroughWindow(NSControl* control) {
     [window sendEvent:down];
 }
 
-static void SendWindowClick(NSView* view, NSPoint point) {
+static void SendWindowClick(
+    NSView* view, NSPoint point,
+    NSEventModifierFlags modifiers = static_cast<NSEventModifierFlags>(0)) {
     NSWindow* window = view.window;
     if (!window) return;
     const NSPoint windowPoint = [view convertPoint:point toView:nil];
     const NSTimeInterval timestamp = NSProcessInfo.processInfo.systemUptime;
     NSEvent* down = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
                                        location:windowPoint
-                                  modifierFlags:0
+                                  modifierFlags:modifiers
                                       timestamp:timestamp
                                    windowNumber:window.windowNumber
                                         context:nil
@@ -1451,7 +1555,7 @@ static void SendWindowClick(NSView* view, NSPoint point) {
                                        pressure:1.0];
     NSEvent* up = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
                                      location:windowPoint
-                                modifierFlags:0
+                                modifierFlags:modifiers
                                     timestamp:timestamp + 0.01
                                  windowNumber:window.windowNumber
                                       context:nil
@@ -1955,6 +2059,12 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     [app addItem:[self menuItem:@"Raccourcis clavier…"
                          action:@selector(editKeyboardShortcuts:)
                             key:@","]];
+    [app addItem:[self menuItem:@"Moteur IA…"
+                         action:@selector(configureAiEngine:)
+                            key:@""]];
+    [app addItem:[self menuItem:@"Modèle Whisper…"
+                         action:@selector(chooseWhisperModel:)
+                            key:@""]];
     [app addItem:NSMenuItem.separatorItem];
     [app addItemWithTitle:@"Quitter CUTMACHINE"
                    action:@selector(terminate:)
@@ -1969,6 +2079,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     [file addItem:[self menuItem:@"Importer des rushes…"
                           action:@selector(importMediaPressed:)
                              key:@"i"]];
+    [file addItem:[self menuItem:@"Importer des sous-titres SRT…"
+                          action:@selector(importSubtitlesPressed:)
+                             key:@""]];
     [file addItem:[self menuItem:@"Reconnecter les médias offline…"
                           action:@selector(batchRelinkOfflineMedia:)
                              key:@""]];
@@ -1983,6 +2096,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     [file addItem:[self menuItem:@"Exporter la vidéo finale…"
                           action:@selector(exportFinalVideo:)
                              key:@"e"]];
+    [file addItem:[self menuItem:@"Exporter les sous-titres SRT…"
+                          action:@selector(exportSubtitlesPressed:)
+                             key:@""]];
     fileRoot.submenu = file;
     [bar addItem:fileRoot];
 
@@ -2115,6 +2231,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     [timeline addItem:[self menuItem:@"Réglages de séquence…"
                               action:@selector(configureSequence:)
                                  key:@""]];
+    [timeline addItem:[self menuItem:@"Transcrire la timeline avec Whisper…"
+                              action:@selector(transcribeTimeline:)
+                                 key:@""]];
     [timeline addItem:NSMenuItem.separatorItem];
     [timeline addItem:[self menuItem:@"Ajouter une piste vidéo"
                               action:@selector(menuAddVideoTrack:)
@@ -2158,6 +2277,41 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     [bar addItem:viewRoot];
     NSApp.mainMenu = bar;
     [self applyShortcutBindingsToMenus];
+}
+
+- (void)configureAiEngine:(id)sender {
+    (void)sender;
+    [self.chatPanelView showConfigurationWindow];
+}
+
+- (NSString*)requestWhisperModelPath {
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.title = @"Choisir un modèle Whisper local";
+    panel.message =
+        @"Sélectionnez un modèle whisper.cpp au format GGML (.bin). "
+         "Ce choix sera mémorisé sur ce Mac.";
+    panel.prompt = @"Utiliser ce modèle";
+    panel.allowsMultipleSelection = NO;
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.resolvesAliases = YES;
+    panel.allowedContentTypes = @[ UTTypeData ];
+    if ([panel runModal] != NSModalResponseOK || !panel.URL) return nil;
+    NSString* modelPath = panel.URL.path;
+    if (modelPath.length == 0) return nil;
+    [NSUserDefaults.standardUserDefaults
+        setObject:modelPath
+           forKey:kWhisperModelPathDefaultsKey];
+    return modelPath;
+}
+
+- (void)chooseWhisperModel:(id)sender {
+    (void)sender;
+    NSString* modelPath = [self requestWhisperModelPath];
+    if (modelPath)
+        self.binSummaryLabel.stringValue =
+            [NSString stringWithFormat:@"Modèle Whisper · %@",
+                                       modelPath.lastPathComponent];
 }
 
 - (void)toggleFullscreen:(id)sender {
@@ -2225,14 +2379,15 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
 }
 
 - (BOOL)commitColorSettings:(const ColorManagementSettings&)settings {
-    const ColorManagementSettings previous =
-        self.state->document.color_management;
-    self.state->document.color_management = settings;
+    EditError error = EditError::None;
     std::string message;
-    if (![self persistEdits:message]) {
-        self.state->document.color_management = previous;
-        std::fprintf(stderr, "Unable to persist color settings: %s\n",
-                     message.c_str());
+    if (![self applyAndPersistTimelineOperation:Operation {
+            SetColorManagementOperation { settings }
+        }
+                                          error:error
+                                        message:message]) {
+        std::fprintf(stderr, "Unable to apply color settings (%s): %s\n",
+                     EditErrorName(error), message.c_str());
         NSBeep();
         return NO;
     }
@@ -3213,6 +3368,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     for (const DocumentSource& source : self.state->document.sources) {
         const LibraryMedia* media =
             self.state->document.FindLibraryMedia(source.id);
+        if (media && !media->has_video) {
+            self.state->mediaMetadata[source.id] = *media;
+            continue;
+        }
         std::filesystem::path mediaPath(source.path);
         if (mediaPath.is_relative()) mediaPath = baseDirectory / mediaPath;
         LibraryMedia detected;
@@ -3254,6 +3413,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     for (const DocumentSource& source : self.state->document.sources) {
         const LibraryMedia* media =
             self.state->document.FindLibraryMedia(source.id);
+        if (media && !media->has_video) continue;
         std::filesystem::path mediaPath(source.path);
         if (mediaPath.is_relative()) {
             mediaPath = baseDirectory / mediaPath;
@@ -3739,6 +3899,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                                   action:@selector(batchRelinkOfflineMedia:)
                                      key:@""]];
     [mediaContext addItem:NSMenuItem.separatorItem];
+    [mediaContext addItem:[self menuItem:@"Transcrire avec Whisper…"
+                                  action:@selector(transcribeSelectedMedia:)
+                                     key:@""]];
+    [mediaContext addItem:NSMenuItem.separatorItem];
     [mediaContext addItem:[self menuItem:@"Générer / recréer le proxy"
                                   action:@selector(generateSelectedMediaProxy:)
                                      key:@""]];
@@ -3923,7 +4087,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     // the window's lifetime.
     __weak AppDelegate* weakSelf = self;
     self.chatBackend = new McpLiveBackend(
-        self.state->document, self.state->editLog, [weakSelf]() {
+        self.state->document, self.state->editLog,
+        [weakSelf]() {
             AppDelegate* strongSelf = weakSelf;
             if (!strongSelf) return;
             const RationalTime playhead = strongSelf.state->requestedPosition;
@@ -3951,6 +4116,218 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             }
             [strongSelf refreshTimelineAfterEditFromPosition:playhead];
             [strongSelf rebuildMediaList];
+        },
+        [weakSelf](ProjectOperation operation, std::string& resultJson,
+                   std::string& errorName, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                errorName = "IoError";
+                message = "the application window is no longer available";
+                return false;
+            }
+            if (![strongSelf persistEdits:message]) {
+                errorName = "IoError";
+                return false;
+            }
+            Project candidate = strongSelf.state->project;
+            ProjectEditLog projectLog = strongSelf.state->projectEditLog;
+            EditError editError = EditError::None;
+            if (!projectLog.Apply(candidate, std::move(operation), editError,
+                                  message)) {
+                errorName = EditErrorName(editError);
+                return false;
+            }
+            const Ulid createdId = candidate.active_timeline_id;
+            if (![strongSelf commitProjectCandidate:candidate
+                                            editLog:strongSelf.state->editLog
+                                         projectLog:projectLog
+                                            message:message]) {
+                errorName = "IoError";
+                return false;
+            }
+            strongSelf.state->project = std::move(candidate);
+            strongSelf.state->projectEditLog = std::move(projectLog);
+            strongSelf.state->lastHistoryDomain = HistoryDomain::Project;
+            [strongSelf rebuildMediaList];
+            if (![strongSelf
+                    activateTimelineIdentifier:
+                        [NSString stringWithUTF8String:createdId.c_str()]]) {
+                errorName = "UnknownSequence";
+                message = "the created timeline could not be activated";
+                return false;
+            }
+            resultJson = "{\"ok\":true,\"timeline_id\":\"" + createdId + "\"}";
+            return true;
+        },
+        [weakSelf](std::string& json, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            json = DescribeProject(strongSelf.state->project);
+            return true;
+        },
+        [weakSelf](std::string& json, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            return DescribeTimelineTranscriptForAgent(
+                strongSelf.state->document,
+                projectPath.parent_path() / ".cutmachine" / "transcripts", json,
+                message);
+        },
+        [weakSelf](const Ulid& sourceId, Transcript& transcript,
+                   std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            return LoadAudioTranscript(
+                (projectPath.parent_path() / ".cutmachine" / "transcripts" /
+                 (sourceId + ".json"))
+                    .string(),
+                transcript, message);
+        },
+        [weakSelf](const Ulid& sourceId, ShotQualityReport& report,
+                   std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            return LoadShotQuality((projectPath.parent_path() / ".cutmachine" /
+                                    "shotquality" / (sourceId + ".json"))
+                                       .string(),
+                                   report, message);
+        },
+        [weakSelf](const Ulid& sourceId, std::string& resultJson,
+                   std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            // Same command the CLI runs, so a grade produced from the chat
+            // panel is the same artifact `--shot-quality` writes.
+            std::string output;
+            const int result = AnalyzeShotQualityCommand(
+                strongSelf.documentPath.UTF8String ?: "", sourceId, output);
+            if (result != 0) {
+                message = output;
+                return false;
+            }
+            resultJson = output;
+            return true;
+        },
+        [weakSelf](const Ulid& sourceId, const RationalTime& time,
+                   std::string& jpegBytes, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const LibraryMedia* media = nullptr;
+            for (const LibraryMedia& item : strongSelf.state->project.rushes) {
+                if (item.id == sourceId) {
+                    media = &item;
+                    break;
+                }
+            }
+            if (media == nullptr) {
+                message = "unknown media_id '" + sourceId + "'";
+                return false;
+            }
+            if (!media->has_video) {
+                message = "media_id '" + sourceId +
+                          "' is audio-only; read_frame requires a video "
+                          "stream";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            std::filesystem::path path(media->path);
+            if (path.is_relative()) path = projectPath.parent_path() / path;
+            return ::CaptureSourceFrame(path.lexically_normal().string(), time,
+                                        FrameCaptureSettings{}, jpegBytes,
+                                        message);
+        },
+        [weakSelf](const Ulid& sourceId, SpeechOnsetReport& report,
+                   std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            return LoadSpeechOnset((projectPath.parent_path() / ".cutmachine" /
+                                    "speechonset" / (sourceId + ".json"))
+                                       .string(),
+                                   report, message);
+        },
+        [weakSelf](const Ulid& sourceId, const SpeechOnsetSettings& settings,
+                   std::string& resultJson, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            std::string output;
+            const int result = AnalyzeSpeechOnsetCommand(
+                strongSelf.documentPath.UTF8String ?: "", sourceId, output,
+                settings);
+            if (result != 0) {
+                message = output;
+                return false;
+            }
+            resultJson = output;
+            return true;
+        },
+        [weakSelf](const Ulid& timelineId, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            if (![strongSelf
+                    activateTimelineIdentifier:
+                        [NSString stringWithUTF8String:timelineId.c_str()]]) {
+                message = "unknown timeline_id '" + timelineId + "'";
+                return false;
+            }
+            return true;
+        },
+        [[CMUiPreferences sharedPreferences]
+            requiresExplicitTimelineForAgentEdits],
+        [weakSelf](const TimelineSheetPlan& plan,
+                   const TimelineSheetSettings& settings,
+                   std::string& jpegBytes, std::string& message) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) {
+                message = "the application window is no longer available";
+                return false;
+            }
+            const std::filesystem::path projectPath =
+                std::filesystem::absolute(std::filesystem::path(
+                    strongSelf.documentPath.UTF8String ?: ""));
+            return RenderTimelineSheet(strongSelf.state->document,
+                                       projectPath.parent_path(), plan,
+                                       settings, jpegBytes, message);
         });
     self.chatPanelView = [[CMChatPanelView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];
@@ -4006,6 +4383,19 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                    self.programMonitorView.bounds.size.height);
     self.offlineMediaLabel.autoresizingMask =
         NSViewWidthSizable | NSViewHeightSizable;
+    self.programSubtitleLabel = [NSTextField labelWithString:@""];
+    self.programSubtitleLabel.alignment = NSTextAlignmentCenter;
+    self.programSubtitleLabel.font =
+        CMFont(ui::theme::kFontSizeMonitorTimecode, NSFontWeightSemibold);
+    self.programSubtitleLabel.textColor = CMThemeColor(ui::theme::kTextPrimary);
+    self.programSubtitleLabel.maximumNumberOfLines = 3;
+    self.programSubtitleLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    self.programSubtitleLabel.hidden = YES;
+    self.programSubtitleLabel.frame = NSMakeRect(
+        32.0, 28.0, self.programMonitorView.bounds.size.width - 64.0, 112.0);
+    self.programSubtitleLabel.autoresizingMask =
+        NSViewWidthSizable | NSViewMaxYMargin;
+    [self.programMonitorView addSubview:self.programSubtitleLabel];
     self.sourceOfflineMediaLabel =
         [NSTextField labelWithString:@"MÉDIA OFFLINE"];
     self.sourceOfflineMediaLabel.alignment = NSTextAlignmentCenter;
@@ -5780,6 +6170,23 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (action == @selector(batchRelinkOfflineMedia:))
         return self.state && !self.state->offlineSourceIds.empty() &&
                self.state->pendingBatchRelinks.empty();
+    if (action == @selector(transcribeTimeline:)) {
+        if (!self.state) return NO;
+        for (const auto& batch : self.state->pendingTimelineTranscriptions)
+            if (batch.second.timeline_id == self.state->activeTimelineId)
+                return NO;
+        // Keep the command actionable. The handler can explain an empty or
+        // muted timeline; a disabled menu item cannot explain a false
+        // negative caused by stale library probe metadata.
+        return YES;
+    }
+    if (action == @selector(transcribeSelectedMedia:)) {
+        const LibraryMedia* media =
+            self.state ? self.state->document.FindLibraryMedia(
+                             [self selectedMediaId].UTF8String ?: "")
+                       : nullptr;
+        return media && media->has_audio;
+    }
     if (action == @selector(generateSelectedMediaProxy:) ||
         action == @selector(regenerateSelectedMediaThumbnail:))
         return self.state && self.state->document.FindLibraryMedia(
@@ -6243,9 +6650,12 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             if (image.image) {
                 image.contentTintColor = nil;
             } else {
-                image.image = SystemSymbol(
-                    offline ? @"exclamationmark.triangle" : @"film",
-                    offline ? @"Média offline" : @"Média vidéo");
+                image.image = SystemSymbol(offline ? @"exclamationmark.triangle"
+                                           : media->has_video ? @"film"
+                                                              : @"waveform",
+                                           offline ? @"Média offline"
+                                           : media->has_video ? @"Média vidéo"
+                                                              : @"Média audio");
                 image.contentTintColor = offline
                                              ? CMThemeColor(ui::theme::kError)
                                              : CMTextSecondaryColor();
@@ -6302,6 +6712,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     else if ([tableColumn.identifier isEqualToString:@"format"])
         label.stringValue =
             self.state->offlineSourceIds.count(media->id) ? @"Média offline"
+            : media->metadata_complete && !media->has_video
+                ? [NSString stringWithFormat:@"Audio · %s · %d ch",
+                                             media->codec.c_str(),
+                                             media->audio_channels]
             : media->metadata_complete
                 ? [NSString stringWithFormat:@"%@%s %dx%d",
                                              media->proxy_path.empty()
@@ -6364,6 +6778,75 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             : @"";
     if ([panel runModal] == NSModalResponseOK)
         [self importMediaURLs:panel.URLs intoBin:target];
+}
+
+- (void)importSubtitlesPressed:(id)sender {
+    (void)sender;
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.title = @"Importer des sous-titres SubRip";
+    panel.prompt = @"Importer";
+    panel.allowsMultipleSelection = NO;
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowedContentTypes = @[ [UTType typeWithFilenameExtension:@"srt"] ];
+    if ([panel runModal] != NSModalResponseOK || !panel.URL) return;
+
+    std::vector<SubtitleCue> cues;
+    std::string message;
+    if (!LoadSrt(panel.URL.fileSystemRepresentation ?: "", cues, message)) {
+        NSAlert* alert = [NSAlert new];
+        alert.alertStyle = NSAlertStyleCritical;
+        alert.messageText = @"Import SRT impossible";
+        alert.informativeText =
+            [NSString stringWithUTF8String:message.c_str()] ?: @"SRT invalide";
+        [alert runModal];
+        return;
+    }
+    int32_t trackIndex = 0;
+    for (const DocumentTrack& track : self.state->document.sequence.tracks)
+        trackIndex = std::max(trackIndex, track.index + 1);
+    EditError error = EditError::None;
+    AddTrackOperation operation = BuildSubtitleTrackEdit(cues, trackIndex);
+    if (![self applyAndPersistTimelineOperation:Operation{std::move(operation)}
+                                          error:error
+                                        message:message]) {
+        NSAlert* alert = [NSAlert new];
+        alert.alertStyle = NSAlertStyleCritical;
+        alert.messageText = @"Import SRT impossible";
+        alert.informativeText = [NSString stringWithUTF8String:message.c_str()]
+                                    ?: @"Erreur inconnue";
+        [alert runModal];
+        return;
+    }
+    [self refreshTimelineAfterEditFromPosition:self.state->requestedPosition];
+    self.state->overlayDirty = true;
+    self.infoLabel.stringValue =
+        [NSString stringWithFormat:@"%lu sous-titre%@ importé%@",
+                                   (unsigned long)cues.size(),
+                                   cues.size() == 1 ? @"" : @"s",
+                                   cues.size() == 1 ? @"" : @"s"];
+}
+
+- (void)exportSubtitlesPressed:(id)sender {
+    (void)sender;
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    panel.title = @"Exporter les sous-titres SubRip";
+    panel.prompt = @"Exporter";
+    panel.nameFieldStringValue = @"sous-titres.srt";
+    panel.allowedContentTypes = @[ [UTType typeWithFilenameExtension:@"srt"] ];
+    if ([panel runModal] != NSModalResponseOK || !panel.URL) return;
+    std::string message;
+    if (!SaveSrt(self.state->document, panel.URL.fileSystemRepresentation ?: "",
+                 message)) {
+        NSAlert* alert = [NSAlert new];
+        alert.alertStyle = NSAlertStyleCritical;
+        alert.messageText = @"Export SRT impossible";
+        alert.informativeText = [NSString stringWithUTF8String:message.c_str()]
+                                    ?: @"Erreur inconnue";
+        [alert runModal];
+        return;
+    }
+    self.infoLabel.stringValue = @"Sous-titres SRT exportés";
 }
 
 - (BOOL)importMediaURLs:(NSArray<NSURL*>*)urls intoBin:(NSString*)binId {
@@ -6456,6 +6939,157 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     [self enqueueProxyForMediaIdentifier:identifier];
 }
 
+- (void)transcribeSelectedMedia:(id)sender {
+    (void)sender;
+    NSString* identifier = [self selectedMediaId];
+    if (!identifier || !self.state) return;
+
+    NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
+    NSString* modelPath = [defaults stringForKey:kWhisperModelPathDefaultsKey];
+    if (modelPath.length == 0 ||
+        ![NSFileManager.defaultManager fileExistsAtPath:modelPath]) {
+        modelPath = [self requestWhisperModelPath];
+        if (!modelPath) return;
+    }
+    [self enqueueTranscriptionForMediaIdentifier:identifier
+                                       modelPath:modelPath
+                                         batchId:Ulid{}];
+}
+
+- (void)transcribeTimeline:(id)sender {
+    (void)sender;
+    if (!self.state) return;
+    NSString* modelPath = [NSUserDefaults.standardUserDefaults
+        stringForKey:kWhisperModelPathDefaultsKey];
+    if (modelPath.length == 0 ||
+        ![NSFileManager.defaultManager fileExistsAtPath:modelPath]) {
+        modelPath = [self requestWhisperModelPath];
+        if (!modelPath) return;
+    }
+
+    const bool hasSolo =
+        std::any_of(self.state->document.sequence.tracks.begin(),
+                    self.state->document.sequence.tracks.end(),
+                    [](const DocumentTrack& track) {
+                        return track.kind == "audio" && track.solo;
+                    });
+    std::set<Ulid> mediaIds;
+    for (const DocumentTrack& track : self.state->document.sequence.tracks) {
+        if (track.kind != "audio" || track.muted || (hasSolo && !track.solo))
+            continue;
+        for (const DocumentClip& clip : track.clips) {
+            const LibraryMedia* media =
+                self.state->document.FindLibraryMedia(clip.source_id);
+            if (media && media->has_audio) mediaIds.insert(clip.source_id);
+        }
+    }
+    if (mediaIds.empty()) {
+        self.binSummaryLabel.stringValue =
+            @"La timeline ne contient aucune piste audio active.";
+        return;
+    }
+    for (const auto& pending : self.state->pendingTranscriptions) {
+        if (mediaIds.count(pending.second.media_id)) {
+            self.binSummaryLabel.stringValue =
+                @"Une source de cette timeline est déjà en transcription.";
+            return;
+        }
+    }
+
+    const Ulid batchId = GenerateUlid();
+    PendingTimelineTranscription batch;
+    batch.timeline_id = self.state->activeTimelineId;
+    const std::filesystem::path projectPath = std::filesystem::absolute(
+        std::filesystem::path(self.documentPath.UTF8String ?: ""));
+    const std::filesystem::path transcriptDirectory =
+        projectPath.parent_path() / ".cutmachine" / "transcripts";
+    WhisperSettings requestedSettings;
+    requestedSettings.whisper_model_path = modelPath.UTF8String ?: "";
+    for (const Ulid& mediaId : mediaIds) {
+        const std::filesystem::path cachedPath =
+            transcriptDirectory / (mediaId + ".json");
+        Transcript cached;
+        std::string cacheError;
+        if (LoadAudioTranscript(cachedPath.string(), cached, cacheError) &&
+            TranscriptCacheMatches(cached, mediaId, requestedSettings)) {
+            batch.transcript_paths.emplace(mediaId, cachedPath);
+            continue;
+        }
+        NSString* identifier = [NSString stringWithUTF8String:mediaId.c_str()];
+        const Ulid taskId =
+            [self enqueueTranscriptionForMediaIdentifier:identifier
+                                               modelPath:modelPath
+                                                 batchId:batchId];
+        if (taskId.empty()) {
+            batch.error = "unable to enqueue every timeline source";
+            break;
+        }
+        batch.task_ids.insert(taskId);
+        batch.transcript_paths.emplace(
+            mediaId,
+            self.state->pendingTranscriptions.at(taskId).absolute_path);
+    }
+    if (batch.transcript_paths.empty()) {
+        self.binSummaryLabel.stringValue =
+            @"Impossible de démarrer la transcription de la timeline.";
+        return;
+    }
+    const bool cachedOnly = batch.task_ids.empty();
+    self.state->pendingTimelineTranscriptions.emplace(batchId,
+                                                      std::move(batch));
+    self.binSummaryLabel.stringValue =
+        cachedOnly
+            ? @"Transcripts en cache · création de S1…"
+            : [NSString stringWithFormat:@"Transcription de la timeline · %lu "
+                                          "source%@…",
+                                         (unsigned long)mediaIds.size(),
+                                         mediaIds.size() == 1 ? @"" : @"s"];
+}
+
+- (Ulid)enqueueTranscriptionForMediaIdentifier:(NSString*)identifier
+                                     modelPath:(NSString*)modelPath
+                                       batchId:(const Ulid&)batchId {
+    if (!identifier || !modelPath || !self.state) return {};
+    const Ulid mediaId(identifier.UTF8String ?: "");
+    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
+    const DocumentSource* source = self.state->document.FindSource(mediaId);
+    if (!media || !source || !media->has_audio) return {};
+    for (const auto& pending : self.state->pendingTranscriptions) {
+        if (pending.second.media_id == mediaId) {
+            self.binSummaryLabel.stringValue =
+                @"Une transcription est déjà en cours pour ce média.";
+            return {};
+        }
+    }
+
+    const std::filesystem::path projectPath = std::filesystem::absolute(
+        std::filesystem::path(self.documentPath.UTF8String ?: ""));
+    const std::filesystem::path base = projectPath.parent_path();
+    std::filesystem::path input(media->path);
+    if (input.is_relative()) input = base / input;
+    input = input.lexically_normal();
+    const std::filesystem::path output =
+        base / ".cutmachine" / "transcripts" / (mediaId + ".json");
+    WhisperSettings settings;
+    settings.whisper_model_path = modelPath.UTF8String ?: "";
+    const Ulid taskId = self.state->mediaTasks->Enqueue(
+        MediaTaskKind::Transcription, "Whisper " + media->filename,
+        [input, output, mediaId, rate = source->rate, settings](
+            MediaTaskContext& context, std::string& taskError) {
+            return GenerateAudioTranscript(input.string(), output.string(),
+                                           mediaId, rate, settings, context,
+                                           taskError);
+        });
+    self.state->pendingTranscriptions.emplace(
+        taskId, PendingTranscription{mediaId, self.state->activeTimelineId,
+                                     batchId, output});
+    self.binSummaryLabel.stringValue =
+        [NSString stringWithFormat:@"Transcription de %s en arrière-plan…",
+                                   media->filename.c_str()];
+    [self refreshMediaTaskStatus];
+    return taskId;
+}
+
 - (void)regenerateSelectedMediaThumbnail:(id)sender {
     (void)sender;
     NSString* identifier = [self selectedMediaId];
@@ -6470,6 +7104,11 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     const DocumentSource* source = self.state->document.FindSource(mediaId);
     if (!media || !source) return;
+    if (!media->has_video) {
+        self.binSummaryLabel.stringValue =
+            @"Ce média est audio seul · aucun proxy vidéo à générer.";
+        return;
+    }
     for (const auto& pending : self.state->pendingProxies) {
         if (pending.second.media_id == mediaId) {
             self.binSummaryLabel.stringValue = @"Un proxy est déjà en cours.";
@@ -6910,6 +7549,13 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
 }
 
 - (BOOL)timelineDropMedia:(NSString*)mediaId atViewPoint:(NSPoint)point {
+    return [self timelineDropMediaIds:mediaId ? @[ mediaId ] : @[]
+                          atViewPoint:point];
+}
+
+- (BOOL)timelineDropMediaIds:(NSArray<NSString*>*)mediaIds
+                 atViewPoint:(NSPoint)point {
+    if (mediaIds.count == 0) return NO;
     const double timelineY =
         self.metalView.bounds.size.height - point.y - [self videoHeight];
     if (point.x < self.state->viewport.header_width ||
@@ -6921,9 +7567,11 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (trackIndex < 0 || trackIndex >= (NSInteger)tracks.size()) return NO;
     const DocumentTrack* track = tracks[trackIndex];
     if (!track || track->kind != "video") return NO;
-    const Ulid sourceId(mediaId.UTF8String ?: "");
-    const DocumentSource* source = self.state->document.FindSource(sourceId);
-    if (!source) {
+    const Ulid targetTrackId = track->id;
+    const Ulid firstSourceId(mediaIds.firstObject.UTF8String ?: "");
+    const DocumentSource* firstSource =
+        self.state->document.FindSource(firstSourceId);
+    if (!firstSource) {
         self.binSummaryLabel.stringValue =
             @"Ce média doit être réingéré avant son montage.";
         return NO;
@@ -6931,7 +7579,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     RationalTime timelineIn;
     try {
         timelineIn =
-            self.state->viewport.XToTime(point.x, source->duration.rate);
+            self.state->viewport.XToTime(point.x, firstSource->duration.rate);
         if (timelineIn.value < 0) timelineIn = {0, timelineIn.rate};
     } catch (const std::exception& exception) {
         self.binSummaryLabel.stringValue =
@@ -6942,78 +7590,110 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditLog stagedLog = self.state->editLog;
     EditError error = EditError::None;
     std::string message;
-    Ulid videoClipId;
-    Ulid audioClipId;
-    const auto detected = self.state->mediaMetadata.find(sourceId);
-    const LibraryMedia* media = detected == self.state->mediaMetadata.end()
-                                    ? stagedDocument.FindLibraryMedia(sourceId)
-                                    : &detected->second;
     Ulid audioTrackId;
-    if (media && media->metadata_complete && media->has_audio) {
-        for (const DocumentTrack* candidateTrack :
-             TimelineTracksInDisplayOrder(stagedDocument)) {
-            if (candidateTrack->kind == "audio" && !candidateTrack->locked &&
-                self.state->targetedTrackIds.count(candidateTrack->id)) {
-                audioTrackId = candidateTrack->id;
-                break;
-            }
+    std::vector<Ulid> videoClipIds;
+    std::vector<Ulid> linkedClipIds;
+    for (NSString* mediaId in mediaIds) {
+        const Ulid sourceId(mediaId.UTF8String ?: "");
+        const DocumentSource* source = stagedDocument.FindSource(sourceId);
+        if (!source) {
+            self.binSummaryLabel.stringValue =
+                @"Un des médias doit être réingéré avant son montage.";
+            return NO;
         }
-        if (audioTrackId.empty()) {
-            for (const DocumentTrack* candidateTrack :
-                 TimelineTracksInDisplayOrder(stagedDocument)) {
-                if (candidateTrack->kind == "audio" &&
-                    !candidateTrack->locked) {
-                    audioTrackId = candidateTrack->id;
+        // EditLog::Apply replaces the staged Document with a validated copy.
+        // Keep exact values, never pointers into it, across each application.
+        const RationalTime sourceDuration = source->duration;
+        const int32_t sourceRate = sourceDuration.rate;
+        const auto detected = self.state->mediaMetadata.find(sourceId);
+        const LibraryMedia* media =
+            detected == self.state->mediaMetadata.end()
+                ? stagedDocument.FindLibraryMedia(sourceId)
+                : &detected->second;
+        Ulid itemAudioTrackId;
+        if (media && media->metadata_complete && media->has_audio) {
+            if (audioTrackId.empty()) {
+                for (const DocumentTrack* candidateTrack :
+                     TimelineTracksInDisplayOrder(stagedDocument)) {
+                    if (candidateTrack->kind == "audio" &&
+                        !candidateTrack->locked &&
+                        self.state->targetedTrackIds.count(
+                            candidateTrack->id)) {
+                        audioTrackId = candidateTrack->id;
+                        break;
+                    }
+                }
+            }
+            if (audioTrackId.empty()) {
+                for (const DocumentTrack* candidateTrack :
+                     TimelineTracksInDisplayOrder(stagedDocument)) {
+                    if (candidateTrack->kind == "audio" &&
+                        !candidateTrack->locked) {
+                        audioTrackId = candidateTrack->id;
+                        break;
+                    }
+                }
+            }
+            if (audioTrackId.empty()) {
+                int32_t index = 0;
+                for (const DocumentTrack& candidateTrack :
+                     stagedDocument.sequence.tracks)
+                    index = std::max(index, candidateTrack.index + 1);
+                audioTrackId = GenerateUlid();
+                if (!stagedLog.Apply(stagedDocument,
+                                     Operation{AddTrackOperation{
+                                         audioTrackId, "audio", index}},
+                                     error, message)) {
+                    self.binSummaryLabel.stringValue = [NSString
+                        stringWithFormat:
+                            @"Création de la piste audio refusée (%s) : %s",
+                            EditErrorName(error), message.c_str()];
+                    return NO;
+                }
+            }
+            itemAudioTrackId = audioTrackId;
+        }
+
+        std::optional<DeleteGapOperation> sourceEdit =
+            TimelineSourceEditOperation(
+                stagedDocument, sourceId, {0, sourceRate}, sourceDuration,
+                timelineIn, targetTrackId, true,
+                itemAudioTrackId.empty() ? std::vector<Ulid>{}
+                                         : std::vector<Ulid>{itemAudioTrackId});
+        if (!sourceEdit ||
+            !stagedLog.Apply(stagedDocument, Operation{std::move(*sourceEdit)},
+                             error, message)) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Insertion refusée (%s) : %s",
+                                 EditErrorName(error), message.c_str()];
+            return NO;
+        }
+        if (const DocumentTrack* videoTrack =
+                stagedDocument.FindTrack(targetTrackId)) {
+            for (const DocumentClip& clip : videoTrack->clips) {
+                if (clip.source_id == sourceId &&
+                    clip.timeline_in == timelineIn &&
+                    clip.source_in == RationalTime{0, sourceRate} &&
+                    clip.duration == sourceDuration) {
+                    videoClipIds.push_back(clip.id);
+                    linkedClipIds.push_back(clip.id);
                     break;
                 }
             }
         }
-        if (audioTrackId.empty()) {
-            int32_t index = 0;
-            for (const DocumentTrack& candidateTrack :
-                 stagedDocument.sequence.tracks)
-                index = std::max(index, candidateTrack.index + 1);
-            audioTrackId = GenerateUlid();
-            if (!stagedLog.Apply(
-                    stagedDocument,
-                    Operation{AddTrackOperation{audioTrackId, "audio", index}},
-                    error, message)) {
-                self.binSummaryLabel.stringValue = [NSString
-                    stringWithFormat:
-                        @"Création de la piste audio refusée (%s) : %s",
-                        EditErrorName(error), message.c_str()];
-                return NO;
+        if (const DocumentTrack* audioTrack =
+                stagedDocument.FindTrack(itemAudioTrackId)) {
+            for (const DocumentClip& clip : audioTrack->clips) {
+                if (clip.source_id == sourceId &&
+                    clip.timeline_in == timelineIn &&
+                    clip.source_in == RationalTime{0, sourceRate} &&
+                    clip.duration == sourceDuration) {
+                    linkedClipIds.push_back(clip.id);
+                    break;
+                }
             }
         }
-    }
-
-    std::optional<DeleteGapOperation> sourceEdit = TimelineSourceEditOperation(
-        stagedDocument, sourceId, {0, source->duration.rate}, source->duration,
-        timelineIn, track->id, true,
-        audioTrackId.empty() ? std::vector<Ulid>{}
-                             : std::vector<Ulid>{audioTrackId});
-    if (!sourceEdit ||
-        !stagedLog.Apply(stagedDocument, Operation{std::move(*sourceEdit)},
-                         error, message)) {
-        self.binSummaryLabel.stringValue =
-            [NSString stringWithFormat:@"Insertion refusée (%s) : %s",
-                                       EditErrorName(error), message.c_str()];
-        return NO;
-    }
-    if (const DocumentTrack* videoTrack = stagedDocument.FindTrack(track->id)) {
-        for (const DocumentClip& clip : videoTrack->clips)
-            if (clip.source_id == sourceId && clip.timeline_in == timelineIn &&
-                clip.source_in == RationalTime{0, source->duration.rate} &&
-                clip.duration == source->duration)
-                videoClipId = clip.id;
-    }
-    if (const DocumentTrack* audioTrack =
-            stagedDocument.FindTrack(audioTrackId)) {
-        for (const DocumentClip& clip : audioTrack->clips)
-            if (clip.source_id == sourceId && clip.timeline_in == timelineIn &&
-                clip.source_in == RationalTime{0, source->duration.rate} &&
-                clip.duration == source->duration)
-                audioClipId = clip.id;
+        timelineIn = timelineIn.add(sourceDuration);
     }
 
     if (![self persistStagedDocument:stagedDocument
@@ -7026,10 +7706,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     }
     self.state->document = std::move(stagedDocument);
     self.state->editLog = std::move(stagedLog);
-    if (!audioClipId.empty() && self.state->linkedSelection)
-        self.state->interaction->SelectClips({videoClipId, audioClipId});
-    else
-        self.state->interaction->SelectClip(videoClipId);
+    self.state->interaction->SelectClips(
+        self.state->linkedSelection ? linkedClipIds : videoClipIds);
     const RationalTime playhead = self.state->requestedPosition;
     [self refreshTimelineAfterEditFromPosition:playhead];
     [self updateSelectionInfo];
@@ -7211,6 +7889,22 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     self.state->overlayDirty = true;
 }
 
+- (void)inspectorView:(CMInspectorView*)inspectorView
+    didCommitClipOpacity:(SetClipOpacityOperation)operation {
+    (void)inspectorView;
+    EditError error = EditError::None;
+    std::string message;
+    if (![self applyAndPersistTimelineOperation:Operation{std::move(operation)}
+                                          error:error
+                                        message:message]) {
+        std::fprintf(stderr, "Opacity edit rejected (%s): %s\n",
+                     EditErrorName(error), message.c_str());
+        return;
+    }
+    [self requestResolvedPosition:self.state->requestedPosition];
+    self.state->overlayDirty = true;
+}
+
 - (void)setLinkedSelectionEnabled:(BOOL)enabled {
     self.state->linkedSelection = enabled;
     self.state->interaction->SetLinkedSelectionEnabled(
@@ -7275,7 +7969,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             const RationalTime playhead = self.state->requestedPosition;
             bool applies = true;
             Operation operation = SetTrackLockOperation{};
-            if (track.kind == "video" && control == 0) {
+            if ((track.kind == "video" || track.kind == "caption") &&
+                control == 0) {
                 operation = SetTrackOutputOperation{track.id, !track.visible,
                                                     track.muted, track.solo};
             } else if (track.kind == "audio" && control == 0) {
@@ -7284,7 +7979,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             } else if (track.kind == "audio" && control == 1) {
                 operation = SetTrackOutputOperation{track.id, track.visible,
                                                     !track.muted, track.solo};
-            } else if ((track.kind == "video" && control == 1) ||
+            } else if (((track.kind == "video" || track.kind == "caption") &&
+                        control == 1) ||
                        (track.kind == "audio" && control == 2)) {
                 operation = SetTrackLockOperation{track.id, !track.locked};
             } else {
@@ -9051,6 +9747,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     [self processCompletedMediaProxies];
     [self processCompletedMediaWaveforms];
     [self processCompletedMediaThumbnails];
+    [self processCompletedMediaTranscriptions];
     [self processCompletedMediaRelinks];
     [self processCompletedBatchRelinks];
     [self refreshMediaTaskStatus];
@@ -9219,6 +9916,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const Ulid mediaId(identifier.UTF8String ?: "");
     const DocumentSource* source = self.state->document.FindSource(mediaId);
     if (!source) return;
+    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     for (const auto& pending : self.state->pendingWaveforms)
         if (pending.second.media_id == mediaId) return;
     const std::filesystem::path projectPath = std::filesystem::absolute(
@@ -9228,7 +9926,6 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (input.is_relative()) input = base / input;
     const std::filesystem::path output =
         base / ".cutmachine" / "waveforms" / (mediaId + ".waveform");
-    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     const std::string label =
         "Waveform " + (media ? media->filename : input.filename().string());
     WaveformSettings settings;
@@ -9281,9 +9978,241 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     }
 }
 
+- (void)processCompletedMediaTranscriptions {
+    if (!self.state || (self.state->pendingTranscriptions.empty() &&
+                        self.state->pendingTimelineTranscriptions.empty()))
+        return;
+    const std::vector<MediaTaskSnapshot> snapshots =
+        self.state->mediaTasks->Snapshot();
+    std::map<Ulid, MediaTaskSnapshot> byId;
+    for (const MediaTaskSnapshot& task : snapshots) byId[task.id] = task;
+    for (auto item = self.state->pendingTranscriptions.begin();
+         item != self.state->pendingTranscriptions.end();) {
+        const auto task = byId.find(item->first);
+        if (task == byId.end() ||
+            task->second.state == MediaTaskState::Queued ||
+            task->second.state == MediaTaskState::Running) {
+            ++item;
+            continue;
+        }
+        const PendingTranscription pending = item->second;
+        item = self.state->pendingTranscriptions.erase(item);
+        if (!pending.batch_id.empty()) {
+            auto batch = self.state->pendingTimelineTranscriptions.find(
+                pending.batch_id);
+            if (batch != self.state->pendingTimelineTranscriptions.end()) {
+                batch->second.task_ids.erase(task->first);
+                if (task->second.state == MediaTaskState::Cancelled)
+                    batch->second.error = "timeline transcription cancelled";
+                else if (task->second.state != MediaTaskState::Succeeded)
+                    batch->second.error = task->second.error;
+            }
+            continue;
+        }
+        if (task->second.state == MediaTaskState::Cancelled) {
+            self.binSummaryLabel.stringValue = @"Transcription annulée.";
+            continue;
+        }
+        if (task->second.state != MediaTaskState::Succeeded) {
+            self.binSummaryLabel.stringValue =
+                [NSString stringWithFormat:@"Échec de la transcription : %s",
+                                           task->second.error.c_str()];
+            continue;
+        }
+
+        Transcript transcript;
+        std::string message;
+        if (!LoadAudioTranscript(pending.absolute_path.string(), transcript,
+                                 message)) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Transcript illisible : %s", message.c_str()];
+            continue;
+        }
+        if (pending.timeline_id != self.state->activeTimelineId) {
+            self.binSummaryLabel.stringValue =
+                @"Transcript prêt · revenez sur la timeline d’origine puis "
+                 "relancez l’action pour créer S1.";
+            continue;
+        }
+
+        std::vector<SubtitleCue> cues;
+        for (const DocumentTrack& track :
+             self.state->document.sequence.tracks) {
+            if (track.kind != "video") continue;
+            for (const DocumentClip& clip : track.clips) {
+                if (clip.source_id != pending.media_id) continue;
+                std::vector<SubtitleCue> clipCues;
+                std::string ignored;
+                if (SubtitleCuesForClip(transcript, clip, clipCues, ignored))
+                    cues.insert(cues.end(), clipCues.begin(), clipCues.end());
+            }
+        }
+        std::stable_sort(cues.begin(), cues.end(),
+                         [](const SubtitleCue& left, const SubtitleCue& right) {
+                             return left.timeline_in < right.timeline_in;
+                         });
+        if (cues.empty()) {
+            self.binSummaryLabel.stringValue =
+                @"Transcript prêt · ce rush n’est pas présent sur la "
+                 "timeline active.";
+            continue;
+        }
+        bool overlaps = false;
+        for (size_t index = 1; index < cues.size(); ++index) {
+            if (cues[index].timeline_in <
+                cues[index - 1].timeline_in.add(cues[index - 1].duration)) {
+                overlaps = true;
+                break;
+            }
+        }
+        if (overlaps) {
+            self.binSummaryLabel.stringValue =
+                @"Transcript prêt · les occurrences du rush se chevauchent; "
+                 "impossible de créer une seule piste S1.";
+            continue;
+        }
+
+        int32_t trackIndex = 0;
+        for (const DocumentTrack& track : self.state->document.sequence.tracks)
+            trackIndex = std::max(trackIndex, track.index + 1);
+        EditError editError = EditError::None;
+        AddTrackOperation operation = BuildSubtitleTrackEdit(cues, trackIndex);
+        if (![self
+                applyAndPersistTimelineOperation:Operation{std::move(operation)}
+                                           error:editError
+                                         message:message]) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Sous-titres non créés (%s) : %s",
+                                 EditErrorName(editError), message.c_str()];
+            continue;
+        }
+        [self
+            refreshTimelineAfterEditFromPosition:self.state->requestedPosition];
+        self.state->overlayDirty = true;
+        self.binSummaryLabel.stringValue = [NSString
+            stringWithFormat:@"Transcript prêt · %lu sous-titre%@ ajouté%@ "
+                              "sur S1",
+                             (unsigned long)cues.size(),
+                             cues.size() == 1 ? @"" : @"s",
+                             cues.size() == 1 ? @"" : @"s"];
+    }
+
+    for (auto item = self.state->pendingTimelineTranscriptions.begin();
+         item != self.state->pendingTimelineTranscriptions.end();) {
+        if (!item->second.task_ids.empty()) {
+            ++item;
+            continue;
+        }
+        PendingTimelineTranscription batch = std::move(item->second);
+        item = self.state->pendingTimelineTranscriptions.erase(item);
+        if (!batch.error.empty()) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Transcription de la timeline échouée : %s",
+                                 batch.error.c_str()];
+            continue;
+        }
+        if (batch.timeline_id != self.state->activeTimelineId) {
+            self.binSummaryLabel.stringValue =
+                @"Transcripts prêts · revenez sur la timeline d’origine puis "
+                 "relancez l’action pour créer S1.";
+            continue;
+        }
+
+        std::map<Ulid, Transcript> transcripts;
+        std::string message;
+        bool loaded = true;
+        for (const auto& transcriptPath : batch.transcript_paths) {
+            Transcript transcript;
+            if (!LoadAudioTranscript(transcriptPath.second.string(), transcript,
+                                     message)) {
+                loaded = false;
+                break;
+            }
+            transcripts.emplace(transcriptPath.first, std::move(transcript));
+        }
+        if (!loaded) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Transcript de timeline illisible : %s",
+                                 message.c_str()];
+            continue;
+        }
+
+        const bool hasSolo =
+            std::any_of(self.state->document.sequence.tracks.begin(),
+                        self.state->document.sequence.tracks.end(),
+                        [](const DocumentTrack& track) {
+                            return track.kind == "audio" && track.solo;
+                        });
+        std::vector<SubtitleCue> cues;
+        for (const DocumentTrack& track :
+             self.state->document.sequence.tracks) {
+            if (track.kind != "audio" || track.muted ||
+                (hasSolo && !track.solo))
+                continue;
+            for (const DocumentClip& clip : track.clips) {
+                const auto transcript = transcripts.find(clip.source_id);
+                if (transcript == transcripts.end()) continue;
+                std::vector<SubtitleCue> clipCues;
+                std::string ignored;
+                if (SubtitleCuesForClip(transcript->second, clip, clipCues,
+                                        ignored))
+                    cues.insert(cues.end(), clipCues.begin(), clipCues.end());
+            }
+        }
+        std::stable_sort(cues.begin(), cues.end(),
+                         [](const SubtitleCue& left, const SubtitleCue& right) {
+                             return left.timeline_in < right.timeline_in;
+                         });
+        if (cues.empty()) {
+            self.binSummaryLabel.stringValue =
+                @"Transcription terminée, mais aucun mot ne correspond aux "
+                 "coupes de la timeline.";
+            continue;
+        }
+        bool overlaps = false;
+        for (size_t index = 1; index < cues.size(); ++index) {
+            if (cues[index].timeline_in <
+                cues[index - 1].timeline_in.add(cues[index - 1].duration)) {
+                overlaps = true;
+                break;
+            }
+        }
+        if (overlaps) {
+            self.binSummaryLabel.stringValue =
+                @"Transcripts prêts · plusieurs pistes audio parlées se "
+                 "chevauchent; impossible de créer une seule piste S1.";
+            continue;
+        }
+
+        int32_t trackIndex = 0;
+        for (const DocumentTrack& track : self.state->document.sequence.tracks)
+            trackIndex = std::max(trackIndex, track.index + 1);
+        EditError editError = EditError::None;
+        AddTrackOperation operation = BuildSubtitleTrackEdit(cues, trackIndex);
+        if (![self
+                applyAndPersistTimelineOperation:Operation{std::move(operation)}
+                                           error:editError
+                                         message:message]) {
+            self.binSummaryLabel.stringValue = [NSString
+                stringWithFormat:@"Sous-titres non créés (%s) : %s",
+                                 EditErrorName(editError), message.c_str()];
+            continue;
+        }
+        [self
+            refreshTimelineAfterEditFromPosition:self.state->requestedPosition];
+        self.state->overlayDirty = true;
+        self.binSummaryLabel.stringValue = [NSString
+            stringWithFormat:@"Timeline transcrite · %lu sous-titre%@ sur S1",
+                             (unsigned long)cues.size(),
+                             cues.size() == 1 ? @"" : @"s"];
+    }
+}
+
 - (void)loadOrEnqueueThumbnailForMediaIdentifier:(NSString*)identifier {
     if (!identifier || !self.state || self.mediaThumbnails[identifier]) return;
     const Ulid mediaId(identifier.UTF8String ?: "");
+    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
+    if (media && !media->has_video) return;
     const std::filesystem::path projectPath = std::filesystem::absolute(
         std::filesystem::path(self.documentPath.UTF8String ?: ""));
     const std::filesystem::path output = projectPath.parent_path() /
@@ -9304,6 +10233,12 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const Ulid mediaId(identifier.UTF8String ?: "");
     const DocumentSource* source = self.state->document.FindSource(mediaId);
     if (!source) return;
+    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
+    if (media && !media->has_video) {
+        self.binSummaryLabel.stringValue =
+            @"Ce média est audio seul · aucune vignette à générer.";
+        return;
+    }
     for (const auto& pending : self.state->pendingThumbnails)
         if (pending.second.media_id == mediaId) return;
     const std::filesystem::path projectPath = std::filesystem::absolute(
@@ -9313,7 +10248,6 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (input.is_relative()) input = base / input;
     const std::filesystem::path output =
         base / ".cutmachine" / "thumbnails" / (mediaId + ".png");
-    const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
     const std::string label =
         "Thumbnail " + (media ? media->filename : input.filename().string());
     ThumbnailSettings settings;
@@ -9450,6 +10384,27 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 ++pendingTask;
             }
         }
+        for (auto pendingTask = self.state->pendingTranscriptions.begin();
+             pendingTask != self.state->pendingTranscriptions.end();) {
+            if (pendingTask->second.media_id == pending.media_id) {
+                self.state->mediaTasks->Cancel(pendingTask->first);
+                const Ulid batchId = pendingTask->second.batch_id;
+                if (!batchId.empty()) {
+                    auto batch =
+                        self.state->pendingTimelineTranscriptions.find(batchId);
+                    if (batch !=
+                        self.state->pendingTimelineTranscriptions.end()) {
+                        batch->second.task_ids.erase(pendingTask->first);
+                        batch->second.error =
+                            "source relinked during timeline transcription";
+                    }
+                }
+                pendingTask =
+                    self.state->pendingTranscriptions.erase(pendingTask);
+            } else {
+                ++pendingTask;
+            }
+        }
 
         const std::filesystem::path projectPath = std::filesystem::absolute(
             std::filesystem::path(self.documentPath.UTF8String ?: ""));
@@ -9467,6 +10422,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                                 ignored);
         std::filesystem::remove(
             base / ".cutmachine" / "thumbnails" / (pending.media_id + ".png"),
+            ignored);
+        std::filesystem::remove(
+            base / ".cutmachine" / "transcripts" / (pending.media_id + ".json"),
             ignored);
         self.state->waveforms.erase(pending.media_id);
         NSString* identifier =
@@ -9620,6 +10578,27 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 ++pendingTask;
             }
         }
+        for (auto pendingTask = self.state->pendingTranscriptions.begin();
+             pendingTask != self.state->pendingTranscriptions.end();) {
+            if (relinkedIds.count(pendingTask->second.media_id)) {
+                self.state->mediaTasks->Cancel(pendingTask->first);
+                const Ulid batchId = pendingTask->second.batch_id;
+                if (!batchId.empty()) {
+                    auto batch =
+                        self.state->pendingTimelineTranscriptions.find(batchId);
+                    if (batch !=
+                        self.state->pendingTimelineTranscriptions.end()) {
+                        batch->second.task_ids.erase(pendingTask->first);
+                        batch->second.error =
+                            "source relinked during timeline transcription";
+                    }
+                }
+                pendingTask =
+                    self.state->pendingTranscriptions.erase(pendingTask);
+            } else {
+                ++pendingTask;
+            }
+        }
 
         const std::filesystem::path projectPath = std::filesystem::absolute(
             std::filesystem::path(self.documentPath.UTF8String ?: ""));
@@ -9643,6 +10622,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 ignored);
             std::filesystem::remove(
                 base / ".cutmachine" / "thumbnails" / (mediaId + ".png"),
+                ignored);
+            std::filesystem::remove(
+                base / ".cutmachine" / "transcripts" / (mediaId + ".json"),
                 ignored);
             self.state->waveforms.erase(mediaId);
             NSString* identifier =
@@ -9773,6 +10755,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     for (const DocumentSource& source : self.state->document.sources) {
         const LibraryMedia* media =
             self.state->document.FindLibraryMedia(source.id);
+        if (media && !media->has_video) {
+            self.state->frameCache->ClearSource(source.id);
+            continue;
+        }
         std::filesystem::path original(source.path);
         if (original.is_relative()) original = base / original;
         std::filesystem::path selected = original;
@@ -9887,9 +10873,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         return;
     }
     for (const auto& source : addedSources) {
-        if (const LibraryMedia* media =
-                self.state->document.FindLibraryMedia(source.first))
-            self.state->mediaMetadata[source.first] = *media;
+        const LibraryMedia* media =
+            self.state->document.FindLibraryMedia(source.first);
+        if (media) self.state->mediaMetadata[source.first] = *media;
+        if (media && !media->has_video) continue;
         auto worker = std::make_unique<DecodeWorker>(
             source.first, *self.state->frameCache,
             *self.state->performanceMetrics);
@@ -10131,12 +11118,16 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         tracks.begin(), tracks.end(),
         [](const DocumentTrack* track) { return track->kind == "video"; }));
     uint32_t audioNumber = 0;
+    uint32_t captionNumber = 0;
     for (size_t index = 0; index < tracks.size(); ++index) {
         const double y = top + kTimelineRulerHeight +
                          index * self.state->viewport.track_height;
         if (y >= top + timelineHeight) break;
         const bool video = tracks[index]->kind == "video";
-        const uint32_t trackNumber = video ? videoNumber-- : ++audioNumber;
+        const bool caption = tracks[index]->kind == "caption";
+        const uint32_t trackNumber = video     ? videoNumber--
+                                     : caption ? ++captionNumber
+                                               : ++audioNumber;
         if (video) sawVideoTrack = true;
         if (!video && sawVideoTrack && !drewAudioDivider) {
             addColor(0.0, y - 2.0, width, 2.0, ui::theme::kBorderStrong);
@@ -10150,11 +11141,16 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         addColor(0.0, y, 4.0, self.state->viewport.track_height,
                  ui::theme::TrackTint(video));
         addText(8.0, y + 4.0, 28.0, ui::theme::kFontSizeSmall,
-                std::string(video ? "V" : "A") + std::to_string(trackNumber),
+                std::string(video     ? "V"
+                            : caption ? "S"
+                                      : "A") +
+                    std::to_string(trackNumber),
                 ui::theme::kTextPrimary, MetalFontFace::Mono, true);
         addText(8.0, y + 20.0, 30.0, ui::theme::kFontSizeCaption,
-                video ? "VID." : "AUD.", ui::theme::kTextTertiary,
-                MetalFontFace::Mono, true);
+                video     ? "VID."
+                : caption ? "SUB."
+                          : "AUD.",
+                ui::theme::kTextTertiary, MetalFontFace::Mono, true);
 
         const auto addPill = [&](double x, const std::string& label,
                                  bool active, int control,
@@ -10195,7 +11191,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 x + 3.0, y + 17.0, 10.0, icon,
                 active ? ui::theme::kTextPrimary : ui::theme::kTextTertiary);
         };
-        if (video) {
+        if (video || caption) {
             addIconPill(40.0, "eye", tracks[index]->visible, 0);
             addIconPill(58.0, "lock", tracks[index]->locked, 1);
         } else {
@@ -10369,11 +11365,16 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         const double clipSpan = right - left;
         add(left, y + 28.0, clipSpan, 14.0, 0.0f, 0.0f, 0.0f, 0.40f);
         if (clipSpan >= ui::theme::kTimelineClipNameMinWidth) {
+            const DocumentClip* documentClip =
+                self.state->document.FindClip(clip.clip_id);
+            const std::string name =
+                documentClip && clip.source_id.empty()
+                    ? documentClip->caption_text
+                    : TimelineClipName(self.state->document,
+                                       self.state->project, clip.source_id);
             addText(left + 5.0, y + 29.0, clipSpan - 10.0,
-                    ui::theme::kFontSizeSmall,
-                    TimelineClipName(self.state->document, self.state->project,
-                                     clip.source_id),
-                    ui::theme::kTextClip, MetalFontFace::Mono, true);
+                    ui::theme::kFontSizeSmall, name, ui::theme::kTextClip,
+                    MetalFontFace::Mono, true);
         }
         add(left, y + 40.0, clipSpan, 2.0, 0.0f, 0.0f, 0.0f, 0.28f);
         if (clip.audio && clip.sync_drift && clip.sync_drift->value != 0) {
@@ -10625,6 +11626,17 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         self.state->performanceMetrics->RecordDrop();
     }
     const bool programChanged = candidates != self.state->rendered;
+    const auto activeSubtitles =
+        ActiveSubtitles(self.state->document, self.state->requestedPosition);
+    NSMutableArray<NSString*>* subtitleLines = [NSMutableArray array];
+    for (const DocumentClip* subtitle : activeSubtitles)
+        [subtitleLines
+            addObject:[NSString
+                          stringWithUTF8String:subtitle->caption_text.c_str()]
+                          ?: @""];
+    self.programSubtitleLabel.stringValue =
+        [subtitleLines componentsJoinedByString:@"\n"];
+    self.programSubtitleLabel.hidden = activeSubtitles.empty();
     if (self.state->overlayDirty || programChanged) {
         TimelineRenderData programData;
         programData.color_management = self.state->document.color_management;
@@ -10837,6 +11849,38 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
     // WindowServer, but no Accessibility permission or synthetic global input.
     UiSmokeCheck(self.window != nil && self.state != nullptr,
                  "application launches a real editor window");
+
+    // Becoming key is a round trip through the WindowServer, and the
+    // dispatch_async that got us here only promises the next main-queue turn
+    // -- so applicationDidFinishLaunching's activateIgnoringOtherApps has
+    // usually, but not always, landed. AppKit routes the first click on a
+    // non-key window to activating it rather than to the view under it, so
+    // losing that race made every selection-, rename- and drag-dependent
+    // check below fail *together*, intermittently: measured at 1 run in 6 on
+    // an otherwise idle Mac, and easily mistaken for a real regression by
+    // whoever ran ctest next.
+    //
+    // Waiting is the fix rather than retrying a click: a click that arrives
+    // before the window is key is a different gesture, not a lost one.
+    if (!self.window.isKeyWindow) {
+        [NSApp activateIgnoringOtherApps:YES];
+        [self.window makeKeyAndOrderFront:nil];
+        NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:5.0];
+        while (!self.window.isKeyWindow && deadline.timeIntervalSinceNow > 0) {
+            NSEvent* event = [NSApp
+                nextEventMatchingMask:NSEventMaskAny
+                            untilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]
+                               inMode:NSDefaultRunLoopMode
+                              dequeue:YES];
+            if (event) [NSApp sendEvent:event];
+        }
+    }
+    // Reported rather than assumed: on a machine with no usable WindowServer
+    // session -- a locked screen, a headless runner -- the window never
+    // becomes key, and one honest failure naming that is worth more than
+    // seven that blame the media panel.
+    UiSmokeCheck(self.window.isKeyWindow,
+                 "editor window becomes key before any input check");
 
     NSButton* toggle = self.sourceMonitorToggleButton;
     const NSPoint togglePoint =
@@ -11092,10 +12136,37 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
         [self updateSelectionInfo];
         NSMutableArray<NSSlider*>* sliders = [NSMutableArray array];
         CollectSliders(self.inspectorView, sliders);
-        UiSmokeCheck(sliders.count == ui::inspector::GradeControls().size(),
-                     "Inspector exposes every grading slider");
-        if (sliders.count > 0) {
-            NSSlider* exposure = sliders.firstObject;
+        UiSmokeCheck(sliders.count == ui::inspector::GradeControls().size() + 1,
+                     "Inspector exposes opacity and every grading slider");
+        NSSlider* opacitySlider = nil;
+        NSSlider* exposure = nil;
+        const ui::inspector::GradeControlSpec& exposureSpec =
+            ui::inspector::GradeControls().front();
+        for (NSSlider* slider in sliders) {
+            if (std::abs(slider.minValue) < 0.001 &&
+                std::abs(slider.maxValue - 1.0) < 0.001)
+                opacitySlider = slider;
+            if (std::abs(slider.minValue - exposureSpec.min_value) < 0.001 &&
+                std::abs(slider.maxValue - exposureSpec.max_value) < 0.001)
+                exposure = slider;
+        }
+        if (opacitySlider) {
+            opacitySlider.floatValue = 0.42f;
+            [opacitySlider sendAction:opacitySlider.action
+                                   to:opacitySlider.target];
+            NSDate* opacityDeadline = [NSDate dateWithTimeIntervalSinceNow:0.2];
+            while (opacityDeadline.timeIntervalSinceNow > 0.0)
+                [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode
+                                       beforeDate:opacityDeadline];
+            const DocumentClip* composited =
+                self.state->document.FindClip(*initialClipId);
+            UiSmokeCheck(composited && composited->opacity.num == 420 &&
+                             composited->opacity.den == 1000,
+                         "Inspector opacity commits through EditLog");
+        } else {
+            UiSmokeCheck(false, "Inspector exposes its opacity slider");
+        }
+        if (exposure) {
             exposure.floatValue = 0.5f;
             [exposure sendAction:exposure.action to:exposure.target];
             NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:0.2];
@@ -11142,6 +12213,8 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
                 UiSmokeCheck(
                     afterTrack && afterTrack->clips.size() > beforeCount &&
                         right && right->effects.size() == 1 &&
+                        right->opacity.num == 420 &&
+                        right->opacity.den == 1000 &&
                         std::abs(ui::inspector::CurrentGradeControlValue(
                                      right->effects,
                                      ui::inspector::GradeControls().front()) -
@@ -11149,6 +12222,8 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
                     "Cutting from Inspector focus preserves grading");
                 [self setTimelineTool:TimelineTool::Select];
             }
+        } else {
+            UiSmokeCheck(false, "Inspector exposes its exposure slider");
         }
 
         const DocumentTrack* multiTrack =
@@ -11302,6 +12377,25 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
             UiSmokeCheck([self.mediaCollection.selectionIndexPaths
                              containsObject:iconPath],
                          "A physical click selects the first rush tile");
+            NSIndexPath* shiftedPath =
+                [NSIndexPath indexPathForItem:iconPath.item + 1 inSection:0];
+            NSCollectionViewItem* shiftedItem =
+                [self.mediaCollection itemAtIndexPath:shiftedPath];
+            if (shiftedItem) {
+                const NSRect shiftedFrame =
+                    [shiftedItem.view convertRect:shiftedItem.view.bounds
+                                           toView:self.mediaCollection];
+                SendWindowClick(
+                    self.mediaCollection,
+                    NSMakePoint(NSMidX(shiftedFrame), NSMidY(shiftedFrame)),
+                    NSEventModifierFlagShift);
+            }
+            UiSmokeCheck(shiftedItem &&
+                             [self.mediaCollection.selectionIndexPaths
+                                 containsObject:iconPath] &&
+                             [self.mediaCollection.selectionIndexPaths
+                                 containsObject:shiftedPath],
+                         "Shift-click extends the icon-mode media selection");
         }
         if (iconItem) {
             const NSPoint labelCenterInCollection = [iconItem.textField
@@ -11389,6 +12483,10 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
         iconAttributes = [self.mediaCollection.collectionViewLayout
             layoutAttributesForItemAtIndexPath:iconPath];
         if (iconItem) {
+            NSIndexPath* secondPath =
+                [NSIndexPath indexPathForItem:iconPath.item + 1 inSection:0];
+            self.mediaCollection.selectionIndexPaths =
+                [NSSet setWithObjects:iconPath, secondPath, nil];
             const NSRect dragFrame =
                 [iconItem.view convertRect:iconItem.view.bounds
                                     toView:self.mediaCollection];
@@ -11401,6 +12499,8 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
                      "Physical icon drag reaches the collection mouseDown");
         UiSmokeCheck(gUiSmokeIconDragSession,
                      "Physical icon gesture starts an AppKit drag session");
+        UiSmokeCheck(gUiSmokeMediaDragCount == 2,
+                     "Icon drag payload preserves both selected rushes");
         UiSmokeCheck(iconItem && iconAttributes,
                      "Physical icon drag uses a visible collection item");
     }
@@ -11491,18 +12591,39 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
                      "Source Overwrite button performs a persisted edit");
     }
 
-    if (initialTrackId) {
+    if (initialTrackId && self.state->document.sources.size() >= 2) {
         const size_t before = self.state->editLog.AppliedCount();
+        const Ulid secondSourceId = self.state->document.sources[1].id;
         const double timelineY =
             kTimelineRulerHeight + self.state->viewport.track_height * 0.5;
         const NSPoint point =
             NSMakePoint(self.state->viewport.TimeToX({75, 25}),
                         self.metalView.bounds.size.height - timelineY);
-        const BOOL accepted = [self
-            timelineDropMedia:[NSString stringWithUTF8String:sourceId.c_str()]
-                  atViewPoint:point];
-        UiSmokeCheck(accepted && self.state->editLog.AppliedCount() > before,
-                     "Media drop performs a persisted timeline edit");
+        const BOOL linkedSelection = self.state->linkedSelection;
+        self.state->linkedSelection = false;
+        const BOOL accepted = [self timelineDropMediaIds:@[
+            [NSString stringWithUTF8String:sourceId.c_str()],
+            [NSString stringWithUTF8String:secondSourceId.c_str()]
+        ]
+                                             atViewPoint:point];
+        const std::vector<Ulid> dropped =
+            self.state->interaction->SelectedClipIds();
+        const DocumentClip* firstDropped =
+            dropped.empty() ? nullptr
+                            : self.state->document.FindClip(dropped[0]);
+        const DocumentClip* secondDropped =
+            dropped.size() < 2 ? nullptr
+                               : self.state->document.FindClip(dropped[1]);
+        UiSmokeCheck(
+            accepted && self.state->editLog.AppliedCount() >= before + 2 &&
+                dropped.size() == 2 && firstDropped && secondDropped &&
+                firstDropped->source_id == sourceId &&
+                secondDropped->source_id == secondSourceId &&
+                secondDropped->timeline_in ==
+                    firstDropped->timeline_in.add(firstDropped->duration),
+            "Multi-media drop inserts the selected rushes in order");
+        self.state->linkedSelection = linkedSelection;
+        self.state->interaction->SetLinkedSelectionEnabled(linkedSelection);
     }
 
     CAMetalLayer* sourceLayer = (CAMetalLayer*)self.sourceMonitorView.layer;
@@ -11567,13 +12688,20 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
 @end
 
 int main(int argc, char* argv[]) {
+    const auto failCli = [](const std::string& errorCode,
+                            const std::string& detail, int exitStatus) {
+        std::string output;
+        const int result =
+            FailCliCommand(errorCode, detail, output, exitStatus);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    };
 #if defined(CUTMACHINE_UI_SMOKE_TEST)
     if (argc == 2 && std::string(argv[1]) == "--ui-smoke") {
         std::string error;
         if (!PrepareUiSmokeProject(error)) {
-            std::fprintf(stderr, "Unable to prepare UI smoke project: %s\n",
-                         error.c_str());
-            return 1;
+            return failCli("IoError",
+                           "unable to prepare UI smoke project: " + error, 1);
         }
         gUiSmokeTesting = true;
     }
@@ -11581,6 +12709,233 @@ int main(int argc, char* argv[]) {
     if (argc == 3 && std::string(argv[1]) == "--describe") {
         std::string output;
         const int result = DescribeCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 4 && std::string(argv[1]) == "--create-project") {
+        std::string output;
+        const int result = CreateProjectCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    // B7 -- the timeline's assembled PCM goes straight to Whisper. Unlike
+    // --transcribe this command has no media id: its optional timeline id is
+    // resolved by the project and its model is the local configured model.
+    if (argc >= 3 && std::string(argv[1]) == "--transcribe-timeline") {
+        std::string timelineId;
+        std::string language = "auto";
+        bool verbatim = false;
+        for (int index = 3; index < argc; ++index) {
+            const std::string option(argv[index]);
+            if (option == "--timeline" && index + 1 < argc &&
+                timelineId.empty()) {
+                timelineId = argv[++index];
+            } else if (option == "--language" && index + 1 < argc) {
+                language = argv[++index];
+            } else if (option == "--verbatim") {
+                verbatim = true;
+            } else {
+                return failCli(
+                    "ValidationFailed",
+                    "unknown --transcribe-timeline option '" + option + "'", 2);
+            }
+        }
+        std::string output;
+        const int result = TranscribeTimelineCommand(
+            argv[2], timelineId, language, verbatim, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    // B7 -- direct SRT from a delivered media file, with no disposable
+    // project. The local Whisper model remains configured exactly as for the
+    // other transcription surfaces.
+    if (argc >= 4 && std::string(argv[1]) == "--srt-from-media") {
+        std::string language = "auto";
+        bool verbatim = false;
+        for (int index = 4; index < argc; ++index) {
+            const std::string option(argv[index]);
+            if (option == "--language" && index + 1 < argc) {
+                language = argv[++index];
+            } else if (option == "--verbatim") {
+                verbatim = true;
+            } else {
+                return failCli(
+                    "ValidationFailed",
+                    "unknown --srt-from-media option '" + option + "'", 2);
+            }
+        }
+        std::string output;
+        const int result =
+            SrtFromMediaCommand(argv[2], argv[3], language, verbatim, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    // ALPHA-2026-08 -- the model path became optional the day it became a
+    // local setting (Transcription.h). Omitting it entirely, or passing it
+    // empty to reach the arguments behind it, resolves the configured model.
+    //
+    // QC-2026-09 A3 -- several media ids may be given, comma-separated, so
+    // one call pays the model load once. The grammar is otherwise unchanged:
+    // `--transcribe <projet> <media-ids> [modèle] [langue] [--verbatim]`.
+    if (argc >= 4 && std::string(argv[1]) == "--transcribe") {
+        std::vector<std::string> mediaIds;
+        {
+            const std::string joined(argv[3]);
+            size_t start = 0;
+            while (start <= joined.size()) {
+                const size_t comma = joined.find(',', start);
+                const std::string piece = joined.substr(
+                    start, comma == std::string::npos ? std::string::npos
+                                                      : comma - start);
+                if (!piece.empty()) mediaIds.push_back(piece);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+        std::string language = "auto";
+        bool verbatim = false;
+        bool includeSilent = false;
+        std::string modelPath;
+        int positional = 0;
+        for (int index = 4; index < argc; ++index) {
+            const std::string option(argv[index]);
+            if (option == "--verbatim") {
+                verbatim = true;
+            } else if (option == "--include-silent") {
+                includeSilent = true;
+            } else if (positional == 0) {
+                modelPath = option;
+                ++positional;
+            } else if (positional == 1) {
+                language = option;
+                ++positional;
+            } else {
+                return failCli("ValidationFailed",
+                               "unexpected transcription argument '" +
+                                   std::string(argv[index]) + "'",
+                               2);
+            }
+        }
+        std::string output;
+        const int result =
+            TranscribeMediaCommand(argv[2], mediaIds, modelPath, language,
+                                   verbatim, includeSilent, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 4 && std::string(argv[1]) == "--shot-quality") {
+        std::string output;
+        const int result = AnalyzeShotQualityCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--shot-quality-report") {
+        std::string output;
+        const int result = ShotQualityReportCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--timeline-stats") {
+        std::string output;
+        const int result = TimelineStatsCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc >= 4 && (std::string(argv[1]) == "--contact-sheet" ||
+                      std::string(argv[1]) == "--cut-sheet")) {
+        std::string timelineId;
+        int32_t maximumImages = 24;
+        for (int index = 4; index < argc; ++index) {
+            const std::string option(argv[index]);
+            if (option == "--timeline" && index + 1 < argc &&
+                timelineId.empty()) {
+                timelineId = argv[++index];
+            } else if (option == "--max-images" && index + 1 < argc) {
+                maximumImages = std::atoi(argv[++index]);
+            } else {
+                return failCli("ValidationFailed",
+                               "unknown timeline sheet option '" + option + "'",
+                               2);
+            }
+        }
+        std::string output;
+        const int result =
+            std::string(argv[1]) == "--contact-sheet"
+                ? ContactSheetCommand(argv[2], argv[3], timelineId,
+                                      maximumImages, output)
+                : CutSheetCommand(argv[2], argv[3], timelineId, maximumImages,
+                                  output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--locate-source-frame") {
+        std::string output;
+        const int result = LocateSourceFrameCommand(
+            argv[2], argv[3], std::atoll(argv[4]), output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 4 && std::string(argv[1]) == "--disfluencies") {
+        std::string output;
+        const int result = ListDisfluenciesCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    // QC-2026-09 A2 -- min-gap and keep default in the engine, so the short
+    // form is the one an editor types and the long form is the one a script
+    // pins.
+    if ((argc == 4 || argc == 6) &&
+        std::string(argv[1]) == "--tighten-pauses") {
+        PauseTighteningSettings defaults;
+        int64_t minimumGapMs = defaults.minimum_gap_milliseconds;
+        int64_t keepFrames = defaults.keep_frames;
+        if (argc == 6) {
+            minimumGapMs = std::atoll(argv[4]);
+            keepFrames = std::atoll(argv[5]);
+        }
+        std::string output;
+        const int result = TightenPausesCommand(argv[2], argv[3], minimumGapMs,
+                                                keepFrames, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    // B4 -- boundary air uses the B1 speech groups, not transcript words.
+    // Short forms use the engine's three-frame / 300 ms safety defaults;
+    // scripts can pin both values positionally after the clip ids.
+    if ((argc == 4 || argc == 6) &&
+        std::string(argv[1]) == "--trim-boundary-air") {
+        BoundaryAirSettings defaults;
+        int64_t keepFrames = defaults.keep_frames;
+        int64_t minimumAirMs = defaults.minimum_air_milliseconds;
+        if (argc == 6) {
+            keepFrames = std::atoll(argv[4]);
+            minimumAirMs = std::atoll(argv[5]);
+        }
+        std::string output;
+        const int result = TrimBoundaryAirCommand(argv[2], argv[3], keepFrames,
+                                                  minimumAirMs, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if ((argc == 5 || argc == 7) &&
+        std::string(argv[1]) == "--close-junction-air") {
+        BoundaryAirSettings defaults;
+        int64_t keepFrames = defaults.keep_frames;
+        int64_t minimumAirMs = defaults.minimum_air_milliseconds;
+        if (argc == 7) {
+            keepFrames = std::atoll(argv[5]);
+            minimumAirMs = std::atoll(argv[6]);
+        }
+        std::string output;
+        const int result = CloseJunctionAirCommand(
+            argv[2], argv[3], argv[4], keepFrames, minimumAirMs, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--remove-words") {
+        std::string output;
+        const int result =
+            RemoveWordsCommand(argv[2], argv[3], argv[4], output);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
@@ -11613,9 +12968,10 @@ int main(int argc, char* argv[]) {
         int port = 0;
         if (argc == 5) {
             if (std::string(argv[3]) != "--port") {
-                std::fprintf(stderr, "Unknown --mcp-serve option: %s\n",
-                             argv[3]);
-                return 2;
+                return failCli(
+                    "ValidationFailed",
+                    "unknown --mcp-serve option '" + std::string(argv[3]) + "'",
+                    2);
             }
             port = std::atoi(argv[4]);
         }
@@ -11626,13 +12982,23 @@ int main(int argc, char* argv[]) {
         // tool call takes the same load/apply/commit path a human editing
         // through the app or the CLI does. No AppKit/Metal/media decoding is
         // initialized for this path.
-        McpProjectBackend backend(argv[2]);
+        ProjectSessionLock projectLock;
+        std::string lockOwner;
+        std::string lockError;
+        if (!projectLock.Acquire(argv[2], lockOwner, lockError)) {
+            return failCli("IoError",
+                           "mcp-serve cannot lock the project: " + lockError,
+                           1);
+        }
+        const bool requireExplicitTimeline =
+            [[CMUiPreferences sharedPreferences]
+                requiresExplicitTimelineForAgentEdits];
+        McpProjectBackend backend(argv[2], requireExplicitTimeline);
         McpServer server(backend);
         std::string startError;
         if (!server.Start(port, startError)) {
-            std::fprintf(stderr, "mcp-serve failed to start: %s\n",
-                         startError.c_str());
-            return 1;
+            return failCli("IoError",
+                           "mcp-serve failed to start: " + startError, 1);
         }
         std::fprintf(stderr,
                      "MCP server listening on http://127.0.0.1:%d/mcp for "
@@ -11653,18 +13019,87 @@ int main(int argc, char* argv[]) {
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
     }
-    if (argc >= 4 && argc <= 6 && std::string(argv[1]) == "--export") {
+    if (argc == 4 && std::string(argv[1]) == "--speech-onset") {
+        std::string output;
+        const int result = AnalyzeSpeechOnsetCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    // QC-2026-09 (A1) -- `--write` is what makes the alignment reach the tools
+    // that cut on words; without it this only reports what it would correct.
+    if ((argc == 3 || argc == 4) &&
+        std::string(argv[1]) == "--align-transcripts") {
+        if (argc == 4 && std::string(argv[3]) != "--write") {
+            return failCli("ValidationFailed",
+                           "unknown --align-transcripts option '" +
+                               std::string(argv[3]) + "'",
+                           2);
+        }
+        std::string output;
+        const int result = AlignTranscriptsCommand(argv[2], argc == 4, output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--speech-onset-report") {
+        std::string output;
+        const int result = SpeechOnsetReportCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if ((argc == 4 || argc == 6) && std::string(argv[1]) == "--export-srt") {
+        if (argc == 6 && std::string(argv[4]) != "--timeline") {
+            return failCli(
+                "ValidationFailed",
+                "unknown --export-srt option '" + std::string(argv[4]) + "'",
+                2);
+        }
+        std::string output;
+        const int result = ExportSrtCommand(argv[2], argv[3], output,
+                                            argc == 6 ? argv[5] : "");
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if ((argc == 3 || argc == 5) &&
+        std::string(argv[1]) == "--export-resolve-timeline") {
+        if (argc == 5 && std::string(argv[3]) != "--timeline") {
+            return failCli("ValidationFailed",
+                           "unknown --export-resolve-timeline option '" +
+                               std::string(argv[3]) + "'",
+                           2);
+        }
+        std::string output;
+        const int result = ExportResolveTimelineCommand(
+            argv[2], output, argc == 5 ? argv[4] : "");
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--propose-sequence") {
+        std::string output;
+        const int result = ProposeSequenceCommand(argv[2], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc == 4 && std::string(argv[1]) == "--import-resolve") {
+        std::string output;
+        const int result = ImportResolveCommand(argv[2], argv[3], output);
+        std::fwrite(output.data(), 1, output.size(), stdout);
+        return result;
+    }
+    if (argc >= 4 && argc <= 8 && std::string(argv[1]) == "--export") {
         ExportSettings settings = Exporter::HevcMain10Preset(argv[3]);
+        std::string timelineId;
         for (int index = 4; index < argc; ++index) {
             const std::string option(argv[index]);
             if (option == "--software")
                 settings.encoder = ExportEncoder::HevcSoftware;
             else if (option == "--overwrite")
                 settings.overwrite = true;
+            else if (option == "--timeline" && index + 1 < argc &&
+                     timelineId.empty())
+                timelineId = argv[++index];
             else {
-                std::fprintf(stderr, "Unknown export option: %s\n",
-                             argv[index]);
-                return 2;
+                return failCli("ValidationFailed",
+                               "unknown export option '" + option + "'", 2);
             }
         }
         std::string output;
@@ -11683,7 +13118,7 @@ int main(int argc, char* argv[]) {
                     std::fflush(stderr);
                 }
             },
-            nullptr, output);
+            nullptr, output, timelineId);
         if (lastPercent >= 0) std::fputc('\n', stderr);
         std::fwrite(output.data(), 1, output.size(), stdout);
         return result;
@@ -11693,26 +13128,11 @@ int main(int argc, char* argv[]) {
                      && !gUiSmokeTesting
 #endif
                      )) {
-        std::fprintf(
-            stderr,
-            "Usage: %s [/path/to/project.cutmachine.json]\n"
-            "       %s --describe /path/to/project.cutmachine.json\n"
-            "       %s --apply-op /path/to/project.cutmachine.json "
-            "'<op.json>'\n"
-            "       %s --apply-project-op /path/to/project.cutmachine.json "
-            "'<op.json>'\n"
-            "       %s --undo-project-op /path/to/project.cutmachine.json\n"
-            "       %s --redo-project-op /path/to/project.cutmachine.json\n"
-            "       %s --mcp-serve /path/to/project.cutmachine.json "
-            "[--port N]\n"
-            "       %s --ingest /path/to/project.cutmachine.json "
-            "/path/to/media "
-            "[--recursive]\n"
-            "       %s --export /path/to/project.cutmachine.json output.mp4 "
-            "[--software] [--overwrite]\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-            argv[0], argv[0]);
-        return 2;
+        return failCli(
+            "ValidationFailed",
+            "invalid command line; expected a project path or a supported "
+            "--command with its documented arguments",
+            2);
     }
 
     @autoreleasepool {

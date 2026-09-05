@@ -97,6 +97,15 @@ l’utilisateur et le PID. Une seconde écriture est refusée. Un verrou dont le
 PID local n’existe plus est retiré ; un verrou d’une autre machine n’est jamais
 cassé automatiquement.
 
+La transaction ne touche que les fichiers qu'elle a elle-même écrits : dans
+`Timelines/`, un fichier n'est reconnu comme timeline obsolète que si son nom
+est un ULID valide suivi de `.json`. C'est ce qui rend le format utilisable sur
+un volume exFAT ou FAT — celui de la plupart des disques média partagés — où
+macOS crée un fichier compagnon AppleDouble `._<nom>` à côté de chaque fichier.
+Ces compagnons ne peuvent pas être renommés seuls, et les prendre pour des
+timelines périmées faisait échouer toute sauvegarde d'un projet stocké sur un
+tel disque.
+
 Les renommages multiples ne sont pas une transaction matérielle face à un crash
 machine. Il faut fermer CUTMACHINE et attendre la synchronisation complète avant
 d’ouvrir un package sur un autre Mac. Pour un transfert, une archive ZIP fermée

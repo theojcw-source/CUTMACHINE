@@ -3,13 +3,48 @@
 #include "Document.h"
 
 #include <algorithm>
+#include <cctype>
+
+namespace {
+
+std::string AliasPrefix(size_t ordinal) {
+    std::string prefix;
+    do {
+        prefix.insert(prefix.begin(),
+                      static_cast<char>('A' + static_cast<int>(ordinal % 26)));
+        ordinal /= 26;
+        if (ordinal == 0) break;
+        --ordinal;
+    } while (true);
+    return prefix;
+}
+
+std::string UpperAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](char character) {
+                       return static_cast<char>(
+                           std::toupper(static_cast<unsigned char>(character)));
+                   });
+    return value;
+}
+
+}  // namespace
 
 std::vector<Ulid> CollectDocumentIds(const Document& document) {
     std::vector<Ulid> ids;
     ids.push_back(document.sequence.id);
     for (const DocumentTrack& track : document.sequence.tracks) {
         ids.push_back(track.id);
-        for (const DocumentClip& clip : track.clips) ids.push_back(clip.id);
+        for (const DocumentClip& clip : track.clips) {
+            ids.push_back(clip.id);
+            // F1.2 -- ROADMAP.md: linked-group operations expose their group
+            // ID as an addressable argument even though the group is stored
+            // on its member clips rather than as a standalone document node.
+            if (!clip.link_group_id.empty() &&
+                std::find(ids.begin(), ids.end(), clip.link_group_id) ==
+                    ids.end())
+                ids.push_back(clip.link_group_id);
+        }
     }
     for (const DocumentSource& source : document.sources)
         ids.push_back(source.id);
@@ -30,7 +65,30 @@ std::vector<Ulid> CollectDocumentIds(const Document& document) {
 
 IdResolver::IdResolver(const Document& document)
     : universe_(CollectDocumentIds(document)),
-      sequence_id_(document.sequence.id) {}
+      sequence_id_(document.sequence.id) {
+    std::vector<const DocumentTrack*> tracks;
+    for (const DocumentTrack& track : document.sequence.tracks)
+        tracks.push_back(&track);
+    std::stable_sort(tracks.begin(), tracks.end(),
+                     [](const DocumentTrack* left, const DocumentTrack* right) {
+                         return left->index < right->index;
+                     });
+    for (size_t trackOrdinal = 0; trackOrdinal < tracks.size();
+         ++trackOrdinal) {
+        for (size_t clipIndex = 0;
+             clipIndex < tracks[trackOrdinal]->clips.size(); ++clipIndex) {
+            aliases_.push_back(
+                {AliasPrefix(trackOrdinal) + std::to_string(clipIndex + 1),
+                 tracks[trackOrdinal]->clips[clipIndex].id});
+        }
+    }
+    for (size_t index = 0; index < document.library.size(); ++index)
+        aliases_.push_back(
+            {"M" + std::to_string(index + 1), document.library[index].id});
+    for (size_t index = 0; index < document.sequence.markers.size(); ++index)
+        aliases_.push_back({"K" + std::to_string(index + 1),
+                            document.sequence.markers[index].id});
+}
 
 bool IdResolver::Resolve(const std::string& fieldName, const std::string& input,
                          Ulid& output, std::string& error) const {
@@ -46,6 +104,23 @@ bool IdResolver::Resolve(const std::string& fieldName, const std::string& input,
         universe_.end()) {
         output = input;
         return true;
+    }
+    const std::string alias = UpperAscii(input);
+    const Ulid* aliasMatch = nullptr;
+    size_t aliasMatchCount = 0;
+    for (const auto& candidate : aliases_) {
+        if (candidate.first != alias) continue;
+        aliasMatch = &candidate.second;
+        ++aliasMatchCount;
+    }
+    if (aliasMatchCount == 1) {
+        output = *aliasMatch;
+        return true;
+    }
+    if (aliasMatchCount > 1) {
+        error = "'" + fieldName + "': alias '" + input +
+                "' is ambiguous, matches more than one object";
+        return false;
     }
     const Ulid* match = nullptr;
     size_t matchCount = 0;

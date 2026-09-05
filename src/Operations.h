@@ -66,6 +66,9 @@ struct InsertClipOperation {
 
 struct RemoveClipOperation {
     Ulid clip_id;
+    // QC-2026-09 A5 -- tracks without the removed A/V member still need the
+    // same ripple to preserve their downstream alignment.
+    std::vector<Ulid> sync_track_ids;
     std::vector<ExactTimelinePosition> exact_timeline_result;
 };
 
@@ -133,6 +136,14 @@ struct LinkedClipMove {
     RationalTime timeline_in;
 };
 
+// UI-2026-08 -- dragging an arbitrary timeline selection is one intention and
+// therefore one undoable operation. Members need not share an A/V link group;
+// each keeps its stable clip ID and receives an exact destination.
+struct MoveClipsOperation {
+    std::vector<LinkedClipMove> moves;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 struct MoveLinkedClipsOperation {
     Ulid link_group_id;
     std::vector<LinkedClipMove> moves;
@@ -162,6 +173,27 @@ struct RippleTrimOperation {
     std::vector<ExactTrackState> exact_track_result;
 };
 
+// B4 -- ROADMAP.md. One measured boundary trim, already resolved to the
+// exact delta ApplyRippleTrim understands. Keeping the linked members beside
+// each boundary matters at a junction: the outgoing and incoming clips have
+// different A/V groups, while the whole gesture must still be one event-log
+// entry.
+struct BoundaryAirTrim {
+    Ulid clip_id;
+    TrimEdge edge = TrimEdge::Head;
+    RationalTime delta;
+    std::vector<Ulid> linked_clip_ids;
+};
+
+// Applies one clip's head/tail cleanup, or both sides of a junction,
+// atomically. The exact snapshots are both the rollback representation and
+// the canonical inverse, matching the other multi-track operations.
+struct TrimBoundaryAirOperation {
+    std::vector<BoundaryAirTrim> trims;
+    std::vector<Ulid> sync_track_ids;
+    std::vector<ExactTrackState> exact_track_result;
+};
+
 struct RollEditPair {
     Ulid left_clip_id;
     Ulid right_clip_id;
@@ -184,6 +216,7 @@ struct SlipEditOperation {
 struct RemoveLinkedClipsOperation {
     Ulid link_group_id;
     std::vector<Ulid> clip_ids;
+    std::vector<Ulid> sync_track_ids;
     std::vector<ExactTrackState> exact_track_result;
 };
 
@@ -229,6 +262,12 @@ struct UpdateSequenceOperation {
     int32_t width = 1920;
     int32_t height = 1080;
     MediaRate frame_rate{25, 1};
+};
+
+// COLOR-2026-08 -- project color is authoritative document state, so UI,
+// CLI, and MCP must all change it through the same reversible operation.
+struct SetColorManagementOperation {
+    ColorManagementSettings settings;
 };
 
 struct RemoveTrackOperation {
@@ -357,6 +396,9 @@ struct SplitLinkedClipsOperation {
     Ulid left_group_id;
     Ulid right_group_id;
     std::vector<Ulid> right_clip_ids;
+    // Additional tracks receive an edit at the same exact position even
+    // when they hold no member of the linked group.
+    std::vector<Ulid> sync_track_ids;
     std::vector<ExactTrackState> exact_track_result;
 };
 
@@ -400,6 +442,23 @@ struct JoinClipOperation {
 struct SetClipEffectsOperation {
     Ulid clip_id;
     std::vector<ClipEffect> effects;
+};
+
+// ALPHA-2026-08 -- per-clip opacity is independently addressable from the
+// creative color stack and has a compact, byte-exact inverse.
+struct SetClipOpacityOperation {
+    Ulid clip_id;
+    EffectParamValue opacity{1, 1};
+};
+
+// QC-2026-09 A7 -- one audible clip setting is one editorial decision. The
+// complete replacement state makes its inverse byte-exact and leaves no
+// partial gain/fade state for a caller to reconcile.
+struct SetClipAudioOperation {
+    Ulid clip_id;
+    EffectParamValue gain_db{0, 1};
+    RationalTime fade_in{0, 1};
+    RationalTime fade_out{0, 1};
 };
 
 struct AddCaptionStyleOperation {
@@ -467,8 +526,15 @@ struct RemoveWordsOperation {
     // or tail edge (see ApplyRemoveWords) -- there is no fragment on the
     // other side of those cuts to pad against.
     RationalTime gap_padding{0, 1};
+    // Other clips cut by the exact same source ranges, each ripple-closed on
+    // its own track, inside this one operation. This is how an A/V pair is
+    // cleaned: picture and sound must lose the same frames or they drift,
+    // and doing it as two operations would turn one editorial gesture into
+    // two undo steps. Every named clip must contain every range in its own
+    // source span, which is checked here rather than trusted.
+    std::vector<Ulid> linked_clip_ids;
     // Other tracks ripple-shifted by this clip's same total delta, beyond
-    // its own track. Mirrors RippleTrimOperation::sync_track_ids.
+    // the tracks cut above. Mirrors RippleTrimOperation::sync_track_ids.
     std::vector<Ulid> sync_track_ids;
     std::vector<ExactTrackState> exact_track_result;
 };
@@ -476,21 +542,22 @@ struct RemoveWordsOperation {
 using Operation = std::variant<
     InsertClipOperation, RemoveClipOperation, ClearClipOperation,
     ClearClipsOperation, PasteClipsOperation, TrimClipOperation,
-    MoveClipOperation, DeleteGapOperation, DetachAudioOperation,
-    MoveLinkedClipsOperation, TrimLinkedClipsOperation, RippleTrimOperation,
-    RollEditOperation, SlipEditOperation, RemoveLinkedClipsOperation,
-    ClearLinkedClipsOperation, AddTrackOperation, RemoveTrackOperation,
-    SetTrackLockOperation, SetTrackSyncLockOperation, SetTrackOutputOperation,
-    UpdateSequenceOperation, SplitClipOperation, SplitLinkedClipsOperation,
+    MoveClipOperation, MoveClipsOperation, DeleteGapOperation,
+    DetachAudioOperation, MoveLinkedClipsOperation, TrimLinkedClipsOperation,
+    RippleTrimOperation, TrimBoundaryAirOperation, RollEditOperation,
+    SlipEditOperation, RemoveLinkedClipsOperation, ClearLinkedClipsOperation,
+    AddTrackOperation, RemoveTrackOperation, SetTrackLockOperation,
+    SetTrackSyncLockOperation, SetTrackOutputOperation, UpdateSequenceOperation,
+    SetColorManagementOperation, SplitClipOperation, SplitLinkedClipsOperation,
     JoinClipOperation, AddBinOperation, RemoveBinOperation, RenameBinOperation,
     MoveBinOperation, SetMediaBinOperation, AddMarkerOperation,
     RemoveMarkerOperation, UpdateMarkerOperation, AddTransitionOperation,
     RemoveTransitionOperation, UpdateTransitionOperation, SetClipLinkOperation,
-    SetClipEffectsOperation, AddCaptionStyleOperation,
-    RemoveCaptionStyleOperation, SetClipCaptionOperation,
-    AddMulticamGroupOperation, RemoveMulticamGroupOperation,
-    SetMulticamActiveAngleOperation, RemoveWordsOperation,
-    SplitClipAtPositionsOperation>;
+    SetClipEffectsOperation, SetClipOpacityOperation, SetClipAudioOperation,
+    AddCaptionStyleOperation, RemoveCaptionStyleOperation,
+    SetClipCaptionOperation, AddMulticamGroupOperation,
+    RemoveMulticamGroupOperation, SetMulticamActiveAngleOperation,
+    RemoveWordsOperation, SplitClipAtPositionsOperation>;
 
 // Turns a repeat spacing into the exact positions to cut `clipId` at:
 // interval, 2*interval, ... for as long as they stay strictly inside the
@@ -509,6 +576,28 @@ bool ResolveIntervalSplits(const Document& document, const Ulid& clipId,
                            SplitClipAtPositionsOperation& operation,
                            std::string& error);
 
+// Other clips sharing `clip`'s A/V link group *and* genuinely covering the
+// same cut. A word-level cut that touched only the clip it was aimed at
+// would shorten the sound and leave the picture, so a detached A/V pair has
+// to be cut together -- and working out which clips those are is a
+// document-shape question the caller should not have to answer
+// (PHILOSOPHY.md principle 7).
+//
+// The containment test is what keeps this an intent-layer decision rather
+// than a guess. A link group can hold a member that reads from another
+// source, or from another part of the same one; cutting it by these ranges
+// would be meaningless, so it is left alone here. RemoveWordsOperation stays
+// strict about whatever it is finally told: naming such a clip explicitly is
+// still an error, it just is not one this resolver produces.
+//
+// QC-2026-09 (A2) -- lives here rather than in McpTools.cc, where it was
+// written for Q4b, because pause tightening needs the same answer from both
+// the CLI and the MCP surface. A rule about which clips a cut has to carry
+// is engine knowledge; two copies of it would be two chances to drift.
+std::vector<Ulid> LinkedClipIdsCoveringRanges(
+    const Document& document, const DocumentClip& clip,
+    const std::vector<WordRemovalRange>& ranges);
+
 struct ExactProjectState {
     std::string canonical_json;
 };
@@ -521,6 +610,32 @@ struct AddProjectTimelineOperation {
     Ulid timeline_id;
     Ulid video_track_id;
     Ulid audio_track_id;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
+// ALPHA-2026-08 -- An agent chooses editorial source ranges, while the engine
+// owns the deterministic assembly, generated identities and exact timeline
+// positions. This keeps a natural-language "make a short" request on the
+// same reversible project-operation path as every other edit.
+struct ProjectTimelineSourceSegment {
+    Ulid source_id;
+    RationalTime source_in;
+    RationalTime duration;
+    Ulid video_clip_id;
+    Ulid audio_clip_id;
+    Ulid link_group_id;
+};
+
+struct CreateProjectTimelineFromSegmentsOperation {
+    std::string name = "Interview short";
+    int32_t width = 1920;
+    int32_t height = 1080;
+    MediaRate frame_rate{25, 1};
+    std::vector<ProjectTimelineSourceSegment> segments;
+    Ulid timeline_id;
+    Ulid video_track_id;
+    Ulid audio_track_id;
+    bool make_active = true;
     std::optional<ExactProjectState> exact_project_result;
 };
 
@@ -553,15 +668,26 @@ struct ProjectRelinkItem {
     std::string stored_path;
 };
 
+// QC-2026-08 -- Switching which timeline is active was reachable only from
+// the app's own timeline list, so an agent could create a timeline and then
+// not navigate to one. That is the "moteur d'abord" rule broken in the
+// direction the rule exists to prevent (PHILOSOPHY.md principle 3): a
+// capability the mouse had and no other surface did.
+struct SetActiveProjectTimelineOperation {
+    Ulid timeline_id;
+    std::optional<ExactProjectState> exact_project_result;
+};
+
 struct RelinkProjectMediaOperation {
     std::vector<ProjectRelinkItem> replacements;
     std::optional<ExactProjectState> exact_project_result;
 };
 
-using ProjectOperation =
-    std::variant<AddProjectTimelineOperation, RemoveProjectTimelineOperation,
-                 SetProjectBinMetadataOperation, SetProjectTimelineBinOperation,
-                 RenameProjectItemOperation, RelinkProjectMediaOperation>;
+using ProjectOperation = std::variant<
+    AddProjectTimelineOperation, CreateProjectTimelineFromSegmentsOperation,
+    RemoveProjectTimelineOperation, SetProjectBinMetadataOperation,
+    SetProjectTimelineBinOperation, RenameProjectItemOperation,
+    SetActiveProjectTimelineOperation, RelinkProjectMediaOperation>;
 
 // On success, operation is enriched with generated IDs and exact redo state.
 // Both document and operation remain unchanged on failure.

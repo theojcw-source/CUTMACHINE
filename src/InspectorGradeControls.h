@@ -110,6 +110,22 @@ inline EffectParamValue QuantizeGradeControlValue(const GradeControlSpec& spec,
     return EffectParamValue{num, den};
 }
 
+// ALPHA-2026-08 -- Inspector percentages cross into the canonical model at a
+// fixed 1/1000 boundary. Keeping this pure lets the portable UI policy tests
+// cover the same value AppKit submits through SetClipOpacityOperation.
+inline EffectParamValue QuantizeClipOpacity(float sliderValue) {
+    const float clamped = std::clamp(sliderValue, 0.0f, 1.0f);
+    return {static_cast<int32_t>(
+                std::lround(static_cast<double>(clamped) * 1000.0)),
+            1000};
+}
+
+inline float CurrentClipOpacity(const EffectParamValue& opacity) {
+    return opacity.den > 0 ? static_cast<float>(opacity.num) /
+                                 static_cast<float>(opacity.den)
+                           : 1.0f;
+}
+
 // Reads a knob's current value out of a clip's effect stack, honoring the
 // registry's default (ColorEffects.h) when the clip carries no entry for
 // this type -- the same rule ResolveColorGrade applies at render time,

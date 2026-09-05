@@ -38,4 +38,8 @@
 // to anything read from the project.
 - (nullable NSString*)lastActiveIdentifierForDock:(ui::PanelDock)dock;
 
+// B9 -- automation can opt out of implicit active-timeline state. This is a
+// machine-local safety policy, never project data.
+- (BOOL)requiresExplicitTimelineForAgentEdits;
+
 @end

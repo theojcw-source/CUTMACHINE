@@ -36,6 +36,7 @@ using chat::ChatLlmClient;
 using chat::ChatLlmConfig;
 using chat::ChatSession;
 using chat::ChatTranscriptEntry;
+using mcp_json::Value;
 
 int failures = 0;
 
@@ -77,8 +78,9 @@ Document Fixture() {
 // and McpLiveBackend (the app's real backend, McpLiveBackend.h) both call.
 class InMemoryBackend : public McpBackend {
 public:
-    explicit InMemoryBackend(Document document)
-        : document_(std::move(document)) {}
+    explicit InMemoryBackend(Document document, std::string describeJson = {})
+        : document_(std::move(document)),
+          describe_json_(std::move(describeJson)) {}
 
     bool SnapshotDocument(Document& document, std::string&) override {
         document = document_;
@@ -122,6 +124,10 @@ public:
     }
 
     bool Describe(std::string& json, std::string&) override {
+        if (!describe_json_.empty()) {
+            json = describe_json_;
+            return true;
+        }
         json = "{\"clip_count\":" +
                std::to_string(document_.sequence.tracks.at(0).clips.size()) +
                "}";
@@ -133,6 +139,7 @@ public:
 private:
     Document document_;
     EditLog log_;
+    std::string describe_json_;
 };
 
 // A scripted transport: each call to SendMessages consumes the next
@@ -144,7 +151,7 @@ public:
     explicit ScriptedTransport(std::vector<std::string> responses)
         : responses_(std::move(responses)) {}
 
-    bool operator()(const ChatHttpRequest&, ChatHttpResponse& response,
+    bool operator()(const ChatHttpRequest& request, ChatHttpResponse& response,
                     std::string& error) {
         if (call_count_ >= responses_.size()) {
             error = "scripted transport ran out of responses";
@@ -152,20 +159,33 @@ public:
         }
         response.status_code = 200;
         response.body = responses_[call_count_];
+        requests_.push_back(request);
         ++call_count_;
         return true;
     }
 
     size_t CallCount() const { return call_count_; }
+    const ChatHttpRequest& Request(size_t index) const {
+        return requests_.at(index);
+    }
 
 private:
     std::vector<std::string> responses_;
+    std::vector<ChatHttpRequest> requests_;
     size_t call_count_ = 0;
 };
 
 ChatLlmConfig TestConfig() {
     ChatLlmConfig config;
     config.api_key = "sk-test-key";
+    return config;
+}
+
+ChatLlmConfig OllamaConfig() {
+    ChatLlmConfig config;
+    config.provider = chat::ChatLlmProvider::Ollama;
+    config.model = "qwen2.5-coder:7b";
+    config.base_url = "http://localhost:11434";
     return config;
 }
 
@@ -293,6 +313,59 @@ int main() {
             }
             Check(sawFailedResult,
                   "the transcript records the failed tool call");
+        });
+
+    Test(
+        "Ollama describe results are compacted before the model follow-up", [] {
+            const std::string description =
+                R"({"sequence":{"name":"Montage"},"timeline":{)"
+                R"("duration":{"frames":10},"tracks":[{"items":[)"
+                R"({"type":"clip","source_id":"used"}]}],"sources":[)"
+                R"({"id":"used","file":"used.mov"},)"
+                R"({"id":"unused","file":"unused.mov"}]},"library":[)"
+                R"({"alias":"M1","id":"unused","filename":"unused.mov",)"
+                R"("codec":"codec_marker","in_use":false}],)"
+                R"("bins":[],"markers":[]})";
+            InMemoryBackend backend(Fixture(), description);
+            McpToolRegistry registry;
+            ScriptedTransport transport({
+                R"({"message":{"role":"assistant","content":)"
+                R"("{\"name\":\"describe\",\"arguments\":{}}"},)"
+                R"("done":true,"done_reason":"stop"})",
+                R"({"message":{"role":"assistant","content":"Diagnostic."},)"
+                R"("done":true,"done_reason":"stop"})",
+            });
+            ChatLlmClient llm(OllamaConfig(), std::ref(transport));
+            ChatSession session(backend, registry, llm);
+
+            std::string error;
+            const bool ok = session.SubmitUserMessage("Décris.", error);
+            Check(ok, "the Ollama describe loop succeeds: " + error);
+            Check(transport.CallCount() == 2,
+                  "textual describe call produces a model follow-up");
+
+            Value request;
+            std::string parseError;
+            Check(Value::Parse(transport.Request(1).body, request, parseError),
+                  "follow-up request is valid JSON: " + parseError);
+            const Value* messages = request.Find("messages");
+            const Value* content = nullptr;
+            if (messages && messages->IsArray() && !messages->AsArray().empty())
+                content = messages->AsArray().back().Find("content");
+            Value compact;
+            Check(content && content->IsString() &&
+                      Value::Parse(content->AsString(), compact, parseError),
+                  "tool content remains structured JSON: " + parseError);
+            const Value* timeline = compact.Find("timeline");
+            const Value* sources =
+                timeline ? timeline->Find("sources") : nullptr;
+            Check(
+                sources && sources->IsArray() && sources->AsArray().size() == 1,
+                "only timeline-used sources remain in the compact view");
+            const Value* library = compact.Find("library");
+            Check(library && library->IsArray() &&
+                      library->AsArray().front().Find("codec") == nullptr,
+                  "heavy library metadata is omitted for the local model");
         });
 
     Test("a transport failure stops the turn and is recorded as an error", [] {

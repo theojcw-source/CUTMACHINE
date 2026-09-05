@@ -13,9 +13,12 @@ bool ValidateRelinkCandidate(const Document& document, const Ulid& mediaId,
         error = "unknown media or mounted source";
         return false;
     }
-    if (!replacement.metadata_complete || replacement.width <= 0 ||
-        replacement.height <= 0) {
-        error = "replacement is not a valid video source";
+    if (!replacement.metadata_complete ||
+        (media->has_video && !replacement.has_video) ||
+        (!media->has_video && !replacement.has_audio)) {
+        error = media->has_video
+                    ? "replacement has no video for existing video media"
+                    : "replacement has no audio for existing audio media";
         return false;
     }
     if (static_cast<int64_t>(replacement.rate.num) * source->rate.den !=

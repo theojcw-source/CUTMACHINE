@@ -55,6 +55,52 @@ int main() {
               verticalId,
           "serialized project operation retains enriched IDs");
 
+    // QC-2026-08 -- switching the active timeline is an operation like any
+    // other, so an agent can navigate a project instead of being stuck on
+    // whatever the app last left active.
+    Check(project.active_timeline_id == firstId,
+          "adding a timeline does not steal focus from the active one");
+    const std::string beforeActivate = project.SaveToString();
+    Check(projectLog.Apply(
+              project,
+              ProjectOperation{SetActiveProjectTimelineOperation{verticalId}},
+              editError, error),
+          "activate timeline operation: " + error);
+    Check(project.active_timeline_id == verticalId &&
+              project.ActiveTimeline() == project.FindTimeline(verticalId),
+          "the named timeline becomes active");
+    const std::string afterActivate = project.SaveToString();
+    Check(projectLog.Undo(project, editError, error),
+          "undo activate: " + error);
+    Check(project.SaveToString() == beforeActivate &&
+              project.active_timeline_id == firstId,
+          "undoing an activation restores byte-identical JSON");
+    Check(projectLog.Redo(project, editError, error),
+          "redo activate: " + error);
+    Check(project.SaveToString() == afterActivate,
+          "redoing an activation is byte-identical too");
+    ProjectOperation decodedActivate;
+    Check(DeserializeProjectOperation(
+              SerializeProjectOperation(projectLog.AppliedEntries().back().op),
+              decodedActivate, editError, error) &&
+              std::get<SetActiveProjectTimelineOperation>(decodedActivate)
+                      .timeline_id == verticalId,
+          "activation round-trips through canonical JSON: " + error);
+    const std::string beforeUnknown = project.SaveToString();
+    Check(!projectLog.Apply(project,
+                            ProjectOperation{SetActiveProjectTimelineOperation{
+                                "01K30000000000000000000099"}},
+                            editError, error) &&
+              editError == EditError::UnknownSequence,
+          "activating a timeline the project does not hold is refused by name");
+    Check(project.SaveToString() == beforeUnknown,
+          "and the refusal leaves the project untouched");
+    Check(projectLog.Apply(
+              project,
+              ProjectOperation{SetActiveProjectTimelineOperation{firstId}},
+              editError, error),
+          "restore the original active timeline: " + error);
+
     const std::string beforeSessionSelection = project.SaveToString();
     Document edit = project.MakeDocument(verticalId);
     Check(project.SaveToString() == beforeSessionSelection,
@@ -113,6 +159,7 @@ int main() {
                       "rush.mov",
                       "rush.mov",
                       "h264",
+                      true,
                       1920,
                       1080,
                       "yuv420p",
@@ -127,6 +174,10 @@ int main() {
                       true,
                       48000,
                       2,
+                      // audio_level_measured / audio_level (QC-2026-09 A3):
+                      // this fixture is built by hand, never ingested.
+                      false,
+                      0,
                       "",
                       "",
                       true}};
@@ -158,6 +209,102 @@ int main() {
     stored.active_timeline_id = second;
     stored.bin_metadata[source.id] = {"Hero shot", 5, {"select", "day"}, 7};
     Check(stored.Validate(error), "serializable project: " + error);
+
+    Project shortProject = stored;
+    ProjectEditLog shortLog;
+    const std::string beforeShort = shortProject.SaveToString();
+    CreateProjectTimelineFromSegmentsOperation shortOperation;
+    shortOperation.name = "Short dynamique";
+    shortOperation.width = stored.ActiveTimeline()->width;
+    shortOperation.height = stored.ActiveTimeline()->height;
+    shortOperation.frame_rate = stored.ActiveTimeline()->frame_rate;
+    shortOperation.segments = {
+        {source.id, {50, 25}, {25, 25}},
+        {source.id, {0, 25}, {50, 25}},
+    };
+    Check(shortLog.Apply(shortProject, ProjectOperation{shortOperation},
+                         editError, error),
+          "create short timeline: " + error);
+    const auto& appliedShort =
+        std::get<CreateProjectTimelineFromSegmentsOperation>(
+            shortLog.AppliedEntries().back().op);
+    const std::string afterShort = shortProject.SaveToString();
+    Check(shortProject.active_timeline_id == appliedShort.timeline_id &&
+              shortProject.ActiveTimeline()->tracks.size() == 2 &&
+              shortProject.ActiveTimeline()->tracks[0].clips.size() == 2 &&
+              shortProject.ActiveTimeline()->tracks[1].clips.size() == 2 &&
+              shortProject.ActiveTimeline()->tracks[0].clips[1].timeline_in ==
+                  RationalTime{25, 25},
+          "short assembly creates linked A/V clips in the requested order");
+    ProjectOperation decodedShort;
+    Check(DeserializeProjectOperation(
+              SerializeProjectOperation(shortLog.AppliedEntries().back().op),
+              decodedShort, editError, error),
+          "short operation round-trip: " + error);
+    Check(std::get<CreateProjectTimelineFromSegmentsOperation>(decodedShort)
+                  .segments[0]
+                  .video_clip_id == appliedShort.segments[0].video_clip_id,
+          "short operation retains generated clip IDs");
+    Check(shortLog.Undo(shortProject, editError, error),
+          "undo short timeline: " + error);
+    Check(shortProject.SaveToString() == beforeShort,
+          "undo short timeline restores byte-identical project JSON");
+    Check(shortLog.Redo(shortProject, editError, error),
+          "redo short timeline: " + error);
+    Check(shortProject.SaveToString() == afterShort,
+          "redo short timeline restores byte-identical project JSON");
+
+    // B10 -- one ordered project batch is one exact history step. The rename
+    // deliberately depends on the preceding add, so reversing execution order
+    // would fail instead of merely producing a different cosmetic result.
+    Project batchProject("Batch project");
+    const std::string beforeBatch = batchProject.SaveToString();
+    const Ulid batchTimelineId = GenerateUlid();
+    ProjectEditLog batchLog;
+    Check(batchLog.ApplyBatch(
+              batchProject,
+              {ProjectOperation{AddProjectTimelineOperation{"Added first",
+                                                            1920,
+                                                            1080,
+                                                            {25, 1},
+                                                            batchTimelineId,
+                                                            GenerateUlid(),
+                                                            GenerateUlid()}},
+               ProjectOperation{
+                   RenameProjectItemOperation{batchTimelineId, "Renamed"}}},
+              editError, error),
+          "ordered project batch applies: " + error);
+    const std::string afterBatch = batchProject.SaveToString();
+    Check(batchProject.FindTimeline(batchTimelineId) != nullptr &&
+              batchProject.FindTimeline(batchTimelineId)->name == "Renamed",
+          "project batch applies operations in input order");
+    Check(batchLog.AppliedCount() == 1,
+          "project batch creates exactly one history entry");
+    ProjectEditLog decodedBatchLog;
+    Check(ProjectEditLog::Deserialize(batchLog.Serialize(), decodedBatchLog,
+                                      editError, error) &&
+              decodedBatchLog.AppliedCount() == 1,
+          "project batch history round-trips canonically: " + error);
+    Check(batchLog.Undo(batchProject, editError, error) &&
+              batchProject.SaveToString() == beforeBatch,
+          "one undo restores the bytes before a project batch: " + error);
+    Check(batchLog.Redo(batchProject, editError, error) &&
+              batchProject.SaveToString() == afterBatch,
+          "one redo restores the bytes after a project batch: " + error);
+
+    const std::string beforeRejectedBatch = batchProject.SaveToString();
+    const std::string logBeforeRejectedBatch = batchLog.Serialize();
+    Check(!batchLog.ApplyBatch(batchProject,
+                               {ProjectOperation{RenameProjectItemOperation{
+                                    batchTimelineId, "Must roll back"}},
+                                ProjectOperation{RemoveProjectTimelineOperation{
+                                    "01K39999999999999999999999"}}},
+                               editError, error) &&
+              editError == EditError::UnknownSequence,
+          "a refusal makes the whole project batch fail");
+    Check(batchProject.SaveToString() == beforeRejectedBatch &&
+              batchLog.Serialize() == logBeforeRejectedBatch,
+          "a refused project batch leaves project and history byte-identical");
 
     const std::string serialized = stored.SaveToString();
     Project loaded("placeholder");

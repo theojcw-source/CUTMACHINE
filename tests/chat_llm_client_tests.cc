@@ -1,4 +1,4 @@
-// Pure-C++ test for the Anthropic Messages API client (ROADMAP.md F2.4).
+// Pure-C++ test for the model API client (ROADMAP.md F2.4).
 // Depends only on Json.h/McpTools.h/ChatLlmClient.h -- no AppKit, no
 // sockets, no real network -- so it builds and runs on a plain Linux host,
 // the same way tests/mcp_tools_tests.cc does for the MCP tool dispatcher.
@@ -47,6 +47,23 @@ ChatLlmConfig TestConfig() {
     config.model = "claude-sonnet-4-5";
     config.api_key = "sk-test-key";
     config.base_url = "https://api.example.invalid";
+    return config;
+}
+
+ChatLlmConfig OllamaConfig() {
+    ChatLlmConfig config;
+    config.provider = chat::ChatLlmProvider::OpenAiCompatible;
+    config.model = "qwen2.5-coder:7b";
+    config.base_url = "http://localhost:11434/v1";
+    return config;
+}
+
+ChatLlmConfig OllamaNativeConfig() {
+    ChatLlmConfig config;
+    config.provider = chat::ChatLlmProvider::Ollama;
+    config.model = "qwen2.5-coder:7b";
+    config.base_url = "http://localhost:11434";
+    config.context_tokens = 32768;
     return config;
 }
 
@@ -300,6 +317,198 @@ int main() {
                 "the transport's own error is surfaced, got: " + result.error);
         });
 
+    Test(
+        "Ollama uses OpenAI chat completions without requiring an API key", [] {
+            ChatHttpRequest captured;
+            auto transport = [&](const ChatHttpRequest& request,
+                                 ChatHttpResponse& response, std::string&) {
+                captured = request;
+                response.status_code = 200;
+                response.body = R"({"choices":[{"message":{"role":"assistant",)"
+                                R"("content":"Bonjour depuis Qwen."},)"
+                                R"("finish_reason":"stop"}]})";
+                return true;
+            };
+            ChatMessage user;
+            user.role = "user";
+            user.content.push_back(ChatContentBlock::MakeText("Bonjour"));
+            ChatLlmClient client(OllamaConfig(), transport);
+            const ChatSendResult result =
+                client.SendMessages({user}, "Tu montes.", OneToolCatalog());
+
+            Check(result.ok, "the Ollama call succeeds: " + result.error);
+            Check(captured.url == "http://localhost:11434/v1/chat/completions",
+                  "the request targets Ollama's OpenAI endpoint");
+            bool sawAuthorization = false;
+            for (const auto& header : captured.headers)
+                sawAuthorization |= header.first == "Authorization";
+            Check(!sawAuthorization,
+                  "a local Ollama request sends no fake credential");
+
+            Value body;
+            std::string parseError;
+            Check(
+                Value::Parse(captured.body, body, parseError),
+                "OpenAI-compatible request body is valid JSON: " + parseError);
+            const Value* messages = body.Find("messages");
+            Check(messages && messages->IsArray() &&
+                      messages->AsArray().size() == 2,
+                  "system and user messages are sent");
+            const Value* tools = body.Find("tools");
+            Check(tools && tools->IsArray() && tools->AsArray().size() == 1,
+                  "MCP tools use the OpenAI function schema");
+            Check(result.content.size() == 1 &&
+                      result.content.front().text == "Bonjour depuis Qwen.",
+                  "the OpenAI text response is parsed");
+        });
+
+    Test("OpenAI tool calls and tool results bridge the agent loop", [] {
+        ChatHttpRequest captured;
+        auto transport = [&](const ChatHttpRequest& request,
+                             ChatHttpResponse& response, std::string&) {
+            captured = request;
+            response.status_code = 200;
+            response.body =
+                R"({"choices":[{"message":{"role":"assistant",)"
+                R"("content":null,"tool_calls":[{"id":"call_1",)"
+                R"("type":"function","function":{"name":"trim_clip",)"
+                R"("arguments":"{\"clip_id\":\"01K3X\"}"}}]},)"
+                R"("finish_reason":"tool_calls"}]})";
+            return true;
+        };
+        ChatLlmClient client(OllamaConfig(), transport);
+        const ChatSendResult result =
+            client.SendMessages({}, "sys", OneToolCatalog());
+        Check(result.ok, "the tool response succeeds: " + result.error);
+        Check(result.stop_reason == "tool_use",
+              "OpenAI tool_calls maps to the session's tool_use reason");
+        Check(result.content.size() == 1 &&
+                  result.content.front().type == ChatBlockType::ToolUse,
+              "the function call becomes a ToolUse block");
+        if (!result.content.empty()) {
+            const Value* clipId =
+                result.content.front().tool_input.Find("clip_id");
+            Check(clipId && clipId->IsString() && clipId->AsString() == "01K3X",
+                  "function arguments parse as structured tool input");
+        }
+
+        Value input = Value::MakeObject();
+        input.Set("clip_id", Value::MakeString("01K3X"));
+        ChatMessage assistant;
+        assistant.role = "assistant";
+        assistant.content.push_back(
+            ChatContentBlock::MakeToolUse("call_1", "trim_clip", input));
+        ChatMessage toolResult;
+        toolResult.role = "user";
+        toolResult.content.push_back(
+            ChatContentBlock::MakeToolResult("call_1", "{\"ok\":true}", false));
+        client.SendMessages({assistant, toolResult}, "sys", {});
+
+        Value body;
+        std::string parseError;
+        Check(Value::Parse(captured.body, body, parseError),
+              "follow-up request body is valid JSON: " + parseError);
+        const Value* messages = body.Find("messages");
+        Check(
+            messages && messages->IsArray() && messages->AsArray().size() == 3,
+            "system, assistant tool call and tool result are sent");
+        if (messages && messages->IsArray() &&
+            messages->AsArray().size() == 3) {
+            const Value* role = messages->AsArray()[2].Find("role");
+            Check(role && role->IsString() && role->AsString() == "tool",
+                  "tool result uses the OpenAI tool role");
+        }
+    });
+
+    Test(
+        "native Ollama requests a larger context and accepts Qwen textual "
+        "tools",
+        [] {
+            ChatHttpRequest captured;
+            auto transport = [&](const ChatHttpRequest& request,
+                                 ChatHttpResponse& response, std::string&) {
+                captured = request;
+                response.status_code = 200;
+                response.body =
+                    R"({"message":{"role":"assistant","content":)"
+                    R"("{\"name\":\"trim_clip\",\"arguments\":{\"clip_id\":\"01K3X\"}}"},)"
+                    R"("done":true,"done_reason":"stop"})";
+                return true;
+            };
+            ChatLlmClient client(OllamaNativeConfig(), transport);
+            const ChatSendResult result =
+                client.SendMessages({}, "sys", OneToolCatalog());
+
+            Check(result.ok,
+                  "the native Ollama call succeeds: " + result.error);
+            Check(captured.url == "http://localhost:11434/api/chat",
+                  "native Ollama targets /api/chat");
+            Value body;
+            std::string parseError;
+            Check(Value::Parse(captured.body, body, parseError),
+                  "native Ollama request is valid JSON: " + parseError);
+            const Value* options = body.Find("options");
+            const Value* context = options ? options->Find("num_ctx") : nullptr;
+            int64_t contextTokens = 0;
+            Check(context && context->AsInt64(contextTokens) &&
+                      contextTokens == 32768,
+                  "native Ollama receives the configured 32K context");
+            Check(result.stop_reason == "tool_use" &&
+                      result.content.size() == 1 &&
+                      result.content.front().type == ChatBlockType::ToolUse,
+                  "Qwen's strict textual tool object becomes a tool call");
+            if (!result.content.empty())
+                Check(result.content.front().tool_name == "trim_clip",
+                      "the textual tool name is preserved");
+        });
+
+    Test("native Ollama history carries function calls and named tool results",
+         [] {
+             ChatHttpRequest captured;
+             auto transport = [&](const ChatHttpRequest& request,
+                                  ChatHttpResponse& response, std::string&) {
+                 captured = request;
+                 response.status_code = 200;
+                 response.body =
+                     R"({"message":{"role":"assistant","content":"fait"},)"
+                     R"("done":true,"done_reason":"stop"})";
+                 return true;
+             };
+             Value input = Value::MakeObject();
+             input.Set("clip_id", Value::MakeString("01K3X"));
+             ChatMessage assistant;
+             assistant.role = "assistant";
+             assistant.content.push_back(ChatContentBlock::MakeToolUse(
+                 "ollama_text_tool", "trim_clip", input));
+             ChatMessage resultMessage;
+             resultMessage.role = "user";
+             resultMessage.content.push_back(ChatContentBlock::MakeToolResult(
+                 "ollama_text_tool", "{\"ok\":true}", false, "trim_clip"));
+             ChatLlmClient client(OllamaNativeConfig(), transport);
+             const ChatSendResult result = client.SendMessages(
+                 {assistant, resultMessage}, "sys", OneToolCatalog());
+             Check(result.ok, "the follow-up succeeds: " + result.error);
+
+             Value body;
+             std::string parseError;
+             Check(Value::Parse(captured.body, body, parseError),
+                   "follow-up body is valid JSON: " + parseError);
+             const Value* messages = body.Find("messages");
+             Check(messages && messages->IsArray() &&
+                       messages->AsArray().size() == 3,
+                   "system, assistant and tool messages are present");
+             if (messages && messages->IsArray() &&
+                 messages->AsArray().size() == 3) {
+                 const Value& tool = messages->AsArray()[2];
+                 const Value* role = tool.Find("role");
+                 const Value* name = tool.Find("tool_name");
+                 Check(role && role->IsString() && role->AsString() == "tool" &&
+                           name && name->IsString() &&
+                           name->AsString() == "trim_clip",
+                       "native tool result names the invoked function");
+             }
+         });
+
     Test("a missing API key short-circuits before the transport runs", [] {
         bool transportCalled = false;
         auto transport = [&](const ChatHttpRequest&, ChatHttpResponse& response,
@@ -321,6 +530,67 @@ int main() {
         std::cerr << failures << " assertion(s) failed\n";
         return 1;
     }
+    // QC-2026-08 -- a tool result carrying a picture must reach Anthropic as
+    // an image block, not as a description of one. Without this the whole
+    // read_frame path is a no-op the model never sees.
+    {
+        chat::ChatLlmConfig imageConfig;
+        imageConfig.provider = chat::ChatLlmProvider::AnthropicMessages;
+        imageConfig.model = "claude-sonnet-4-5";
+        imageConfig.api_key = "test-key";
+        imageConfig.base_url = "https://api.anthropic.test";
+        std::string captured;
+        chat::ChatLlmClient imageClient(
+            imageConfig, [&captured](const ChatHttpRequest& request,
+                                     ChatHttpResponse& response, std::string&) {
+                captured = request.body;
+                response.status_code = 200;
+                response.body = R"({"content":[{"type":"text","text":"vu"}]})";
+                return true;
+            });
+        chat::ChatMessage message;
+        message.role = "user";
+        message.content.push_back(chat::ChatContentBlock::MakeToolResult(
+            "toolu_1", "{\"source_id\":\"M1\"}", false, "read_frame",
+            "Zm9vYmFy", "image/jpeg"));
+        std::vector<McpTool> noTools;
+        const chat::ChatSendResult result =
+            imageClient.SendMessages({message}, "system", noTools);
+        Check(result.ok, "the image-carrying turn is sent: " + result.error);
+        Check(captured.find("\"type\":\"image\"") != std::string::npos,
+              "the request carries an image block");
+        Check(
+            captured.find("\"media_type\":\"image/jpeg\"") != std::string::npos,
+            "with its MIME type");
+        Check(captured.find("\"data\":\"Zm9vYmFy\"") != std::string::npos,
+              "and the base64 payload itself");
+        Check(captured.find("\"type\":\"text\",\"text\":\"{") !=
+                  std::string::npos,
+              "the tool's own text stays alongside the picture");
+
+        // Every other tool result must keep the plain string form, so adding
+        // pictures changed nothing about the traffic that already worked.
+        std::string plainBody;
+        chat::ChatLlmClient plainClient(
+            imageConfig,
+            [&plainBody](const ChatHttpRequest& request,
+                         ChatHttpResponse& response, std::string&) {
+                plainBody = request.body;
+                response.status_code = 200;
+                response.body = R"({"content":[{"type":"text","text":"ok"}]})";
+                return true;
+            });
+        chat::ChatMessage plain;
+        plain.role = "user";
+        plain.content.push_back(chat::ChatContentBlock::MakeToolResult(
+            "toolu_2", "{\"ok\":true}", false, "describe"));
+        Check(plainClient.SendMessages({plain}, "system", noTools).ok,
+              "a textual tool result still sends");
+        Check(plainBody.find("\"type\":\"image\"") == std::string::npos &&
+                  plainBody.find("\"content\":\"{") != std::string::npos,
+              "a textual tool result keeps the plain string content form");
+    }
+
     std::cout << "All chat LLM client tests passed\n";
     return 0;
 }

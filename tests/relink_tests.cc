@@ -89,6 +89,11 @@ int main() {
               SerializeProjectOperation(projectLog.AppliedEntries().back().op),
               serializedRelink, editError, error),
           "relink operation serializes");
+    const auto* reparsedRelink =
+        std::get_if<RelinkProjectMediaOperation>(&serializedRelink);
+    Check(reparsedRelink && !reparsedRelink->replacements.empty() &&
+              reparsedRelink->replacements[0].replacement.has_video,
+          "relink serialization preserves picture capability");
 
     Project shorter = Project::FromDocument(Fixture());
     LibraryMedia shortMedia = shorter.rushes[0];

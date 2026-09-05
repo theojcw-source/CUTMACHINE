@@ -46,8 +46,11 @@
 // `operation` is ready to submit to EditLog::Apply as-is (clip_id and the
 // clip's complete new effects vector already set) -- see the file comment
 // above.
-- (void)inspectorView:(CMInspectorView*)inspectorView
+- (void)inspectorView:(CMInspectorView* _Nonnull)inspectorView
     didCommitClipEffects:(SetClipEffectsOperation)operation;
+
+- (void)inspectorView:(CMInspectorView* _Nonnull)inspectorView
+    didCommitClipOpacity:(SetClipOpacityOperation)operation;
 
 @end
 

@@ -34,4 +34,9 @@
         stringForKey:[self defaultsKeyForDock:dock]];
 }
 
+- (BOOL)requiresExplicitTimelineForAgentEdits {
+    return [NSUserDefaults.standardUserDefaults
+        boolForKey:@"CMRequireExplicitTimeline"];
+}
+
 @end

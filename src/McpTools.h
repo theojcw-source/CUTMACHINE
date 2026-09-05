@@ -43,10 +43,35 @@ struct McpTool {
 
 struct McpToolCallOutcome {
     bool ok = false;
+    // B2 -- ROADMAP.md. Always a JSON object: the tool payload on success,
+    // or {"ok":false,"error":...,"detail":...} on refusal. The named
+    // fields below remain available to callers that need branching without
+    // parsing the payload.
     std::string result_json;
     std::string error_name;
     std::string message;
+    // A tool may return a picture as well as text (today only read_frame).
+    // Base64, with its MIME type; empty when the tool returned text only.
+    //
+    // Carried out of the dispatcher through two reserved keys in its result
+    // JSON rather than by widening McpDispatchFn: the signature is shared by
+    // every tool in the catalog, and changing it to thread an out-parameter
+    // no other tool populates would touch all of them to serve one. Call()
+    // lifts the keys into these fields and removes them from the text, so
+    // nothing downstream sees the convention.
+    std::string image_base64;
+    std::string image_mime;
 };
+
+// The reserved envelope a dispatcher returns when it has a picture: the two
+// image fields plus the result text it would otherwise have returned on its
+// own. An envelope rather than extra keys on the real payload, so lifting it
+// is a lookup instead of a rebuild -- mcp_json::Value has no key
+// enumeration, and widening a shared type to serve one tool would be the
+// wrong trade.
+inline constexpr char kMcpImageDataKey[] = "__image_base64";
+inline constexpr char kMcpImageMimeKey[] = "__image_mime";
+inline constexpr char kMcpImageTextKey[] = "__text";
 
 class McpToolRegistry {
 public:
