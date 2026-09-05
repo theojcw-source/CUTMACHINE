@@ -54,3 +54,14 @@ std::string ProjectEditLogPathForProject(const std::string& projectPath);
 bool CommitTextArtifacts(
     const std::vector<std::pair<std::string, std::string>>& artifacts,
     std::string& message);
+
+// S2 -- SAVING_ROADMAP.md. Recovers an interrupted transaction rooted in
+// directory and removes leftovers whose durable commit marker is already gone.
+bool RecoverTextArtifactTransaction(const std::string& directory,
+                                    std::string& message);
+
+// S4 -- SAVING_ROADMAP.md. Project packages use this variant so removal of
+// obsolete canonical files belongs to the generation being published.
+bool CommitTextArtifactsAndRemove(
+    const std::vector<std::pair<std::string, std::string>>& artifacts,
+    const std::vector<std::string>& removals, std::string& message);

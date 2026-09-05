@@ -1349,6 +1349,9 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (BOOL)persistStagedDocument:(const Document&)document
                       editLog:(const EditLog&)editLog
                       message:(std::string&)message;
+- (BOOL)applyAndPersistTimelineOperation:(Operation)operation
+                                   error:(EditError&)error
+                                 message:(std::string&)message;
 - (BOOL)commitProjectCandidate:(const Project&)project
                        editLog:(const EditLog&)editLog
                        message:(std::string&)message;
@@ -2344,18 +2347,14 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     }
     EditError editError = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(self.state->document,
-                                   Operation{std::move(updated)}, editError,
-                                   message)) {
+    if (![self applyAndPersistTimelineOperation:Operation{std::move(updated)}
+                                          error:editError
+                                        message:message]) {
         [self showExportError:message];
         return;
     }
     [self refreshTimelineAfterEditFromPosition:self.state->requestedPosition];
     [self rebuildMediaList];
-    if (![self persistEdits:message]) {
-        [self showExportError:message];
-        return;
-    }
     self.state->overlayDirty = true;
 }
 
@@ -3063,6 +3062,54 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             [NSString stringWithUTF8String:error.c_str()];
         return NO;
     }
+    if (!RecoverTextArtifactTransaction(
+            std::filesystem::path(documentPath).parent_path().string(),
+            error)) {
+        self.lastProjectLoadError =
+            [NSString stringWithFormat:@"Transaction projet irrécupérable : %s",
+                                       error.c_str()];
+        return NO;
+    }
+    bool recoveredAutosave = false;
+    const ProjectRecoveryInfo recovery = ProjectRecovery::Inspect(documentPath);
+    if (recovery.state == ProjectRecoveryState::Available) {
+        NSAlert* alert = [NSAlert new];
+        alert.messageText = @"Récupération disponible";
+        alert.informativeText = @"Une sauvegarde automatique plus récente que "
+                                @"le projet a été trouvée.";
+        [alert addButtonWithTitle:@"Récupérer"];
+        [alert addButtonWithTitle:@"Ignorer"];
+        if ([alert runModal] == NSAlertFirstButtonReturn) {
+            Project recovered;
+            std::map<std::string, EditLog> recoveredLogs;
+            ProjectEditLog recoveredProjectLog;
+            if (!ProjectRecovery::LoadAutosave(documentPath, recovered,
+                                               recoveredLogs,
+                                               recoveredProjectLog, error)) {
+                std::fprintf(stderr, "Unable to recover project: %s\n",
+                             error.c_str());
+                return NO;
+            }
+            if (!CommitStoredProjectAndLogs(documentPath, recovered,
+                                            recoveredLogs, recoveredProjectLog,
+                                            error)) {
+                std::fprintf(stderr, "Unable to recover project: %s\n",
+                             error.c_str());
+                return NO;
+            }
+            self.state->project = std::move(recovered);
+            recoveredAutosave = true;
+        }
+        if (!ProjectRecovery::DiscardAutosave(documentPath, error))
+            std::fprintf(stderr, "Unable to discard autosave: %s\n",
+                         error.c_str());
+    } else if (recovery.state == ProjectRecoveryState::Invalid) {
+        std::fprintf(stderr, "Invalid autosave ignored: %s\n",
+                     recovery.error.c_str());
+    }
+    // Recovery must run before package validation: an interrupted commit can
+    // leave the main generation incomplete while its autosave is still the
+    // only valid representation of the project.
     CollectionIntegrityReport integrity;
     if (!VerifyPortableProject(documentPath, integrity, error)) {
         self.lastProjectLoadError = [NSString
@@ -3089,43 +3136,6 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 @"Ouverture annulée après contrôle d’intégrité.";
             return NO;
         }
-    }
-    bool recoveredAutosave = false;
-    const ProjectRecoveryInfo recovery = ProjectRecovery::Inspect(documentPath);
-    if (recovery.state == ProjectRecoveryState::Available) {
-        NSAlert* alert = [NSAlert new];
-        alert.messageText = @"Récupération disponible";
-        alert.informativeText = @"Une sauvegarde automatique plus récente que "
-                                @"le projet a été trouvée.";
-        [alert addButtonWithTitle:@"Récupérer"];
-        [alert addButtonWithTitle:@"Ignorer"];
-        if ([alert runModal] == NSAlertFirstButtonReturn) {
-            Project recovered;
-            if (!ProjectRecovery::LoadAutosave(documentPath, recovered,
-                                               error)) {
-                std::fprintf(stderr, "Unable to recover project: %s\n",
-                             error.c_str());
-                return NO;
-            }
-            std::map<std::string, EditLog> recoveredLogs;
-            for (const DocumentSequence& timeline : recovered.timelines)
-                recoveredLogs.emplace(timeline.id, EditLog{});
-            if (!CommitStoredProjectAndLogs(documentPath, recovered,
-                                            recoveredLogs, ProjectEditLog{},
-                                            error)) {
-                std::fprintf(stderr, "Unable to recover project: %s\n",
-                             error.c_str());
-                return NO;
-            }
-            self.state->project = std::move(recovered);
-            recoveredAutosave = true;
-        }
-        if (!ProjectRecovery::DiscardAutosave(documentPath, error))
-            std::fprintf(stderr, "Unable to discard autosave: %s\n",
-                         error.c_str());
-    } else if (recovery.state == ProjectRecoveryState::Invalid) {
-        std::fprintf(stderr, "Invalid autosave ignored: %s\n",
-                     recovery.error.c_str());
     }
     if (!recoveredAutosave &&
         !LoadStoredProject(documentPath, self.state->project, error)) {
@@ -3302,8 +3312,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
 }
 
 - (BOOL)separateEmbeddedAudioByDefault:(std::string&)message {
+    Document stagedDocument = self.state->document;
+    EditLog stagedLog = self.state->editLog;
     std::vector<Ulid> videoClipIds;
-    for (const DocumentTrack& track : self.state->document.sequence.tracks) {
+    for (const DocumentTrack& track : stagedDocument.sequence.tracks) {
         if (track.kind != "video") continue;
         for (const DocumentClip& clip : track.clips) {
             if (!clip.include_audio) continue;
@@ -3311,7 +3323,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 self.state->mediaMetadata.find(clip.source_id);
             const LibraryMedia* media =
                 detected == self.state->mediaMetadata.end()
-                    ? self.state->document.FindLibraryMedia(clip.source_id)
+                    ? stagedDocument.FindLibraryMedia(clip.source_id)
                     : &detected->second;
             if (media && media->metadata_complete && media->has_audio)
                 videoClipIds.push_back(clip.id);
@@ -3322,9 +3334,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         const Ulid audioClipId = GenerateUlid();
         Ulid targetTrackId;
         for (const DocumentTrack* track :
-             TimelineTracksInDisplayOrder(self.state->document)) {
+             TimelineTracksInDisplayOrder(stagedDocument)) {
             if (track->kind != "audio") continue;
-            Document candidate = self.state->document;
+            Document candidate = stagedDocument;
             Operation probe =
                 DetachAudioOperation{videoClipId, track->id, audioClipId, {}};
             Operation inverse = RemoveClipOperation{};
@@ -3338,21 +3350,19 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         }
         if (targetTrackId.empty()) {
             int32_t index = 0;
-            for (const DocumentTrack& track :
-                 self.state->document.sequence.tracks)
+            for (const DocumentTrack& track : stagedDocument.sequence.tracks)
                 index = std::max(index, track.index + 1);
             targetTrackId = GenerateUlid();
-            if (!self.state->editLog.Apply(
-                    self.state->document,
+            if (!stagedLog.Apply(
+                    stagedDocument,
                     Operation{AddTrackOperation{targetTrackId, "audio", index}},
                     error, message))
                 return NO;
         }
-        if (!self.state->editLog.Apply(
-                self.state->document,
-                Operation{DetachAudioOperation{
-                    videoClipId, targetTrackId, audioClipId, {}}},
-                error, message))
+        if (!stagedLog.Apply(stagedDocument,
+                             Operation{DetachAudioOperation{
+                                 videoClipId, targetTrackId, audioClipId, {}}},
+                             error, message))
             return NO;
     }
     size_t migratedLinks = 0;
@@ -3363,15 +3373,14 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         Ulid group;
     };
     std::vector<LegacyPair> legacyPairs;
-    for (const DocumentTrack& videoTrack :
-         self.state->document.sequence.tracks) {
+    for (const DocumentTrack& videoTrack : stagedDocument.sequence.tracks) {
         if (videoTrack.kind != "video") continue;
         for (const DocumentClip& video : videoTrack.clips) {
             if (video.include_audio || !video.sync_anchor_clip_id.empty())
                 continue;
             const DocumentClip* match = nullptr;
             for (const DocumentTrack& audioTrack :
-                 self.state->document.sequence.tracks) {
+                 stagedDocument.sequence.tracks) {
                 if (audioTrack.kind != "audio") continue;
                 for (const DocumentClip& audio : audioTrack.clips) {
                     if (!audio.sync_anchor_clip_id.empty() ||
@@ -3399,8 +3408,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         }
     }
     for (const auto& pair : legacyPairs) {
-        if (!self.state->editLog.Apply(
-                self.state->document,
+        if (!stagedLog.Apply(
+                stagedDocument,
                 Operation{SetClipLinkOperation{pair.video, pair.audio,
                                                pair.group, pair.group}},
                 error, message))
@@ -3408,7 +3417,13 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         ++migratedLinks;
     }
     if (!videoClipIds.empty() || migratedLinks > 0) {
-        if (![self persistEdits:message]) return NO;
+        if (![self persistStagedDocument:stagedDocument
+                                 editLog:stagedLog
+                                 message:message])
+            return NO;
+        self.state->document = std::move(stagedDocument);
+        self.state->editLog = std::move(stagedLog);
+        self.state->lastHistoryDomain = HistoryDomain::Timeline;
         std::fprintf(
             stderr,
             "Separated %zu embedded audio clip(s), migrated %zu A/V link(s)\n",
@@ -3911,18 +3926,31 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         self.state->document, self.state->editLog, [weakSelf]() {
             AppDelegate* strongSelf = weakSelf;
             if (!strongSelf) return;
-            // Same sequence every other in-app edit handler runs after a
-            // successful `self.state->editLog.Apply(...)` -- see e.g.
-            // -addTrack: -- so a chat-driven edit is saved and reflected on
-            // screen exactly like a mouse-driven one.
             const RationalTime playhead = strongSelf.state->requestedPosition;
-            [strongSelf refreshTimelineAfterEditFromPosition:playhead];
-            [strongSelf rebuildMediaList];
             std::string persistMessage;
             if (![strongSelf persistEdits:persistMessage]) {
+                // McpLiveBackend owns references to the active objects and
+                // applies before invoking this callback. The project and the
+                // per-timeline log still hold the last committed generation,
+                // so restore both when the disk commit fails.
+                strongSelf.state->document =
+                    strongSelf.state->project.MakeDocument(
+                        strongSelf.state->activeTimelineId);
+                const auto committedLog =
+                    strongSelf.state->timelineEditLogs.find(
+                        strongSelf.state->activeTimelineId);
+                strongSelf.state->editLog =
+                    committedLog == strongSelf.state->timelineEditLogs.end()
+                        ? EditLog{}
+                        : committedLog->second;
                 std::fprintf(stderr, "Unable to persist chat-driven edit: %s\n",
                              persistMessage.c_str());
+                strongSelf.infoLabel.stringValue = [NSString
+                    stringWithFormat:@"Modification du chat annulée : %s",
+                                     persistMessage.c_str()];
             }
+            [strongSelf refreshTimelineAfterEditFromPosition:playhead];
+            [strongSelf rebuildMediaList];
         });
     self.chatPanelView = [[CMChatPanelView alloc]
         initWithFrame:NSMakeRect(0.0, 0.0, rightDockWidth, workspaceHeight)];
@@ -4510,16 +4538,12 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
 
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(self.state->document, std::move(operation),
-                                   error, message)) {
-        self.binSummaryLabel.stringValue = [NSString
-            stringWithFormat:@"Déplacement refusé : %s", message.c_str()];
-        return NO;
-    }
-    if (![self persistEdits:message]) {
+    if (![self applyAndPersistTimelineOperation:std::move(operation)
+                                          error:error
+                                        message:message]) {
         self.binSummaryLabel.stringValue =
-            [NSString stringWithFormat:@"Enregistrement impossible : %s",
-                                       message.c_str()];
+            [NSString stringWithFormat:@"Déplacement impossible (%s) : %s",
+                                       EditErrorName(error), message.c_str()];
         return NO;
     }
     NSString* selected = target.length == 0 ? @"__root__" : target;
@@ -5044,17 +5068,15 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (!self.state) return;
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(
-            self.state->document,
-            Operation{AddCaptionStyleOperation{CaptionStyle{}, -1}}, error,
-            message)) {
+    if (![self applyAndPersistTimelineOperation:Operation {
+            AddCaptionStyleOperation { CaptionStyle{}, -1 }
+        }
+                                          error:error
+                                        message:message]) {
         self.captionSelectionLabel.stringValue = [NSString
             stringWithFormat:@"Création refusée : %s", message.c_str()];
         return;
     }
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist caption style: %s\n",
-                     message.c_str());
     [self rebuildCaptionStylesList];
 }
 
@@ -5065,16 +5087,15 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (styleId.empty()) return;
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(
-            self.state->document,
-            Operation{RemoveCaptionStyleOperation{styleId}}, error, message)) {
+    if (![self applyAndPersistTimelineOperation:Operation {
+            RemoveCaptionStyleOperation { styleId }
+        }
+                                          error:error
+                                        message:message]) {
         self.captionSelectionLabel.stringValue = [NSString
             stringWithFormat:@"Suppression refusée : %s", message.c_str()];
         return;
     }
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist caption style removal: %s\n",
-                     message.c_str());
     [self rebuildCaptionStylesList];
 }
 
@@ -5086,28 +5107,37 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const std::vector<Ulid> selected =
         self.state->interaction->SelectedClipIds();
     if (selected.empty()) return;
+    Document stagedDocument = self.state->document;
+    EditLog stagedLog = self.state->editLog;
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = self.state->requestedPosition;
     for (const Ulid& clipId : selected) {
-        const DocumentClip* clip = self.state->document.FindClip(clipId);
+        const DocumentClip* clip = stagedDocument.FindClip(clipId);
         const std::string existingText =
             (clip && clip->caption_group_id == styleId) ? clip->caption_text
                                                         : std::string{};
-        if (!self.state->editLog.Apply(
-                self.state->document,
-                Operation{ui::media_panel::JoinClipToCaptionStyle(
-                    clipId, styleId, existingText)},
-                error, message)) {
+        if (!stagedLog.Apply(stagedDocument,
+                             Operation{ui::media_panel::JoinClipToCaptionStyle(
+                                 clipId, styleId, existingText)},
+                             error, message)) {
             self.captionSelectionLabel.stringValue = [NSString
                 stringWithFormat:@"Application refusée : %s", message.c_str()];
             return;
         }
     }
+    if (![self persistStagedDocument:stagedDocument
+                             editLog:stagedLog
+                             message:message]) {
+        self.captionSelectionLabel.stringValue =
+            [NSString stringWithFormat:@"Enregistrement impossible : %s",
+                                       message.c_str()];
+        return;
+    }
+    self.state->document = std::move(stagedDocument);
+    self.state->editLog = std::move(stagedLog);
+    self.state->lastHistoryDomain = HistoryDomain::Timeline;
     [self refreshTimelineAfterEditFromPosition:playhead];
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist caption assignment: %s\n",
-                     message.c_str());
     self.state->overlayDirty = true;
     [self rebuildCaptionStylesList];
 }
@@ -5118,12 +5148,14 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const std::vector<Ulid> selected =
         self.state->interaction->SelectedClipIds();
     if (selected.empty()) return;
+    Document stagedDocument = self.state->document;
+    EditLog stagedLog = self.state->editLog;
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = self.state->requestedPosition;
     for (const Ulid& clipId : selected) {
-        if (!self.state->editLog.Apply(
-                self.state->document,
+        if (!stagedLog.Apply(
+                stagedDocument,
                 Operation{ui::media_panel::ClearClipCaption(clipId)}, error,
                 message)) {
             self.captionSelectionLabel.stringValue = [NSString
@@ -5131,10 +5163,18 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             return;
         }
     }
+    if (![self persistStagedDocument:stagedDocument
+                             editLog:stagedLog
+                             message:message]) {
+        self.captionSelectionLabel.stringValue =
+            [NSString stringWithFormat:@"Enregistrement impossible : %s",
+                                       message.c_str()];
+        return;
+    }
+    self.state->document = std::move(stagedDocument);
+    self.state->editLog = std::move(stagedLog);
+    self.state->lastHistoryDomain = HistoryDomain::Timeline;
     [self refreshTimelineAfterEditFromPosition:playhead];
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist caption removal: %s\n",
-                     message.c_str());
     self.state->overlayDirty = true;
     [self rebuildCaptionStylesList];
 }
@@ -6539,16 +6579,15 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const Ulid binId = GenerateUlid();
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(
-            self.state->document,
-            Operation{AddBinOperation{binId, name, parent}}, error, message)) {
+    if (![self applyAndPersistTimelineOperation:Operation {
+            AddBinOperation { binId, name, parent }
+        }
+                                          error:error
+                                        message:message]) {
         self.binSummaryLabel.stringValue = [NSString
             stringWithFormat:@"Création refusée : %s", message.c_str()];
         return;
     }
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist bin creation: %s\n",
-                     message.c_str());
     NSString* identifier = [NSString stringWithUTF8String:binId.c_str()];
     [self refreshBinControlsSelecting:identifier];
     [self beginEditingBin:identifier];
@@ -6560,16 +6599,15 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (!self.state->document.FindBin(binId)) return;
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(self.state->document,
-                                   Operation{RemoveBinOperation{binId, "", ""}},
-                                   error, message)) {
+    if (![self applyAndPersistTimelineOperation:Operation {
+            RemoveBinOperation { binId, "", "" }
+        }
+                                          error:error
+                                        message:message]) {
         self.binSummaryLabel.stringValue = [NSString
             stringWithFormat:@"Suppression refusée : %s", message.c_str()];
         return;
     }
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist bin deletion: %s\n",
-                     message.c_str());
     [self refreshBinControlsSelecting:@"__all__"];
 }
 
@@ -6626,12 +6664,13 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     if (bin) {
-        if (!self.state->editLog.Apply(
-                self.state->document,
-                Operation{RenameBinOperation{identifier.UTF8String ?: "",
-                                             name.UTF8String ?: ""}},
-                error, message) ||
-            ![self persistEdits:message]) {
+        if (![self applyAndPersistTimelineOperation:Operation {
+                RenameBinOperation {
+                    identifier.UTF8String ?: "", name.UTF8String ?: ""
+                }
+            }
+                                              error:error
+                                            message:message]) {
             self.binSummaryLabel.stringValue = [NSString
                 stringWithFormat:@"Renommage refusé : %s", message.c_str()];
             return;
@@ -6731,22 +6770,31 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     alert.accessoryView = destinations;
     if ([alert runModal] != NSAlertFirstButtonReturn) return;
     NSString* bin = destinations.selectedItem.representedObject ?: @"";
+    Document stagedDocument = self.state->document;
+    EditLog stagedLog = self.state->editLog;
     EditError error = EditError::None;
     std::string message;
     for (NSString* media in mediaIds) {
-        if (!self.state->editLog.Apply(
-                self.state->document,
-                Operation{SetMediaBinOperation{media.UTF8String ?: "",
-                                               bin.UTF8String ?: ""}},
-                error, message)) {
+        if (!stagedLog.Apply(stagedDocument,
+                             Operation{SetMediaBinOperation{
+                                 media.UTF8String ?: "", bin.UTF8String ?: ""}},
+                             error, message)) {
             self.binSummaryLabel.stringValue = [NSString
                 stringWithFormat:@"Classement refusé : %s", message.c_str()];
             return;
         }
     }
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist media bin: %s\n",
-                     message.c_str());
+    if (![self persistStagedDocument:stagedDocument
+                             editLog:stagedLog
+                             message:message]) {
+        self.binSummaryLabel.stringValue =
+            [NSString stringWithFormat:@"Enregistrement impossible : %s",
+                                       message.c_str()];
+        return;
+    }
+    self.state->document = std::move(stagedDocument);
+    self.state->editLog = std::move(stagedLog);
+    self.state->lastHistoryDomain = HistoryDomain::Timeline;
     [self refreshBinControlsSelecting:bin.length == 0 ? @"__root__" : bin];
 }
 
@@ -7153,17 +7201,14 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     (void)inspectorView;
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(self.state->document,
-                                   Operation{std::move(operation)}, error,
-                                   message)) {
+    if (![self applyAndPersistTimelineOperation:Operation{std::move(operation)}
+                                          error:error
+                                        message:message]) {
         std::fprintf(stderr, "Grading edit rejected (%s): %s\n",
                      EditErrorName(error), message.c_str());
         return;
     }
     self.state->overlayDirty = true;
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist grading edit: %s\n",
-                     message.c_str());
 }
 
 - (void)setLinkedSelectionEnabled:(BOOL)enabled {
@@ -7245,11 +7290,11 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             } else {
                 applies = false;
             }
-            if (applies && self.state->editLog.Apply(self.state->document,
-                                                     std::move(operation),
-                                                     error, message)) {
+            if (applies &&
+                [self applyAndPersistTimelineOperation:std::move(operation)
+                                                 error:error
+                                               message:message]) {
                 [self refreshTimelineAfterEditFromPosition:playhead];
-                [self persistEdits:message];
                 self.state->overlayDirty = true;
             }
         }
@@ -7318,17 +7363,15 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         EditError error = EditError::None;
         std::string message;
         const RationalTime playhead = self.state->requestedPosition;
-        if (self.state->editLog.Apply(self.state->document,
-                                      std::move(operation), error, message)) {
+        if ([self applyAndPersistTimelineOperation:std::move(operation)
+                                             error:error
+                                           message:message]) {
             if (linkedCut)
                 self.state->interaction->SelectClips(ExpandLinkedClipSelection(
                     self.state->document, {hit->clip_id}));
             else
                 self.state->interaction->SelectClip(hit->clip_id);
             [self refreshTimelineAfterEditFromPosition:playhead];
-            if (![self persistEdits:message])
-                std::fprintf(stderr, "Unable to persist cut: %s\n",
-                             message.c_str());
             [self updateSelectionInfo];
             self.state->overlayDirty = true;
         } else if (error != EditError::InvalidTimelineIn) {
@@ -7597,6 +7640,23 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     return YES;
 }
 
+- (BOOL)applyAndPersistTimelineOperation:(Operation)operation
+                                   error:(EditError&)error
+                                 message:(std::string&)message {
+    Document stagedDocument = self.state->document;
+    EditLog stagedLog = self.state->editLog;
+    if (!stagedLog.Apply(stagedDocument, std::move(operation), error, message))
+        return NO;
+    if (![self persistStagedDocument:stagedDocument
+                             editLog:stagedLog
+                             message:message])
+        return NO;
+    self.state->document = std::move(stagedDocument);
+    self.state->editLog = std::move(stagedLog);
+    self.state->lastHistoryDomain = HistoryDomain::Timeline;
+    return YES;
+}
+
 - (BOOL)commitProjectCandidate:(const Project&)project
                        editLog:(const EditLog&)editLog
                        message:(std::string&)message {
@@ -7611,10 +7671,11 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                     projectLog:(const ProjectEditLog&)projectLog
                        message:(std::string&)message {
     const char* path = self.documentPath.UTF8String;
-    if (!ProjectRecovery::WriteAutosave(path ? path : "", project, message))
-        return NO;
     std::map<std::string, EditLog> timelineLogs = self.state->timelineEditLogs;
     timelineLogs[self.state->activeTimelineId] = editLog;
+    if (!ProjectRecovery::WriteAutosave(path ? path : "", project, timelineLogs,
+                                        projectLog, message))
+        return NO;
     if (!CommitStoredProjectAndLogs(path ? path : "", project, timelineLogs,
                                     projectLog, message))
         return NO;
@@ -7650,15 +7711,13 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const Ulid trackId = GenerateUlid();
     Operation operation =
         AddTrackOperation{trackId, audio ? "audio" : "video", index};
-    if (self.state->editLog.Apply(self.state->document, std::move(operation),
-                                  error, message)) {
+    if ([self applyAndPersistTimelineOperation:std::move(operation)
+                                         error:error
+                                       message:message]) {
         self.state->targetedTrackIds.insert(trackId);
         self.state->timelineTargetTracks[self.state->activeTimelineId] =
             self.state->targetedTrackIds;
         [self refreshTimelineAfterEditFromPosition:playhead];
-        if (![self persistEdits:message])
-            std::fprintf(stderr, "Unable to persist track creation: %s\n",
-                         message.c_str());
         [self updateSelectionInfo];
         self.state->overlayDirty = true;
     } else {
@@ -7725,6 +7784,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const RationalTime playhead = self.state->requestedPosition;
     EditError error = EditError::None;
     std::string message;
+    const Document documentBeforeEdit = self.state->document;
+    const EditLog logBeforeEdit = self.state->editLog;
     if (self.state->duplicateDragging) {
         const auto preview = self.state->interaction->MovePreview();
         self.state->interaction->CancelDrag();
@@ -7739,10 +7800,16 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         else
             self.infoLabel.stringValue = @"Duplication annulée";
     } else if (self.state->interaction->PointerUp(error, message)) {
-        [self refreshTimelineAfterEditFromPosition:playhead];
-        if (![self persistEdits:message])
+        if (![self persistEdits:message]) {
+            self.state->document = documentBeforeEdit;
+            self.state->editLog = logBeforeEdit;
             std::fprintf(stderr, "Unable to persist edit: %s\n",
                          message.c_str());
+            self.infoLabel.stringValue =
+                [NSString stringWithFormat:@"Modification non enregistrée : %s",
+                                           message.c_str()];
+        }
+        [self refreshTimelineAfterEditFromPosition:playhead];
     } else if (error != EditError::None) {
         std::fprintf(stderr, "Edit rejected (%s): %s\n", EditErrorName(error),
                      message.c_str());
@@ -8034,31 +8101,37 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
 
 - (BOOL)applyTimelinePaste:(PasteClipsOperation)operation
                      label:(NSString*)label {
+    Document stagedDocument = self.state->document;
+    EditLog stagedLog = self.state->editLog;
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = self.state->requestedPosition;
-    if (!self.state->editLog.Apply(self.state->document,
-                                   Operation{std::move(operation)}, error,
-                                   message)) {
+    if (!stagedLog.Apply(stagedDocument, Operation{std::move(operation)}, error,
+                         message)) {
         self.infoLabel.stringValue =
             [NSString stringWithFormat:@"%@ refusé (%s) : %s", label,
                                        EditErrorName(error), message.c_str()];
         return NO;
     }
-    const auto& stored = std::get<PasteClipsOperation>(
-        self.state->editLog.AppliedEntries().back().op);
+    const auto& stored =
+        std::get<PasteClipsOperation>(stagedLog.AppliedEntries().back().op);
     std::vector<Ulid> pastedIds;
     pastedIds.reserve(stored.clips.size());
     for (const PastedClip& clip : stored.clips)
         pastedIds.push_back(clip.clip_id);
-    self.state->interaction->SelectClips(pastedIds);
-    [self refreshTimelineAfterEditFromPosition:playhead];
-    if (![self persistEdits:message]) {
+    if (![self persistStagedDocument:stagedDocument
+                             editLog:stagedLog
+                             message:message]) {
         std::fprintf(stderr, "Unable to persist paste: %s\n", message.c_str());
         self.infoLabel.stringValue = [NSString
-            stringWithFormat:@"%@ non sauvegardé : %s", label, message.c_str()];
+            stringWithFormat:@"%@ impossible : %s", label, message.c_str()];
         return NO;
     }
+    self.state->document = std::move(stagedDocument);
+    self.state->editLog = std::move(stagedLog);
+    self.state->lastHistoryDomain = HistoryDomain::Timeline;
+    self.state->interaction->SelectClips(pastedIds);
+    [self refreshTimelineAfterEditFromPosition:playhead];
     [self updateSelectionInfo];
     self.infoLabel.stringValue =
         [NSString stringWithFormat:@"%@ · %lu clip%@", label,
@@ -8123,12 +8196,21 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         return;
     }
     const RationalTime playhead = self.state->requestedPosition;
-    if (self.state->editLog.Undo(self.state->document, error, message)) {
-        [self refreshTimelineAfterEditFromPosition:playhead];
-        [self refreshBinControlsSelecting:nil];
-        if (![self persistEdits:message])
+    Document stagedDocument = self.state->document;
+    EditLog stagedLog = self.state->editLog;
+    if (stagedLog.Undo(stagedDocument, error, message)) {
+        if (![self persistStagedDocument:stagedDocument
+                                 editLog:stagedLog
+                                 message:message]) {
             std::fprintf(stderr, "Unable to persist undo: %s\n",
                          message.c_str());
+            return;
+        }
+        self.state->document = std::move(stagedDocument);
+        self.state->editLog = std::move(stagedLog);
+        self.state->lastHistoryDomain = HistoryDomain::Timeline;
+        [self refreshTimelineAfterEditFromPosition:playhead];
+        [self refreshBinControlsSelecting:nil];
         [self updateSelectionInfo];
         self.state->overlayDirty = true;
     } else if (error != EditError::EmptyUndo) {
@@ -8176,12 +8258,21 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         return;
     }
     const RationalTime playhead = self.state->requestedPosition;
-    if (self.state->editLog.Redo(self.state->document, error, message)) {
-        [self refreshTimelineAfterEditFromPosition:playhead];
-        [self refreshBinControlsSelecting:nil];
-        if (![self persistEdits:message])
+    Document stagedDocument = self.state->document;
+    EditLog stagedLog = self.state->editLog;
+    if (stagedLog.Redo(stagedDocument, error, message)) {
+        if (![self persistStagedDocument:stagedDocument
+                                 editLog:stagedLog
+                                 message:message]) {
             std::fprintf(stderr, "Unable to persist redo: %s\n",
                          message.c_str());
+            return;
+        }
+        self.state->document = std::move(stagedDocument);
+        self.state->editLog = std::move(stagedLog);
+        self.state->lastHistoryDomain = HistoryDomain::Timeline;
+        [self refreshTimelineAfterEditFromPosition:playhead];
+        [self refreshBinControlsSelecting:nil];
         [self updateSelectionInfo];
         self.state->overlayDirty = true;
     } else if (error != EditError::EmptyRedo) {
@@ -8207,9 +8298,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = *self.state->timelineIn;
-    if (!self.state->editLog.Apply(self.state->document,
-                                   Operation{std::move(*rangeOperation)}, error,
-                                   message)) {
+    if (![self applyAndPersistTimelineOperation:Operation{
+                                                    std::move(*rangeOperation)}
+                                          error:error
+                                        message:message]) {
         std::fprintf(stderr, "Range delete rejected (%s): %s\n",
                      EditErrorName(error), message.c_str());
         return NO;
@@ -8218,7 +8310,6 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     self.state->timelineOut.reset();
     self.state->interaction->SelectClip("");
     [self refreshTimelineAfterEditFromPosition:playhead];
-    [self persistEdits:message];
     self.infoLabel.stringValue = ripple ? @"Zone In/Out extraite avec ripple"
                                         : @"Zone In/Out effacée (gap conservé)";
     self.state->overlayDirty = true;
@@ -8245,12 +8336,12 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = self.state->requestedPosition;
-    if (!self.state->editLog.Apply(self.state->document, std::move(operation),
-                                   error, message))
+    if (![self applyAndPersistTimelineOperation:std::move(operation)
+                                          error:error
+                                        message:message])
         return NO;
     self.state->interaction->SelectClip("");
     [self refreshTimelineAfterEditFromPosition:playhead];
-    [self persistEdits:message];
     [self updateSelectionInfo];
     return YES;
 }
@@ -8570,18 +8661,17 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     transition.duration = {halfFrames * 2 * rate.den, rate.num};
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(
-            self.state->document, Operation{AddTransitionOperation{transition}},
-            error, message)) {
+    if (![self applyAndPersistTimelineOperation:Operation {
+            AddTransitionOperation { transition }
+        }
+                                          error:error
+                                        message:message]) {
         self.infoLabel.stringValue =
             [NSString stringWithFormat:@"Transition refusée (%s) : %s",
                                        EditErrorName(error), message.c_str()];
         return;
     }
     [self refreshTimelineAfterEditFromPosition:self.state->requestedPosition];
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist transition: %s\n",
-                     message.c_str());
     self.infoLabel.stringValue =
         [NSString stringWithFormat:@"Fondu enchaîné · %lld images",
                                    static_cast<long long>(halfFrames * 2)];
@@ -8614,19 +8704,17 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const Ulid transitionId = chosen->id;
     EditError error = EditError::None;
     std::string message;
-    if (!self.state->editLog.Apply(
-            self.state->document,
-            Operation{RemoveTransitionOperation{transitionId}}, error,
-            message)) {
+    if (![self applyAndPersistTimelineOperation:Operation {
+            RemoveTransitionOperation { transitionId }
+        }
+                                          error:error
+                                        message:message]) {
         self.infoLabel.stringValue =
             [NSString stringWithFormat:@"Suppression refusée (%s) : %s",
                                        EditErrorName(error), message.c_str()];
         return;
     }
     [self refreshTimelineAfterEditFromPosition:self.state->requestedPosition];
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist transition removal: %s\n",
-                     message.c_str());
     self.infoLabel.stringValue = @"Fondu enchaîné supprimé";
     self.state->overlayDirty = true;
 }
@@ -8696,18 +8784,17 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = self.state->requestedPosition;
-    if (!self.state->editLog.Apply(self.state->document,
-                                   Operation{RemoveTrackOperation{track->id}},
-                                   error, message)) {
+    if (![self applyAndPersistTimelineOperation:Operation {
+            RemoveTrackOperation { track->id }
+        }
+                                          error:error
+                                        message:message]) {
         self.infoLabel.stringValue = [NSString
             stringWithFormat:@"Suppression refusée : %s", message.c_str()];
         return;
     }
     self.state->interaction->SelectClip("");
     [self refreshTimelineAfterEditFromPosition:playhead];
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist track removal: %s\n",
-                     message.c_str());
     [self updateSelectionInfo];
     self.state->overlayDirty = true;
 }
@@ -8732,13 +8819,19 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             return;
         }
     }
+    const RationalTime playhead = self.state->requestedPosition;
+    if (![self persistStagedDocument:stagedDocument
+                             editLog:stagedLog
+                             message:message]) {
+        self.infoLabel.stringValue =
+            [NSString stringWithFormat:@"Enregistrement impossible : %s",
+                                       message.c_str()];
+        return;
+    }
     self.state->document = std::move(stagedDocument);
     self.state->editLog = std::move(stagedLog);
-    const RationalTime playhead = self.state->requestedPosition;
+    self.state->lastHistoryDomain = HistoryDomain::Timeline;
     [self refreshTimelineAfterEditFromPosition:playhead];
-    if (![self persistEdits:message])
-        std::fprintf(stderr, "Unable to persist empty track removal: %s\n",
-                     message.c_str());
     self.infoLabel.stringValue =
         [NSString stringWithFormat:@"%lu piste%@ vide%@ supprimée%@",
                                    (unsigned long)emptyTrackIds.size(),
@@ -8897,10 +8990,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = self.state->requestedPosition;
-    if (self.state->editLog.Apply(self.state->document, std::move(operation),
-                                  error, message)) {
+    if ([self applyAndPersistTimelineOperation:std::move(operation)
+                                         error:error
+                                       message:message]) {
         [self refreshTimelineAfterEditFromPosition:playhead];
-        [self persistEdits:message];
         [self updateSelectionInfo];
     }
 }
@@ -8914,16 +9007,16 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     (void)sender;
     if (!self.state->contextGap) return;
     const TimelineGapSelection gap = *self.state->contextGap;
-    self.state->interaction->SelectClip("");
     Operation operation = GapDeleteOperationForSelection(
         self.state->document, gap, self.state->linkedSelection);
     EditError error = EditError::None;
     std::string message;
     const RationalTime playhead = self.state->requestedPosition;
-    if (self.state->editLog.Apply(self.state->document, std::move(operation),
-                                  error, message)) {
+    if ([self applyAndPersistTimelineOperation:std::move(operation)
+                                         error:error
+                                       message:message]) {
+        self.state->interaction->SelectClip("");
         [self refreshTimelineAfterEditFromPosition:playhead];
-        [self persistEdits:message];
         [self updateSelectionInfo];
     }
 }
