@@ -1,462 +1,491 @@
 ---
 name: monter-une-itw
-description: Monter une interview (ITW/ITM/ADS/LISAA) dans un projet CUTMACHINE et la livrer — style de la maison, bout à bout, montage, plans de coupe, recalage sur le signal, étalonnage S-Log3, export, SRT, renvoi vers DaVinci Resolve. À utiliser quand on demande de « monter » une interview, d'en refaire l'export, d'y ajouter des plans d'illustration, d'en sortir les sous-titres ou de la renvoyer dans Resolve.
+description: Monter une interview (ITW/ITM/ADS/LISAA) dans un projet CUTMACHINE et la livrer — cohérence du propos, resserrement, plans de coupe, étalonnage S-Log3, export, SRT, renvoi vers DaVinci Resolve. À utiliser quand on demande de « monter » une interview, d'en refaire l'export, d'y ajouter des plans d'illustration, d'en sortir les sous-titres ou de la renvoyer dans Resolve.
 ---
 
 # Monter une interview avec CUTMACHINE
 
-## Lis ça d'abord : deux passes, pas une
+## La règle qui prime sur toutes les autres
 
-La première exécution de cette procédure a rendu un montage jugé par le
-monteur **« bon bout à bout, mais pas utilisable tel quel »**. Il a dû le
-retravailler. Le diagnostic est exact et il faut le prendre au sérieux :
+**Un montage d'interview est d'abord un propos qui se tient.** Pas une durée,
+pas un nombre de plans par minute, pas un pourcentage de plans de coupe. Si le
+spectateur ne peut pas suivre le raisonnement de la personne, aucun chiffre ne
+rattrape ça.
 
-- un **bout à bout** enchaîne les bonnes phrases dans le bon ordre, sans
-  coupe fautive. C'est ce que produit `create_interview_short`, et c'est ce
-  que la procédure d'origine polissait ;
-- un **montage** a en plus un rythme, une accroche, une durée tenue, et rien
-  de redondant. C'est un travail différent, avec ses propres critères.
+Cette règle est écrite en tête parce que la version précédente de ce skill ne
+l'avait pas, et que le montage produit sous sa conduite a été refusé. Les
+chiffres y étaient tous bons — 25 plans/minute, 48 % de B-roll, première coupe
+à 3,0 s — et le film ne se tenait pas.
 
-Polir un bout à bout ne le transforme pas en montage. La passe 2 ci-dessous
-existe parce qu'elle avait été sautée sans que personne s'en aperçoive — les
-vérifications au frame près passaient toutes, et elles ne voient pas
-l'ennui.
+### Le test de l'antécédent
 
-**Symptôme mesurable de la passe sautée**, relevé sur le montage livré :
-quatre plans sur neuf s'ouvraient sur « Alors », cinq sur neuf sur un
-marqueur de discours. C'était lisible dans les transcriptions du début à la
-fin ; elles n'avaient jamais été lues d'un bloc, seulement clip par clip
-pour vérifier les bornes.
+C'est le contrôle qui aurait attrapé l'erreur, et il se fait sur le texte, à
+la sélection, avant toute opération.
 
----
+**Lis le texte retenu comme quelqu'un qui n'a pas vu les rushes.** Pour chaque
+mot qui renvoie à autre chose — `c'est`, `ça`, `ce projet`, `le`, `la`, `y`,
+`en`, `également`, `aussi`, `du coup`, `pour ça` — demande-toi : *ce à quoi ce
+mot renvoie est-il dans le montage ?* Si la réponse est non, tu as une
+référence pendante, et c'est une faute de montage, pas une imperfection.
 
-## Passe 0 — Lire le style de la maison
+Deux exemples réels, tous deux produits par la procédure d'avant :
 
-**Ne saute jamais cette étape.** Le chutier **`TL`** du projet Resolve
-contient les montages déjà finis par le monteur, en timelines — pas en
-fichiers. Ce sont des références de montage faites par la personne pour qui
-tu travailles, et elles se mesurent.
+- Un montage ouvrait sur « **…de réhabiliter** des anciens moulins à
+  Châteaulin ». Ni sujet ni verbe : le film démarre au milieu d'une phrase.
+- Un autre ouvrait sur « **c'est** un lieu de passage pour tous les gens qui
+  vont vers la côte ». « C'est » quoi ? Le nom de la ville n'arrive que huit
+  mots plus loin.
 
-```python
-# via sidecar/resolve_bridge.py : connect(), puis pour chaque timeline du chutier TL
-#   durée      = (GetEndFrame() - GetStartFrame()) / cadence
-#   plans      = somme des GetItemListInTrack("video", v)
-#   1re coupe  = fin du premier plan de V1
-#   B-roll     = durée cumulée des plans sur V2 et au-dessus
-```
+Et le cas le plus coûteux, parce qu'il est invisible plan par plan : garder
+une conséquence dont on a coupé la cause. Sur la même série, « **Et moi, en
+tant que sportive également**, c'est complètement ce que je ressens dans ce
+projet-là » était conservé, alors que la phrase qui le portait — « j'ai
+compris que le sport dynamise les événements, les espaces et les personnes » —
+avait été coupée. Le « également » ne renvoie à rien, « ce que je ressens »
+non plus. Chaque plan était propre ; l'enchaînement ne voulait rien dire.
 
-### Chiffres mesurés sur ITM267 (15 montages exploitables, 08/2026)
+### Ce qui en découle
 
-| | médiane | étendue |
-|---|---|---|
-| durée | **64,6 s** | 41 → 86 s |
-| plans | **21** | 10 → 33 |
-| plans par minute | **17,5** | 12 → 30 |
-| première coupe | **3,0 s** | 0,8 → 10 s |
-| part de B-roll | **40 %** | 18 → 73 % |
+- **Garde l'antécédent avec sa conséquence.** Elles se sélectionnent
+  ensemble ou pas du tout.
+- **Ne réordonne que si la référence survit au déplacement.** Prendre une
+  bonne phrase au milieu pour en faire l'accroche marche seulement si elle se
+  suffit à elle-même. « Personne ne s'arrête jamais à Châteaulin » se suffit ;
+  « c'est un lieu de passage » non.
+- **Préfère peu de blocs longs et complets à beaucoup de morceaux courts.**
+  Un bloc qui contient sa propre logique ne peut pas produire de référence
+  pendante ; un morceau de deux secondes, si.
+- **Une digression technique n'a pas sa place dans une minute.** Sur le même
+  montage, quinze secondes sur le traitement du corten passaient avant le
+  propos du personnage. Ce qui est passionnant en soutenance encombre un
+  format court.
 
-Ces chiffres sont la cible. Le premier montage produit par cette procédure
-les manquait tous dans le même sens — 12,2 plans/minute, première coupe à
-6,8 s, 31 % de B-roll — et a été jugé « bon bout à bout, pas utilisable ».
-**Sous-couper est le mode d'échec par défaut de cette procédure.** Si tes
-chiffres sont sous la médiane, tu n'as pas fini.
+### L'ordre de travail qui en découle
 
-Regarde aussi la première seconde de trois montages finis, et note s'ils
-ouvrent sur un plan de beauté ou sur un visage.
+1. Lire **toute** la parole de la personne comme un script.
+2. Écrire son raisonnement en une phrase : de quoi elle part, ce qu'elle a
+   fait, pourquoi ça compte, où ça la mène.
+3. Choisir les blocs qui portent ce raisonnement, entiers.
+4. Passer le test de l'antécédent sur le texte retenu.
+5. **Seulement ensuite** : resserrer, illustrer, exporter.
 
-## Comment regarder un rush
-
-**Ne décris jamais un plan depuis son nom de fichier ni depuis sa
-transcription seule.** `C7422.MP4` ne dit rien, et la transcription ne dit
-rien de l'image. C'est comme ça qu'un plan de beauté sur fond noir se
-retrouve enterré à la dixième seconde d'un montage.
-
-Procède **du grossier au fin**, jamais l'inverse :
-
-1. **Planche contact** sur toute la durée du rush — une vignette toutes les
-   quelques secondes, assemblées en une seule image. Une planche de neuf
-   vignettes coûte une lecture ; neuf lectures coûtent neuf fois plus et se
-   comparent moins bien.
-   ```sh
-   for t in 2 6 10 14 18; do
-     ffmpeg -nostdin -v error -ss $t -i "$RUSH" -frames:v 1 -vf scale=150:-2 -y "/tmp/v_$t.jpg"
-   done
-   ffmpeg -nostdin -v error -i /tmp/v_2.jpg -i /tmp/v_6.jpg -i /tmp/v_10.jpg \
-          -i /tmp/v_14.jpg -i /tmp/v_18.jpg \
-          -filter_complex "[0][1][2][3][4]hstack=inputs=5" -y /tmp/planche.jpg
-   ```
-2. **Transcription** du passage repéré, pour savoir ce qui s'y dit.
-3. **Zoom** : quelques images rapprochées sur l'intervalle retenu, pour
-   trancher un point d'entrée ou juger un raccord.
-
-Pour juger un **raccord**, il faut les deux images qui l'encadrent côte à
-côte — dernière image sortante et première image entrante. C'est ce qui a
-révélé le seul mauvais raccord du montage (A5→A6, sortie en plein filé).
-
-Attention : les images extraites d'un rush log sont **délavées**. Ce n'est
-pas ce que verra le spectateur, et ça fausse tout jugement d'exposition ou de
-lisibilité. Tant que `read_frame` n'applique pas la transformation couleur du
-document, extrais tes images depuis un export étalonné quand le jugement
-porte sur l'image elle-même.
-
-## Les six pièges techniques
-
-Ils sont tous vérifiés en conditions réelles. Ils coûtent une livraison
-ratée ou trois minutes d'encodage jetées si on les découvre après coup.
-
-### 1. La gestion couleur est désactivée par défaut → livraison en log
-
-Rushes Sony ILME-FX30 en **S-Log3-Cine / S-Gamut3.Cine**, déclaré dans le
-fichier annexe de tournage :
-
-```sh
-grep CaptureGamma 1_RUSHES/C7432M01.XML   # -> value="s-log3-cine"
-```
-
-`color_management.enabled` vaut `false` à la création. Sans correction
-l'export sort plat et délavé. Par MCP :
-
-```json
-{"name":"set_color_management","arguments":{
-  "enabled":true,"input_gamut":"sony_sgamut3_cine","input_transfer":"sony_slog3",
-  "input_ycbcr_matrix":"bt709","input_range":"auto","working_gamut":"acescct",
-  "output_gamut":"rec709","output_transfer":"rec709"}}
-```
-
-Contrôle : un rush log est vers YMIN 160 / SATAVG 30 ; un livrable étalonné
-descend les noirs sous 30 et monte la saturation au-delà de 45.
-
-```sh
-ffprobe -v error -f lavfi -i "movie='FICHIER':sp=30,signalstats" \
-  -show_entries frame_tags=lavfi.signalstats.YMIN,lavfi.signalstats.YAVG,\
-lavfi.signalstats.YMAX,lavfi.signalstats.SATAVG -of csv=p=0 -read_intervals "%+#1"
-```
-
-### 2. Les horodatages whisper sont faux — en tête, et au milieu
-
-Whisper place les premiers mots d'un segment sur du silence : sur `C7429` il
-donne « Alors, » à 0,00 s alors que la parole commence à 1,36 s.
-`create_interview_short` construit ses entrées là-dessus, d'où jusqu'à 1,3 s
-d'air mort en tête de plan, que le monteur entend comme des hésitations.
-
-**« Chaque coupe entre sur du silence » n'est pas un bon signe : c'est le
-défaut.**
-
-La mesure est dans le moteur, ne la refais pas à la main :
-
-```sh
-./build/cutmachine --speech-onset "$PROJET" "<media-id>"   # une fois par source
-./build/cutmachine --align-transcripts "$PROJET" --write   # recale les mots
-./build/cutmachine --speech-onset-report "$PROJET"
-```
-
-**`--align-transcripts --write` d'abord, avant toute décision de coupe.**
-(MCP : `align_transcript` avec `apply: true`.) Il compare chaque frontière de
-mot à l'enveloppe et corrige celles qui tombent dans le silence, dans le cache
-que lisent `remove_words`, `clean_disfluencies` et le montage d'interview.
-Lis le rapport : `moved_count` dit ce qui a bougé, et un `refused_no_edge`
-élevé veut dire que le transcript annonce des mots là où l'enveloppe n'entend
-rien — regarde plutôt que de faire confiance à l'un ou à l'autre.
-
-Ce qu'il ne fait **pas**, dit franchement : un mot mal placé au milieu d'un
-flux de parole continu a ses deux frontières dans la parole, et rien dans
-l'enveloppe ne dit qu'il est faux. Seules les erreurs bordées de silence sont
-corrigibles — ce sont les nuisibles, d'où l'intérêt, mais ce n'est pas de
-l'alignement forcé. Le contrôle sur le son **monté** (passe 3) reste dû.
-
-ou, en MCP, `analyze_speech_onset` puis `list_speech_onsets`. Le rapport
-publie `lead_in` et **`suggested_trim` en images entières, amorce déduite** :
-passe-le tel quel à `ripple_trim`, ne le recalcule pas. `link_group_id` donne
-le groupe à rogner en entier pour ne pas casser la synchro.
-
-Avant de rogner, **prouve que ce n'est pas de la parole** : compare le niveau
-de la zone au plancher de bruit du même plan et à un silence connu. Du
-souffle est 20 dB sous la parole ; un mot dit doucement, non.
-
-**La dérive n'est pas cantonnée à la tête du segment.** Mesurée jusqu'à
-**1,3 s en plein milieu d'un rush** sur ADS260 : sur `C8011`, « une fois qu'il
-est fini » est annoncée à 10,52 s et se trouve à 11,64 s. Deux conséquences
-directes :
-
-- **`remove_words` coupait à côté sur ces rushes.** Il résout les images
-  depuis ces horodatages (`ResolveWordRemoval`), donc il enlevait les
-  mauvaises. `--align-transcripts --write` traite la classe bordée de silence,
-  qui est celle qui fait mal ; passe-le avant toute coupe par mot. Pour une
-  compression interne, `tighten_pauses` fait le travail sans lire un mot du
-  tout, ce qui est plus sûr que n'importe quel horodatage.
-- **Ré-transcrire un extrait ne suffit pas.** Whisper étale encore le premier
-  mot sur le début du fichier : un extrait qui démarre ~0,2 s avant la parole
-  se lit, un extrait qui démarre dans le silence, non. Le seul étalon fiable
-  est le son **monté** — c'est l'étape 1 de la passe 3, et elle passe avant
-  l'export.
-
-### 3. `--disfluencies` ne voit que ce qui est écrit
-
-Il renvoie `[]` alors que le monteur entend des « euh » : whisper, même en
-verbatim, ne les écrit pas. Les fillers non écrits se cachent dans les trous
-**entre** deux mots transcrits. Cherche les trous ≥ 0,30 s et regarde s'ils
-sont voisés : trou voisé = mot manquant à la transcription ; trou muet =
-respiration, on n'y touche pas.
-
-### 4. Les caches de qualité d'image périmés sont rejetés en silence
-
-Un cache `version: 2` n'est pas lu par un binaire qui écrit du `version: 3` :
-les clips remontent en `unanalyzed`, ce qui **n'est pas un feu vert**, c'est
-un inconnu. Régénère avec `--shot-quality`, puis `--shot-quality-report`.
-
-`Soft` / `Blurry` sont relatifs à la médiane de la source : sur un plan filé
-à la main, un pic de flou est du filé. **Regarde l'image** avant de rejeter.
-
-### 5. `--export` ne prend pas de dimensions
-
-Il suit le format de séquence. Pour livrer en 1080×1920 depuis une séquence
-2160×3840, passe par `update_sequence`, puis **annule après l'export** et
-vérifie que la séquence est revenue à son format.
-
-### 6. exFAT n'a pas de liens durs
-
-`Exporter::Run` validait l'export par `link(2)` : échec avec `Operation not
-supported` **après avoir rendu 100 % des images**, puis destruction du rendu.
-Corrigé par un repli `rename`. Si un export meurt à 100 %, c'est là.
-
-Ne passe **jamais** `--overwrite` sur un nom de livrable existant.
+La durée est ce qui **résulte** de ce choix, pas ce qui le commande.
 
 ---
 
-## Passe 1 — le bout à bout
+## Les silences : mesure-les, ne les devine pas
 
-1. **État des lieux.** `--describe` : format de séquence, pistes, chutiers,
-   durée. Repère la timeline de dérushage et celle de montage.
-2. **Transcriptions en verbatim** (`"verbatim": true`), sinon
-   `--transcribe … --verbatim`. Nomme **tous** les rushes en une fois
-   (media-id séparés par des virgules, ou `media_ids` en MCP) : le modèle n'est
-   chargé qu'une seule fois, ~8 s économisés par rush. Les rushes muets sont
-   sautés et signalés, à condition qu'ils aient été ingérés par une version qui
-   mesure le niveau — sinon, refais un `--ingest` dessus.
-   Puis `--align-transcripts "$PROJET" --write` (piège 2) avant toute
-   sélection.
-3. **Sélection.** Timeline de dérushage active, `get_timeline_transcript`,
-   puis `create_interview_short` en nommant les `span_id` dans l'ordre
-   éditorial. **Ne retape jamais un timecode.**
-4. **Recale les entrées** (piège 2) et nettoie les fillers (piège 3).
+Deuxième reproche du monteur sur la version refusée : « tu laisses des
+silences ». Il avait raison, et le défaut était invisible dans les rapports
+d'opération.
 
-À ce stade tu as un bout à bout correct. **Tu n'as pas un montage.**
+### Le réglage qui laissait passer le problème
 
----
+`tighten_pauses` prend `min_gap_ms` et `keep_frames`. La première passe a
+tourné en **400 ms / 6 images** et son rapport annonçait fièrement quatre
+creux refermés par plan — en taisant que **36 à 44 creux étaient « trop
+courts »** et laissés en place. Additionnés, ces creux sous 400 ms faisaient
+le film entier respirer mou.
 
-## Passe 2 — le montage
+Réglage qui marche : **250 ms / 3 images**. Sur le même montage, il a refermé
+**19 creux au lieu de 4** et retiré 6,5 s au lieu de 4,1 s. Le silence mesuré
+est passé de 6,1 % à 2,1 % de la durée.
 
-C'est la passe qui manquait. Elle se fait sur le texte avant de se faire à
-l'image : ouvre les transcriptions des plans retenus et lis-les **d'un
-bloc**, comme un script, pas clip par clip.
+Ne descends pas beaucoup plus bas sans écouter : sous ~200 ms on colle les
+mots entre eux et la parole devient haletante.
 
-### L'ordre compte : le silence d'abord, le texte ensuite
+### Comment le mesurer
 
-Resserre en deux temps, dans cet ordre.
-
-**D'abord les temps morts, sans transcription.** Les pauses, les respirations
-entre phrases et l'air mort en tête de plan se mesurent dans le signal
-(`--speech-onset-report`) et se coupent sans lire un mot. C'est mécanique,
-c'est sûr, et ça se fait avant tout jugement éditorial.
-
-Le geste est outillé, ne le refais pas plan par plan à la main :
+`silencedetect` sur le son monté, **au bon seuil**. C'est le piège : à
+−35 dB on ne voit presque rien (1,6 % sur un film pourtant mou), parce que le
+fond de salle est au-dessus de ce seuil. C'est à **−30 dB** que les creux
+apparaissent — on cherche l'absence de *parole*, pas l'absence de *signal*.
 
 ```sh
-./build/cutmachine --tighten-pauses "$PROJET" "<clip-id>" 400 6
+ffmpeg -nostdin -hide_banner -i "$FILM" \
+  -af silencedetect=noise=-30dB:d=0.18 -f null - 2>&1 | grep silence_
 ```
 
-(MCP : `tighten_pauses`, arguments `min_gap_ms` et `keep_frames`.) Il cherche
-les creux internes d'au moins `min_gap`, ramène chacun à `keep` images, referme
-en ripple, et emporte la paire A/V liée — une seule opération, un seul `undo`.
-Le rapport dit ce qu'il a refermé et ce qu'il a laissé. L'**air de tête et de
-queue n'est pas touché** : ça, c'est un `ripple_trim` piloté par
-`suggested_trim`, et le rapport le publie (`head_air`, `tail_air`) plutôt que
-de le couper en douce. Mesuré : deux appels équivalents ont retiré 6,6 s de
-silences internes sur un seul montage.
+Repère : **c'est le creux le plus long qui compte, pas le total.** Douze
+respirations de 0,2 s ne s'entendent pas ; un seul trou de 0,6 s s'entend.
+Vise **aucun creux au-delà de ~0,3 s**, et regarde le total (3 à 4 %) comme un
+signe, pas comme une note. Le contrôle se fait sur le son monté, pas après
+l'export.
 
-**Ensuite la redondance, sur le texte.** Une fois le silence retiré, ce qui
-reste est de la parole, et les choix deviennent éditoriaux.
+### Ne descends pas sous 300 ms
 
-L'ordre inverse — partir de la transcription — est ce qui a produit le
-premier montage raté : on ne coupe que ce qui est écrit, et le silence n'est
-écrit nulle part.
+Mesuré : à **250 ms**, `tighten_pauses` a refermé un creux de 7 images **à
+l'intérieur du mot « notre »** — le montage disait « Ouais. nd'étude » là où
+la personne dit « Pour notre projet d'étude ». Le creux était réel dans
+l'enveloppe (une occlusive laisse un trou), mais ce n'était pas une pause.
 
-### Tiens une durée
+**300 à 320 ms / 4 images** est le bon compromis : les mots restent entiers et
+le plus long creux tombe à 0,26 s. C'est le réglage par défaut à retenir.
 
-Prends la médiane de la passe 0 comme cible et écris-la avant de commencer.
-Sans cible, « quelle phrase est de trop » est une question de goût ; avec,
-c'est une contrainte. Le montage d'origine faisait 71 s pour 121 s de rushes
-— un ratio de dérushage de 0,6, très faible pour de l'interview.
+Et surtout : **relis le texte monté après chaque changement de réglage.**
+Aucun rapport d'opération ne dit qu'un mot a été coupé en deux ; seule la
+transcription du son monté le montre.
 
-### Coupe à l'intérieur des phrases
+### Deux limites à connaître
 
-**C'est le geste qui sépare les deux passes.** `create_interview_short`
-travaille par spans, taillés pour la lisibilité des sous-titres — c'est de la
-granularité de bout à bout. Un span sélectionné n'est pas un atome : il se
-recoupe.
-
-Mesuré sur la reprise du monteur, plan par plan, contre la version rendue :
-
-| source | version rendue | reprise du monteur |
-|---|---|---|
-| C7429 | 1 bloc de 8,2 s | **2 morceaux**, 2,5 s au total |
-| C7430 | 1 bloc de 14,4 s | **5 morceaux**, 10,9 s au total |
-| C7431 | 1 bloc de 8,3 s | 2 morceaux, 6,3 s |
-| C7432 | 2 blocs, 15,6 s | 3 morceaux, 11,3 s |
-| C7436 | 1 bloc de 13,9 s | **3 morceaux**, 11,8 s |
-
-Neuf plans sont devenus dix-sept, et 17,5 secondes de parole ont disparu.
-Aucune phrase n'a été supprimée en entier : elles ont toutes été resserrées
-de l'intérieur. La compression se fait au mot, avec `remove_words`, ou par
-`split_clip` puis suppression — exactement l'outillage du nettoyage des
-fillers, appliqué à la redondance.
-
-**Ne calcule jamais une position timeline à la main.** Une décision se prend
-dans le rush (« couper juste après le nom »), et la conversion vers la
-timeline est ce qu'on rate. `split_clip`, `trim_clip` et `ripple_trim`
-acceptent `source_frame` **à la place** de `timeline_position` ou de `delta` :
-donne le numéro d'image du rush, le moteur résout la position. Sur un rognage,
-`Head` veut dire « le plan démarre sur cette image » et `Tail` « c'est la
-dernière image jouée » — borne inclusive. Et `locate_source_frame` répond « où
-joue l'image N » quand tu as besoin de le savoir plutôt que de couper : il
-rend **toutes** les correspondances, image et son détaché compris.
-
-**Ne t'arrête pas aux « euh » évidents.** C'est l'erreur du premier montage :
-les fillers ont été nettoyés, et rien d'autre. Quatre familles se coupent, et
-il faut les traiter toutes les quatre :
-
-- **les marqueurs de discours en tête de plan** — « Alors », « Du coup »,
-  « Et », « Ensuite ». Le montage d'origine en avait cinq sur neuf, dont
-  quatre fois « Alors ». Sur une coupe, ils s'entendent tous ;
-- **les faux départs et les phrases reprises** — la personne se corrige et
-  redit sa phrase : garde la seconde version, jette la première ;
-- **les redites** — deux formulations de la même idée, à dix secondes
-  d'écart : garde la plus nette ;
-- **les fins molles et les relances** — « et voilà », « Ok », « tout ici »,
-  et les questions de l'intervieweur restées dans le plan.
-
-### Relis après avoir coupé
-
-Une coupe au mot déplace tous les indices suivants : **relis la transcription
-complète après chaque passe de suppression**, jamais seulement le clip
-touché. Tu cherches trois choses :
-
-- une **pensée orpheline** — une phrase dont la chute est partie avec la
-  coupe. C'est le défaut exact laissé sur A4, où « c'est les seuls à pouvoir
-  vivre dehors » avait disparu ;
-- une **prise en double** — la version qu'on croyait supprimée est restée ;
-- un **enchaînement bancal** entre deux morceaux qui ne se suivaient pas.
-
-Et garde la hiérarchie dans le bon sens : **un propos qui se tient vaut mieux
-qu'un montage court**. La durée cible est un garde-fou contre la mollesse,
-pas un objectif à battre.
-
-### Vérifie que l'histoire est entière
-
-Relis le texte retenu comme un récit et demande-toi ce qui manque. Sur le
-montage d'origine, le plan A4 s'arrêtait sur « filtrer son air directement en
-lui » et laissait tomber « ça a créé beaucoup de modifications génétiques […]
-c'est les seuls à pouvoir vivre dehors » — c'est-à-dire **la chute de
-l'histoire du personnage**. Le défaut avait été repéré et laissé au motif que
-la demande portait sur la finition. Ne fais pas ça : signale-le, ou corrige-le
-et dis-le.
-
-### Décide de la première seconde
-
-Sur un format vertical, l'accroche est une décision à part entière, et la
-maison coupe tôt : **première coupe à 3,0 s en médiane**, parfois à 0,8 s.
-
-Le montage rendu tenait son plan d'ouverture 6,8 s. Le monteur l'a ramené à
-1,8 s, et a envoyé le plan de beauté du personnage sur fond noir juste
-derrière — le même plan qui, dans la version rendue, n'arrivait qu'à la
-dixième seconde. Demande-toi explicitement : *quelle est la première image, et
-combien de temps la tient-on ?*
-
-### Compte tes plans avant de rendre
-
-Le contrôle le plus efficace, et il est arithmétique :
-
-```
-plans par minute = nombre total de plans vidéo / (durée en secondes / 60)
-```
-
-Sous **17 plans/minute**, tu rends un bout à bout. La version rendue était à
-12,2 ; la reprise du monteur à 25,8. Aligne aussi les durées de plan : le
-montage rendu finissait sur 13,9 s de plan parlant ininterrompu — le monteur
-l'a découpé en trois. Si un plan dépasse largement les autres, il faut soit
-le couper, soit le couvrir.
-
-### Pose les plans de coupe
-
-Piste vidéo au-dessus (`add_track`, `index: 2`), `insert_clip` **en ordre
-croissant de position**. Règles vérifiées :
-
-- **Jamais quelqu'un qui parle face caméra** : un plan de coupe sur une autre
-  parole se lit comme une faute de synchro. Vérifie à l'image.
-- **Couvre les raccords faibles**, et décale la coupe image d'une
-  demi-seconde avant la coupe son.
-- **Un plan de coupe sert aussi à masquer une compression** : si tu coupes
-  dans une phrase, l'image doit souvent passer ailleurs à cet endroit. Un
-  montage compressé demande plus de couverture qu'un bout à bout — d'où les
-  40 % de médiane maison.
-- **Laisse-les courir.** La version rendue alternait locuteur / coupe /
-  locuteur avec des retours courts. Le monteur, lui, a enchaîné deux plans de
-  coupe sans revenir au visage : 9,2 secondes continues de B-roll sur la
-  narration d'ouverture, et un plan de 8,3 s plus loin. Un plan de coupe de
-  4 s entouré de retours d'une seconde et demie donne un montage nerveux et
-  illisible ; mieux vaut moins de retours, plus longs.
-- **Sources à 50 i/s** : `source_in` au débit de la source
-  (`{"value":350,"rate":50}`), `duration` au débit de la séquence. Les deux
-  doivent tomber sur des images entières.
-- La piste de coupe ne contient aucun membre des groupes liés : nomme-la dans
-  `sync_track_ids` à chaque `ripple_trim`, sinon elle ne suit pas le décalage.
+- `tighten_pauses` ne touche **ni la tête ni la queue** du plan : elle les
+  publie (`head_air`, `tail_air`) et laisse. L'air de tête se rogne avec
+  `ripple_trim` piloté par `analyze_speech_onset`.
+- Chaque creux refermé **coupe le plan en deux**. Un montage resserré à 250 ms
+  passe de 6 blocs à 25 plans : autant de faux raccords à couvrir. C'est le
+  prix du resserrement, et c'est ce qui justifie les plans de coupe.
 
 ---
 
-## Passe 3 — finition et sortie
+## Les pièges de pilotage qui coûtent un aller-retour
 
-**L'ordre compte, et le prendre à l'envers coûte cher.** L'encodage est le
-poste le plus long de la procédure — ~4 min pour 70 s de film, le double si une
-analyse tourne en même temps. Le contrôle qui attrape les mots mangés aux
-bordures de plan se fait donc **avant** l'export, sur un montage son fabriqué
-en quelques secondes. Sur ADS260, l'avoir fait après a coûté **trois exports
-pour 70 secondes**, chacun ne trouvant qu'un ou deux défauts.
+Aucun ne lève d'erreur parlante. Tous ont été rencontrés en conditions réelles.
 
-1. **Relis le texte réellement monté.** Concatène le son des plans retenus
-   depuis les rushes, transcris-le, lis-le d'un bloc :
-   ```sh
-   # une entrée par plan, aux bornes source du montage
-   for each plan: ffmpeg -nostdin -v error -ss <src_in/25> -t <durée/25> \
-       -i "$RUSHES/<rush>.MP4" -ac 1 -ar 16000 -y "p_<n>.wav"
-   ffmpeg -nostdin -v error -f concat -safe 0 -i plans.txt -c copy -y son.wav
-   ```
-   puis `--ingest` + `--transcribe` sur ce fichier. **C'est un contrôle, pas
-   une boucle de sondage** : depuis `--align-transcripts --write`, les bornes
-   ne se vérifient plus une par une en extrayant des fragments. Fais-le une
-   fois, sur le son monté entier. Tu cherches un mot avalé en
-   tête ou en queue de plan — sur ADS260 : « Je m'appelle » disparu, « Le
-   moment » amputé, un plan qui finissait sur un « où ça met » qui pendait —
-   pas la qualité de l'image. Corrige les bordures, refais le son, relis.
-   **Tant que ce texte n'est pas propre, n'exporte pas.**
-2. **Son.** Les plans viennent de rushes différents, à des distances de micro
-   différentes. Vérifie le niveau moyen plan par plan et signale les écarts.
-   *(Le moteur n'expose pas de gain par clip ni de fondu audio à ce jour —
-   si un écart est audible, dis-le plutôt que de le passer sous silence.)*
-3. **Couleur.** Piège 1.
-4. **Export, une seule fois.** Piège 5, puis :
-   ```sh
-   ./build/cutmachine --export "$PROJET" "$EXPORT/<CODE>_ITW_<Sujet>_<Perso>.mov"
-   ```
-   Ne lance aucune analyse lourde pendant — `--shot-quality` sur sept rushes 4K
-   a doublé la durée de l'encodage sur ADS260, pour ne rien trouver : sur une
-   interview au pied, les plans signalés étaient des gestes de main.
-5. **Sous-titres, depuis le livrable.** `--export-srt` sur le projet de montage
-   produit des cues fausses : elles héritent des horodatages du piège 2 et
-   perdent les mots que whisper avait posés sur du silence rogné (sur ADS260,
-   la première cue disait « encore moi. » au lieu de « Salut, c'est encore
-   moi. »). Ingère le `.mov` rendu dans un projet jetable, transcris-le,
-   pose-le sur une piste audio, puis `--export-srt`. Les cues viennent des
-   **pistes audio**, donc un plan de coupe ne se sous-titre pas tout seul.
+### Les spans appartiennent à la timeline active
+
+`get_timeline_transcript` et `create_interview_short` lisent la timeline
+**active**. Après avoir fabriqué un montage, l'actif est ce montage : demander
+`S276` là-dedans rend `unknown span_id 'S276'`, alors que le span existe
+parfaitement dans le dérushage.
+
+**Repasse sur le dérushage avant chaque nouvelle sélection**
+(`set_active_timeline`). Et méfie-toi de la suite : quand la création échoue,
+l'actif ne bouge pas, donc l'opération suivante — un resserrement, par
+exemple — s'applique au **dérushage**. C'est arrivé : 92 creux refermés dans
+la matière brute au lieu du film. Mets un garde-fou qui refuse toute opération
+de montage quand l'actif est le dérushage.
+
+### `ripple_trim` n'emporte pas ce qu'on croit
+
+`tighten_pauses` emporte le plan son lié tout seul et le dit dans `also_cut`.
+**`ripple_trim`, non.** Rogner la tête d'un plan vidéo laisse le son en place,
+décale l'image seule et pose un trou en fin de piste vidéo — **sans changer la
+durée de la timeline**, donc le contrôle « la durée a-t-elle bougé ? » ne voit
+rien.
+
+Il faut nommer explicitement :
+
+- `linked_clip_ids` : le plan son de la paire ;
+- `sync_track_ids` : la piste de coupe, qui n'appartient à aucun groupe lié et
+  ne suivrait pas le décalage.
+
+Contrôle après coup : les durées de V1 et de A1 doivent coïncider plan par
+plan.
+
+### Désigner le bon plan quand un rush en fournit plusieurs
+
+Un même rush alimente souvent trois blocs du montage. « Le premier » ou « le
+dernier » vise à côté. Trie les plans du rush par `source_in` et nomme le rang.
+Et applique les corrections de bordure **avant** le resserrement : après, le
+rush est éclaté en dix morceaux et le rang ne désigne plus rien.
+
+### Le chemin du projet, c'est le `.json`, pas le dossier
+
+Toutes les commandes veulent
+`…/NOM.cutmachine-project/project.cutmachine.json`. Passe le dossier et tu
+reçois `ParseError: unsupported project package (CUTMACHINE package v2
+required)` — un message qui accuse le format du paquet alors que le paquet est
+parfaitement valide : le contrôle cherche `manifest.json` à côté du chemin
+donné, et à côté d'un dossier il n'y a rien. Ne perds pas dix minutes à
+inspecter le manifeste.
+
+### Les alias de `describe` se renumérotent
+
+`A1`, `A2`… sont positionnels : ils changent après chaque découpe. Repère
+toujours un plan par `source_in` ou par identifiant, jamais par alias.
+
+---
+
+## La question de l'intervieweur s'entend, et rien ne la signale
+
+Le défaut le plus coûteux de cette série, parce qu'il est **invisible dans
+toutes les transcriptions**.
+
+whisper ne transcrit que le locuteur principal. Quand un rush commence par la
+question de l'intervieweur, whisper la saute et pose le premier mot de la
+réponse à l'image 0. `create_interview_short` construit l'entrée du plan
+là-dessus, donc le montage démarre **sur la question**. Elle s'entend
+parfaitement au montage ; elle n'apparaît dans aucun contrôle textuel.
+
+Mesuré sur LISAASTR136 : six blocs sur huit montages ouvraient sur « Et c'est
+quoi ? », « Qu'est-ce que c'est ? » ou l'équivalent.
+
+### Pourquoi l'onset ne le voit pas
+
+`analyze_speech_onset` mesure de la **parole**, pas *qui* parle. La question
+est de la parole : l'onset la déclare « tight » et ne suggère aucun rognage.
+
+### Le discriminateur fiable : le niveau
+
+**L'intervieweur n'est pas micro-cravaté.** Sa question est systématiquement
+**15 à 20 dB sous** la réponse. Sur un rush mesuré : question à −27/−49 dB,
+réponse à −11/−14 dB, avec un creux net entre les deux.
+
+Le repérage se fait donc sur l'enveloppe RMS 20 ms, avec un seuil **calé sur
+le rush lui-même** — 90e centile moins ~9 dB — et une tenue de quelques
+fenêtres pour ne pas déclencher sur un bruit :
+
+```
+seuil = centile90(niveaux) - 9 dB
+début = première fenêtre qui tient >= 6 fenêtres au-dessus du seuil
+```
+
+Sur les rushes de cette série, ça rend des débuts de 12 à 25 images
+(0,5 à 1,0 s) — cohérents avec la lecture manuelle de l'enveloppe.
+
+### Quand le niveau ne suffit pas : le creux
+
+Le discriminateur du niveau suppose que l'intervieweur est loin du micro.
+Ça ne tient pas toujours. Sur ADS260 (C8009), la question et la réponse sont
+à des crêtes voisines — +13 contre +18 dans l'échelle de l'enveloppe — et
+seul **le creux entre les deux** sépare : question jusqu'à l'image 179,
+silence 180-185, réponse à partir de 186.
+
+Alors lis le creux, pas le niveau. Et méfie-toi des groupes tout faits :
+`analyze_speech_onset` regroupe avec un écart de 200 ms par défaut, donc
+**il fusionne la question et la réponse quand la personne enchaîne vite**.
+Mesuré sur ce même rush : le premier groupe publié allait de 0 à 181 et
+couvrait les deux, ce qui a placé l'entrée du bloc 65 images trop tard. Le
+montage disait « **Long et fastidieux**, j'ai peint en tout… » là où elle dit
+« Ça a été un processus long et fastidieux ». Descends `group_gap_ms`, ou lis
+directement les niveaux 20 ms du cache `speechonset`.
+
+### whisper épingle le premier mot du rush à l'image 0
+
+Défaut jumeau du précédent, et il frappe **même quand il n'y a pas de
+question**. whisper ne place pas le premier mot où il est : il le pose à zéro
+et étire les suivants jusqu'à retomber sur la parole réelle vers le milieu du
+fichier.
+
+Mesuré sur les quatre rushes d'ADS260 où le bloc d'ouverture était pris en
+tête, en comparant le premier mot annoncé au premier groupe de l'enveloppe :
+
+| rush | whisper | enveloppe | dérive |
+|---|---|---|---|
+| C8008 | 0 | 34 | **+34** |
+| C8012 | 0 | 29 | **+29** |
+| C8013 | 0 | 94 | **+94** |
+| C8014 | 0 | 45 | **+45** |
+
+Un plan entré sur l'horodatage whisper commence donc par une à quatre
+secondes de fond de salle — et `trim_boundary_air` les referme, mais après
+coup, sur un montage déjà découpé.
+
+**Prends toujours l'entrée du premier bloc d'un rush sur l'enveloppe.** En
+revanche, à partir du premier vrai creux, whisper redevient juste : sur
+C8008, la fin de « …un film d'animation. » est annoncée à 135 et l'enveloppe
+décroche à 136. La dérive est un défaut de **tête de fichier**, pas un
+décalage général.
+
+Contrôle qui la révèle en une ligne, sans rien décoder : compare le premier
+mot de la transcription au premier groupe de parole du cache. S'ils ne
+coïncident pas à quelques images près, tous les horodatages de la première
+phrase sont faux.
+
+### Le contrôle à passer sur chaque montage
+
+Pour chaque rush du montage, compare le `source_in` du **premier** bloc au
+début mesuré. S'il est en deçà, la question est dedans.
+
+Deux cas de correction, et le second est celui qu'on rate :
+
+- le bloc commence avant la parole : `ripple_trim` de la tête sur le début
+  mesuré ;
+- **le premier morceau est entièrement dans la question** — fréquent après
+  resserrement, qui coupe justement au creux entre question et réponse. Un
+  morceau plus court que le rognage demandé **ne se rogne pas** : le moteur
+  répond sans rien faire et la durée ne bouge pas. Il faut le `remove_clip`,
+  puis rogner le suivant.
+
+### Certains refus reviennent en texte, pas en `ok:false`
+
+`create_interview_short` refuse deux spans « separated by more than a
+breath » — utile, ça empêche de recoller deux morceaux entre lesquels la
+personne a fait autre chose. Mais **le refus arrive parfois comme une chaîne
+de texte**, pas comme `{"ok":false}`.
+
+Un client qui ne teste que `ok` croit avoir réussi. La suite s'exécute alors
+sur la timeline précédente — le dérushage si aucun montage n'existe encore —
+et l'erreur ne se voit que trois opérations plus loin, sous une forme
+incompréhensible (`IndexError` sur la liste des pistes, parce que le
+dérushage n'a pas de piste vidéo à l'index 0).
+
+Fais lever une exception sur toute réponse commençant par `ValidationFailed`,
+`ParseError`, `NotFound`, `Conflict` ou `Refused`, même hors JSON. Et vérifie
+le nom de la timeline active après chaque création.
+
+### Quand un span refuse de se coller au suivant
+
+Le refus « separated by more than a breath » se contourne en **coupant le
+segment en deux** — mais souvent la vraie réponse est de ne pas vouloir ce
+raccord. Sur un cas mesuré, `S3`/`S4` séparaient « Voici notre projet de fin
+d'étude » de « Notre projet ici a porté sur… » : deux départs, dont le second
+est le bon. Prends le second et **rallonge sa tête** avec `ripple_trim` sur
+l'image du mot voulu — `ripple_trim` étend aussi bien qu'il rogne.
+
+---
+
+## La finition : les creux que le resserrement ne voit pas
+
+`tighten_pauses` ne touche **ni la tête ni la queue** d'un plan. Après
+resserrement, les seuls creux qui restent sont donc aux bordures — et ce sont
+justement ceux qui s'entendent, puisque les creux internes ont été refermés.
+
+Boucle de finition, à répéter jusqu'à ce qu'elle ne trouve plus rien :
+
+1. mesurer les creux du son monté (`silencedetect -30dB`) ;
+2. pour chaque creux ≥ 0,4 s, trouver le plan qui le contient ;
+3. si le creux est **près du début** du plan → rogner la tête ;
+   près de la **fin** → rogner la queue ;
+4. supprimer les plans de moins de 6 images : à 0,2 s ce ne sont pas des
+   plans, ce sont des clignotements.
+
+Prends une marge large pour « près du début » — **25 images**, pas 10. Avec
+une marge étroite, un creux à 15 images du début est classé « interne », on
+lui applique un resserrement qui refuse d'y toucher, et il ne bouge jamais.
+Mesuré : trois passes avec marge 25 ont fait tomber le silence de 3,4 % à
+0,3 %, plus grand creux de 0,67 s à 0,19 s.
+
+### L'enveloppe tranche, pas whisper
+
+Le repérage de la bordure **ne se fait pas sur les horodatages whisper**. Cas
+mesuré : whisper place « l'objectif, » à l'image 386, l'enveloppe montre du
+silence jusqu'à 398 et la parole qui démarre à **399**. Treize images de
+dérive, en plein milieu du fichier.
+
+Symétriquement, ne rogne pas au jugé : couper la queue « douze images avant la
+fin » a mangé la fin de « café-librairie », que le montage disait alors
+« café libre ». **Lis l'enveloppe, prends l'image où le niveau décroche.**
+
+Et après chaque rognage de bordure, **relis le texte monté**. C'est le seul
+contrôle qui voit un mot amputé.
+
+---
+
+## Les plans de coupe servent le sens, pas le compteur
+
+Ils ont deux fonctions, dans cet ordre :
+
+1. **montrer ce dont la personne parle** au moment où elle en parle ;
+2. couvrir les faux raccords que le resserrement a créés.
+
+La première prime. Un plan de coupe posé « parce qu'il faut 40 % » et qui
+montre autre chose que le propos est pire que pas de plan de coupe du tout :
+il détourne l'attention au lieu de la porter.
+
+### L'image peut porter une référence
+
+La règle de l'antécédent a une exception, et elle est utile : **un objet
+montré à l'écran est son propre antécédent.** Quand quelqu'un dit « lorsqu'on
+va souffler dans **ce tuyau** » sans que le tuyau ait été nommé avant, le plan
+de coupe qui montre le tuyau à cet instant règle la question. Encore faut-il
+qu'il soit là *à cet instant* — d'où la première fonction.
+
+### Règles de pose vérifiées
+
+- **Jamais quelqu'un qui parle face caméra** en plan de coupe : ça se lit
+  comme une faute de synchro. Vérifie à l'image, pas au nom de fichier.
+- **Laisse-les courir.** Mieux vaut cinq coupes de 5 à 8 s que douze de 2 s.
+  Les retours courts au visage donnent un montage nerveux et illisible.
+- **Garde le visage pour les moments personnels.** Quand la personne dit ce
+  qui la touche, on la regarde. C'est le seul endroit du film où l'image du
+  visage vaut mieux qu'une maquette.
+- **Pose en ordre croissant de position sur une piste vide.** `insert_clip`
+  insère et fait un ripple : revenir enrichir une piste déjà peuplée décale
+  tout ce qui est en aval, silencieusement. Pour densifier, `remove_track` +
+  `add_track` et repose tout d'un coup.
+- **Sources à 50 i/s** : `source_in` au débit de la source, `duration` au
+  débit de la séquence.
+- La piste de coupe n'appartient à aucun groupe lié : nomme-la dans
+  `sync_track_ids` de chaque `ripple_trim`, sinon elle ne suit pas.
+
+### Le compte des plans se lit après, pas avant
+
+Une fois le propos tenu et les silences fermés, regarde les chiffres pour
+détecter une anomalie — pas pour piloter. Sur cette série, les huit montages
+finis tombent entre 20 et 30 plans/minute et 40 à 55 % de B-roll **sans que
+ces valeurs aient été visées**. Elles sont la conséquence d'un resserrement
+serré (beaucoup de faux raccords à couvrir) et d'un matériau très illustratif.
+
+---
+
+## L'ordre de travail, de bout en bout
+
+Chaque étape produit ce dont la suivante a besoin. Prises dans le désordre,
+elles se défont mutuellement — notamment les corrections de bordure, qui ne
+sont plus adressables une fois le resserrement passé.
+
+1. **Transcrire tous les rushes en verbatim**, en une seule fois (`media_ids`)
+   pour ne charger le modèle qu'une fois.
+2. **Classer les rushes** : parole / plan muet. whisper hallucine sur le
+   silence, et un plan de coupe peut porter du son (voir plus bas).
+3. **Analyser les attaques** (`analyze_speech_onset`) puis
+   **`align_transcript --write`**. Avant toute décision de coupe.
+4. **Lire toute la parole de la personne** et écrire son raisonnement en une
+   phrase.
+5. **Choisir les blocs**, entiers, dans un ordre qui préserve les références.
+6. **Mesurer chaque borne sur l'enveloppe** avant de poser quoi que ce soit :
+   entrée sur l'attaque moins 2 à 3 images, sortie sur le décrochage plus
+   2 à 3. Les horodatages whisper ne servent qu'à *trouver* la phrase.
+7. **Monter les blocs** — `create_interview_short` depuis le dérushage actif,
+   ou `add_timeline` + `insert_clip` image/son + `set_clip_link` quand la
+   sélection est en images source plutôt qu'en spans.
+8. **Corriger les bordures** (`trim_boundary_air`) — *avant* le resserrement.
+9. **Resserrer** (`tighten_pauses`, 300–320 ms / 4 images).
+10. **Purger les questions d'intervieweur** (repérage au creux et au niveau).
+11. **Finition** : fragments-éclair, creux de bordure, en boucle.
+12. **Relire le texte du son monté** (`transcribe_timeline`). Tant qu'il n'est
+    pas propre, ne pas continuer.
+13. **Poser les plans de coupe** sur le sens.
+14. **Couleur, puis livraison** : export, SRT, Resolve — voir plus bas ce qui
+    est vraiment demandé.
+
+Le contrôle du texte (12) est le seul qui attrape les mots amputés et les
+enchaînements absurdes. **Fais-le au moins deux fois** : une fois le montage
+posé, une fois après le resserrement.
+
+### `transcribe_timeline` remplace toute la chorégraphie
+
+Ce contrôle demandait avant une quarantaine de lignes hors moteur — extraire
+le son de chaque plan avec `ffmpeg -ss/-t`, concaténer, habiller d'une vidéo
+noire (`--ingest` refusait un fichier sans image, et voulait un dossier),
+transcrire, relire le cache. **Ce n'est plus le cas.** `transcribe_timeline`
+(outil MCP, ou `--transcribe-timeline`) décode le son des pistes audio aux
+bornes des plans, le mixe directement dans whisper, et rend le texte. Aucun
+fichier intermédiaire, aucun export.
+
+Sur ADS260 il a attrapé les deux seules fautes du montage, invisibles
+ailleurs : un bloc entré 65 images trop tard (« **Long et fastidieux**, j'ai
+peint… ») et un bloc sorti 124 images trop tôt (« un projet de court métrage
+qui a été, **ce ne sera pas du tout à l'aquarelle** » — « tout récemment
+financé » manquait). Les deux venaient de bornes lues sur des groupes de
+parole plutôt que sur l'enveloppe brute.
+
+Le cache s'écrit dans `.cutmachine/timeline-transcripts/<id du montage>.json`
+et **porte les mots aux positions du montage** — c'est ce qui sert à faire le
+SRT (voir plus bas).
+
+### La boucle de finition peut diverger — borne-la
+
+Mesuré : sur un creux à cheval sur une jonction de blocs, la boucle a rogné
+quatre fois la même queue et le creux a **grandi** (0,51 → 0,64 s) au lieu de
+disparaître. Le trou n'appartenait pas au plan qui le contenait : il était
+pour moitié la queue du plan sortant, pour moitié la tête du plan entrant.
+Rogner un seul côté déplace la jonction sans fermer le trou.
+
+Deux garde-fous :
+
+- **borne le nombre de passes** et signale la non-convergence au lieu de
+  boucler ;
+- quand un creux enjambe une jonction, **mesure les deux côtés** et rogne les
+  deux : la queue du sortant à l'image où le niveau décroche, la tête de
+  l'entrant à l'image où il remonte. Sur le cas mesuré : queue à 356 au lieu
+  de 359, tête à 379 au lieu de 368 — 0,64 s ramenés à 0,31 s en une fois.
+
+Et laisse **2 à 3 images de battement** avant l'attaque plutôt que de couper
+dessus : une coupe pile sur le premier phonème l'escamote (le montage disait
+« .. c'est un sujet » au lieu de « Et sur le plan plus personnel, c'est un
+sujet »).
 
 ---
 
@@ -465,80 +494,369 @@ pour 70 secondes**, chacun ne trouvant qu'un ou deux défauts.
 Le projet Resolve doit être **ouvert** : au lancement, Resolve part sur
 « Untitled Project » et le pont rapporte 0 chutier sans erreur.
 
-```sh
-./build/cutmachine --export-resolve-timeline "$PROJET" > /tmp/tl.json
-python3 sidecar/resolve_bridge.py --send /tmp/tl.json --name "<nom cible>"
-```
+### Demande-toi d'abord si l'export est vraiment le livrable
 
-`--name` est indispensable pour renvoyer une révision : Resolve refuse un nom
-déjà pris. Le schéma v2 porte par plan sa couche vidéo, sa position et le
-sort de son audio ; le pont crée les pistes manquantes et décale chaque
-`recordFrame` du `GetStartFrame()` de la timeline (90000 pour 01:00:00:00 à
-25 i/s). Les plans de coupe partent en `mediaType: 1`, sans son.
+Quand la commande est « remonte la timeline », le livrable est **la timeline
+Resolve**, pas un fichier. Le monteur étalonne et sort le master lui-même
+depuis Resolve ; rendre un `.mov` depuis CUTMACHINE ne fait que consommer
+2,2 min par film et produire un fichier que personne n'ouvrira.
 
-### Le SRT dans Resolve
+**Ne rends un master que si on le demande.** Ce qui reste dû dans ce cas :
+la timeline renvoyée, et le SRT si le projet en portait un.
 
-`Timeline.ImportIntoTimeline` **refuse le SRT** : il le lit comme un EDL et
-le log dit `Import Log (Fatal) - File of srt type cannot be imported.`
+### L'ordre est piégeux : les sous-titres d'abord
 
-Ce qui fonctionne :
-
-```python
-tl.AddTrack("subtitle")
-item = mp.ImportMedia(["/chemin/durable/sous-titres.srt"])[0]
-mp.AppendToTimeline([{"mediaPoolItem": item, "trackIndex": 1}])
-```
-
-**Mais l'ordre est piégeux : les sous-titres d'abord, les plans ensuite.**
-`AppendToTimeline` pose l'élément de sous-titres à la fin de **ce que la
+`AppendToTimeline` pose l'élément de sous-titres **à la fin de ce que la
 timeline contient déjà**, pas au début de sa piste. Sur une timeline de
-montage déjà remplie, les 34 cues d'ADS260 ont atterri à l'image 1760 — juste
-après le dernier plan — et la timeline est passée de 70 à 140 s sans erreur.
+montage déjà remplie, les cues atterrissent après le dernier plan et la
+timeline double de longueur, sans erreur.
 
-Le pont `--send` créant sa propre timeline, il faut donc reconstruire à la
-main dans le bon ordre : `CreateEmptyTimeline`, `AddTrack("subtitle")`,
-`AppendToTimeline` du SRT (il tombe à zéro, la timeline est vide), **puis**
-les plans avec leur `recordFrame` absolu — la position absolue les place
-correctement quoi qu'il y ait déjà. Réutilise `index_media_pool` du pont pour
-retrouver les rushes : il renvoie `{"by_path": …, "by_name": …}`, pas un
-dictionnaire plat.
+Construis donc dans cet ordre :
 
-Contrôle après coup : `GetEndFrame() - GetStartFrame()` doit valoir la durée
-du montage, et le premier élément de sous-titre partir de zéro. Une timeline
-deux fois trop longue est la signature de ce piège.
+1. `CreateEmptyTimeline` ;
+2. `AddTrack("subtitle")` ;
+3. `AppendToTimeline` du SRT — il tombe à zéro, la timeline est vide ;
+4. `AddTrack("video")` autant que de couches ;
+5. les plans, avec leur `recordFrame` **absolu** (décalé du `GetStartFrame()`
+   de la timeline : 90000 pour 01:00:00:00 à 25 i/s).
 
-**Ne mets rien d'autre dans le `clipInfo` du SRT.** Ajouter `startFrame`,
-`endFrame`, `recordFrame` ou `mediaType` sur un élément de sous-titres a fait
-planter le pont Python. Importe depuis un chemin durable, pas depuis `/tmp`.
-La persistance après redémarrage de Resolve **reste à reconfirmer**.
+Ne mets **rien d'autre** dans le `clipInfo` du SRT que `mediaPoolItem` et
+`trackIndex` : y ajouter `startFrame`, `endFrame`, `recordFrame` ou
+`mediaType` fait planter le pont.
+
+**Il n'y a pas de contournement, et `recordFrame` n'en est pas un.** Mesuré sur
+un montage de 1853 images déjà rempli : piste de sous-titres neuve et vide,
+`AppendToTimeline` pose quand même les 102 cues **à l'image 1853** et double la
+timeline. Avec `recordFrame` mis à l'origine de la séquence, même résultat —
+il est ignoré, sans erreur.
+
+Donc **sous-titrer une timeline déjà montée demande de la reconstruire**. Deux
+règles pour que ça ne coûte pas le travail du monteur :
+
+- **construis à côté, jamais par-dessus** : une timeline sœur (`…_ST`), l'autre
+  intacte tant que le relevé ne coïncide pas ;
+- **relève d'abord tout ce que la timeline porte** — pas seulement les plans.
+  Sur ADS260, onze plans portaient une transformation faite à la main :
+  quatre recadrages à 1,52× avec un tilt différent chacun sur l'interview, et
+  sept incrustations à 0,32× sur la couche d'illustration. Elles ne survivent
+  qu'à un `GetProperty` avant / `SetProperty` après. Vérifie aussi les
+  marqueurs, les compositions Fusion et les versions d'étalonnage : ce qui
+  n'est pas relevé est perdu sans avertissement.
+
+### Le point d'entrée source revient parfois une image plus bas
+
+Autre asymétrie entre ce que Resolve accepte et ce qu'il rapporte : appelé
+avec `startFrame: X`, `GetSourceStartFrame()` rend parfois **X − 1**. Mesuré
+sur la reconstruction d'ADS260 : dix plans sur trente-trois, sans motif visible
+(même rush, même cadence, mêmes voisins conformes).
+
+Position et durée restent exactes, donc les coupes ne bougent pas — mais la
+matière jouée glisse d'une image. Ne raisonne pas là-dessus, **mesure** :
+construis, compare le relevé à l'original, réinjecte l'écart, reconstruis. Sur
+le cas mesuré ça converge en deux passes. Borne le nombre de passes et abandonne
+en laissant l'original intact plutôt que de boucler.
+
+### Resolve met en cache le média importé, par son chemin
+
+Le piège le plus coûteux de cette série. **Réécrire un `.srt` sur le disque ne
+rafraîchit pas l'élément du Media Pool** : `ImportMedia` rend l'ancien, et la
+timeline repart avec les cues de la version précédente.
+
+Ça ne se voit pas dans le retour de l'API, et pas toujours dans la durée : sur
+huit montages renvoyés, **sept portaient l'ancien sous-titrage**, et seuls
+trois avaient une durée aberrante — les autres coïncidaient par hasard parce
+que le nouveau montage était plus long que l'ancien SRT.
+
+Deux parades :
+
+- **importe depuis un nom de fichier neuf** à chaque révision
+  (`…_st2.srt`), sur un chemin durable — pas `/tmp`, Resolve garde le lien ;
+- **compte les éléments de sous-titres** de la timeline renvoyée et compare-le
+  au nombre de cues du SRT. C'est le seul contrôle qui attrape le cache.
+
+### Les illustrations à une autre cadence ne passent pas par le moteur
+
+Les stockshots et les films d'élèves arrivent en 23,976 ou 24 i/s alors que le
+montage est à 25. `--export-resolve-timeline` **refuse** ces plans, et il a
+raison : il exige une durée qui tombe sur une image source entière, et aucune
+durée n'est entière à la fois à 25 et à 23,976 — il faudrait 1001 images de
+séquence, soit 40 s, pour retomber sur la grille.
+
+La parade est de ne pas les faire porter par CUTMACHINE : monte la parole dans
+le moteur, exporte, puis **écris la couche d'illustration directement dans le
+fichier d'échange** avec `video_layer: 1` et `with_audio: false`. `path` doit
+être celui de l'élément du Media Pool ; `send_timeline` ajoute la piste vidéo
+qu'il faut.
+
+Deux faits mesurés sur ce chemin :
+
+- **Resolve conforme par la durée.** N images source occupent
+  `N × 25 / cadence_source` images de séquence — vérifié sur les 137 plans de
+  la timeline d'illustration d'ADS260, où l'entrée du plan suivant tombe
+  exactement là où ce calcul la met.
+- **Et il tronque, il n'arrondit pas.** Sur les neuf coupes posées, la durée
+  rendue vaut à chaque fois le plancher de ce produit. Dimensionner à
+  l'arrondi laisse la dernière coupe **une image trop courte** — donc une
+  image d'interview qui clignote sous elle. Choisis la longueur source dont le
+  plancher vaut la durée voulue, et positionne la coupe suivante sur cette
+  durée-là, pas sur celle que tu visais.
+
+Deux coupes contiguës posées sur les durées visées se chevauchent d'une
+demi-image et Resolve écrase silencieusement : mesuré sur un carton de titre
+suivi du plan suivant.
+
+### La DA des sous-titres ne se lit par aucune API
+
+Quand le monteur a stylé les cartons d'une timeline et demande de reporter ce
+look sur les autres, rien dans le scripting Resolve ne le donne :
+`timelineItem.GetProperty()` sur un carton ne rend que le bloc de transformation
+(Pan, Tilt, ZoomX…), identique entre une timeline stylée et une timeline nue, et
+les 157 réglages de `timeline.GetSetting()` sont identiques eux aussi. Le README
+local ne documente aucune méthode de style de sous-titre.
+
+**Le look est dans le `FieldsBlob` de la piste de sous-titres**, pas sur les
+cartons. Une piste nue y porte deux champs (`NumLayers`,
+`ExcludeTrackFromSequenceCaching`) ; une piste stylée en porte un troisième,
+`EffectFiltersBA`, avec le descripteur de police Qt en clair
+(`Fira Sans,13,-1,5,57,0` + `Medium`) et le reste compressé en zstd.
+
+Le seul chemin est donc un aller-retour `.drt` — une archive zip contenant
+`project.xml`, `MediaPool/Master/MpFolder.xml` et `SeqContainer/<uuid>.xml` :
+
+1. `timeline.Export(chemin, resolve.EXPORT_DRT)` sur la timeline stylée, et
+   relever le `<FieldsBlob>` qui suit `<SubtitleTrackVec>` ;
+2. exporter chaque timeline à styler, y remplacer ce même blob, rezipper ;
+3. `mediaPool.ImportTimelineFromFile(chemin)`.
+
+Trois faits mesurés sur ITM270 :
+
+- **le nom de la timeline importée vient du nom du fichier `.drt`**, pas du XML ;
+- le contenu survit intact au round-trip (plans, couches, son, sous-titres,
+  positions et durées relus à l'identique) ;
+- le contrôle qui prouve la greffe est de **réexporter la timeline importée et
+  de comparer son blob** à celui de la source. Rien d'autre ne le montre, et
+  surtout pas l'API.
+
+Comme la timeline doit de toute façon être reconstruite pour changer les cues
+(voir l'ordre piégeux plus haut), fais les deux d'un coup : reconstruis avec le
+nouveau SRT, puis greffe le blob à l'import.
+
+### Les contrôles après renvoi
+
+- `GetEndFrame() - GetStartFrame()` doit valoir **exactement** la durée du
+  montage. Une timeline plus longue = le piège de l'ordre.
+- **La piste d'interview ne doit avoir aucun trou** et la piste son doit
+  compter autant de plans qu'elle. Un trou = une image noire au montage.
+- **Relis les positions et les durées de la piste d'illustration** telles que
+  Resolve les rapporte, pas telles que tu les as demandées : c'est là que la
+  troncature de conformation se voit.
+- Le nombre d'éléments de sous-titres doit valoir le nombre de cues du SRT.
+  Sinon = le piège du cache.
+- Le premier élément de sous-titre doit partir de zéro (à une image ou deux
+  près, selon la première cue).
+- Resolve refuse un nom déjà pris : pour republier une révision, supprime
+  l'ancienne timeline (`DeleteClips` sur son MediaPoolItem) ou change de nom.
 
 ---
 
-## Vérifications avant de rendre
+## Couleur, export, sous-titres
 
-- `ctest --test-dir build --output-on-failure`. `cutmachine_ui_smoke_tests`
-  est instable quand une autre application est au premier plan : relance-le
-  seul avant de conclure à une régression.
-- Durée, résolution, cadence, présence du son (`ffprobe`).
-- Niveau audio : `ffmpeg -hide_banner -i "$F" -af volumedetect -f null -`
-  (`-v error` masque la sortie de volumedetect).
-- **Ouverture** : le niveau moyen de la première seconde et demie doit être
-  proche de celui du fichier entier. S'il est nettement plus bas, il reste de
-  l'air mort en tête.
-- Planche de vignettes aux points de coupe et au milieu de chaque plan de
-  coupe.
-- **Ne compare jamais à un fichier sans vérifier qu'il existe** : `ffprobe`
-  sur un chemin absent sort une chaîne vide, et une « comparaison » avec du
-  vide passe pour un résultat.
+### La gestion couleur est désactivée par défaut
+
+Rushes Sony ILME-FX30 en **S-Log3-Cine / S-Gamut3.Cine**, déclaré dans le
+fichier annexe de tournage :
+
+```sh
+grep CaptureGamma 1_RUSHES/C7432M01.XML   # -> value="s-log3-cine"
+```
+
+Sans `set_color_management`, l'export sort plat et délavé :
+
+```json
+{"name":"set_color_management","arguments":{
+  "enabled":true,"input_gamut":"sony_sgamut3_cine","input_transfer":"sony_slog3",
+  "input_ycbcr_matrix":"bt709","input_range":"auto","working_gamut":"acescct",
+  "output_gamut":"rec709","output_transfer":"rec709"}}
+```
+
+**Contrôle : c'est la saturation qui tranche, pas les noirs.** Compare la
+`SATAVG` du livrable à celle du rush log correspondant, au même instant.
+Mesuré sur LISAASTR136 : rushes entre **6 et 18**, livrables entre **12 et
+56** — un facteur deux à quatre selon la matière. Les valeurs absolues ne
+veulent rien dire : un studio blanc avec des maquettes blanches sort à 9 tout
+en étant parfaitement étalonné. `YMIN` ne prouve rien du tout.
+
+### `--export` ne prend pas de dimensions
+
+Il suit le format de séquence. Pour livrer en 1080×1920 depuis une séquence
+2160×3840 : `update_sequence`, export, **puis remettre** la séquence à son
+format de travail. Ne passe **jamais** `--overwrite` sur un nom de livrable
+existant — supprime l'ancien fichier d'abord.
+
+exFAT n'a pas de liens durs : si un export meurt à 100 %, c'est là (corrigé
+par un repli `rename` dans `Exporter::Run`).
+
+### Le SRT se fait depuis le son monté, plus depuis le livrable
+
+`--export-srt` produit toujours des cues fausses, et pour une raison
+identifiée : il les construit sur les transcriptions **des rushes**, donc il
+hérite de la dérive de tête de whisper. Sur ADS260, sa première cue disait
+« m'appelle Alix, je suis en train de » — « Salut, je » perdu, parce que ces
+mots sont annoncés aux images 0-21 d'un plan qui entre à 32.
+
+Mais il n'y a plus besoin de rendre le master pour autant. Le cache de
+`transcribe_timeline` — `.cutmachine/timeline-transcripts/<id>.json` — porte
+les mots **aux positions du montage**, mesurés sur le son réellement assemblé.
+Transcris **sans `--verbatim`** (un sous-titre ne porte pas les hésitations)
+et groupe en cues sur une fin de phrase, un creux d'une douzaine d'images, ou
+~42 caractères.
+
+Contrôle : la dernière cue doit tomber sur la durée du film, à l'image près.
+Sur ADS260 : dernier mot à l'image 2115, montage à 2115.
+
+### whisper pose le début des mots trop tôt — la transcription de Resolve le dit
+
+Le défaut ne se voit pas sur un mot isolé, seulement à l'usage : le carton
+change avant qu'on ait fini d'entendre le précédent. Sur ADS260 le monteur a
+repris **23 frontières sur 92** à la main, toutes dans le même sens.
+
+Le juge de paix est la transcription de Resolve, qui est un autre moteur :
+`timeline.CreateSubtitlesFromAudio()`. Mesuré sur 52 ancres — les débuts *et*
+les fins de ses cartons, appariés aux mots de whisper :
+
+| mesure | valeur |
+|---|---|
+| Resolve − whisper, sur l'ensemble | **+2 images** de médiane |
+| aux frontières que le monteur a corrigées | **+3,7 images** |
+| aux frontières qu'il a gardées | **+1,6 image** |
+| corrélation entre la dérive mesurée et sa correction | **+0,55** |
+
+La dérive est donc réelle, et elle est **deux fois plus forte exactement là où
+elle s'entend**. Recale les mots de whisper sur l'échelle de Resolve par
+interpolation entre les ancres, **et seulement au-delà de 5 images d'écart** :
+en deçà on déplace tout sans que personne l'entende. Sur ADS260 ce réglage
+recale 94 mots sur 264 et fait tomber l'erreur aux 23 frontières corrigées de
+**9,17 à 4,91 images** de moyenne, pour 1,8 image de déplacement sur celles
+que le monteur avait validées.
+
+**Ce que ça ne corrige pas.** Un tiers de ses reprises reste — un bloc à +6/+9
+images où les deux moteurs sont d'accord. C'est du goût, pas de la dérive : ne
+cherche pas à le modéliser.
+
+### Deux pièges de `CreateSubtitlesFromAudio`
+
+- **Elle échoue en silence hors de la page Edit.** Appelée depuis la page
+  Deliver elle rend `False` en zéro seconde, sans message. `resolve.OpenPage("edit")`
+  d'abord.
+- **Les clés de réglage ne sont pas des chaînes.** `{"AutoCaptionLanguage": 5}`
+  rend `False` ; les vraies clés sont les constantes `resolve.SUBTITLE_LANGUAGE`,
+  `SUBTITLE_CAPTION_PRESET`, `SUBTITLE_CHARS_PER_LINE`, `SUBTITLE_LINE_BREAK`,
+  `SUBTITLE_GAP` — qui valent 0 à 4. Le README local
+  (`/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/README.txt`,
+  section « Auto Caption Settings ») les documente, avec **1 à 60 caractères par
+  ligne** : le mot à mot est donc prévu par l'API. **Lis ce README avant de
+  chercher en ligne** — il correspond à la version installée, la documentation
+  publique non.
+- **Mais en 20.3.1 le dictionnaire échoue en silence.** Avec les bonnes clés
+  numériques, l'appel rend `True`, ne crée aucune piste et ne produit aucun
+  carton — quelle que soit la valeur, y compris celles qui reproduisent le
+  comportement par défaut. Seul l'appel **sans argument** marche. Les réglages
+  projet `limitSubtitleCPL` et `transcriptionLanguage` s'écrivent bien par
+  `SetSetting` mais ne changent rien au résultat.
+- **Et l'appel répété finit par bloquer le moteur.** Après une série d'essais,
+  même l'appel nu rend `True` avec zéro carton en une seconde au lieu des ~20 s
+  d'une vraie transcription. Rien ne le signale. Il faut redémarrer Resolve.
+  **Fais tes essais de réglage en dernier**, une fois les ancres récoltées.
+
+Faute de mot à mot, on récupère le découpage par défaut (42 caractères) : ses
+42 cartons donnent quand même **52 ancres** avec leurs fins, une toutes les
+1,4 seconde. C'est suffisant pour mesurer la dérive.
+
+### La cadence de lecture, pas seulement le nombre de caractères
+
+Les repères du métier (Netflix, BBC) : **20 caractères par seconde** au
+maximum, **5/6 de seconde** (0,83 s) de durée minimale par carton, deux lignes
+au plus. Mesuré sur ADS260 :
+
+| jeu | cartons | durée médiane | CPS médian | sous 0,83 s | au-delà de 20 CPS |
+|---|---|---|---|---|---|
+| 18 caractères, une ligne | 102 | 0,72 s | 18,1 | 65 | 29 |
+| la version corrigée à la main | 97 | 0,72 s | 17,9 | 57 | 38 |
+| la transcription Resolve, 42 car. | 42 | 1,56 s | 20,9 | 4 | 22 |
+
+Autrement dit **un réglage à 18 caractères sans garde entre cartons produit un
+sous-titrage hors norme des deux côtés** : les deux tiers des cartons durent
+moins que le minimum, un quart dépasse la vitesse de lecture. C'est un choix
+assumé du format vertical, pas une erreur — mais dis-le, et ne va pas plus bas.
+
+### Le nombre de caractères est par carton, pas par ligne
+
+**La maison sous-titre à ~20 caractères par carton, sur une ligne.** Deux
+lignes se tolèrent quand un morceau ne se coupe pas — 5 cartons sur 97 sur
+ADS260, 5 sur 138 sur ITM270 — mais c'est l'exception, pas la cible.
+
+La version précédente de cette section disait l'inverse : « la limite est une
+cible par ligne, avec deux lignes tolérées ». C'était une déduction, pas une
+mesure, et elle a coûté une livraison entière. Lue comme ça sur ITM270, elle a
+donné 25 caractères par ligne sur deux lignes — jusqu'à **50 par carton**,
+deux fois et demie le réglage demandé. Le monteur l'a corrigé en une phrase :
+« l'idée des sous-titres c'est d'avoir aux alentours de 20 caractères ».
+
+Le chiffre était pourtant déjà dans la table ci-dessus (« 18 caractères, une
+ligne, 102 cartons ») : c'est l'interprétation qui était fausse. Ne la
+redéduis pas.
+
+### Des cartons sous 0,83 s, c'est le réglage qui veut ça
+
+Conséquence directe : à 20 caractères et à un débit de pub, un carton dure
+~0,8 s, et beaucoup passent juste en dessous du plancher métier. **Ne les
+refusionne pas** — un garde-fou « tout carton sous 0,83 s est fusionné avec
+son voisin » ramène mécaniquement les cartons à 40-50 caractères et annule le
+réglage. Mesuré sur ITM270 : il a reconstitué des cartons de 45 caractères sur
+deux lignes en une passe.
+
+Ne fusionne que les vrais éclairs — **sous ~8 images** — et seulement quand le
+texte fusionné tient encore dans le budget de lignes.
+
+### Découpe les cartons en équilibrant, pas en remplissant
+
+Remplir gloutonnement jusqu'à la limite déborde à chaque carton et laisse le
+reste de la phrase seul sur le dernier : « du make-up sur » puis « toi. » à
+0,56 s, « de maquillage ITM » puis « Paris. » à 0,40 s.
+
+Découpe plutôt une phrase en `ceil(caractères / 20)` cartons et pose chaque
+frontière **au mot le plus proche de la fraction idéale**, avec une prime aux
+mots qui finissent par une virgule ou un point. Sur ITM270 ça a fait passer
+les cartons de 4-30 caractères très irréguliers à une médiane de 17 à 19, sans
+aucun orphelin.
+
+Dernier détail qui se voit : **whisper accroche la ponctuation d'une phrase au
+token suivant.** Sans reprise, un carton s'ouvre sur « ? T'inquiète » alors
+que le point d'interrogation appartient au carton d'avant. Remonte toute
+ponctuation en tête de carton sur le précédent — avec l'espace insécable que
+le français met devant `? ! ; :`.
+
+### Contrôles avant de rendre
+
+- durée, résolution, cadence, présence du son (`ffprobe`) ;
+- niveau moyen, et **niveau de la première seconde et demie** : s'il est
+  nettement plus bas, il reste de l'air mort en tête. Mesuré : un montage
+  ouvrait 20 dB sous sa moyenne, soit 1,44 s de silence ;
+- ne compare jamais à un fichier sans vérifier qu'il existe : `ffprobe` sur un
+  chemin absent sort une chaîne vide, et une « comparaison » avec du vide
+  passe pour un résultat.
 
 ## Ce que ces vérifications ne voient pas
 
-Elles attrapent les défauts, jamais l'ennui. Un montage peut passer toutes
-les vérifications ci-dessus et rester un bout à bout : durée juste, coupes
-propres, son présent, image nette — et aucun rythme.
+Elles attrapent les défauts, jamais l'ennui, et jamais l'incohérence d'un
+propos. Un montage peut passer toutes les mesures ci-dessus et rester
+inutilisable — c'est exactement ce qui est arrivé à la première version de
+cette série : durées justes, silences fermés, sync propre, et un enchaînement
+qui ne voulait rien dire.
 
-Tant qu'un agent ne peut pas percevoir le montage dans le temps, la passe 2
-est le seul garde-fou, et elle se fait **sur le texte lu d'un bloc**. Rends
-toujours, avec le fichier, ce que tu n'as pas pu juger : dis explicitement
-que tu n'as ni vu ni entendu le résultat, et sur quoi reposent tes
-affirmations.
+Le seul garde-fou est la **relecture du texte monté**, faite comme quelqu'un
+qui n'a pas vu les rushes.
+
+Et rends toujours, avec les fichiers, ce que tu n'as pas pu juger : dis
+explicitement que tu n'as ni vu ni entendu le résultat, et sur quoi reposent
+tes affirmations.

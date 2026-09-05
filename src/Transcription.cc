@@ -186,6 +186,65 @@ bool DecodeMonoPcm16k(const std::string& inputPath,
 // before it, which is the intended behavior for cutting whole words cleanly.
 // Special/timestamp tokens (id >= whisper_token_eot) carry no real text and
 // are skipped, mirroring whisper.cpp's own examples/cli/cli.cpp filter.
+// SUBTITLE-2026-09 -- whisper.cpp offers two token timestamps and they are not
+// of the same quality. `token_timestamps` reads the probability of the
+// timestamp token the decoder emits after each sub-word; Whisper was never
+// trained to emit one after every word, so it emits them every few words and
+// the rest is interpolation. The DTW timestamps come from the cross-attention
+// alignment -- the method WhisperX and stable-ts use -- and they are the ones
+// worth having.
+//
+// Measured on the Fanny montage of LISAASTR136, against DaVinci Resolve's own
+// word-by-word transcription of the same assembled audio (143 words matched):
+// the heuristic start of a word sits 4 images early at the median, 57 % of
+// words are off by more than 3. It never shows on a cut; it shows on every
+// subtitle.
+//
+// The alignment heads are model-specific and whisper.cpp refuses to load a
+// mismatched pair, so an unrecognised model keeps the old behaviour rather
+// than guessing a preset.
+whisper_alignment_heads_preset AlignmentHeadsForModel(const std::string& path) {
+    std::string name = std::filesystem::path(path).filename().string();
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const auto has = [&](const char* needle) {
+        return name.find(needle) != std::string::npos;
+    };
+    // Ordered longest-match first: "large-v3-turbo" also contains "large-v3".
+    if (has("large-v3-turbo") || has("large-v3_turbo"))
+        return WHISPER_AHEADS_LARGE_V3_TURBO;
+    if (has("large-v3")) return WHISPER_AHEADS_LARGE_V3;
+    if (has("large-v2")) return WHISPER_AHEADS_LARGE_V2;
+    if (has("large-v1")) return WHISPER_AHEADS_LARGE_V1;
+    if (has("medium.en")) return WHISPER_AHEADS_MEDIUM_EN;
+    if (has("medium")) return WHISPER_AHEADS_MEDIUM;
+    if (has("small.en")) return WHISPER_AHEADS_SMALL_EN;
+    if (has("small")) return WHISPER_AHEADS_SMALL;
+    if (has("base.en")) return WHISPER_AHEADS_BASE_EN;
+    if (has("base")) return WHISPER_AHEADS_BASE;
+    if (has("tiny.en")) return WHISPER_AHEADS_TINY_EN;
+    if (has("tiny")) return WHISPER_AHEADS_TINY;
+    return WHISPER_AHEADS_NONE;
+}
+
+// Loads the model with cross-attention alignment when the heads are known,
+// and without it otherwise. A refusal here is not fatal: the heuristic
+// timestamps are worse, not unusable, and a transcription is worth more than
+// an exact one that never runs.
+whisper_context* OpenWhisperModel(const std::string& path) {
+    const whisper_alignment_heads_preset preset = AlignmentHeadsForModel(path);
+    if (preset != WHISPER_AHEADS_NONE) {
+        whisper_context_params params = whisper_context_default_params();
+        params.dtw_token_timestamps = true;
+        params.dtw_aheads_preset = preset;
+        if (whisper_context* ctx =
+                whisper_init_from_file_with_params(path.c_str(), params))
+            return ctx;
+    }
+    whisper_context_params params = whisper_context_default_params();
+    return whisper_init_from_file_with_params(path.c_str(), params);
+}
+
 std::vector<TranscriptWord> GroupWordsFromWhisper(whisper_context* ctx,
                                                   const MediaRate& frameRate) {
     std::vector<TranscriptWord> words;
@@ -194,17 +253,33 @@ std::vector<TranscriptWord> GroupWordsFromWhisper(whisper_context* ctx,
     std::string currentText;
     int64_t currentStartCentis = 0;
     int64_t currentEndCentis = 0;
+    // -1 is whisper.cpp's own sentinel for "no DTW timestamp on this token"
+    // (see the whisper_token_data initialiser); it is what a model loaded
+    // without alignment heads leaves behind, so it also selects the fallback.
+    int64_t currentStartDtw = -1;
     const auto flush = [&]() {
         if (currentText.empty()) return;
         std::string text = currentText;
         if (!text.empty() && text.front() == ' ') text.erase(text.begin());
         if (!text.empty()) {
-            const RationalTime start{currentStartCentis, 100};
-            const RationalTime end{currentEndCentis, 100};
+            // The DTW timestamp is one instant per token -- the moment the
+            // token was emitted -- not a span, so it can only place the word,
+            // not measure it. Keeping whisper's own duration and moving the
+            // pair together corrects what is wrong (where the word sits)
+            // without inventing what is not measured (how long it lasts).
+            int64_t startCentis = currentStartCentis;
+            int64_t endCentis = currentEndCentis;
+            if (currentStartDtw >= 0) {
+                endCentis = currentStartDtw + (currentEndCentis - currentStartCentis);
+                startCentis = currentStartDtw;
+            }
+            const RationalTime start{startCentis, 100};
+            const RationalTime end{endCentis, 100};
             words.push_back({text, RoundToSourceFrame(start, frameRate, false),
                              RoundToSourceFrame(end, frameRate, true)});
         }
         currentText.clear();
+        currentStartDtw = -1;
     };
     for (int segment = 0; segment < segmentCount; ++segment) {
         const int tokenCount = whisper_full_n_tokens(ctx, segment);
@@ -216,7 +291,10 @@ std::vector<TranscriptWord> GroupWordsFromWhisper(whisper_context* ctx,
             if (!text || !*text) continue;
             const bool startsNewWord = currentText.empty() || text[0] == ' ';
             if (startsNewWord && !currentText.empty()) flush();
-            if (currentText.empty()) currentStartCentis = data.t0;
+            if (currentText.empty()) {
+                currentStartCentis = data.t0;
+                currentStartDtw = data.t_dtw;
+            }
             currentText += text;
             currentEndCentis = data.t1;
         }
@@ -709,9 +787,7 @@ bool GenerateAudioTranscripts(const std::vector<TranscriptionJob>& jobs,
         error = "a local whisper.cpp model path is required";
         return false;
     }
-    whisper_context_params contextParams = whisper_context_default_params();
-    whisper_context* ctx = whisper_init_from_file_with_params(
-        settings.whisper_model_path.c_str(), contextParams);
+    whisper_context* ctx = OpenWhisperModel(settings.whisper_model_path);
     if (!ctx) {
         error = "unable to load local whisper.cpp model '" +
                 settings.whisper_model_path + "'";
@@ -765,9 +841,7 @@ bool GenerateAudioTranscriptFromPcm(const std::vector<float>& samples,
         error = "a local whisper.cpp model path is required";
         return false;
     }
-    whisper_context_params contextParams = whisper_context_default_params();
-    whisper_context* ctx = whisper_init_from_file_with_params(
-        settings.whisper_model_path.c_str(), contextParams);
+    whisper_context* ctx = OpenWhisperModel(settings.whisper_model_path);
     if (!ctx) {
         error = "unable to load local whisper.cpp model '" +
                 settings.whisper_model_path + "'";
