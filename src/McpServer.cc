@@ -67,8 +67,8 @@ std::string ToolsListResultJson(const McpToolRegistry& registry) {
 }
 
 std::string ToolCallResultJson(const McpToolCallOutcome& outcome) {
-    std::string content = "{\"type\":\"text\",\"text\":\"" +
-                          Esc(outcome.result_json) + "\"}";
+    std::string content =
+        "{\"type\":\"text\",\"text\":\"" + Esc(outcome.result_json) + "\"}";
     // A tool that returned a picture contributes a second content block, in
     // the shape the MCP specification gives image results. The text block
     // stays first so a client that ignores images still gets the answer.

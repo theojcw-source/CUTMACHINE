@@ -47,8 +47,7 @@ int main() {
           "duration spans the full timeline");
     Check(stats.visible_shots == 2,
           "clips hidden by V2 do not become visible shots");
-    Check(stats.visible_cuts == 1,
-          "only the visible transition is a cut");
+    Check(stats.visible_cuts == 1, "only the visible transition is a cut");
     Check(stats.first_cut && *stats.first_cut == RationalTime{10, 25},
           "first visible cutaway is at the overlay start");
     Check(stats.plans_per_minute.numerator == 100 &&
@@ -80,8 +79,9 @@ int main() {
     Document invalid = document;
     invalid.sequence.tracks[0].clips[0].duration.rate = 0;
     Check(!CalculateTimelineStats(invalid, stats, error) &&
-              error == "clip '01K30000000000000000000011' has a non-positive "
-                       "time rate",
+              error ==
+                  "clip '01K30000000000000000000011' has a non-positive "
+                  "time rate",
           "invalid time rates are refused with a stable error");
 
     return failures == 0 ? 0 : 1;

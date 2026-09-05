@@ -93,9 +93,7 @@ std::string ReadFile(const fs::path& path) {
             std::istreambuf_iterator<char>()};
 }
 
-Project MakeProject(const std::string& name) {
-    return Project(name);
-}
+Project MakeProject(const std::string& name) { return Project(name); }
 
 }  // namespace
 
@@ -405,8 +403,7 @@ int main() {
 
         const bool rejected = !ProjectRecovery::WriteAutosave(
             projectPath.string(), p, incompleteLogs, plog, error);
-        Check(rejected,
-              "autosave avec historique incomplet doit être rejeté");
+        Check(rejected, "autosave avec historique incomplet doit être rejeté");
 
         if (rejected) {
             const std::string afterReject =

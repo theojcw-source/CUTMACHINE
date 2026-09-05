@@ -2185,12 +2185,12 @@ bool ApplyAddTrack(Document& candidate, AddTrackOperation& operation,
              message);
         return false;
     }
-    if (operation.index < 0 ||
-        std::any_of(
-            candidate.sequence.tracks.begin(), candidate.sequence.tracks.end(),
-            [&](const DocumentTrack& track) {
-                return track.index == operation.index;
-            })) {
+    if (operation.index < 0 || std::any_of(candidate.sequence.tracks.begin(),
+                                           candidate.sequence.tracks.end(),
+                                           [&](const DocumentTrack& track) {
+                                               return track.index ==
+                                                      operation.index;
+                                           })) {
         Fail(EditError::InvalidOperation,
              "track index must be non-negative and unique", error, message);
         return false;

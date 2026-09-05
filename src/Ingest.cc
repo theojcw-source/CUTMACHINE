@@ -149,17 +149,16 @@ bool ProbeImpl(const std::filesystem::path& absolutePath, LibraryMedia& media,
         int64_t duration = 0;
         if (video->duration != AV_NOPTS_VALUE && video->duration > 0) {
             duration = av_rescale_q_rnd(
-                video->duration, video->time_base,
-                AVRational{1, frameRate.num},
+                video->duration, video->time_base, AVRational{1, frameRate.num},
                 static_cast<AVRounding>(AV_ROUND_NEAR_INF |
                                         AV_ROUND_PASS_MINMAX));
         } else if (context->duration != AV_NOPTS_VALUE &&
                    context->duration > 0) {
-            duration = av_rescale_q_rnd(
-                context->duration, AVRational{1, AV_TIME_BASE},
-                AVRational{1, frameRate.num},
-                static_cast<AVRounding>(AV_ROUND_NEAR_INF |
-                                        AV_ROUND_PASS_MINMAX));
+            duration =
+                av_rescale_q_rnd(context->duration, AVRational{1, AV_TIME_BASE},
+                                 AVRational{1, frameRate.num},
+                                 static_cast<AVRounding>(AV_ROUND_NEAR_INF |
+                                                         AV_ROUND_PASS_MINMAX));
         }
         if (duration <= 0) {
             reason = "video stream has no positive duration";
@@ -231,18 +230,18 @@ bool ProbeImpl(const std::filesystem::path& absolutePath, LibraryMedia& media,
         int64_t duration = 0;
         if (audioStream->duration != AV_NOPTS_VALUE &&
             audioStream->duration > 0) {
-            duration = av_rescale_q_rnd(
-                audioStream->duration, audioStream->time_base,
-                AVRational{1, audio->sample_rate},
-                static_cast<AVRounding>(AV_ROUND_NEAR_INF |
-                                        AV_ROUND_PASS_MINMAX));
+            duration =
+                av_rescale_q_rnd(audioStream->duration, audioStream->time_base,
+                                 AVRational{1, audio->sample_rate},
+                                 static_cast<AVRounding>(AV_ROUND_NEAR_INF |
+                                                         AV_ROUND_PASS_MINMAX));
         } else if (context->duration != AV_NOPTS_VALUE &&
                    context->duration > 0) {
-            duration = av_rescale_q_rnd(
-                context->duration, AVRational{1, AV_TIME_BASE},
-                AVRational{1, audio->sample_rate},
-                static_cast<AVRounding>(AV_ROUND_NEAR_INF |
-                                        AV_ROUND_PASS_MINMAX));
+            duration =
+                av_rescale_q_rnd(context->duration, AVRational{1, AV_TIME_BASE},
+                                 AVRational{1, audio->sample_rate},
+                                 static_cast<AVRounding>(AV_ROUND_NEAR_INF |
+                                                         AV_ROUND_PASS_MINMAX));
         }
         if (duration <= 0) {
             reason = "audio stream has no positive duration";
@@ -427,8 +426,8 @@ void MeasureIngestedAudioLevel(const std::filesystem::path& absolute,
 std::string SuccessJson(size_t added, size_t skipped,
                         const std::vector<IngestError>& errors) {
     std::ostringstream output;
-    output << "{\"ok\":true,\"added\":" << added << ",\"skipped\":"
-           << skipped << ",\"errors\":[";
+    output << "{\"ok\":true,\"added\":" << added << ",\"skipped\":" << skipped
+           << ",\"errors\":[";
     for (size_t index = 0; index < errors.size(); ++index) {
         if (index) output << ',';
         output << "{\"file\":\"" << EscapeJson(errors[index].file)
@@ -454,9 +453,8 @@ bool MeasureMediaAudioLevel(const std::string& path,
                                  reason);
 }
 
-int IngestCommand(const std::string& documentPath,
-                  const std::string& mediaPath, bool recursive,
-                  std::string& output) {
+int IngestCommand(const std::string& documentPath, const std::string& mediaPath,
+                  bool recursive, std::string& output) {
     av_log_set_level(AV_LOG_ERROR);
     Project project;
     std::string reason;

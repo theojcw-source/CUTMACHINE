@@ -51,7 +51,7 @@ bool ClipEnd(const DocumentClip& clip, RationalTime& output,
 }
 
 bool CheckedRatio(__int128 numerator, __int128 denominator,
-                 TimelineStatsRatio& output, std::string& error) {
+                  TimelineStatsRatio& output, std::string& error) {
     if (denominator <= 0) {
         error = "timeline stats ratio has a non-positive denominator";
         return false;
@@ -142,8 +142,7 @@ bool CalculateTimelineStats(const Document& document, TimelineStats& output,
             segments.back().end == start) {
             segments.back().end = end;
         } else {
-            segments.push_back(
-                {topClip->id, topTrack->index, start, end});
+            segments.push_back({topClip->id, topTrack->index, start, end});
         }
     }
 
@@ -162,10 +161,9 @@ bool CalculateTimelineStats(const Document& document, TimelineStats& output,
 
     if (duration.value == 0) {
         output.plans_per_minute = {0, 1};
-    } else if (!CheckedRatio(
-                   static_cast<__int128>(output.visible_shots) * 60 *
-                       duration.rate,
-                   duration.value, output.plans_per_minute, error)) {
+    } else if (!CheckedRatio(static_cast<__int128>(output.visible_shots) * 60 *
+                                 duration.rate,
+                             duration.value, output.plans_per_minute, error)) {
         return false;
     }
     if (output.visible_shots == 0) {

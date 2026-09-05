@@ -205,8 +205,9 @@ bool DecodeMonoPcm16k(const std::string& inputPath,
 // than guessing a preset.
 whisper_alignment_heads_preset AlignmentHeadsForModel(const std::string& path) {
     std::string name = std::filesystem::path(path).filename().string();
-    std::transform(name.begin(), name.end(), name.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     const auto has = [&](const char* needle) {
         return name.find(needle) != std::string::npos;
     };
@@ -270,7 +271,8 @@ std::vector<TranscriptWord> GroupWordsFromWhisper(whisper_context* ctx,
             int64_t startCentis = currentStartCentis;
             int64_t endCentis = currentEndCentis;
             if (currentStartDtw >= 0) {
-                endCentis = currentStartDtw + (currentEndCentis - currentStartCentis);
+                endCentis =
+                    currentStartDtw + (currentEndCentis - currentStartCentis);
                 startCentis = currentStartDtw;
             }
             const RationalTime start{startCentis, 100};

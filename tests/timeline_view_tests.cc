@@ -1558,7 +1558,7 @@ int main() {
                   error == EditError::InvalidOperation,
               "cut on head is rejected");
         Check(message.find("strictly within (10/10, 30/10)") !=
-                  std::string::npos &&
+                      std::string::npos &&
                   message.find("got 10/10") != std::string::npos,
               "cut refusal reports the actual bounds and requested position: " +
                   message);
@@ -1577,9 +1577,10 @@ int main() {
              const Ulid videoId = document.sequence.tracks[0].clips[0].id;
              Check(setupLog.Apply(
                        document,
-                       DetachAudioOperation{
-                           videoId, document.sequence.tracks[1].id,
-                           "01KT0000000000000000000006", {}},
+                       DetachAudioOperation{videoId,
+                                            document.sequence.tracks[1].id,
+                                            "01KT0000000000000000000006",
+                                            {}},
                        error, message),
                    "linked split bounds fixture detaches audio: " + message);
              const Ulid audioId = document.sequence.tracks[1].clips[0].id;
@@ -1592,7 +1593,7 @@ int main() {
                        error == EditError::InvalidOperation,
                    "linked cut on its head is InvalidOperation: " + message);
              Check(message.find("strictly within (10/10, 30/10)") !=
-                       std::string::npos &&
+                           std::string::npos &&
                        message.find("got 10/10") != std::string::npos,
                    "linked cut refusal reports actual bounds and request: " +
                        message);

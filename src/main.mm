@@ -5459,7 +5459,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     if (![self applyAndPersistTimelineOperation:Operation {
-            AddCaptionStyleOperation{CaptionStyle{}, -1}
+            AddCaptionStyleOperation { CaptionStyle{}, -1 }
         }
                                           error:error
                                         message:message]) {
@@ -6653,7 +6653,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 image.image = SystemSymbol(offline ? @"exclamationmark.triangle"
                                            : media->has_video ? @"film"
                                                               : @"waveform",
-                                           offline            ? @"Média offline"
+                                           offline ? @"Média offline"
                                            : media->has_video ? @"Média vidéo"
                                                               : @"Média audio");
                 image.contentTintColor = offline
@@ -7239,7 +7239,7 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     EditError error = EditError::None;
     std::string message;
     if (![self applyAndPersistTimelineOperation:Operation {
-            RemoveBinOperation{binId, "", ""}
+            RemoveBinOperation { binId, "", "" }
         }
                                           error:error
                                         message:message]) {
@@ -7304,8 +7304,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     std::string message;
     if (bin) {
         if (![self applyAndPersistTimelineOperation:Operation {
-                RenameBinOperation{identifier.UTF8String ?: "",
-                                   name.UTF8String ?: ""}
+                RenameBinOperation {
+                    identifier.UTF8String ?: "", name.UTF8String ?: ""
+                }
             }
                                               error:error
                                             message:message]) {

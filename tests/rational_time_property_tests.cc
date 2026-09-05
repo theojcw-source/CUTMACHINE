@@ -329,9 +329,8 @@ int main() {
             {1, 2}, {12, 24}, {25, 50}, {24000, 48000}};
         for (const auto& a : half_second) {
             for (const auto& b : half_second) {
-                Check(
-                    a == b,
-                    "0.5s exprimée en rates différents devrait être égale");
+                Check(a == b,
+                      "0.5s exprimée en rates différents devrait être égale");
             }
         }
     });
@@ -364,8 +363,8 @@ int main() {
     // ------------------------------------------------------------------
     Test("overflow est détecté et lève std::overflow_error", [] {
         // Deux heures de samples à 48kHz au rate le plus élevé
-        const RationalTime huge{
-            std::numeric_limits<int64_t>::max() / 2 + 1, 48000};
+        const RationalTime huge{std::numeric_limits<int64_t>::max() / 2 + 1,
+                                48000};
         bool threw = false;
         try {
             huge.add(huge);

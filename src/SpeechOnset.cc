@@ -111,8 +111,8 @@ unsigned __int128 IntegerSquareRoot(unsigned __int128 value) {
     return root;
 }
 
-SpeechGroup GroupForBounds(const std::vector<int64_t>& levels,
-                           int64_t first, int64_t last, int32_t grid) {
+SpeechGroup GroupForBounds(const std::vector<int64_t>& levels, int64_t first,
+                           int64_t last, int32_t grid) {
     SpeechGroup group;
     group.start = RationalTime{first, grid};
     group.end = RationalTime{last, grid};
@@ -126,11 +126,10 @@ SpeechGroup GroupForBounds(const std::vector<int64_t>& levels,
         peak = std::max(peak, level);
     }
     const uint64_t count = static_cast<uint64_t>(last - first);
-    const int64_t rms = count == 0
-                            ? 0
-                            : static_cast<int64_t>(IntegerSquareRoot(
-                                  squares / static_cast<unsigned __int128>(
-                                                count)));
+    const int64_t rms =
+        count == 0 ? 0
+                   : static_cast<int64_t>(IntegerSquareRoot(
+                         squares / static_cast<unsigned __int128>(count)));
     group.level_dbfs = SpeechLevelDbfs(rms);
     group.peak_dbfs = SpeechLevelDbfs(peak);
     return group;
@@ -261,17 +260,17 @@ bool BuildSpeechGroups(const std::vector<int64_t>& levels,
         if (groupStart < 0) {
             groupStart = index;
         } else if (index - lastVoiceEnd >= gapWindows) {
-            groups.push_back(GroupForBounds(
-                levels, groupStart, lastVoiceEnd,
-                static_cast<int32_t>(windowsPerSecond)));
+            groups.push_back(
+                GroupForBounds(levels, groupStart, lastVoiceEnd,
+                               static_cast<int32_t>(windowsPerSecond)));
             groupStart = index;
         }
         lastVoiceEnd = index + 1;
     }
     if (groupStart >= 0) {
-        groups.push_back(GroupForBounds(
-            levels, groupStart, lastVoiceEnd,
-            static_cast<int32_t>(windowsPerSecond)));
+        groups.push_back(
+            GroupForBounds(levels, groupStart, lastVoiceEnd,
+                           static_cast<int32_t>(windowsPerSecond)));
     }
     return true;
 }
@@ -352,8 +351,8 @@ bool SummarizeClipSpeechOnset(const DocumentClip& clip,
     const int64_t dominantReference = SpeechLevelDbfs(SpeechLevelPercentile(
         inside, static_cast<int>(thresholds.dominant_percentile)));
     for (const SpeechGroup& group : summary.groups) {
-        const int64_t groupWindows = group.end.rescale(grid).value -
-                                     group.start.rescale(grid).value;
+        const int64_t groupWindows =
+            group.end.rescale(grid).value - group.start.rescale(grid).value;
         if (groupWindows >= thresholds.dominant_sustain_windows &&
             group.level_dbfs >= dominantReference - thresholds.dominance_db) {
             summary.dominant_onset = group.start;
@@ -406,9 +405,9 @@ std::string SerializeSpeechOnset(const SpeechOnsetReport& report) {
            << ",\"decode_sample_rate\":" << report.decode_sample_rate
            << ",\"speech_level\":" << report.speech_level
            << ",\"noise_floor\":" << report.noise_floor
-           << ",\"group_gap_milliseconds\":"
-           << report.group_gap_milliseconds << ",\"group_floor_db\":"
-           << report.group_floor_db << ",\"groups\":[";
+           << ",\"group_gap_milliseconds\":" << report.group_gap_milliseconds
+           << ",\"group_floor_db\":" << report.group_floor_db
+           << ",\"groups\":[";
     for (size_t index = 0; index < report.groups.size(); ++index) {
         if (index) output << ',';
         const SpeechGroup& group = report.groups[index];
@@ -501,11 +500,12 @@ bool DeserializeSpeechOnset(const std::string& json, SpeechOnsetReport& report,
             error = "speech onset cache has no groups";
             return false;
         }
-        RationalTime previousEnd{0,
-                                 static_cast<int32_t>(report.windows_per_second)};
+        RationalTime previousEnd{
+            0, static_cast<int32_t>(report.windows_per_second)};
         for (const Value& item : groups->AsArray()) {
             SpeechGroup group;
-            if (!item.IsObject() || !ReadTimeField(item, "start", group.start) ||
+            if (!item.IsObject() ||
+                !ReadTimeField(item, "start", group.start) ||
                 !ReadTimeField(item, "end", group.end) ||
                 !ReadInt64Field(item, "level_dbfs", group.level_dbfs) ||
                 !ReadInt64Field(item, "peak_dbfs", group.peak_dbfs)) {
@@ -529,8 +529,7 @@ bool DeserializeSpeechOnset(const std::string& json, SpeechOnsetReport& report,
             previousEnd = end;
         }
     } else {
-        report.group_gap_milliseconds =
-            cacheThresholds.group_gap_milliseconds;
+        report.group_gap_milliseconds = cacheThresholds.group_gap_milliseconds;
         if (!BuildSpeechGroups(report.levels, report.windows_per_second,
                                report.speech_level, report.noise_floor,
                                cacheThresholds, report.groups, error)) {
@@ -725,8 +724,7 @@ bool GenerateSpeechOnset(const std::string& inputPath,
     }
     report.speech_level = SpeechLevelPercentile(report.levels, 90);
     report.noise_floor = SpeechLevelPercentile(report.levels, 5);
-    report.group_gap_milliseconds =
-        settings.thresholds.group_gap_milliseconds;
+    report.group_gap_milliseconds = settings.thresholds.group_gap_milliseconds;
     report.group_floor_db = settings.thresholds.group_floor_db;
     if (!BuildSpeechGroups(report.levels, report.windows_per_second,
                            report.speech_level, report.noise_floor,
@@ -822,8 +820,7 @@ std::string DescribeSpeechOnsetForAgent(
                 Value groupValue = Value::MakeObject();
                 groupValue.Set("start", TimeValue(group.start));
                 groupValue.Set("end", TimeValue(group.end));
-                groupValue.Set("level_dbfs",
-                               Value::MakeInt(group.level_dbfs));
+                groupValue.Set("level_dbfs", Value::MakeInt(group.level_dbfs));
                 groupValue.Set("peak_dbfs", Value::MakeInt(group.peak_dbfs));
                 groups.Push(std::move(groupValue));
             }

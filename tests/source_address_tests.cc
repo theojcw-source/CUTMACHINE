@@ -146,8 +146,7 @@ int main() {
               "en une position hors du plan");
         Check(error.find("[101, 174]") != std::string::npos &&
                   error.find("got 500") != std::string::npos,
-              "et le refus publie les bornes réelles et la valeur : " +
-                  error);
+              "et le refus publie les bornes réelles et la valeur : " + error);
     }
 
     // --- Les deux rognages --------------------------------------------------
@@ -164,21 +163,19 @@ int main() {
                                          160, TrimEdge::Tail, delta, error) &&
                   delta == RationalTime{-14, 25},
               "sortir sur l'image 160 la garde, elle comprise : " + error);
-        Check(ResolveClipSourceFrameTrim(document,
-                                         "01K30000000000000000000010", 100,
-                                         TrimEdge::Tail, delta, error) &&
+        Check(ResolveClipSourceFrameTrim(document, "01K30000000000000000000010",
+                                         100, TrimEdge::Tail, delta, error) &&
                   delta == RationalTime{-74, 25},
               "sortir sur la première image jouée la garde : " + error);
         Document oneFrame = Fixture();
         EditLog oneFrameLog;
         EditError oneFrameError = EditError::None;
         std::string oneFrameMessage;
-        Check(oneFrameLog.Apply(
-                  oneFrame,
-                  Operation{TrimClipOperation{
-                      "01K30000000000000000000010", TrimEdge::Tail, delta,
-                      std::nullopt}},
-                  oneFrameError, oneFrameMessage),
+        Check(oneFrameLog.Apply(oneFrame,
+                                Operation{TrimClipOperation{
+                                    "01K30000000000000000000010",
+                                    TrimEdge::Tail, delta, std::nullopt}},
+                                oneFrameError, oneFrameMessage),
               "le rognage de queue sur la première image s'applique : " +
                   oneFrameMessage);
         const DocumentClip* oneFrameClip =
@@ -189,7 +186,9 @@ int main() {
 
         Document nonAlignedSource;
         nonAlignedSource.sources = {
-            {kNonAligned, "non-aligned.MP4", {24000, 1001},
+            {kNonAligned,
+             "non-aligned.MP4",
+             {24000, 1001},
              {2000 * 1001 + 500, 24000}},
         };
         nonAlignedSource.sequence.tracks = {
@@ -202,14 +201,14 @@ int main() {
                {2000 * 1001 + 500, 24000},
                {0, 25}}}},
         };
-        Check(ResolveClipSourceFrameTrim(
-                  nonAlignedSource, "01K30000000000000000000031", 2000,
-                  TrimEdge::Tail, delta, error),
-              "la dernière image d'une source non alignée est admise : " +
-                  error);
-        Check(!ResolveClipSourceFrameTrim(
-                  nonAlignedSource, "01K30000000000000000000031", 2001,
-                  TrimEdge::Tail, delta, error),
+        Check(
+            ResolveClipSourceFrameTrim(nonAlignedSource,
+                                       "01K30000000000000000000031", 2000,
+                                       TrimEdge::Tail, delta, error),
+            "la dernière image d'une source non alignée est admise : " + error);
+        Check(!ResolveClipSourceFrameTrim(nonAlignedSource,
+                                          "01K30000000000000000000031", 2001,
+                                          TrimEdge::Tail, delta, error),
               "une image après la fin d'une source non alignée est refusée");
 
         Document nonAlignedClip;
@@ -220,12 +219,15 @@ int main() {
             {"01K30000000000000000000032",
              "video",
              0,
-             {{"01K30000000000000000000033", kNonAligned, {41, 2},
-               {10, 25}, {0, 25}}}},
+             {{"01K30000000000000000000033",
+               kNonAligned,
+               {41, 2},
+               {10, 25},
+               {0, 25}}}},
         };
-        Check(ResolveClipSourceFrameTrim(
-                  nonAlignedClip, "01K30000000000000000000033", 512,
-                  TrimEdge::Tail, delta, error) &&
+        Check(ResolveClipSourceFrameTrim(nonAlignedClip,
+                                         "01K30000000000000000000033", 512,
+                                         TrimEdge::Tail, delta, error) &&
                   delta == RationalTime{-19, 50},
               "la frame contenante de l'entrée non alignée est admise : " +
                   error);
@@ -240,7 +242,8 @@ int main() {
                 error.find("[0, 174]") != std::string::npos &&
                 error.find("got 175") != std::string::npos,
             "un rognage de tête qui laisserait le plan vide publie les "
-            "bornes et la valeur : " + error);
+            "bornes et la valeur : " +
+                error);
 
         // Et le résultat s'applique vraiment : le contrat du ticket est que
         // ces valeurs soient consommables telles quelles par les opérations

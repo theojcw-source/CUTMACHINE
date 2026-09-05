@@ -136,21 +136,19 @@ int main() {
               groups[1].start == RationalTime{60, 50} &&
               groups[1].end == RationalTime{160, 50},
           "parole faible, creux de 0,2 s et parole forte rendent deux groupes");
-    Check(groups.size() == 2 &&
-              groups[0].level_dbfs < groups[1].level_dbfs &&
+    Check(groups.size() == 2 && groups[0].level_dbfs < groups[1].level_dbfs &&
               groups[0].peak_dbfs < groups[1].peak_dbfs,
           "chaque groupe publie son niveau et sa crête en dBFS");
     interview.groups = groups;
-    interview.group_gap_milliseconds =
-        groupThresholds.group_gap_milliseconds;
+    interview.group_gap_milliseconds = groupThresholds.group_gap_milliseconds;
     interview.group_floor_db = groupThresholds.group_floor_db;
     ClipSpeechOnset interviewSummary;
     Check(SummarizeClipSpeechOnset(Clip({0, 50}, {160, 50}), interview,
                                    groupThresholds, kPal, interviewSummary,
                                    groupError),
           "le plan avec question se résume : " + groupError);
-    Check(interviewSummary.measured && interviewSummary.onset ==
-                                              RationalTime{0, 50} &&
+    Check(interviewSummary.measured &&
+              interviewSummary.onset == RationalTime{0, 50} &&
               interviewSummary.dominant_measured &&
               interviewSummary.dominant_onset == RationalTime{60, 50},
           "l'attaque dominante saute la question faible et choisit la réponse");

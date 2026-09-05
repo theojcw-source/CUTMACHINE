@@ -234,11 +234,11 @@ int main() {
     Project audioProject;
     Check(LoadStoredProject(documentPath.string(), audioProject, error),
           "project with audio-only media loads: " + error);
-    const auto audioMedia = std::find_if(
-        audioProject.rushes.begin(), audioProject.rushes.end(),
-        [&](const LibraryMedia& media) {
-            return media.filename == audioPath.filename().string();
-        });
+    const auto audioMedia =
+        std::find_if(audioProject.rushes.begin(), audioProject.rushes.end(),
+                     [&](const LibraryMedia& media) {
+                         return media.filename == audioPath.filename().string();
+                     });
     Check(audioMedia != audioProject.rushes.end(),
           "audio-only media is present in the library");
     if (audioMedia != audioProject.rushes.end()) {
@@ -258,31 +258,31 @@ int main() {
         Document audioDocument = audioProject.MakeActiveDocument();
         audioDocument.sequence.tracks.push_back(
             {"01K83000000000000000000001", "audio", 0, {}});
-        Operation audioInsert = InsertClipOperation{
-            audioDocument.sequence.tracks.back().id,
-            audioMedia->id,
-            {0, 48000},
-            audioMedia->duration,
-            {0, 48000},
-            {},
-            {}};
+        Operation audioInsert =
+            InsertClipOperation{audioDocument.sequence.tracks.back().id,
+                                audioMedia->id,
+                                {0, 48000},
+                                audioMedia->duration,
+                                {0, 48000},
+                                {},
+                                {}};
         Operation audioInverse = RemoveClipOperation{};
         EditError audioEditError = EditError::None;
         std::string audioEditMessage;
-        Check(ApplyOperation(audioDocument, audioInsert, audioInverse,
-                             audioEditError, audioEditMessage),
-              "audio-only media inserts on an audio track: " +
-                  audioEditMessage);
+        Check(
+            ApplyOperation(audioDocument, audioInsert, audioInverse,
+                           audioEditError, audioEditMessage),
+            "audio-only media inserts on an audio track: " + audioEditMessage);
         audioDocument.sequence.tracks.push_back(
             {"01K83000000000000000000002", "video", 1, {}});
-        Operation videoInsert = InsertClipOperation{
-            audioDocument.sequence.tracks.back().id,
-            audioMedia->id,
-            {0, 48000},
-            audioMedia->duration,
-            {0, 48000},
-            {},
-            {}};
+        Operation videoInsert =
+            InsertClipOperation{audioDocument.sequence.tracks.back().id,
+                                audioMedia->id,
+                                {0, 48000},
+                                audioMedia->duration,
+                                {0, 48000},
+                                {},
+                                {}};
         Check(!ApplyOperation(audioDocument, videoInsert, audioInverse,
                               audioEditError, audioEditMessage) &&
                   audioEditError == EditError::InvalidOperation,

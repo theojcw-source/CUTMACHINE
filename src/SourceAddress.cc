@@ -70,12 +70,12 @@ bool FirstFrameAfter(const RationalTime& time, const MediaRate& rate,
 }
 
 bool ValidateSourceFrameBounds(const std::string& operation,
-                               int64_t sourceFrame, int64_t first,
-                               int64_t last, std::string& error) {
+                               int64_t sourceFrame, int64_t first, int64_t last,
+                               std::string& error) {
     if (sourceFrame >= first && sourceFrame <= last) return true;
     error = operation + " source_frame must be within [" +
-            std::to_string(first) + ", " + std::to_string(last) +
-            "]; got " + std::to_string(sourceFrame);
+            std::to_string(first) + ", " + std::to_string(last) + "]; got " +
+            std::to_string(sourceFrame);
     return false;
 }
 

@@ -289,8 +289,8 @@ int main() {
             }
         }
         // On doit avoir au moins appliqué quelques opérations
-        Check(applied >= 5, "trop peu d'opérations applicables : " +
-                                std::to_string(applied));
+        Check(applied >= 5,
+              "trop peu d'opérations applicables : " + std::to_string(applied));
     });
 
     // ------------------------------------------------------------------
@@ -410,9 +410,8 @@ int main() {
             std::string loadMsg;
             const bool loaded =
                 EditLog::Deserialize(s1, reloaded, loadErr, loadMsg);
-            Check(loaded,
-                  "Deserialize a échoué step " + std::to_string(step) +
-                      " : " + loadMsg);
+            Check(loaded, "Deserialize a échoué step " + std::to_string(step) +
+                              " : " + loadMsg);
             if (loaded) {
                 const std::string s2 = reloaded.Serialize();
                 Check(s1 == s2,

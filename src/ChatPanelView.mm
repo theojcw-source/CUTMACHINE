@@ -228,9 +228,10 @@ public:
         return ok;
     }
 
-    bool AnalyzeSourceSpeechOnset(
-        const Ulid& sourceId, const SpeechOnsetSettings& settings,
-        std::string& resultJson, std::string& message) override {
+    bool AnalyzeSourceSpeechOnset(const Ulid& sourceId,
+                                  const SpeechOnsetSettings& settings,
+                                  std::string& resultJson,
+                                  std::string& message) override {
         __block bool ok = false;
         dispatch_sync(dispatch_get_main_queue(), ^{
           ok = live_.AnalyzeSourceSpeechOnset(sourceId, settings, resultJson,
