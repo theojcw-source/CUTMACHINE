@@ -7,11 +7,14 @@
 
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -43,6 +46,60 @@ std::string Quote(const std::filesystem::path& path) {
     for (char character : path.string())
         result += character == '\'' ? "'\\''" : std::string(1, character);
     return result + "'";
+}
+
+// IA1 -- ROADMAP.md. Test the signal supplied to Whisper independently of
+// inference, so an inaudible word cannot survive through a stale mix/cache.
+Document TimelineAudioDocument(const std::string& mediaPath) {
+    Document document;
+    const Ulid sourceId = GenerateUlid();
+    document.sequence.frame_rate = {25, 1};
+    document.sources = {{sourceId, mediaPath, {25, 1}, {25, 25}}};
+    document.sequence.tracks = {
+        {GenerateUlid(),
+         "audio",
+         0,
+         {{GenerateUlid(), sourceId, {0, 25}, {25, 25}, {10, 25}, true}}},
+    };
+    return document;
+}
+
+bool DecodeTimelineAudioForTest(const Document& document,
+                                const std::filesystem::path& project,
+                                const std::string& ffmpegPath,
+                                std::vector<float>& samples,
+                                std::string& error) {
+    TimelineAudioPlan plan;
+    if (!BuildTimelineAudioPlan(document, project, plan, error)) return false;
+    std::atomic_bool finished{false};
+    bool decoded = false;
+    bool idle = false;
+    {
+        MediaTaskManager manager;
+        manager.Enqueue(MediaTaskKind::Transcription, "timeline PCM fixture",
+                        [&](MediaTaskContext& context, std::string& taskError) {
+                            decoded = DecodeFfmpegAudioToPcm16k(
+                                ffmpegPath, plan.ffmpeg_arguments, context,
+                                samples, taskError);
+                            error = taskError;
+                            finished.store(true);
+                            return decoded;
+                        });
+        idle = manager.WaitForIdle(30000);
+        if (!idle) manager.CancelAll();
+        // Join before inspecting captured state, including on timeout.
+    }
+    if (!idle) error = "timeline PCM decode timed out";
+    return idle && finished.load() && decoded;
+}
+
+double PcmRms(const std::vector<float>& samples, size_t begin, size_t end) {
+    if (begin >= end || end > samples.size())
+        throw std::out_of_range("PCM measurement exceeds decoded samples");
+    double energy = 0.0;
+    for (size_t index = begin; index < end; ++index)
+        energy += static_cast<double>(samples[index]) * samples[index];
+    return std::sqrt(energy / static_cast<double>(end - begin));
 }
 
 // A single video track holding one clip whose source is `sourceId`, spanning
@@ -145,9 +202,9 @@ int main() {
                       first.ffmpeg_arguments.end(), "-filter_complex");
         Check(graph != first.ffmpeg_arguments.end() &&
                   graph + 1 != first.ffmpeg_arguments.end() &&
-                  (graph + 1)->find("adelay=19200S") != std::string::npos &&
+                  (graph + 1)->find("adelay=57600S") != std::string::npos &&
                   (graph + 1)->find("amix=inputs=2") != std::string::npos,
-              "the second clip is placed at frame 30 on the 16 kHz PCM grid");
+              "the second clip is placed at frame 30 on the 48 kHz mix grid");
 
         const std::string originalIdentity = first.cache_identity;
         document.sequence.tracks[0].clips[0].duration = {24, 25};
@@ -166,6 +223,41 @@ int main() {
               "cache: " +
                   error);
     });
+
+    Test(
+        "IA1 gain and each fade independently invalidate transcript cache", [] {
+            Document document = TimelineAudioDocument("tone.wav");
+            const std::filesystem::path project =
+                std::filesystem::temp_directory_path() / "IA1-project.json";
+            std::string error;
+            TimelineAudioPlan original;
+            const bool planned =
+                BuildTimelineAudioPlan(document, project, original, error);
+            Check(planned, "baseline audio plan builds: " + error);
+            if (!planned) return;
+            const auto checkIdentity = [&](bool changed,
+                                           const std::string& label) {
+                TimelineAudioPlan candidate;
+                const bool built =
+                    BuildTimelineAudioPlan(document, project, candidate, error);
+                Check(built && (candidate.cache_identity !=
+                                original.cache_identity) == changed,
+                      label + ": " + error);
+            };
+            DocumentClip& clip = document.sequence.tracks[0].clips[0];
+            clip.audio_gain_db = {-20, 1};
+            checkIdentity(true, "gain alone invalidates the transcript");
+            clip.audio_gain_db = {0, 1};
+            checkIdentity(false, "restoring gain restores cache identity");
+            clip.audio_fade_in = {1, 5};
+            checkIdentity(true, "fade-in alone invalidates the transcript");
+            clip.audio_fade_in = {0, 1};
+            checkIdentity(false, "restoring fade-in restores cache identity");
+            clip.audio_fade_out = {1, 5};
+            checkIdentity(true, "fade-out alone invalidates the transcript");
+            clip.audio_fade_out = {0, 1};
+            checkIdentity(false, "restoring fade-out restores cache identity");
+        });
 
     Test("RoundToSourceFrame rounds outward and is exact on frame boundaries",
          [] {
@@ -774,6 +866,101 @@ int main() {
     if (!ffmpegPath) ffmpegPath = FFMPEG_EXECUTABLE;
 #endif
     if (ffmpegPath) {
+        Test(
+            "IA1 transcription PCM follows clip gain, fades and mix limiter",
+            [ffmpegPath] {
+                const std::filesystem::path root =
+                    std::filesystem::temp_directory_path() /
+                    (GenerateUlid() + "-timeline-pcm");
+                std::filesystem::create_directories(root);
+                const std::filesystem::path source = root / "tone.wav";
+                const std::filesystem::path project = root / "project.json";
+                const std::string generate =
+                    Quote(ffmpegPath) +
+                    " -hide_banner -loglevel error -f lavfi -i "
+                    "'sine=frequency=1000:sample_rate=48000:duration=1' "
+                    "-c:a pcm_f32le -y " +
+                    Quote(source);
+                const bool generated = std::system(generate.c_str()) == 0;
+                Check(generated, "generates the timeline PCM fixture");
+                if (!generated) {
+                    std::filesystem::remove_all(root);
+                    return;
+                }
+
+                Document document = TimelineAudioDocument(source.string());
+                std::vector<float> neutral;
+                std::vector<float> processed;
+                std::vector<float> limited;
+                std::string error;
+                bool decoded = DecodeTimelineAudioForTest(
+                    document, project, ffmpegPath, neutral, error);
+                Check(decoded, "neutral timeline PCM decodes: " + error);
+                if (!decoded) {
+                    std::filesystem::remove_all(root);
+                    return;
+                }
+                DocumentClip& clip = document.sequence.tracks[0].clips[0];
+                clip.audio_gain_db = {-20, 1};
+                clip.audio_fade_in = {1, 5};
+                clip.audio_fade_out = {1, 5};
+                decoded = DecodeTimelineAudioForTest(
+                    document, project, ffmpegPath, processed, error);
+                Check(decoded, "processed timeline PCM decodes: " + error);
+                if (!decoded) {
+                    std::filesystem::remove_all(root);
+                    return;
+                }
+
+                constexpr size_t kExpectedSamples = 22400;
+                const bool correctLength = neutral.size() == kExpectedSamples &&
+                                           processed.size() == kExpectedSamples;
+                Check(correctLength,
+                      "gain and fades preserve the exact 1.4 s timeline");
+                if (correctLength) {
+                    Check(PcmRms(processed, 0, 6000) < 1e-7,
+                          "audio processing preserves the leading gap");
+                    const double plateau = PcmRms(processed, 11200, 16000);
+                    const double neutralPlateau = PcmRms(neutral, 11200, 16000);
+                    Check(neutralPlateau > 0.01 &&
+                              std::abs(plateau / neutralPlateau - 0.1) < 0.002,
+                          "a -20 dB edit attenuates audible PCM by ten");
+                    const double attack = PcmRms(processed, 7840, 8160);
+                    const double release = PcmRms(processed, 20640, 20960);
+                    Check(plateau > 0.0 &&
+                              std::abs(attack / plateau - 0.5) < 0.03,
+                          "fade-in attenuates the beginning of the clip");
+                    Check(plateau > 0.0 &&
+                              std::abs(release / plateau - 0.5) < 0.03,
+                          "fade-out attenuates the end of the clip");
+                }
+
+                clip.audio_gain_db = {40, 1};
+                clip.audio_fade_in = {0, 1};
+                clip.audio_fade_out = {0, 1};
+                decoded = DecodeTimelineAudioForTest(
+                    document, project, ffmpegPath, limited, error);
+                Check(decoded, "high-gain timeline PCM decodes: " + error);
+                if (decoded && limited.size() == kExpectedSamples) {
+                    double peak = 0.0;
+                    for (size_t index = 11200; index < 16000; ++index) {
+                        const double amplitude =
+                            std::abs(static_cast<double>(limited[index]));
+                        peak = std::max(peak, amplitude);
+                    }
+                    // The export limits each stereo channel before FFmpeg's
+                    // final mono downmix sums them with equal-power weights.
+                    const double expectedPeak = 0.668344 * std::sqrt(2.0);
+                    Check(std::abs(peak - expectedPeak) < 0.01,
+                          "Whisper receives the limited stereo delivery mix "
+                          "after downmix; measured peak=" +
+                              std::to_string(peak));
+                } else {
+                    Check(false, "limiting preserves the timeline duration");
+                }
+                std::filesystem::remove_all(root);
+            });
+
         Test(
             "GenerateAudioTranscript decodes real audio locally, then "
             "fails cleanly on a local model path that does not resolve "

@@ -87,12 +87,10 @@ creux refermés par plan — en taisant que **36 à 44 creux étaient « trop
 courts »** et laissés en place. Additionnés, ces creux sous 400 ms faisaient
 le film entier respirer mou.
 
-Réglage qui marche : **250 ms / 3 images**. Sur le même montage, il a refermé
-**19 creux au lieu de 4** et retiré 6,5 s au lieu de 4,1 s. Le silence mesuré
-est passé de 6,1 % à 2,1 % de la durée.
-
-Ne descends pas beaucoup plus bas sans écouter : sous ~200 ms on colle les
-mots entre eux et la parole devient haletante.
+Un essai à **250 ms / 3 images** a refermé **19 creux au lieu de 4** et
+retiré 6,5 s au lieu de 4,1 s ; le silence mesuré est passé de 6,1 % à 2,1 %.
+Ce gain arithmétique a ensuite été invalidé par un mot coupé. Ce réglage est
+un résultat historique, pas la consigne à appliquer : voir ci-dessous.
 
 ### Comment le mesurer
 
@@ -119,55 +117,73 @@ l'intérieur du mot « notre »** — le montage disait « Ouais. nd'étude » l
 la personne dit « Pour notre projet d'étude ». Le creux était réel dans
 l'enveloppe (une occlusive laisse un trou), mais ce n'était pas une pause.
 
-**300 à 320 ms / 4 images** est le bon compromis : les mots restent entiers et
-le plus long creux tombe à 0,26 s. C'est le réglage par défaut à retenir.
+Sur les rushes mesurés, **300 à 320 ms / 4 images** a conservé les mots et
+ramené le plus long creux à 0,26 s. C'est le point de départ maison : passe
+explicitement `min_gap_ms: 320` et `keep_frames: 4`, car les valeurs par
+défaut du moteur restent 400 ms / 6 images. `keep_frames` est exprimé à la
+cadence de la source. Ce compromis doit être réévalué sur une autre parole.
 
 Et surtout : **relis le texte monté après chaque changement de réglage.**
-Aucun rapport d'opération ne dit qu'un mot a été coupé en deux ; seule la
-transcription du son monté le montre.
+Aucun rapport d'opération ne dit qu'un mot a été coupé en deux. La
+transcription du son monté peut le signaler ; son absence d'alerte ne
+dispense pas d'examiner les raccords douteux.
 
 ### Deux limites à connaître
 
 - `tighten_pauses` ne touche **ni la tête ni la queue** du plan : elle les
-  publie (`head_air`, `tail_air`) et laisse. L'air de tête se rogne avec
-  `ripple_trim` piloté par `analyze_speech_onset`.
-- Chaque creux refermé **coupe le plan en deux**. Un montage resserré à 250 ms
-  passe de 6 blocs à 25 plans : autant de faux raccords à couvrir. C'est le
+  publie (`head_air`, `tail_air`) et laisse. `trim_boundary_air` traite les
+  bordures ; `close_junction_air` mesure ensemble les deux côtés d'un raccord.
+- Chaque creux refermé **coupe le plan en deux**. L'essai historique à 250 ms
+  est passé de 6 blocs à 25 plans : autant de faux raccords à couvrir. C'est le
   prix du resserrement, et c'est ce qui justifie les plans de coupe.
 
 ---
 
 ## Les pièges de pilotage qui coûtent un aller-retour
 
-Aucun ne lève d'erreur parlante. Tous ont été rencontrés en conditions réelles.
+Tous ont été rencontrés en conditions réelles. Les refus et les liens A/V
+ont depuis été corrigés dans le moteur ; les consignes ci-dessous décrivent
+le contrat actuel.
 
 ### Les spans appartiennent à la timeline active
 
-`get_timeline_transcript` et `create_interview_short` lisent la timeline
-**active**. Après avoir fabriqué un montage, l'actif est ce montage : demander
-`S276` là-dedans rend `unknown span_id 'S276'`, alors que le span existe
-parfaitement dans le dérushage.
+`get_timeline_transcript` lit la timeline **active**, sans argument
+`timeline_id`. Sa réponse donne `timeline_id` et `timeline_name` : conserve
+les deux avec le texte choisi. Les `S1`, `S2`… se renumérotent quand le
+montage change. Relis les spans après modification de leur timeline, plutôt
+que de réutiliser une ancienne sélection.
 
-**Repasse sur le dérushage avant chaque nouvelle sélection**
-(`set_active_timeline`). Et méfie-toi de la suite : quand la création échoue,
-l'actif ne bouge pas, donc l'opération suivante — un resserrement, par
-exemple — s'applique au **dérushage**. C'est arrivé : 92 creux refermés dans
-la matière brute au lieu du film. Mets un garde-fou qui refuse toute opération
-de montage quand l'actif est le dérushage.
+**Repasse sur le dérushage avant chaque nouvelle lecture de sélection**
+(`set_active_timeline` avec son ID complet). Pour `create_interview_short`,
+passe ce même ID dans `timeline_id` : c'est la timeline dont les spans sont
+lus, pas celle qui sera créée. Après succès, relève l'ID et le nom de la
+nouvelle timeline active dans le résultat de `list_timelines` : la création
+MCP peut ne renvoyer que `ok` et `project_hash`.
 
-### `ripple_trim` n'emporte pas ce qu'on croit
+Les opérations suivantes (`tighten_pauses`, `ripple_trim`, etc.) prennent
+l'ID **du montage créé**. Passe `timeline_id` dès que le schéma de l'outil
+le permet ; `transcribe_timeline` l'accepte aussi. Pour les lectures sans
+ce champ (`get_timeline_transcript`, `contact_sheet`, `cut_sheet`,
+`timeline_stats`), active d'abord le montage voulu et vérifie son identité.
+Une édition explicitement ciblée ne change pas nécessairement l'actif MCP.
 
-`tighten_pauses` emporte le plan son lié tout seul et le dit dans `also_cut`.
-**`ripple_trim`, non.** Rogner la tête d'un plan vidéo laisse le son en place,
-décale l'image seule et pose un trou en fin de piste vidéo — **sans changer la
-durée de la timeline**, donc le contrôle « la durée a-t-elle bougé ? » ne voit
-rien.
+Si la création échoue, arrête les opérations qui en dépendent. L'actif peut
+encore être le dérushage : 92 creux y ont déjà été refermés par erreur. Pour
+un nouveau film demandé à partir du dérushage, conserve celui-ci intact.
 
-Il faut nommer explicitement :
+### Liens A/V automatiques, autres pistes explicites
 
-- `linked_clip_ids` : le plan son de la paire ;
-- `sync_track_ids` : la piste de coupe, qui n'appartient à aucun groupe lié et
-  ne suivrait pas le décalage.
+`ripple_trim` emporte désormais tout le groupe A/V lié par défaut, comme
+`tighten_pauses`, et rapporte les autres clips coupés dans `also_cut`.
+Vérifie que le groupe existe : deux clips simplement superposés ne sont pas
+liés. Fournir `linked_clip_ids` à `ripple_trim` sélectionne explicitement un
+sous-ensemble ; omets ce champ pour conserver le groupe entier.
+
+La piste de coupe, sans membre de ce groupe, doit toujours être nommée dans
+`sync_track_ids` pour `ripple_trim` et `tighten_pauses`. Pour
+`trim_boundary_air` et `close_junction_air`, les autres pistes verrouillées
+en synchronisation suivent par défaut ; un `sync_track_ids` explicite
+remplace cette sélection automatique.
 
 Contrôle après coup : les durées de V1 et de A1 doivent coïncider plan par
 plan.
@@ -196,34 +212,37 @@ toujours un plan par `source_in` ou par identifiant, jamais par alias.
 
 ---
 
-## La question de l'intervieweur s'entend, et rien ne la signale
+## Repérer la question de l'intervieweur sans confondre niveau et locuteur
 
-Le défaut le plus coûteux de cette série, parce qu'il est **invisible dans
-toutes les transcriptions**.
+Le défaut le plus coûteux de cette série était **absent des transcriptions
+produites**, bien qu'audible dans le montage.
 
-whisper ne transcrit que le locuteur principal. Quand un rush commence par la
-question de l'intervieweur, whisper la saute et pose le premier mot de la
-réponse à l'image 0. `create_interview_short` construit l'entrée du plan
-là-dessus, donc le montage démarre **sur la question**. Elle s'entend
-parfaitement au montage ; elle n'apparaît dans aucun contrôle textuel.
+Sur ces rushes, Whisper a omis la question de l'intervieweur et posé le
+premier mot de la réponse à l'image 0. `create_interview_short` a construit
+l'entrée du plan là-dessus : le montage démarrait **sur la question**.
+L'absence d'une question dans le texte ne prouve donc pas son absence sonore.
 
 Mesuré sur LISAASTR136 : six blocs sur huit montages ouvraient sur « Et c'est
 quoi ? », « Qu'est-ce que c'est ? » ou l'équivalent.
 
-### Pourquoi l'onset ne le voit pas
+### Ce que les groupes de parole permettent de voir
 
-`analyze_speech_onset` mesure de la **parole**, pas *qui* parle. La question
-est de la parole : l'onset la déclare « tight » et ne suggère aucun rognage.
+`analyze_speech_onset` produit l'enveloppe et les groupes de parole en cache.
+`list_speech_onsets` publie désormais les `groups`, leurs niveaux moyens et
+crêtes en dBFS, ainsi que `dominant_onset` : début du premier groupe soutenu
+proche du niveau de référence du clip. Utilise ces mesures avant de choisir
+une entrée ; le simple `onset` peut désigner la question.
 
-### Le discriminateur fiable : le niveau
+### Le niveau donne un candidat, pas une identité
 
-**L'intervieweur n'est pas micro-cravaté.** Sa question est systématiquement
-**15 à 20 dB sous** la réponse. Sur un rush mesuré : question à −27/−49 dB,
-réponse à −11/−14 dB, avec un creux net entre les deux.
+**Dans cette série, l'intervieweur n'était pas micro-cravaté.** Sa question
+était **15 à 20 dB sous** la réponse. Sur un rush mesuré : question à
+−27/−49 dB, réponse à −11/−14 dB, avec un creux net entre les deux.
 
-Le repérage se fait donc sur l'enveloppe RMS 20 ms, avec un seuil **calé sur
-le rush lui-même** — 90e centile moins ~9 dB — et une tenue de quelques
-fenêtres pour ne pas déclencher sur un bruit :
+Le repérage se fait sur l'enveloppe RMS 20 ms, avec un seuil relatif au
+niveau mesuré et une tenue minimale pour ne pas déclencher sur un bruit.
+`list_speech_onsets` expose les réglages `dominant_percentile` (90),
+`dominance_db` (9) et `dominant_sustain_windows` (6) :
 
 ```
 seuil = centile90(niveaux) - 9 dB
@@ -232,6 +251,9 @@ début = première fenêtre qui tient >= 6 fenêtres au-dessus du seuil
 
 Sur les rushes de cette série, ça rend des débuts de 12 à 25 images
 (0,5 à 1,0 s) — cohérents avec la lecture manuelle de l'enveloppe.
+Cela ne reconnaît pas un locuteur : une réponse douce peut être plus faible
+qu'une question. Confirme le candidat avec le contexte de la réponse et,
+si disponible, l'écoute du passage avant de supprimer de la parole.
 
 ### Quand le niveau ne suffit pas : le creux
 
@@ -285,7 +307,8 @@ phrase sont faux.
 ### Le contrôle à passer sur chaque montage
 
 Pour chaque rush du montage, compare le `source_in` du **premier** bloc au
-début mesuré. S'il est en deçà, la question est dedans.
+début mesuré. S'il est en deçà, inspecte cet intervalle : il peut contenir du
+silence, une question, ou le début utile d'une réponse moins forte.
 
 Deux cas de correction, et le second est celui qu'on rate :
 
@@ -294,25 +317,29 @@ Deux cas de correction, et le second est celui qu'on rate :
 - **le premier morceau est entièrement dans la question** — fréquent après
   resserrement, qui coupe justement au creux entre question et réponse. Un
   morceau plus court que le rognage demandé **ne se rogne pas** : le moteur
-  répond sans rien faire et la durée ne bouge pas. Il faut le `remove_clip`,
-  puis rogner le suivant.
+  refuse désormais une borne impossible avec `InvalidOperation`. Supprime
+  le morceau confirmé inutile avec `remove_linked_clips` pour garder la
+  paire A/V ensemble, puis réévalue le suivant ; nomme aussi les autres
+  pistes à suivre dans `sync_track_ids`.
 
-### Certains refus reviennent en texte, pas en `ok:false`
+### Un refus arrête les opérations qui en dépendent
 
-`create_interview_short` refuse deux spans « separated by more than a
-breath » — utile, ça empêche de recoller deux morceaux entre lesquels la
-personne a fait autre chose. Mais **le refus arrive parfois comme une chaîne
-de texte**, pas comme `{"ok":false}`.
+`create_interview_short` peut refuser des spans « separated by more than a
+breath » : le moteur n'avale pas silencieusement l'intervalle qui les
+sépare. Depuis B2, les refus d'outil ont un contenu JSON
+`{"ok":false,"error":"<code>","detail":"<message>"}` et une enveloppe
+MCP `isError:true`. Vérifie aussi les erreurs JSON-RPC et de transport. Une
+réponse absente ou illisible ne constitue pas un succès.
 
-Un client qui ne teste que `ok` croit avoir réussi. La suite s'exécute alors
-sur la timeline précédente — le dérushage si aucun montage n'existe encore —
-et l'erreur ne se voit que trois opérations plus loin, sous une forme
-incompréhensible (`IndexError` sur la liste des pistes, parce que le
-dérushage n'a pas de piste vidéo à l'index 0).
+Depuis B3, une borne hors du clip provoque un refus nommé ; n'attends pas
+un succès sans effet et ne répète pas la même requête. Relis les bornes et
+reformule l'opération. Certains outils d'intention renvoient légitimement
+`applied:false` quand rien n'est à nettoyer ou en prévisualisation : lis ce
+champ et le rapport, sans annoncer une modification qui n'a pas eu lieu.
 
-Fais lever une exception sur toute réponse commençant par `ValidationFailed`,
-`ParseError`, `NotFound`, `Conflict` ou `Refused`, même hors JSON. Et vérifie
-le nom de la timeline active après chaque création.
+Après création ou activation, contrôle le succès puis l'ID, le nom et l'état
+actif dans le résultat de `list_timelines`. Après un refus, corrige sa cause
+avant tout resserrement ou suppression qui supposait la création réussie.
 
 ### Quand un span refuse de se coller au suivant
 
@@ -327,18 +354,18 @@ l'image du mot voulu — `ripple_trim` étend aussi bien qu'il rogne.
 
 ## La finition : les creux que le resserrement ne voit pas
 
-`tighten_pauses` ne touche **ni la tête ni la queue** d'un plan. Après
-resserrement, les seuls creux qui restent sont donc aux bordures — et ce sont
-justement ceux qui s'entendent, puisque les creux internes ont été refermés.
+`tighten_pauses` ne touche **ni la tête ni la queue** d'un plan. Les creux
+internes sous le seuil restent aussi en place. Mesure le son monté pour
+distinguer ces cas, sans déduire la qualité d'un raccord du rapport d'édition.
 
-Boucle de finition, à répéter jusqu'à ce qu'elle ne trouve plus rien :
+Boucle de finition, bornée selon la section sur la convergence ci-dessous :
 
 1. mesurer les creux du son monté (`silencedetect -30dB`) ;
 2. pour chaque creux ≥ 0,4 s, trouver le plan qui le contient ;
-3. si le creux est **près du début** du plan → rogner la tête ;
-   près de la **fin** → rogner la queue ;
-4. supprimer les plans de moins de 6 images : à 0,2 s ce ne sont pas des
-   plans, ce sont des clignotements.
+3. pour une bordure, utiliser `trim_boundary_air` ; si le creux traverse
+   un raccord, `close_junction_air` avec `left_clip_id` et `right_clip_id` ;
+4. examiner les plans de moins de 6 images : une image-éclair peut se couvrir,
+   mais ne supprime pas sa parole utile au seul motif de sa durée.
 
 Prends une marge large pour « près du début » — **25 images**, pas 10. Avec
 une marge étroite, un creux à 15 images du début est classé « interne », on
@@ -357,8 +384,9 @@ Symétriquement, ne rogne pas au jugé : couper la queue « douze images avant l
 fin » a mangé la fin de « café-librairie », que le montage disait alors
 « café libre ». **Lis l'enveloppe, prends l'image où le niveau décroche.**
 
-Et après chaque rognage de bordure, **relis le texte monté**. C'est le seul
-contrôle qui voit un mot amputé.
+Et après chaque rognage de bordure, **compare le texte choisi au texte du
+son monté**, puis examine le raccord si les deux divergent. La transcription
+peut signaler un mot amputé, mais aussi en reconstituer un qui est inaudible.
 
 ---
 
@@ -419,30 +447,60 @@ sont plus adressables une fois le resserrement passé.
    pour ne charger le modèle qu'une fois.
 2. **Classer les rushes** : parole / plan muet. whisper hallucine sur le
    silence, et un plan de coupe peut porter du son (voir plus bas).
-3. **Analyser les attaques** (`analyze_speech_onset`) puis
-   **`align_transcript --write`**. Avant toute décision de coupe.
+3. **Analyser les attaques** (`analyze_speech_onset` avec `media_id`) puis
+   **`align_transcript` avec `apply: true`** en MCP
+   (`--align-transcripts --write` en CLI). Avant toute décision de coupe.
 4. **Lire toute la parole de la personne** et écrire son raisonnement en une
    phrase.
 5. **Choisir les blocs**, entiers, dans un ordre qui préserve les références.
+   Garder leur texte dans l'ordre retenu avec les spans et la timeline source.
 6. **Mesurer chaque borne sur l'enveloppe** avant de poser quoi que ce soit :
    entrée sur l'attaque moins 2 à 3 images, sortie sur le décrochage plus
    2 à 3. Les horodatages whisper ne servent qu'à *trouver* la phrase.
-7. **Monter les blocs** — `create_interview_short` depuis le dérushage actif,
+7. **Monter les blocs** — `create_interview_short` ciblant le dérushage par
+   `timeline_id` et les `span_id` relus sur celui-ci,
    ou `add_timeline` + `insert_clip` image/son + `set_clip_link` quand la
    sélection est en images source plutôt qu'en spans.
 8. **Corriger les bordures** (`trim_boundary_air`) — *avant* le resserrement.
-9. **Resserrer** (`tighten_pauses`, 300–320 ms / 4 images).
+9. **Resserrer** (`tighten_pauses`, `min_gap_ms: 320`, `keep_frames: 4` comme
+   point de départ maison, avec l'ID du montage dans `timeline_id`).
 10. **Purger les questions d'intervieweur** (repérage au creux et au niveau).
 11. **Finition** : fragments-éclair, creux de bordure, en boucle.
-12. **Relire le texte du son monté** (`transcribe_timeline`). Tant qu'il n'est
-    pas propre, ne pas continuer.
+12. **Comparer le texte choisi, le texte du projet et le texte du son monté**
+    (`transcribe_timeline` avec l'ID du montage). Résoudre les écarts qui
+    touchent le sens avant la finition visuelle.
 13. **Poser les plans de coupe** sur le sens.
 14. **Couleur, puis livraison** : export, SRT, Resolve — voir plus bas ce qui
     est vraiment demandé.
 
-Le contrôle du texte (12) est le seul qui attrape les mots amputés et les
-enchaînements absurdes. **Fais-le au moins deux fois** : une fois le montage
-posé, une fois après le resserrement.
+Fais le contrôle du texte une fois le montage posé, puis après le
+resserrement ou une correction de bornes : ce sont ces modifications qui
+peuvent avoir amputé un mot ou rompu un enchaînement.
+
+### Trois lectures distinctes, puis les raccords
+
+- **Texte choisi** : relis le script retenu sans les rushes. Vérifie les
+  antécédents, les liens de cause à effet et la fidélité à ce que la personne
+  voulait dire. Les spans sont découpés pour les sous-titres ; utilise
+  `end_span_id` pour garder une idée entière quand elle couvre plusieurs spans.
+- **Texte du projet** : active le montage et appelle
+  `get_timeline_transcript`. Compare l'ordre et les plages au texte choisi.
+  Ce texte est projeté depuis les caches des rushes : il vérifie la sélection,
+  mais ne constitue pas une nouvelle écoute des coupes.
+- **Texte du son monté** : appelle `transcribe_timeline` avec `timeline_id`
+  et `verbatim: true`. Compare-le aux deux précédents pour localiser une
+  phrase incomplète, une répétition ou une borne suspecte. Une différence est
+  une alerte à examiner, pas une autorisation de couper automatiquement ;
+  un accord des textes ne prouve ni l'absence de question ni l'intelligibilité.
+
+Examine ensuite les raccords signalés : enveloppe et groupes de parole,
+écoute du passage si disponible, puis `cut_sheet` et `contact_sheet` pour
+les images. Les planches montrent les rushes sélectionnés avec la
+transformation couleur globale ; elles ne remplacent pas le contrôle du
+rendu final des effets, transitions et sous-titres. Les silences, niveaux
+et `timeline_stats` localisent des défauts possibles ; ils ne jugent pas la
+compréhension du récit. Si le client ne permet pas d'écouter ou de visionner
+un résultat, conserve cette limite dans le compte rendu de livraison.
 
 ### `transcribe_timeline` remplace toute la chorégraphie
 
@@ -477,9 +535,11 @@ Deux garde-fous :
 
 - **borne le nombre de passes** et signale la non-convergence au lieu de
   boucler ;
-- quand un creux enjambe une jonction, **mesure les deux côtés** et rogne les
-  deux : la queue du sortant à l'image où le niveau décroche, la tête de
-  l'entrant à l'image où il remonte. Sur le cas mesuré : queue à 356 au lieu
+- quand un creux enjambe une jonction, **mesure les deux côtés** avec
+  `close_junction_air` et vérifie son rapport ; l'outil traite les deux dans
+  une opération réversible. Le principe : la queue du sortant à l'image où
+  le niveau décroche, la tête de l'entrant à l'image où il remonte.
+  Sur le cas mesuré : queue à 356 au lieu
   de 359, tête à 379 au lieu de 368 — 0,64 s ramenés à 0,31 s en une fois.
 
 Et laisse **2 à 3 images de battement** avant l'attaque plutôt que de couper
@@ -854,9 +914,11 @@ inutilisable — c'est exactement ce qui est arrivé à la première version de
 cette série : durées justes, silences fermés, sync propre, et un enchaînement
 qui ne voulait rien dire.
 
-Le seul garde-fou est la **relecture du texte monté**, faite comme quelqu'un
-qui n'a pas vu les rushes.
+La **relecture du texte monté**, faite comme quelqu'un qui n'a pas vu les
+rushes, reste nécessaire pour juger le récit. Elle se complète par l'examen
+des raccords et du résultat audiovisuel dès que les outils disponibles le
+permettent.
 
-Et rends toujours, avec les fichiers, ce que tu n'as pas pu juger : dis
-explicitement que tu n'as ni vu ni entendu le résultat, et sur quoi reposent
-tes affirmations.
+Et rends, avec les fichiers, les contrôles réellement effectués et ce que
+tu n'as pas pu juger : précise si tu as examiné des planches, le texte
+retranscrit, une écoute ou le film rendu, et sur quoi reposent tes affirmations.

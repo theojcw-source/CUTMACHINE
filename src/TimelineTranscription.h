@@ -16,9 +16,9 @@ struct TimelineAudioPlan {
     std::vector<std::string> ffmpeg_arguments;
     RationalTime duration{0, 1};
     size_t audio_clips = 0;
-    // Changes whenever an audible clip's source boundaries or placement
-    // changes. It is stored as Transcript::media_id, alongside model and
-    // language, so a stale timeline transcript is never reused.
+    // Changes whenever an audible clip's source boundaries, placement, gain
+    // or fades change. Stored as Transcript::media_id alongside model and
+    // language; the mix version also invalidates older decode pipelines.
     std::string cache_identity;
 };
 

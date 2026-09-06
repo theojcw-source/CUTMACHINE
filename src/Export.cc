@@ -1,5 +1,6 @@
 #include "Export.h"
 
+#include "AudioMixFilters.h"
 #include "ColorManagement.h"
 #include "Ingest.h"
 #include "Timeline.h"
@@ -29,14 +30,7 @@ extern char** environ;
 namespace {
 
 std::string Decimal(const RationalTime& time) {
-    std::ostringstream output;
-    output.imbue(std::locale::classic());
-    output << std::fixed << std::setprecision(12)
-           << static_cast<long double>(time.value) / time.rate;
-    std::string value = output.str();
-    while (value.size() > 2 && value.back() == '0') value.pop_back();
-    if (!value.empty() && value.back() == '.') value.push_back('0');
-    return value;
+    return audio_mix::Seconds(time);
 }
 
 std::string FilterSeconds(const RationalTime& time) {
@@ -290,9 +284,6 @@ bool Exporter::BuildPlan(const Document& document,
         RationalTime duration;
         RationalTime timeline_in;
         std::optional<RationalTime> fade_in;
-        RationalTime audio_fade_in{0, 1};
-        RationalTime audio_fade_out{0, 1};
-        EffectParamValue audio_gain_db{0, 1};
         int input_index = -1;
         bool video = false;
         bool audio = false;
@@ -338,9 +329,6 @@ bool Exporter::BuildPlan(const Document& document,
             input.source_in = clip.source_in;
             input.duration = clip.duration;
             input.timeline_in = clip.timeline_in;
-            input.audio_gain_db = clip.audio_gain_db;
-            input.audio_fade_in = clip.audio_fade_in;
-            input.audio_fade_out = clip.audio_fade_out;
             input.input_index = static_cast<int>(inputs.size());
             input.video = video;
             input.audio = audio;
@@ -496,15 +484,7 @@ bool Exporter::BuildPlan(const Document& document,
               << ",asetpts=PTS-STARTPTS,aresample="
               << settings.audio_sample_rate
               << ",aformat=sample_fmts=fltp:channel_layouts=stereo";
-        if (input.audio_gain_db.num != 0)
-            graph << ",volume=pow(10\\,(" << input.audio_gain_db.num << '/'
-                  << input.audio_gain_db.den << ")/20)";
-        if (input.audio_fade_in.value != 0)
-            graph << ",afade=t=in:st=0:d=" << Decimal(input.audio_fade_in);
-        if (input.audio_fade_out.value != 0)
-            graph << ",afade=t=out:st="
-                  << Decimal(input.duration.sub(input.audio_fade_out))
-                  << ":d=" << Decimal(input.audio_fade_out);
+        audio_mix::AppendClipEnvelope(graph, *input.clip);
         graph << ",adelay=" << delaySamples << "S:all=1[a" << audioOrdinal
               << "];";
         ++audioOrdinal;
@@ -515,11 +495,7 @@ bool Exporter::BuildPlan(const Document& document,
     } else {
         for (size_t index = 0; index < audioOrdinal; ++index)
             graph << "[a" << index << ']';
-        graph << "amix=inputs=" << audioOrdinal
-              << ":duration=longest:normalize=0,"
-                 "alimiter=limit=0.668344:level=0:latency=1,"
-                 "apad,atrim="
-              << "duration=" << Decimal(duration) << "[audio]";
+        audio_mix::AppendMixedOutput(graph, audioOrdinal, duration);
     }
 
     arguments.insert(arguments.end(), {"-filter_complex", graph.str(), "-map",
