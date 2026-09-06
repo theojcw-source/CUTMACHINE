@@ -277,8 +277,7 @@ struct AudioPlayback::Impl {
             mixed.fadeOutSamples = clip.fadeOutSamples;
             next->clips.push_back(std::move(mixed));
         }
-        std::atomic_store(&plan,
-                          std::static_pointer_cast<const MixPlan>(next));
+        std::atomic_store(&plan, std::static_pointer_cast<const MixPlan>(next));
     }
 
     // Evicting a source the plan still names is harmless -- every MixClip

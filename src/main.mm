@@ -432,8 +432,7 @@ struct PendingDecodeOpen {
 void ParallelForEachIndex(size_t count,
                           const std::function<void(size_t)>& body) {
     constexpr size_t kMaxConcurrentOpens = 8;
-    const size_t hardware =
-        std::max(1u, std::thread::hardware_concurrency());
+    const size_t hardware = std::max(1u, std::thread::hardware_concurrency());
     const size_t workers =
         std::min(count, std::min(hardware, kMaxConcurrentOpens));
     if (workers <= 1) {
@@ -4688,9 +4687,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             [self loadOrEnqueueWaveformForMediaIdentifier:
                       [NSString stringWithUTF8String:source.id.c_str()]];
         if (media && self.state->offlineSourceIds.count(source.id) == 0)
-            loadedThumbnail |= [self
-                stageThumbnailForMediaIdentifier:
-                    [NSString stringWithUTF8String:source.id.c_str()]];
+            loadedThumbnail |=
+                [self stageThumbnailForMediaIdentifier:
+                          [NSString stringWithUTF8String:source.id.c_str()]];
     }
     if (loadedThumbnail) [self.mediaCollection reloadData];
     [self requestResolvedPosition:{0, 1}];
@@ -10940,9 +10939,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     PerformanceMetrics* metrics = self.state->performanceMetrics.get();
     // A unique_ptr cannot be captured by a block copied between queues; the
     // vector holding them can, behind a shared_ptr.
-    auto opened =
-        std::make_shared<std::vector<std::unique_ptr<DecodeWorker>>>(
-            pending->size());
+    auto opened = std::make_shared<std::vector<std::unique_ptr<DecodeWorker>>>(
+        pending->size());
     __weak AppDelegate* weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
       ParallelForEachIndex(pending->size(), [&](size_t index) {
@@ -12223,9 +12221,9 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
                      storedMetadata->second.rotation_degrees == 90,
                  "media with complete metadata is read from the project "
                  "rather than probed off the drive");
-    UiSmokeCheck(!self.state->openingDecodeWorkers &&
-                     !self.state->workers.empty(),
-                 "the decoders opened behind the window are installed");
+    UiSmokeCheck(
+        !self.state->openingDecodeWorkers && !self.state->workers.empty(),
+        "the decoders opened behind the window are installed");
 
     NSButton* toggle = self.sourceMonitorToggleButton;
     const NSPoint togglePoint =
@@ -12815,12 +12813,12 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
             const int opensBeforeIdleReload = gUiSmokeDecodeOpens;
             const size_t workersBeforeIdleReload = self.state->workers.size();
             [self reloadDecodeWorkers];
-            UiSmokeCheck(workersBeforeIdleReload > 0 &&
-                             self.state->workers.size() ==
-                                 workersBeforeIdleReload &&
-                             gUiSmokeDecodeOpens == opensBeforeIdleReload,
-                         "Reloading decoders without a media change reopens "
-                         "no media");
+            UiSmokeCheck(
+                workersBeforeIdleReload > 0 &&
+                    self.state->workers.size() == workersBeforeIdleReload &&
+                    gUiSmokeDecodeOpens == opensBeforeIdleReload,
+                "Reloading decoders without a media change reopens "
+                "no media");
 
             const int reloadsBeforeRenameHistory = gUiSmokeDecodeReloads;
             [self menuUndo:nil];

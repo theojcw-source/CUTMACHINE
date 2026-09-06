@@ -100,16 +100,14 @@ int main() {
     snapshot = manager.Snapshot();
     check(snapshot.size() <= MediaTaskManager::kRetainedFinishedTasks,
           "finished task history stays bounded");
-    const auto newest = std::find_if(
-        snapshot.begin(), snapshot.end(),
-        [&](const MediaTaskSnapshot& task) {
-            return task.id == manyIds.back();
-        });
-    const auto oldest = std::find_if(
-        snapshot.begin(), snapshot.end(),
-        [&](const MediaTaskSnapshot& task) {
-            return task.id == manyIds.front();
-        });
+    const auto newest = std::find_if(snapshot.begin(), snapshot.end(),
+                                     [&](const MediaTaskSnapshot& task) {
+                                         return task.id == manyIds.back();
+                                     });
+    const auto oldest = std::find_if(snapshot.begin(), snapshot.end(),
+                                     [&](const MediaTaskSnapshot& task) {
+                                         return task.id == manyIds.front();
+                                     });
     check(newest != snapshot.end() && oldest == snapshot.end(),
           "the newest finished tasks are the ones kept");
 
