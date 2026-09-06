@@ -512,6 +512,40 @@ int main() {
               projectLogBeforeRejection,
           "refused project operation leaves project log byte-identical");
 
+    // B10 -- ROADMAP.md, on the project journal. A timeline edit and a
+    // project edit keep separate histories, and committing one must not
+    // publish an empty version of the other: --apply-op and --undo used to
+    // hand CommitStoredProjectAndLogs a default-constructed ProjectEditLog,
+    // which erased every project undo step on each clip the agent moved.
+    const std::string projectLogBeforeTimelineEdit =
+        Read(ProjectEditLogPathForProject(projectPath.string()));
+    const Operation timelineEditOnProject = TrimClipOperation{
+        "01K30000000000000000000003", TrimEdge::Tail, {-1, 25}, std::nullopt};
+    Check(ApplyOperationCommand(projectPath.string(),
+                                SerializeOperation(timelineEditOnProject),
+                                result) == 0,
+          "timeline edit on a project with history succeeds: " + result);
+    Check(Read(ProjectEditLogPathForProject(projectPath.string())) ==
+              projectLogBeforeTimelineEdit,
+          "a timeline edit leaves the project journal byte-identical");
+    Check(UndoOperationCommand(projectPath.string(), result) == 0,
+          "undoing that timeline edit succeeds: " + result);
+    Check(Read(ProjectEditLogPathForProject(projectPath.string())) ==
+              projectLogBeforeTimelineEdit,
+          "undoing a timeline edit leaves the project journal byte-identical");
+    ProjectEditLog survivingProjectLog;
+    Check(
+        ProjectEditLog::Load(ProjectEditLogPathForProject(projectPath.string()),
+                             survivingProjectLog, editError, detail) &&
+            survivingProjectLog.AppliedCount() == 1,
+        "project history survives timeline edits: " + detail);
+    Check(UndoProjectOperationCommand(projectPath.string(), result) == 0,
+          "project undo still reaches the step taken before the timeline "
+          "edit: " +
+              result);
+    Check(RedoProjectOperationCommand(projectPath.string(), result) == 0,
+          "project redo replays it: " + result);
+
     // B10 -- reproduce the measured project cardinality and the exact cleanup
     // shape. Corrupt journals are stronger than a timing-only assertion: an
     // eager reader would reject them, while the lazy project path must leave

@@ -2133,81 +2133,6 @@ int ProposeSequenceCommand(const std::string& projectPath,
     return 0;
 }
 
-int ApplyOperationCommand(const std::string& documentPath,
-                          const std::string& operationJson, std::string& output,
-                          const std::string& timelineId) {
-    Operation operation = RemoveClipOperation{};
-    EditError error = EditError::None;
-    std::string message;
-    if (!DeserializeOperation(operationJson, operation, error, message)) {
-        output = ErrorJson(error, message);
-        return 1;
-    }
-
-    Project project;
-    if (!LoadStoredProject(documentPath, project, message)) {
-        output = ErrorJson(EditError::ParseError, message);
-        return 1;
-    }
-    const Ulid selectedTimeline =
-        timelineId.empty() ? project.active_timeline_id : timelineId;
-    if (!project.FindTimeline(selectedTimeline)) {
-        output = ErrorJson(EditError::UnknownSequence,
-                           "unknown timeline_id '" + selectedTimeline + "'");
-        return 1;
-    }
-    Document document = project.MakeDocument(selectedTimeline);
-    // DELTA-2026-08 -- the state the caller already knows about. Kept so the
-    // result can say what changed instead of making the caller re-read the
-    // whole timeline to find out.
-    const Document before = document;
-
-    EditLog log;
-    const std::string timelineLogPath =
-        TimelineEditLogPathForProject(documentPath, selectedTimeline);
-    std::string logPath = timelineLogPath;
-    std::error_code existsError;
-    bool logExists = std::filesystem::exists(logPath, existsError);
-    if (existsError) {
-        output = ErrorJson(EditError::IoError,
-                           "unable to inspect edit log '" + logPath +
-                               "': " + existsError.message());
-        return 1;
-    }
-    if (logExists) {
-        std::string logJson;
-        if (!ReadFile(logPath, logJson, message)) {
-            output = ErrorJson(EditError::IoError, message);
-            return 1;
-        }
-        if (!EditLog::Deserialize(logJson, log, error, message)) {
-            output = ErrorJson(error, message);
-            return 1;
-        }
-    }
-
-    if (!log.Apply(document, std::move(operation), error, message)) {
-        output = ErrorJson(error, message);
-        return 1;
-    }
-
-    const std::string updatedDocument = document.SaveToString();
-    std::map<std::string, EditLog> logs;
-    logs[selectedTimeline] = log;
-    ProjectEditLog projectLog;
-    if (!project.CommitDocument(selectedTimeline, document, message) ||
-        !CommitStoredProjectAndLogs(documentPath, project, logs, projectLog,
-                                    message)) {
-        output = ErrorJson(EditError::IoError, message);
-        return 1;
-    }
-    DocumentDelta delta;
-    ComputeDocumentDelta(before, document, delta);
-    output = "{\"ok\":true,\"doc_hash\":\"" + CanonicalHash(updatedDocument) +
-             "\",\"delta\":" + SerializeDocumentDelta(delta) + "}\n";
-    return 0;
-}
-
 namespace {
 
 bool LoadOptionalTimelineLog(const std::string& projectPath,
@@ -2244,6 +2169,76 @@ bool LoadOptionalProjectLog(const std::string& projectPath, ProjectEditLog& log,
     return ReadFile(path, json, message) &&
            ProjectEditLog::Deserialize(json, log, error, message);
 }
+
+}  // namespace
+
+int ApplyOperationCommand(const std::string& documentPath,
+                          const std::string& operationJson, std::string& output,
+                          const std::string& timelineId) {
+    Operation operation = RemoveClipOperation{};
+    EditError error = EditError::None;
+    std::string message;
+    if (!DeserializeOperation(operationJson, operation, error, message)) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+
+    Project project;
+    if (!LoadStoredProject(documentPath, project, message)) {
+        output = ErrorJson(EditError::ParseError, message);
+        return 1;
+    }
+    const Ulid selectedTimeline =
+        timelineId.empty() ? project.active_timeline_id : timelineId;
+    if (!project.FindTimeline(selectedTimeline)) {
+        output = ErrorJson(EditError::UnknownSequence,
+                           "unknown timeline_id '" + selectedTimeline + "'");
+        return 1;
+    }
+    Document document = project.MakeDocument(selectedTimeline);
+    // DELTA-2026-08 -- the state the caller already knows about. Kept so the
+    // result can say what changed instead of making the caller re-read the
+    // whole timeline to find out.
+    const Document before = document;
+
+    EditLog log;
+    if (!LoadOptionalTimelineLog(documentPath, selectedTimeline, log, error,
+                                 message)) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+
+    if (!log.Apply(document, std::move(operation), error, message)) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+
+    const std::string updatedDocument = document.SaveToString();
+    std::map<std::string, EditLog> logs;
+    logs[selectedTimeline] = log;
+    // B10 -- ROADMAP.md, extended to the project journal. A timeline edit
+    // leaves project-level history untouched, so it has to be read back and
+    // rewritten as-is: committing a default-constructed one erased every
+    // project undo step on each --apply-op and each MCP tool call.
+    ProjectEditLog projectLog;
+    if (!LoadOptionalProjectLog(documentPath, projectLog, error, message)) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
+    if (!project.CommitDocument(selectedTimeline, document, message) ||
+        !CommitStoredProjectAndLogs(documentPath, project, logs, projectLog,
+                                    message)) {
+        output = ErrorJson(EditError::IoError, message);
+        return 1;
+    }
+    DocumentDelta delta;
+    ComputeDocumentDelta(before, document, delta);
+    output = "{\"ok\":true,\"doc_hash\":\"" + CanonicalHash(updatedDocument) +
+             "\",\"delta\":" + SerializeDocumentDelta(delta) + "}\n";
+    return 0;
+}
+
+namespace {
 
 int MutateProjectLogCommand(
     const std::string& projectPath,
@@ -2388,7 +2383,14 @@ int MutateTimelineLogCommand(const std::string& documentPath, bool redo,
     const std::string updatedDocument = document.SaveToString();
     std::map<std::string, EditLog> logs;
     logs[selectedTimeline] = log;
+    // B10 -- ROADMAP.md, extended to the project journal, for the same
+    // reason ApplyOperationCommand above reloads it: undoing a timeline edit
+    // must not erase project-level history.
     ProjectEditLog projectLog;
+    if (!LoadOptionalProjectLog(documentPath, projectLog, error, message)) {
+        output = ErrorJson(error, message);
+        return 1;
+    }
     if (!project.CommitDocument(selectedTimeline, document, message) ||
         !CommitStoredProjectAndLogs(documentPath, project, logs, projectLog,
                                     message)) {
