@@ -946,3 +946,176 @@ automatique. Répéter les cas pour distinguer progrès et variance du modèle.
 Ordre : IA1/IA2 terminés, établir la référence IA6, puis IA3 et IA4. IA5 peut
 avancer en parallèle. Mesurer chaque changement avant d'en attribuer le gain
 à un nouveau modèle, à un prompt plus long ou à davantage d'appels d'outils.
+
+## Coût d'attente à l'usage — PERF-2026-09
+
+Ce lot ne réduit pas un temps de calcul : il supprime du travail refait à
+l'identique. Chaque point ci-dessous est une opération déjà faite qu'on
+recommençait — sonder un rush dont le document porte déjà les métadonnées,
+rouvrir un décodeur encore correct, relire un projet que rien n'a modifié,
+réécrire des octets déjà présents sur le disque. Le repère est le volume
+externe USB/exFAT sur lequel les projets sont montés, pas un SSD interne :
+c'est là que la milliseconde d'I/O se paie, et c'est là que le montage se
+fait.
+
+Deux tickets restent ouverts et n'ont pas été mesurés : ce tableau ne
+prétend pas couvrir tout le coût d'attente de l'éditeur.
+
+| Ticket | État | Résultat attendu |
+|---|---|---|
+| PERF1 — Ouverture sans re-sondage | fait | Le document répond pour les rushes qu'il décrit ; seuls les médias hérités sans métadonnées vont au disque |
+| PERF2 — Décodeurs réutilisés, ouverts hors thread principal | fait | Une mutation de projet ne rouvre que les sources qui ont changé ; l'ouverture ne bloque plus la fenêtre |
+| PERF3 — Préchargement au raccord et maintien d'image | fait | Plus de flash de la piste inférieure en passant un raccord en lecture |
+| PERF4 — Historique des tâches média borné | fait | `Snapshot()` ne recopie plus tout l'historique de session à chaque tick |
+| PERF5 — Backend MCP : un chargement par appel | fait | Un appel d'outil ne relit plus le paquet trois ou quatre fois |
+| PERF6 — Commit : ne réécrire que ce qui diffère | fait | Une timeline modifiée ne provoque plus la réécriture fsync du paquet entier |
+| PERF7 — Coût du rendu de la timeline | à faire | `timelineRenderData` est reconstruit en entier à chaque tick, non mesuré |
+| PERF8 — Repère de mesure reproductible | à préparer | Aucun chiffre de ce lot n'est rejouable : ni projet témoin, ni protocole |
+
+### PERF1 — Ouverture sans re-sondage
+
+L'ouverture sondait chaque rush (`avformat_open_input` puis
+`avformat_find_stream_info`, environ 110 ms pour un fichier caméra de 256 Mo)
+pour remplir une carte de métadonnées que `LibraryMedia` contenait déjà, et
+dont `metadata_complete` disait déjà si elle avait été sondée. Le reste du
+projet fait confiance à ce champ — `Operations.cc` valide les insertions
+contre lui, `Export.cc` en résout le livrable, le relink et les planches le
+lisent. Seul ce chemin retournait au fichier, ce qui permettait au moniteur
+d'afficher une rotation que l'export n'appliquait pas : deux réponses à une
+question, et la lente n'était pas la bonne.
+
+Le magasin répond donc, et le disque n'est consulté que pour ce qu'il ne
+peut pas décrire (médias de version 1 promus sans métadonnées techniques,
+sources sans entrée de bibliothèque). Contrepartie assumée : un rush
+remplacé sur le disque à l'insu du projet ne change plus le moniteur tant
+qu'il n'est pas ré-ingéré ou relié — il ne changeait déjà pas l'export, donc
+les deux s'accordent au lieu de diverger, et un échange qui compte reste
+rattrapé à l'ouverture du décodeur par `DecodeWorkerMatchesSource`.
+
+### PERF2 — Décodeurs réutilisés, ouverts hors thread principal
+
+`reloadDecodeWorkers` arrêtait *tous* les décodeurs et les rouvrait *tous*,
+sur le thread principal, à chaque appel — donc après chaque mutation de
+projet et chaque bascule de proxy. Vider le cache d'images de chaque source
+au passage jetait des images encore valides, si bien que les premières
+images de lecture suivantes se redécodaient aussi.
+
+`DecodeWorker::Path()` expose le média réellement ouvert, substitution de
+proxy comprise : un worker déjà ouvert sur exactement ce que le document
+nomme est encore correct, et tout ce qu'il a mis en cache l'est aussi. Seules
+les sources apparues, disparues ou changées sont touchées.
+
+L'ouverture initiale, elle, se fait derrière la fenêtre une fois celle-ci à
+l'écran (`-openDecodeWorkersInBackground`), avec installation des résultats
+sur le thread principal. Un résultat dont la source a disparu, changé de
+média ou acquis un worker entre-temps est jeté plutôt que de disputer la
+place à `reloadDecodeWorkers`.
+
+Limite connue : un worker écarté à l'installation est détruit, et
+`~DecodeWorker` désenregistre son identifiant de source du cache d'images.
+Si `reloadDecodeWorkers` a installé entre-temps un worker pour la même
+source, cet identifiant sort de `activeSources_` alors qu'il est vivant.
+`activeSources_` ne sert qu'à calculer la fenêtre de préchargement par
+source : la conséquence est un budget momentanément trop large, corrigé au
+rechargement suivant. Aucune image n'est perdue, mais le compteur n'est pas
+un compte de références et gagnerait à en devenir un.
+
+### PERF3 — Préchargement au raccord et maintien d'image
+
+Le décodeur du plan entrant n'était sollicité qu'une fois la tête de lecture
+arrivée sur le raccord — une image trop tard pour un seek suivi d'un décodage.
+`Renderer.mm` composite de bas en haut et *saute* une image nulle : une
+couche en retard ne dessine pas « pas prêt », elle ne dessine rien, et la
+piste du dessous apparaît. C'est l'origine du flash au raccord.
+
+Deux moitiés, séparées exprès. `Timeline::ResolveUpcoming(position,
+direction, lookahead)` est une fonction pure et testée qui rend la première
+image dont la lecture aura besoin de l'autre côté du raccord le plus proche
+de chaque piste, dans le sens de déplacement ; l'appelant ne réchauffe pas
+une source déjà affichée, un worker ne retenant qu'une image cible.
+`PlaybackPresentation.h` — C++ portable sans AppKit, comme `UiTheme.h` —
+décide si le moniteur Record peut composer ce que le cache contient ou doit
+tenir son image précédente un tick de plus. Une couche active, non décodée
+mais décodable fait tenir l'image ; une source hors ligne, qui ne sera jamais
+remplie, ne prend pas le moniteur en otage. Plafond de 30 ticks (une
+demi-seconde à 60 Hz), après quoi le composite est présenté tel quel, trou
+compris, ce qui est au moins honnête sur l'état du lecteur.
+
+Non validé à l'écran : comme tout le reste de la Phase 2, l'absence de flash
+relève de [`VISUAL_QA_CHECKLIST.md`](VISUAL_QA_CHECKLIST.md) et n'a pas été
+constatée sur un vrai Mac.
+
+### PERF4 — Historique des tâches média borné
+
+Les tâches terminées étaient conservées indéfiniment, et `Snapshot()` les
+recopiait toutes — quatre `std::string` pièce — sous le mutex que prennent
+les workers pour rapporter leur progression. L'éditeur l'interroge à chaque
+tick d'affichage : importer quelques centaines de rushes transformait une
+fenêtre au repos en copie permanente à 60 Hz de tout l'historique de session,
+ralentissant les workers avec elle. `kRetainedFinishedTasks = 256`, les plus
+anciennes tombant à mesure que d'autres se terminent. La borne est large
+exprès : l'éditeur réconcilie les tâches terminées contre ses propres listes
+une fois par tick, donc il faudrait 256 fins de tâche dans un même tick pour
+en perdre une.
+
+### PERF5 — Backend MCP : un chargement par appel
+
+Un seul appel d'outil MCP rechargeait le paquet complet trois à quatre fois :
+pour résoudre la timeline, pour le snapshot contre lequel le dispatcher
+résout les alias, en général une fois de plus dans le dispatcher, et encore
+une fois dans la commande CLI qui applique l'édition. Chacune relit le
+fichier projet *plus tous les `Timelines/*.json`*, les parse et revalide le
+résultat.
+
+`--mcp-serve` tient le verrou de session pendant toute sa durée de vie :
+rien hors de ce processus ne peut déplacer ces octets, donc ces
+rechargements étaient de la répétition, pas des relectures de quelque chose
+qui avait changé. `McpProjectBackend` garde le projet chargé et l'invalidation
+est prise par une `CommandScope` — la portée est tracée à « exécute une
+commande » et non à « écrit », pour que savoir si une commande committe reste
+l'affaire de `Cli.cc`, et qu'une commande devenue écrivante plus tard
+n'invalide pas ce raisonnement en silence.
+
+La comparaison taille + date d'écriture n'est qu'un second avis, pour un
+paquet édité hors de CUTMACHINE : elle ne tient pas seule (deux éditions
+consécutives peuvent laisser la même longueur et, sur exFAT et ses deux
+secondes de résolution, la même date), et elle ne porte que sur le fichier
+projet alors que le chargement lit aussi les timelines à côté. Ce qui rend le
+cache correct est l'invalidation par commande, pas cet horodatage.
+
+### PERF6 — Commit : ne réécrire que ce qui diffère
+
+Chaque commit reçoit le paquet entier — fichier projet, manifeste, chaque
+timeline, chaque journal — même quand une seule timeline a bougé. Chaque
+octet réécrit coûte un `F_FULLFSYNC` plus deux syncs de répertoire : sur un
+volume USB/exFAT, des dizaines de millisecondes pièce, payées sur le thread
+depuis lequel l'éditeur dessine. `CommitArtifacts` compare d'abord et ne
+réécrit que ce qui diffère : une génération est durable dès que ses octets
+sont sur disque, et un artefact dont les octets y sont déjà l'est par
+définition.
+
+Deux points d'ordre : la comparaison se fait **après** `RecoverTransaction`,
+car tant que la reprise n'a pas tourné ce qui est sur disque peut être une
+génération à moitié committée, et comparer contre ça sauterait un artefact
+qui a besoin d'être réécrit ; et cela n'affaiblit aucune garantie de
+`SAVING_ROADMAP.md` S2, puisque ce qui n'est pas réécrit n'est pas changé et
+n'a donc besoin ni du journal ni d'une entrée de rollback.
+
+### PERF7 — Coût du rendu de la timeline
+
+Non entamé. `timelineRenderData` ([`src/main.mm`](src/main.mm), non testée)
+reconstruit la display list entière à chaque tick, quads de toutes les pistes
+compris, qu'il y ait eu un changement ou non. Le coût n'est pas mesuré et ne
+doit pas être supposé : c'est le prochain endroit à instrumenter, pas le
+prochain à optimiser.
+
+### PERF8 — Repère de mesure reproductible
+
+À préparer, et c'est la dette la plus gênante de ce lot. Les chiffres cités
+ici (110 ms de sondage, dizaines de millisecondes par fsync) sont des
+observations ponctuelles sur une machine et un volume, sans projet témoin
+suivi ni protocole écrit : ils ne sont pas rejouables, et personne ne peut
+donc vérifier qu'un changement ultérieur a conservé le gain. Un projet de
+référence avec un nombre de rushes fixé, sur un volume externe, et une
+procédure de mesure des mêmes points, permettrait aux PERF suivants
+d'affirmer un gain plutôt que de le raconter.
