@@ -393,10 +393,10 @@ int main() {
     // the LaCie drives this project is edited from are exFAT.
     Project cacheProject = Project::FromDocument(Fixture(), "Cache fixture");
     std::string cachePath;
-    Check(CreatePortableProject(
-              (directory / "Cache.cutmachine-project").string(), cacheProject,
-              cachePath, error),
-          "cache fixture package saves: " + error);
+    Check(
+        CreatePortableProject((directory / "Cache.cutmachine-project").string(),
+                              cacheProject, cachePath, error),
+        "cache fixture package saves: " + error);
 
     McpProjectBackend cacheBackend(cachePath);
     Document cachedBefore;
@@ -431,8 +431,7 @@ int main() {
           "the second snapshot succeeds: " + cacheMessage);
     const DocumentClip* movedClip =
         cachedAfter.FindClip("01K30000000000000000000003");
-    Check(movedClip != nullptr &&
-              movedClip->timeline_in == RationalTime{9, 25},
+    Check(movedClip != nullptr && movedClip->timeline_in == RationalTime{9, 25},
           "a snapshot taken after an edit through the same backend sees the "
           "edit, with neither the file's size nor its timestamp to reveal it");
 

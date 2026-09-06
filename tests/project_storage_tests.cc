@@ -144,8 +144,7 @@ int main() {
         TimelineEditLogPathForProject(sourceProject, editedTimeline);
     const fs::path untouchedLogPath =
         TimelineEditLogPathForProject(sourceProject, untouchedTimeline);
-    const fs::path projectLogPath =
-        ProjectEditLogPathForProject(sourceProject);
+    const fs::path projectLogPath = ProjectEditLogPathForProject(sourceProject);
 
     const ino_t manifestInode = inodeOf(manifestPath);
     const ino_t untouchedInode = inodeOf(untouchedPath);
