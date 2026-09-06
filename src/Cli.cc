@@ -204,6 +204,7 @@ struct CommitArtifact {
     bool backed_up = false;
     bool committed = false;
     bool remove = false;
+    bool unchanged = false;
 };
 
 std::string HexEncode(const std::string& input) {
@@ -387,6 +388,24 @@ void RemoveTransactionLeftovers(const std::filesystem::path& directory) {
     }
 }
 
+// PERF-2026-09. A generation is durable once its bytes are on disk -- and an
+// artifact whose bytes are already exactly there is, by definition, already
+// durable. Every commit hands us the whole package (project file, manifest,
+// each timeline, each journal) even when one timeline moved, and each byte
+// rewritten costs an F_FULLFSYNC plus two directory syncs: on an external
+// USB/exFAT volume that is tens of milliseconds apiece, paid on the thread
+// the editor draws from. Comparing first turns those into one cheap read.
+// This weakens no guarantee in SAVING_ROADMAP.md S2: what is not rewritten
+// is not changed, so it needs neither the journal nor a rollback entry.
+bool ArtifactMatchesDisk(const CommitArtifact& artifact, bool exists) {
+    if (artifact.remove) return !exists;
+    if (!exists) return false;
+    std::string existing;
+    std::string ignored;
+    return ReadFile(artifact.path.string(), existing, ignored) &&
+           existing == artifact.contents;
+}
+
 // S2 -- SAVING_ROADMAP.md. Every byte and the rollback marker reach durable
 // storage before an existing canonical destination is moved.
 bool CommitArtifacts(std::vector<CommitArtifact> artifacts,
@@ -405,6 +424,25 @@ bool CommitArtifacts(std::vector<CommitArtifact> artifacts,
         }
     if (!RecoverTransaction(directory, message)) return false;
     RemoveTransactionLeftovers(directory);
+    // Recovery first: until it has run, what is on disk may still be a
+    // half-committed generation, and comparing against that would skip an
+    // artifact that does need rewriting.
+    for (CommitArtifact& artifact : artifacts) {
+        std::error_code existsError;
+        artifact.existed = std::filesystem::exists(artifact.path, existsError);
+        if (existsError) {
+            message = "unable to inspect '" + artifact.path.string() +
+                      "': " + existsError.message();
+            return false;
+        }
+        artifact.unchanged = ArtifactMatchesDisk(artifact, artifact.existed);
+    }
+    artifacts.erase(std::remove_if(artifacts.begin(), artifacts.end(),
+                                   [](const CommitArtifact& artifact) {
+                                       return artifact.unchanged;
+                                   }),
+                    artifacts.end());
+    if (artifacts.empty()) return true;
     const std::string nonce = ".cutmachine-" + GenerateUlid();
     const std::filesystem::path marker = directory / ".cutmachine-transaction";
     const std::filesystem::path markerTemporary =
@@ -424,14 +462,6 @@ bool CommitArtifacts(std::vector<CommitArtifact> artifacts,
     for (CommitArtifact& artifact : artifacts) {
         artifact.temporary = artifact.path.string() + nonce + ".tmp";
         artifact.backup = artifact.path.string() + nonce + ".bak";
-        std::error_code existsError;
-        artifact.existed = std::filesystem::exists(artifact.path, existsError);
-        if (existsError) {
-            message = "unable to inspect '" + artifact.path.string() +
-                      "': " + existsError.message();
-            cleanupTemporary();
-            return false;
-        }
         if (!artifact.remove &&
             !WriteFile(artifact.temporary, artifact.contents, message)) {
             cleanupTemporary();

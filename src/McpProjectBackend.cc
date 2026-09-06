@@ -44,6 +44,43 @@ McpProjectBackend::McpProjectBackend(std::string projectPath,
     : project_path_(std::move(projectPath)),
       require_explicit_timeline_(requireExplicitTimeline) {}
 
+// See McpProjectBackend.h for why a session-lifetime cache is sound here.
+// The size/mtime comparison is only a second opinion, for a package edited
+// outside CUTMACHINE altogether: it cannot stand on its own, because two
+// consecutive edits can leave the project file the same length and, on
+// exFAT's two-second timestamp resolution, the same mtime. What makes the
+// cache correct is that every command that could write drops it.
+bool McpProjectBackend::LoadProject(Project& project, std::string& message) {
+    const std::filesystem::path path(project_path_);
+    std::error_code sizeError;
+    const std::uintmax_t size = std::filesystem::file_size(path, sizeError);
+    std::error_code timeError;
+    const std::filesystem::file_time_type writeTime =
+        std::filesystem::last_write_time(path, timeError);
+    const bool stamped = !sizeError && !timeError;
+    if (cache_valid_ && stamped && size == cached_size_ &&
+        writeTime == cached_write_time_) {
+        project = cached_project_;
+        return true;
+    }
+    InvalidateCache();
+    if (!LoadStoredProject(project_path_, project, message)) return false;
+    if (stamped) {
+        cached_project_ = project;
+        cached_size_ = size;
+        cached_write_time_ = writeTime;
+        cache_valid_ = true;
+    }
+    return true;
+}
+
+void McpProjectBackend::InvalidateCache() {
+    cache_valid_ = false;
+    cached_project_ = Project{};
+    cached_size_ = 0;
+    cached_write_time_ = {};
+}
+
 bool McpProjectBackend::SelectTimelineForEdit(const std::string& timelineId,
                                               std::string& errorName,
                                               std::string& message) {
@@ -53,7 +90,7 @@ bool McpProjectBackend::SelectTimelineForEdit(const std::string& timelineId,
         return false;
     }
     Project project;
-    if (!LoadStoredProject(project_path_, project, message)) {
+    if (!LoadProject(project, message)) {
         errorName = "IoError";
         return false;
     }
@@ -71,7 +108,7 @@ bool McpProjectBackend::SelectTimelineForEdit(const std::string& timelineId,
 bool McpProjectBackend::SnapshotDocument(Document& document,
                                          std::string& message) {
     Project project;
-    if (!LoadStoredProject(project_path_, project, message)) return false;
+    if (!LoadProject(project, message)) return false;
     document = selected_timeline_id_.empty()
                    ? project.MakeActiveDocument()
                    : project.MakeDocument(selected_timeline_id_);
@@ -82,6 +119,7 @@ bool McpProjectBackend::ApplyOperation(Operation operation,
                                        std::string& resultJson,
                                        std::string& errorName,
                                        std::string& message) {
+    const CommandScope scope(*this);
     const std::string operationJson = SerializeOperation(operation);
     std::string output;
     const int result = ApplyOperationCommand(project_path_, operationJson,
@@ -94,6 +132,7 @@ bool McpProjectBackend::ApplyProjectEdit(ProjectOperation operation,
                                          std::string& resultJson,
                                          std::string& errorName,
                                          std::string& message) {
+    const CommandScope scope(*this);
     std::string output;
     const int result = ApplyProjectOperationCommand(
         project_path_, SerializeProjectOperation(operation), output);
@@ -104,7 +143,7 @@ bool McpProjectBackend::ApplyProjectEdit(ProjectOperation operation,
 bool McpProjectBackend::ReadTimelineTranscript(std::string& json,
                                                std::string& message) {
     Project project;
-    if (!LoadStoredProject(project_path_, project, message)) return false;
+    if (!LoadProject(project, message)) return false;
     const std::filesystem::path projectPath =
         std::filesystem::absolute(project_path_);
     return DescribeTimelineTranscriptForAgent(
@@ -151,6 +190,7 @@ bool McpProjectBackend::ReadSourceSpeechOnset(const Ulid& sourceId,
 bool McpProjectBackend::AnalyzeSourceSpeechOnset(
     const Ulid& sourceId, const SpeechOnsetSettings& settings,
     std::string& resultJson, std::string& message) {
+    const CommandScope scope(*this);
     std::string output;
     const int result =
         AnalyzeSpeechOnsetCommand(project_path_, sourceId, output, settings);
@@ -162,6 +202,7 @@ bool McpProjectBackend::AnalyzeSourceSpeechOnset(
 bool McpProjectBackend::AlignSourceTranscripts(bool apply,
                                                std::string& resultJson,
                                                std::string& message) {
+    const CommandScope scope(*this);
     std::string output;
     const int result = AlignTranscriptsCommand(project_path_, apply, output);
     std::string errorName;
@@ -172,6 +213,7 @@ bool McpProjectBackend::AlignSourceTranscripts(bool apply,
 bool McpProjectBackend::AnalyzeSourceShotQuality(const Ulid& sourceId,
                                                  std::string& resultJson,
                                                  std::string& message) {
+    const CommandScope scope(*this);
     // Same command `--shot-quality` runs, for the same reason ApplyOperation
     // reuses ApplyOperationCommand: one analysis path, not two.
     std::string output;
@@ -187,6 +229,7 @@ bool McpProjectBackend::TranscribeSources(const std::vector<Ulid>& sourceIds,
                                           bool verbatim, bool includeSilent,
                                           std::string& resultJson,
                                           std::string& message) {
+    const CommandScope scope(*this);
     // Same command `--transcribe` runs. The empty model path is deliberate:
     // it resolves the locally configured model, which is the only form a
     // caller that is not a human typing a path can use.
@@ -204,6 +247,7 @@ bool McpProjectBackend::TranscribeTimeline(const std::string& timelineId,
                                            bool verbatim,
                                            std::string& resultJson,
                                            std::string& message) {
+    const CommandScope scope(*this);
     std::string output;
     const int result = TranscribeTimelineCommand(project_path_, timelineId,
                                                  language, verbatim, output);
@@ -217,7 +261,7 @@ bool McpProjectBackend::CaptureSourceFrame(const Ulid& sourceId,
                                            std::string& jpegBytes,
                                            std::string& message) {
     Project project;
-    if (!LoadStoredProject(project_path_, project, message)) return false;
+    if (!LoadProject(project, message)) return false;
     const auto media = std::find_if(
         project.rushes.begin(), project.rushes.end(),
         [&](const LibraryMedia& item) { return item.id == sourceId; });
@@ -242,7 +286,7 @@ bool McpProjectBackend::CaptureTimelineSheet(
     const TimelineSheetPlan& plan, const TimelineSheetSettings& settings,
     std::string& jpegBytes, std::string& message) {
     Project project;
-    if (!LoadStoredProject(project_path_, project, message)) return false;
+    if (!LoadProject(project, message)) return false;
     const Document document = selected_timeline_id_.empty()
                                   ? project.MakeActiveDocument()
                                   : project.MakeDocument(selected_timeline_id_);
@@ -254,6 +298,7 @@ bool McpProjectBackend::CaptureTimelineSheet(
 
 bool McpProjectBackend::Undo(std::string& resultJson, std::string& errorName,
                              std::string& message) {
+    const CommandScope scope(*this);
     std::string output;
     const int result =
         UndoOperationCommand(project_path_, output, selected_timeline_id_);
@@ -263,6 +308,7 @@ bool McpProjectBackend::Undo(std::string& resultJson, std::string& errorName,
 
 bool McpProjectBackend::Redo(std::string& resultJson, std::string& errorName,
                              std::string& message) {
+    const CommandScope scope(*this);
     std::string output;
     const int result =
         RedoOperationCommand(project_path_, output, selected_timeline_id_);
@@ -271,6 +317,7 @@ bool McpProjectBackend::Redo(std::string& resultJson, std::string& errorName,
 }
 
 bool McpProjectBackend::Describe(std::string& json, std::string& message) {
+    const CommandScope scope(*this);
     std::string output;
     const int result = DescribeCommand(project_path_, output);
     if (result == 0) {

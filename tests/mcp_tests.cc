@@ -380,6 +380,61 @@ int main() {
           "an engine-refused tool call also leaves the project file "
           "byte-identical");
 
+    // ---- the session cache never outlives an edit made through it ----
+    // PERF-2026-09. McpProjectBackend keeps the project it loaded for the
+    // life of the session, because one tool call used to reload the whole
+    // package three or four times over. What makes that sound is that every
+    // command drops the cache -- not the size/mtime stamp kept beside it,
+    // which is only a second opinion for a package edited outside
+    // CUTMACHINE. So this drives an edit the stamp cannot see: one that
+    // leaves the project file exactly as long, with its modification time
+    // put back. That is not a contrivance -- it is what an exFAT volume,
+    // whose timestamps advance in two-second steps, produces on its own, and
+    // the LaCie drives this project is edited from are exFAT.
+    Project cacheProject = Project::FromDocument(Fixture(), "Cache fixture");
+    std::string cachePath;
+    Check(
+        CreatePortableProject((directory / "Cache.cutmachine-project").string(),
+                              cacheProject, cachePath, error),
+        "cache fixture package saves: " + error);
+
+    McpProjectBackend cacheBackend(cachePath);
+    Document cachedBefore;
+    std::string cacheMessage;
+    Check(cacheBackend.SnapshotDocument(cachedBefore, cacheMessage),
+          "the first snapshot loads and caches the project: " + cacheMessage);
+
+    const std::filesystem::path cacheFile(cachePath);
+    const auto stampedTime = std::filesystem::last_write_time(cacheFile);
+    const auto stampedSize = std::filesystem::file_size(cacheFile);
+
+    // timeline_in 5 -> 9: one digit for one digit, so the serialized project
+    // keeps its exact length. The clip occupies [9,19), still clear of the
+    // second clip at [20,30).
+    std::string moveResult;
+    std::string moveErrorName;
+    Check(cacheBackend.ApplyOperation(
+              MoveClipOperation{"01K30000000000000000000003",
+                                "01K30000000000000000000002",
+                                {9, 25},
+                                {}},
+              moveResult, moveErrorName, cacheMessage),
+          "the edit through the cached backend applies: " + moveErrorName +
+              " " + cacheMessage);
+    Check(std::filesystem::file_size(cacheFile) == stampedSize,
+          "the fixture edit leaves the project file exactly as long, so the "
+          "size half of the stamp cannot detect it");
+    std::filesystem::last_write_time(cacheFile, stampedTime);
+
+    Document cachedAfter;
+    Check(cacheBackend.SnapshotDocument(cachedAfter, cacheMessage),
+          "the second snapshot succeeds: " + cacheMessage);
+    const DocumentClip* movedClip =
+        cachedAfter.FindClip("01K30000000000000000000003");
+    Check(movedClip != nullptr && movedClip->timeline_in == RationalTime{9, 25},
+          "a snapshot taken after an edit through the same backend sees the "
+          "edit, with neither the file's size nor its timestamp to reveal it");
+
     server.Stop();
     std::filesystem::remove_all(directory);
 

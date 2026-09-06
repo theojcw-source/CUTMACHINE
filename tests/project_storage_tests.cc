@@ -6,6 +6,8 @@
 #include "ProjectStorage.h"
 #include "Ulid.h"
 
+#include <sys/stat.h>
+
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -118,6 +120,95 @@ int main() {
           "external media absent from the collection manifest is not "
           "reported as modified: " +
               error);
+
+    // PERF-2026-09. Every commit is handed the whole package, but only the
+    // artifacts whose bytes actually change may be rewritten: each rewrite
+    // costs an F_FULLFSYNC plus two directory syncs, and on an external
+    // exFAT volume that is what makes a single edit visibly stall the
+    // editor. A rewrite renames the destination aside and moves a fresh file
+    // into place, so the inode is the exact observable: it survives a skip
+    // and never survives a rewrite.
+    const auto inodeOf = [](const fs::path& path) -> ino_t {
+        struct stat status = {};
+        return ::stat(path.c_str(), &status) == 0 ? status.st_ino : 0;
+    };
+    const fs::path package = fs::path(sourceProject).parent_path();
+    const std::string editedTimeline = project.timelines.front().id;
+    const std::string untouchedTimeline = project.timelines.back().id;
+    const fs::path manifestPath = package / "manifest.json";
+    const fs::path editedPath =
+        package / "Timelines" / (editedTimeline + ".json");
+    const fs::path untouchedPath =
+        package / "Timelines" / (untouchedTimeline + ".json");
+    const fs::path editedLogPath =
+        TimelineEditLogPathForProject(sourceProject, editedTimeline);
+    const fs::path untouchedLogPath =
+        TimelineEditLogPathForProject(sourceProject, untouchedTimeline);
+    const fs::path projectLogPath = ProjectEditLogPathForProject(sourceProject);
+
+    const ino_t manifestInode = inodeOf(manifestPath);
+    const ino_t untouchedInode = inodeOf(untouchedPath);
+    const ino_t untouchedLogInode = inodeOf(untouchedLogPath);
+    const ino_t projectLogInode = inodeOf(projectLogPath);
+    const ino_t editedInode = inodeOf(editedPath);
+    const ino_t editedLogInode = inodeOf(editedLogPath);
+    Check(manifestInode != 0 && untouchedInode != 0 && editedInode != 0 &&
+              untouchedLogInode != 0 && projectLogInode != 0 &&
+              editedLogInode != 0,
+          "every package artifact exists before the incremental commit");
+
+    Check(CommitStoredProjectAndLogs(sourceProject, project, logs, projectLog,
+                                     error),
+          "re-committing an unchanged project succeeds: " + error);
+    Check(inodeOf(fs::path(sourceProject)) != 0 &&
+              inodeOf(manifestPath) == manifestInode &&
+              inodeOf(editedPath) == editedInode &&
+              inodeOf(untouchedPath) == untouchedInode &&
+              inodeOf(editedLogPath) == editedLogInode &&
+              inodeOf(untouchedLogPath) == untouchedLogInode &&
+              inodeOf(projectLogPath) == projectLogInode,
+          "a commit that changes nothing rewrites nothing");
+
+    // Edited on copies, and reverted below: everything after this block
+    // reads the package back from disk and expects the pristine fixture.
+    Project incrementalProject = project;
+    std::map<std::string, EditLog> incrementalLogs = logs;
+    Document editedDocument = incrementalProject.MakeDocument(editedTimeline);
+    EditError incrementalError = EditError::None;
+    std::string incrementalDetail;
+    DocumentMarker incrementalMarker;
+    incrementalMarker.name = "Incremental";
+    incrementalMarker.time = {50, 25};
+    Check(incrementalLogs.at(editedTimeline)
+              .Apply(editedDocument, AddMarkerOperation{incrementalMarker},
+                     incrementalError, incrementalDetail),
+          "incremental fixture edit applies: " + incrementalDetail);
+    Check(incrementalProject.CommitDocument(editedTimeline, editedDocument,
+                                            incrementalDetail),
+          "incremental fixture edit stages: " + incrementalDetail);
+    Check(CommitStoredProjectAndLogs(sourceProject, incrementalProject,
+                                     incrementalLogs, projectLog, error),
+          "committing one edited timeline succeeds: " + error);
+    Check(inodeOf(editedPath) != editedInode &&
+              inodeOf(editedLogPath) != editedLogInode,
+          "the edited timeline and its journal are rewritten");
+    Check(inodeOf(manifestPath) == manifestInode &&
+              inodeOf(untouchedPath) == untouchedInode &&
+              inodeOf(untouchedLogPath) == untouchedLogInode &&
+              inodeOf(projectLogPath) == projectLogInode,
+          "the manifest, the other timeline, its journal and the project "
+          "journal are left untouched");
+
+    Project reloadedIncremental;
+    Check(LoadStoredProject(sourceProject, reloadedIncremental, error) &&
+              reloadedIncremental.MakeDocument(editedTimeline)
+                      .sequence.markers.size() ==
+                  editedDocument.sequence.markers.size(),
+          "the incrementally committed generation reloads with its edit: " +
+              error);
+    Check(CommitStoredProjectAndLogs(sourceProject, project, logs, projectLog,
+                                     error),
+          "the pristine fixture is restored for the checks below: " + error);
 
     const fs::path destination = root / "Portable Film.cutmachine-project";
     PortableProjectResult result;
