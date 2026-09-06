@@ -401,6 +401,63 @@ int main() {
     });
 
     Test(
+        "upcoming cuts resolve the frame each decoder must be warmed with", [] {
+            const Document document = ValidDocument();
+            Timeline timeline(document);
+            const Ulid& firstSource = document.sources[0].id;
+            const Ulid& secondSource = document.sources[1].id;
+
+            const auto ahead = timeline.ResolveUpcoming({0, 25}, 1, {2, 25});
+            Check(ahead.size() == 2 && ahead[0].source_id == secondSource &&
+                      ahead[0].source_frame == 10 &&
+                      ahead[1].source_id == firstSource &&
+                      ahead[1].source_frame == 0,
+                  "a cut ahead resolves the incoming clip's first frame, one "
+                  "entry per track");
+
+            const auto near = timeline.ResolveUpcoming({0, 25}, 1, {1, 25});
+            Check(near.size() == 1 && near[0].source_id == firstSource &&
+                      near[0].source_frame == 0,
+                  "a cut beyond the lookahead is not warmed yet");
+
+            Check(timeline.ResolveUpcoming({2, 25}, 1, {2, 25}).empty(),
+                  "no cut ahead means nothing to warm");
+            Check(timeline.ResolveUpcoming({0, 25}, 0, {2, 25}).empty(),
+                  "a stopped playhead warms nothing");
+            Check(timeline.ResolveUpcoming({0, 25}, 1, {0, 25}).empty(),
+                  "an empty lookahead warms nothing");
+
+            const auto back = timeline.ResolveUpcoming({3, 25}, -1, {2, 25});
+            Check(back.size() == 2 && back[0].source_id == firstSource &&
+                      back[0].source_frame == 101 &&
+                      back[1].source_id == firstSource &&
+                      back[1].source_frame == 0,
+                  "played backward, a clip is entered by its last frame");
+
+            const auto backNear =
+                timeline.ResolveUpcoming({4, 25}, -1, {1, 25});
+            Check(backNear.size() == 1 &&
+                      backNear[0].source_id == secondSource &&
+                      backNear[0].source_frame == 11,
+                  "backward lookahead stops at the same distance forward "
+                  "lookahead does");
+
+            // Same set of tracks main.mm composites from
+            // (rebuildVideoTrackIds).
+            Document hidden = document;
+            hidden.sequence.tracks[1].visible = false;
+            Check(
+                Timeline(hidden).ResolveUpcoming({0, 25}, 1, {2, 25}).size() ==
+                    1,
+                "a hidden track feeds no layer, so it warms no decoder");
+            Document audio = document;
+            audio.sequence.tracks[1].kind = "audio";
+            Check(Timeline(audio).ResolveUpcoming({0, 25}, 1, {2, 25}).size() ==
+                      1,
+                  "an audio track warms no video decoder");
+        });
+
+    Test(
         "cross dissolve persists, validates handles and resolves two layers",
         [] {
             Document document = ValidDocument();

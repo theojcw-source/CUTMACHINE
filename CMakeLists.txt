@@ -552,6 +552,16 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME cutmachine_ui_theme_tests COMMAND cutmachine_ui_theme_tests)
 
+    # PERF-2026-09 -- the Record monitor's hold rule. PlaybackPresentation.h
+    # is plain C++ with no AppKit dependency, like UiTheme.h/PanelLayout.h
+    # around it, so this runs on a plain Linux host and under the sanitizers.
+    add_executable(cutmachine_playback_presentation_tests
+                   tests/playback_presentation_tests.cc)
+    target_include_directories(cutmachine_playback_presentation_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME cutmachine_playback_presentation_tests
+             COMMAND cutmachine_playback_presentation_tests)
+
     add_executable(cutmachine_panel_layout_tests tests/panel_layout_tests.cc)
     target_include_directories(cutmachine_panel_layout_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -648,6 +658,11 @@ if(BUILD_TESTING)
         CUTMACHINE_UI_SMOKE_TEST=1
         CUTMACHINE_SHADER_PATH="${SHADER_RUNTIME_PATH}"
         CUTMACHINE_ICON_DIR="${CUTMACHINE_ICON_OUTPUT_DIR}"
+        # PERF-2026-09. The smoke fixture's media used to be a text file, so
+        # every source in it was offline and no decoder ever opened. Real
+        # media is what lets the smoke run assert anything about decoders at
+        # all -- and it puts actual frames through the monitors besides.
+        FFMPEG_EXECUTABLE="${FFMPEG_EXECUTABLE}"
     )
     target_link_libraries(cutmachine_ui_smoke_tests PRIVATE
         cutmachine_model

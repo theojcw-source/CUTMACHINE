@@ -60,6 +60,8 @@ entre plusieurs tickets.
 - [ ] Le timecode affiché dans le dock bas et celui affiché dans le bandeau d'info sous la timeline sont toujours identiques (même formule, `Timecode.h`)
 - [ ] Scrub rapide (drag continu sur la barre) reste fluide, pas de lag perceptible
 - [ ] Mode NTSC (29.97 / 30000:1001) : le timecode ne dérive pas après plusieurs minutes de lecture
+- [ ] **Passage d'un plan au suivant en lecture (PERF-2026-09)** : sur un montage à deux pistes vidéo (interview en V1, plans de coupe en V2), lire à travers l'entrée *et* la sortie de chaque plan de coupe. Aucune image de la piste du dessous ne doit apparaître à la jonction ; en cas de décodeur en retard, le moniteur **garde l'image précédente** (jusqu'à une demi-seconde) au lieu de laisser un trou. Vérifier aussi en lecture arrière et en ×2/×4, et sur un plan de coupe jamais lu depuis l'ouverture du projet (cache froid) — c'est le cas qui produisait le flash
+- [ ] Un vrai trou dans le montage (V2 sans plan à cet endroit) laisse bien voir V1, immédiatement : le maintien d'image ne doit pas retarder ce cas-là
 
 ## 6. Interaction croisée entre panneaux
 

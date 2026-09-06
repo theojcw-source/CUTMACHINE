@@ -121,6 +121,7 @@ bool MediaTaskManager::Cancel(const Ulid& id) {
                          queue_.end());
             completion = task->completion;
             completed = task->snapshot;
+            PruneFinishedLocked();
             idleCondition_.notify_all();
         }
     }
@@ -144,6 +145,33 @@ std::vector<MediaTaskSnapshot> MediaTaskManager::Snapshot() const {
     result.reserve(tasks_.size());
     for (const auto& task : tasks_) result.push_back(task.second->snapshot);
     return result;
+}
+
+namespace {
+
+bool IsFinished(MediaTaskState state) {
+    return state == MediaTaskState::Succeeded ||
+           state == MediaTaskState::Failed ||
+           state == MediaTaskState::Cancelled;
+}
+
+}  // namespace
+
+// ULIDs sort by creation time, and so does the map that holds them, so the
+// first finished task encountered is the oldest one.
+void MediaTaskManager::PruneFinishedLocked() {
+    size_t finished = 0;
+    for (const auto& item : tasks_)
+        if (IsFinished(item.second->snapshot.state)) ++finished;
+    for (auto item = tasks_.begin();
+         item != tasks_.end() && finished > kRetainedFinishedTasks;) {
+        if (IsFinished(item->second->snapshot.state)) {
+            item = tasks_.erase(item);
+            --finished;
+        } else {
+            ++item;
+        }
+    }
 }
 
 bool MediaTaskManager::IdleLocked() const {
@@ -172,6 +200,7 @@ void MediaTaskManager::WorkerLoop() {
             task = tasks_.at(id);
             if (task->cancelled->load()) {
                 task->snapshot.state = MediaTaskState::Cancelled;
+                PruneFinishedLocked();
                 idleCondition_.notify_all();
                 continue;
             }
@@ -213,6 +242,7 @@ void MediaTaskManager::WorkerLoop() {
             }
             completed = task->snapshot;
             completion = task->completion;
+            PruneFinishedLocked();
             idleCondition_.notify_all();
         }
         if (completion) completion(completed);

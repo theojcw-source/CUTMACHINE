@@ -5,6 +5,7 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
+#include <vector>
 
 int main() {
     int failures = 0;
@@ -82,6 +83,35 @@ int main() {
               failure->state == MediaTaskState::Failed &&
               failure->error == "decode failed",
           "failure reason is retained");
+
+    // PERF-2026-09. Finished tasks used to accumulate for the life of the
+    // session, and the editor copies the whole set on every display tick, so
+    // importing a few hundred rushes left an idle window copying that
+    // history sixty times a second under the workers' own mutex. The history
+    // is bounded now, newest kept.
+    const size_t overflow = MediaTaskManager::kRetainedFinishedTasks + 40;
+    std::vector<Ulid> manyIds;
+    manyIds.reserve(overflow);
+    for (size_t index = 0; index < overflow; ++index)
+        manyIds.push_back(manager.Enqueue(
+            MediaTaskKind::Thumbnail, "bulk",
+            [](MediaTaskContext&, std::string&) { return true; }));
+    check(manager.WaitForIdle(5000), "the bulk of tasks reaches idle");
+    snapshot = manager.Snapshot();
+    check(snapshot.size() <= MediaTaskManager::kRetainedFinishedTasks,
+          "finished task history stays bounded");
+    const auto newest = std::find_if(
+        snapshot.begin(), snapshot.end(),
+        [&](const MediaTaskSnapshot& task) {
+            return task.id == manyIds.back();
+        });
+    const auto oldest = std::find_if(
+        snapshot.begin(), snapshot.end(),
+        [&](const MediaTaskSnapshot& task) {
+            return task.id == manyIds.front();
+        });
+    check(newest != snapshot.end() && oldest == snapshot.end(),
+          "the newest finished tasks are the ones kept");
 
     if (failures) return 1;
     std::cout << "All media task manager tests passed\n";

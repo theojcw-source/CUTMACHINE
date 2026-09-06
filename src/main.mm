@@ -17,6 +17,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -46,6 +47,7 @@ extern "C" {
 #include "PanelLayout.h"
 #include "PauseTightening.h"
 #include "PerformanceMetrics.h"
+#include "PlaybackPresentation.h"
 #include "Project.h"
 #include "ProjectRecovery.h"
 #include "ProjectStorage.h"
@@ -105,6 +107,9 @@ bool gUiSmokeIconMouseDown = false;
 bool gUiSmokeIconDragSession = false;
 NSUInteger gUiSmokeMediaDragCount = 0;
 int gUiSmokeDecodeReloads = 0;
+int gUiSmokeDecodeOpens = 0;
+size_t gUiSmokeWorkersAtWindowShow = 0;
+Ulid gUiSmokeStoredMetadataMediaId;
 std::filesystem::path gUiSmokeRoot;
 std::string gUiSmokeProjectPath;
 
@@ -123,11 +128,20 @@ bool PrepareUiSmokeProject(std::string& error) {
                    (GenerateUlid() + "-cutmachine-ui-smoke");
     std::filesystem::create_directories(gUiSmokeRoot);
     const std::filesystem::path mediaPath = gUiSmokeRoot / "fixture.mov";
-    if (FILE* media = std::fopen(mediaPath.c_str(), "wb")) {
-        const char bytes[] = "CUTMACHINE UI smoke fixture";
-        std::fwrite(bytes, 1, sizeof(bytes), media);
-        std::fclose(media);
-    } else {
+    // Long enough to satisfy the 100-frame source declared below, which
+    // DecodeWorkerMatchesSource checks against the real frame count.
+    const auto quote = [](const std::filesystem::path& path) {
+        std::string result = "'";
+        for (char character : path.string())
+            result += character == '\'' ? "'\\''" : std::string(1, character);
+        return result + "'";
+    };
+    const std::string generate =
+        quote(FFMPEG_EXECUTABLE) +
+        " -hide_banner -loglevel error -y "
+        "-f lavfi -i 'color=c=black:s=64x64:r=25:d=4.2' -c:v mpeg4 " +
+        quote(mediaPath);
+    if (std::system(generate.c_str()) != 0) {
         error = "unable to create UI smoke media fixture";
         return false;
     }
@@ -155,6 +169,24 @@ bool PrepareUiSmokeProject(std::string& error) {
         LibraryMedia extra = media;
         extra.id = GenerateUlid();
         extra.filename = "0" + std::to_string(index) + "-fixture.mov";
+        // PERF-2026-09. One entry carries probed metadata, as every entry
+        // ingested by a current version does, so the smoke run covers the
+        // path that answers from the library as well as the legacy path that
+        // still goes to the drive. Its rotation is deliberately a value the
+        // real fixture file cannot report: if the startup path ever goes
+        // back to probing this entry, the check below sees 0 instead of 90.
+        if (index == 1) {
+            extra.metadata_complete = true;
+            extra.codec = "mpeg4";
+            extra.has_video = true;
+            extra.width = 64;
+            extra.height = 64;
+            extra.pixel_format = "yuv420p";
+            extra.rotation_degrees = 90;
+            extra.orientation = "portrait";
+            extra.has_audio = false;
+            gUiSmokeStoredMetadataMediaId = extra.id;
+        }
         document.library.push_back(extra);
         document.sources.push_back(
             {extra.id, extra.path, extra.rate, extra.duration});
@@ -377,6 +409,49 @@ struct PendingBatchRelink {
     std::shared_ptr<BatchRelinkResult> result;
 };
 
+// PERF-2026-09. Opening a project probes every rush and then opens a decoder
+// for every rush: two avformat_open_input plus avformat_find_stream_info per
+// source, one after the other, on the thread AppKit draws from. They are
+// independent per source and spend most of their time waiting on the drive,
+// which is why an interview project's launch was seconds of frozen window on
+// an external volume. Nothing here shares FFmpeg state between sources --
+// each iteration opens, reads and closes its own context, exactly as the
+// media task workers already do concurrently for thumbnails and waveforms.
+//
+// The body writes only into its own slot; every mutation of the app's state
+// stays on the calling thread, in source order, in the pass that follows.
+// The cap is there because past a handful of concurrent reads the drive, not
+// the CPU, is the queue.
+struct PendingDecodeOpen {
+    Ulid source_id;
+    std::string selected;
+    std::string original;
+    bool using_proxy = false;
+};
+
+void ParallelForEachIndex(size_t count,
+                          const std::function<void(size_t)>& body) {
+    constexpr size_t kMaxConcurrentOpens = 8;
+    const size_t hardware =
+        std::max(1u, std::thread::hardware_concurrency());
+    const size_t workers =
+        std::min(count, std::min(hardware, kMaxConcurrentOpens));
+    if (workers <= 1) {
+        for (size_t index = 0; index < count; ++index) body(index);
+        return;
+    }
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    for (size_t worker = 0; worker < workers; ++worker)
+        pool.emplace_back([&] {
+            for (size_t index = next.fetch_add(1); index < count;
+                 index = next.fetch_add(1))
+                body(index);
+        });
+    for (std::thread& thread : pool) thread.join();
+}
+
 bool DecodeWorkerMatchesSource(const DecodeWorker& worker,
                                const DocumentSource& source) {
     if (static_cast<int64_t>(worker.FrameRateNumerator()) * source.rate.den !=
@@ -536,6 +611,9 @@ struct AppState {
     bool proxiesEnabled = true;
     bool automaticProxiesEnabled = false;
     std::map<Ulid, std::unique_ptr<DecodeWorker>> workers;
+    // True from the moment the background decoder open is
+    // dispatched until its results are installed.
+    bool openingDecodeWorkers = false;
     // Sources remain part of the edit even when their files are unavailable.
     // Keeping this separate from the document makes reconnecting media a
     // runtime concern rather than a destructive edit.
@@ -545,6 +623,11 @@ struct AppState {
     std::vector<Ulid> videoTrackIds;
     std::vector<ResolvedSlot> requested;
     std::vector<RenderedSlot> rendered;
+    // PERF-2026-09. Whether the Record monitor holds a previously composited
+    // image, and for how many ticks it has been holding it. Runtime playback
+    // state, never persisted; the policy lives in PlaybackPresentation.h.
+    bool programPresented = false;
+    int programHeldTicks = 0;
     RenderedSlot sourceRendered;
     RationalTime duration{0, 1};
     RationalTime requestedPosition{0, 1};
@@ -1476,12 +1559,14 @@ DeleteGapOperation GapDeleteOperationForSelection(
 - (void)processCompletedMediaRelinks;
 - (void)processCompletedBatchRelinks;
 - (void)reloadDecodeWorkers;
+- (void)openDecodeWorkersInBackground;
 - (void)refreshAfterProjectMutation;
 - (void)refreshAfterProjectRename;
 - (void)enqueueProxyForMediaIdentifier:(NSString*)identifier;
 - (void)loadOrEnqueueWaveformForMediaIdentifier:(NSString*)identifier;
 - (void)enqueueWaveformForMediaIdentifier:(NSString*)identifier;
 - (void)loadOrEnqueueThumbnailForMediaIdentifier:(NSString*)identifier;
+- (BOOL)stageThumbnailForMediaIdentifier:(NSString*)identifier;
 - (void)enqueueThumbnailForMediaIdentifier:(NSString*)identifier;
 - (Ulid)enqueueTranscriptionForMediaIdentifier:(NSString*)identifier
                                      modelPath:(NSString*)modelPath
@@ -3365,22 +3450,72 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     const std::filesystem::path baseDirectory =
         std::filesystem::absolute(std::filesystem::path(documentPath))
             .parent_path();
-    for (const DocumentSource& source : self.state->document.sources) {
+    // PERF-2026-09. This used to re-probe every rush on every open -- an
+    // avformat_open_input plus avformat_find_stream_info per source,
+    // measured at about 110 ms for a 256 MB camera file -- to fill a map the
+    // interface reads for rotation, colour and channel counts.
+    //
+    // LibraryMedia already carries every one of those fields, and
+    // `metadata_complete` already says whether they were probed. The rest of
+    // the project trusts exactly that: Operations.cc validates inserts
+    // against it, Export.cc resolves the rendered deliverable from it,
+    // Relink and TimelineSheets read it. Only this path went back to the
+    // file, which meant the monitor could show a rotation the export would
+    // not apply -- two answers to one question, and the slow one was not the
+    // authoritative one.
+    //
+    // So the store answers, and the drive is only consulted for the entries
+    // it cannot answer for: version-1 media promoted without technical
+    // metadata (`metadata_complete == false`, see Document.cc), and sources
+    // with no library entry at all. In a project ingested by any current
+    // version that is nothing, and opening it costs no media I/O here.
+    //
+    // The trade is that a rush swapped on disk behind the project's back no
+    // longer changes the monitor until it is re-ingested or relinked. It
+    // never changed the export, so this makes the two agree instead of
+    // letting them drift; a swap that matters is still caught when the
+    // decoder opens, by DecodeWorkerMatchesSource.
+    const std::vector<DocumentSource>& openSources =
+        self.state->document.sources;
+    struct ProbedSource {
+        bool needs_probe = false;
+        bool probed = false;
+        LibraryMedia detected;
+        std::string media_path;
+        std::string probe_error;
+    };
+    std::vector<ProbedSource> probes(openSources.size());
+    for (size_t index = 0; index < openSources.size(); ++index) {
+        const DocumentSource& source = openSources[index];
         const LibraryMedia* media =
             self.state->document.FindLibraryMedia(source.id);
-        if (media && !media->has_video) {
+        if (media && media->metadata_complete) {
             self.state->mediaMetadata[source.id] = *media;
             continue;
         }
+        ProbedSource& probe = probes[index];
+        probe.needs_probe = true;
         std::filesystem::path mediaPath(source.path);
         if (mediaPath.is_relative()) mediaPath = baseDirectory / mediaPath;
-        LibraryMedia detected;
-        detected.id = source.id;
-        detected.path = media ? media->path : source.path;
-        detected.filename = mediaPath.filename().string();
-        std::string probeError;
-        if (ProbeMediaMetadata(mediaPath.lexically_normal().string(), detected,
-                               probeError)) {
+        probe.media_path = mediaPath.lexically_normal().string();
+        probe.detected.id = source.id;
+        probe.detected.path = media ? media->path : source.path;
+        probe.detected.filename = mediaPath.filename().string();
+    }
+    // Whatever is left is legacy, and rare, so it still goes to the drive --
+    // together rather than one at a time. See ParallelForEachIndex above.
+    ParallelForEachIndex(probes.size(), [&](size_t index) {
+        ProbedSource& probe = probes[index];
+        if (!probe.needs_probe) return;
+        probe.probed = ProbeMediaMetadata(probe.media_path, probe.detected,
+                                          probe.probe_error);
+    });
+    for (size_t index = 0; index < openSources.size(); ++index) {
+        const DocumentSource& source = openSources[index];
+        const ProbedSource& probe = probes[index];
+        if (!probe.needs_probe) continue;
+        if (probe.probed) {
+            const LibraryMedia& detected = probe.detected;
             self.state->mediaMetadata[source.id] = detected;
             std::fprintf(
                 stderr,
@@ -3394,11 +3529,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 detected.orientation.c_str());
         } else {
             std::fprintf(stderr, "Metadata probe failed for %s: %s\n",
-                         mediaPath.string().c_str(), probeError.c_str());
-            if (media && media->metadata_complete)
-                self.state->mediaMetadata[source.id] = *media;
+                         probe.media_path.c_str(), probe.probe_error.c_str());
         }
     }
+
     if (![self separateEmbeddedAudioByDefault:error]) {
         std::fprintf(stderr, "Unable to separate embedded audio: %s\n",
                      error.c_str());
@@ -3410,63 +3544,14 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         std::fprintf(stderr, "Unable to initialize audio: %s\n", error.c_str());
         return NO;
     }
-    for (const DocumentSource& source : self.state->document.sources) {
-        const LibraryMedia* media =
-            self.state->document.FindLibraryMedia(source.id);
-        if (media && !media->has_video) continue;
-        std::filesystem::path mediaPath(source.path);
-        if (mediaPath.is_relative()) {
-            mediaPath = baseDirectory / mediaPath;
-        }
-        const std::filesystem::path originalPath = mediaPath;
-        if (self.state->proxiesEnabled && media && !media->proxy_path.empty()) {
-            std::filesystem::path proxyPath(media->proxy_path);
-            if (proxyPath.is_relative()) proxyPath = baseDirectory / proxyPath;
-            std::error_code proxyError;
-            if (std::filesystem::is_regular_file(proxyPath, proxyError) &&
-                !proxyError)
-                mediaPath = proxyPath;
-        }
-        const bool usingProxy = mediaPath != originalPath;
-        auto worker =
-            std::make_unique<DecodeWorker>(source.id, *self.state->frameCache,
-                                           *self.state->performanceMetrics);
-        if (!worker->Open(mediaPath.lexically_normal().string(), 5)) {
-            if (mediaPath != originalPath) {
-                worker = std::make_unique<DecodeWorker>(
-                    source.id, *self.state->frameCache,
-                    *self.state->performanceMetrics);
-            }
-            if (mediaPath == originalPath ||
-                !worker->Open(originalPath.lexically_normal().string(), 5)) {
-                std::fprintf(stderr, "Source offline %s at %s\n",
-                             source.id.c_str(), originalPath.string().c_str());
-                self.state->offlineSourceIds.insert(source.id);
-                continue;
-            }
-        }
-        if (usingProxy && !DecodeWorkerMatchesSource(*worker, source)) {
-            std::fprintf(stderr,
-                         "Proxy incompatible for source %s; using original\n",
-                         source.id.c_str());
-            worker = std::make_unique<DecodeWorker>(
-                source.id, *self.state->frameCache,
-                *self.state->performanceMetrics);
-            if (!worker->Open(originalPath.lexically_normal().string(), 5)) {
-                self.state->offlineSourceIds.insert(source.id);
-                continue;
-            }
-        }
-        if (!DecodeWorkerMatchesSource(*worker, source)) {
-            std::fprintf(
-                stderr, "Source %s declares rate %d/%d but media is %d/%d\n",
-                source.id.c_str(), source.rate.num, source.rate.den,
-                worker->FrameRateNumerator(), worker->FrameRateDenominator());
-            return NO;
-        }
-        self.state->workers.emplace(source.id, std::move(worker));
-    }
-
+    // PERF-2026-09. The decoders are deliberately not opened here. Each one
+    // is an avformat_open_input plus avformat_find_stream_info against the
+    // media itself, and doing them before the window exists is what made
+    // opening a project on an external drive show nothing at all for
+    // seconds. -openDecodeWorkersInBackground does them once the editor is
+    // on screen; until they land, sources simply have no worker, which is
+    // the same state an offline source is already in and which every
+    // consumer of `workers` already handles.
     [self rebuildVideoTrackIds];
     return YES;
 }
@@ -4585,9 +4670,13 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
-    for (auto& worker : self.state->workers) {
-        worker.second->Start();
-    }
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+    if (gUiSmokeTesting)
+        gUiSmokeWorkersAtWindowShow = self.state->workers.size();
+#endif
+    // The window is up; the decoders open behind it.
+    [self openDecodeWorkersInBackground];
+    BOOL loadedThumbnail = NO;
     for (const DocumentSource& source : self.state->document.sources) {
         const auto detected = self.state->mediaMetadata.find(source.id);
         const LibraryMedia* media =
@@ -4599,9 +4688,11 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             [self loadOrEnqueueWaveformForMediaIdentifier:
                       [NSString stringWithUTF8String:source.id.c_str()]];
         if (media && self.state->offlineSourceIds.count(source.id) == 0)
-            [self loadOrEnqueueThumbnailForMediaIdentifier:
-                      [NSString stringWithUTF8String:source.id.c_str()]];
+            loadedThumbnail |= [self
+                stageThumbnailForMediaIdentifier:
+                    [NSString stringWithUTF8String:source.id.c_str()]];
     }
+    if (loadedThumbnail) [self.mediaCollection reloadData];
     [self requestResolvedPosition:{0, 1}];
     self.displayTimer = [NSTimer timerWithTimeInterval:(1.0 / 60.0)
                                                 target:self
@@ -4661,6 +4752,36 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     self.offlineMediaLabel.hidden =
         topmost == self.state->requested.rend() ||
         self.state->offlineSourceIds.count(topmost->sourceId) == 0;
+    [self warmUpcomingDecoders:position];
+}
+
+// PERF-2026-09. Playback crosses cuts into sources whose decoder has never
+// been asked for anything, and the first request arrives one tick before the
+// frame is due -- far too late for a seek and a decode. The layer then has no
+// frame at all, and until PlaybackPresentation.h's hold the compositor
+// uncovered the track underneath for those ticks. Ask the incoming decoder
+// while the outgoing clip is still on screen instead, and only for sources no
+// visible layer is using: a worker holds one target frame, so warming a
+// source that is being shown right now would steal it from the current image.
+- (void)warmUpcomingDecoders:(RationalTime)position {
+    if (self.state->playbackDirection == 0 || !self.state->timeline) return;
+    const int speed = std::abs(self.state->playbackDirection);
+    // One second of timeline at nominal speed, and proportionally further
+    // ahead when playing faster -- the decoder gets the same wall-clock
+    // warning either way.
+    const RationalTime lookahead{speed, 1};
+    for (const ResolvedFrame& upcoming : self.state->timeline->ResolveUpcoming(
+             position, self.state->playbackDirection, lookahead)) {
+        const bool onScreen = std::any_of(
+            self.state->requested.begin(), self.state->requested.end(),
+            [&](const ResolvedSlot& slot) {
+                return slot.active && slot.sourceId == upcoming.source_id;
+            });
+        if (onScreen) continue;
+        const auto worker = self.state->workers.find(upcoming.source_id);
+        if (worker != self.state->workers.end())
+            worker->second->RequestFrame(upcoming.source_frame);
+    }
 }
 
 - (void)requestSourcePosition:(RationalTime)position {
@@ -10209,10 +10330,21 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
 }
 
 - (void)loadOrEnqueueThumbnailForMediaIdentifier:(NSString*)identifier {
-    if (!identifier || !self.state || self.mediaThumbnails[identifier]) return;
+    if ([self stageThumbnailForMediaIdentifier:identifier])
+        [self.mediaCollection reloadData];
+}
+
+// PERF-2026-09. Returns whether the collection view now shows something it
+// did not before, so a caller loading a whole library can reload it once
+// instead of once per rush. -reloadData is O(items), so the startup loop was
+// quadratic in the number of rushes on top of reading each thumbnail off the
+// drive on the main thread.
+- (BOOL)stageThumbnailForMediaIdentifier:(NSString*)identifier {
+    if (!identifier || !self.state || self.mediaThumbnails[identifier])
+        return NO;
     const Ulid mediaId(identifier.UTF8String ?: "");
     const LibraryMedia* media = self.state->document.FindLibraryMedia(mediaId);
-    if (media && !media->has_video) return;
+    if (media && !media->has_video) return NO;
     const std::filesystem::path projectPath = std::filesystem::absolute(
         std::filesystem::path(self.documentPath.UTF8String ?: ""));
     const std::filesystem::path output = projectPath.parent_path() /
@@ -10222,10 +10354,10 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
         initWithContentsOfFile:[NSString stringWithUTF8String:output.c_str()]];
     if (image) {
         self.mediaThumbnails[identifier] = image;
-        [self.mediaCollection reloadData];
-        return;
+        return YES;
     }
     [self enqueueThumbnailForMediaIdentifier:identifier];
+    return NO;
 }
 
 - (void)enqueueThumbnailForMediaIdentifier:(NSString*)identifier {
@@ -10741,17 +10873,149 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     self.state->overlayDirty = true;
 }
 
+// PERF-2026-09. This used to stop every decoder and reopen every one of
+// them, on the main thread, on each call -- and it is called after every
+// project mutation and every proxy toggle. Reopening is an
+// avformat_open_input plus avformat_find_stream_info per rush, which on the
+// external drives this project is cut from is hundreds of milliseconds each,
+// so a project holding twenty rushes froze the editor for seconds every time
+// a source list was touched at all. Clearing each source from the frame
+// cache alongside threw away decoded pictures that were still valid, making
+// the next few frames of playback re-decode as well.
+//
+// A worker already open on exactly the media the document now names is still
+// correct, and so is everything it has cached, so it is kept as-is. Only
+// sources that appeared, disappeared, or changed media are touched.
+//
+// One case still reopens every time: a source whose proxy exists but is
+// rejected as incompatible below falls back to the original, so the worker's
+// path never equals the proxy path the next call selects. That is the old
+// behaviour, not a regression, and it stops as soon as the bad proxy is
+// removed or regenerated.
+// PERF-2026-09. Opens every source's decoder off the main thread, once the
+// editor is on screen, and installs the results back on it. A worker is only
+// installed if the source it belongs to still exists, still declares the
+// media that was opened, and has not acquired a worker in the meantime -- so
+// an edit landing while this is in flight makes the stale results be dropped
+// rather than fight -reloadDecodeWorkers.
+//
+// A source whose media does not match what the project declares is marked
+// offline here rather than refusing to open the project, which is what
+// -reloadDecodeWorkers has always done for the same condition on every later
+// call. The two paths disagreed; this is the one that leaves the editor
+// usable and the relink flow reachable.
+- (void)openDecodeWorkersInBackground {
+    if (!self.state || !self.state->frameCache) return;
+    const std::filesystem::path base =
+        std::filesystem::absolute(
+            std::filesystem::path(self.documentPath.UTF8String ?: ""))
+            .parent_path();
+    auto pending = std::make_shared<std::vector<PendingDecodeOpen>>();
+    for (const DocumentSource& source : self.state->document.sources) {
+        const LibraryMedia* media =
+            self.state->document.FindLibraryMedia(source.id);
+        if (media && !media->has_video) continue;
+        if (self.state->workers.count(source.id) != 0) continue;
+        std::filesystem::path original(source.path);
+        if (original.is_relative()) original = base / original;
+        std::filesystem::path selected = original;
+        if (self.state->proxiesEnabled && media && !media->proxy_path.empty()) {
+            std::filesystem::path proxy(media->proxy_path);
+            if (proxy.is_relative()) proxy = base / proxy;
+            std::error_code existsError;
+            if (std::filesystem::is_regular_file(proxy, existsError) &&
+                !existsError)
+                selected = proxy;
+        }
+        pending->push_back({source.id, selected.lexically_normal().string(),
+                            original.lexically_normal().string(),
+                            selected != original});
+    }
+    self.state->openingDecodeWorkers = !pending->empty();
+    if (pending->empty()) return;
+
+    // Both outlive this work and are internally locked, so the opening
+    // threads may use them directly.
+    FrameCache* cache = self.state->frameCache.get();
+    PerformanceMetrics* metrics = self.state->performanceMetrics.get();
+    // A unique_ptr cannot be captured by a block copied between queues; the
+    // vector holding them can, behind a shared_ptr.
+    auto opened =
+        std::make_shared<std::vector<std::unique_ptr<DecodeWorker>>>(
+            pending->size());
+    __weak AppDelegate* weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      ParallelForEachIndex(pending->size(), [&](size_t index) {
+          const PendingDecodeOpen& item = (*pending)[index];
+          auto worker =
+              std::make_unique<DecodeWorker>(item.source_id, *cache, *metrics);
+          if (!worker->Open(item.selected, 5)) {
+              if (!item.using_proxy) return;
+              worker = std::make_unique<DecodeWorker>(item.source_id, *cache,
+                                                      *metrics);
+              if (!worker->Open(item.original, 5)) return;
+          }
+          (*opened)[index] = std::move(worker);
+      });
+      // Scheduled on the run loop rather than dispatched to the main queue.
+      // The main queue is serial, so a block sent to it cannot run while
+      // another one is still executing -- which is exactly the situation any
+      // caller that spins the run loop waiting for these workers is in, the
+      // in-process smoke test among them. Common modes additionally let the
+      // install land during event tracking, the same reason the display
+      // timer is registered there.
+      CFRunLoopRef mainLoop = CFRunLoopGetMain();
+      CFRunLoopPerformBlock(mainLoop, kCFRunLoopCommonModes, ^{
+        AppDelegate* strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.state) return;
+        auto* state = strongSelf.state;
+        state->openingDecodeWorkers = false;
+        for (size_t index = 0; index < pending->size(); ++index) {
+            const PendingDecodeOpen& item = (*pending)[index];
+            std::unique_ptr<DecodeWorker>& worker = (*opened)[index];
+            const DocumentSource* source =
+                state->document.FindSource(item.source_id);
+            if (!source || state->workers.count(item.source_id) != 0) continue;
+            if (!worker) {
+                std::fprintf(stderr, "Source offline %s at %s\n",
+                             item.source_id.c_str(), item.original.c_str());
+                state->offlineSourceIds.insert(item.source_id);
+                continue;
+            }
+            if (!DecodeWorkerMatchesSource(*worker, *source)) {
+                std::fprintf(
+                    stderr,
+                    "Source %s declares rate %d/%d but media is %d/%d\n",
+                    item.source_id.c_str(), source->rate.num, source->rate.den,
+                    worker->FrameRateNumerator(),
+                    worker->FrameRateDenominator());
+                state->offlineSourceIds.insert(item.source_id);
+                continue;
+            }
+            worker->Start();
+            state->workers.emplace(item.source_id, std::move(worker));
+        }
+        state->rendered.clear();
+        state->sourceRendered = {};
+        [strongSelf requestResolvedPosition:state->requestedPosition];
+        if (state->sourceMonitor)
+            [strongSelf requestSourcePosition:state->sourceMonitorPosition];
+        state->overlayDirty = true;
+      });
+      CFRunLoopWakeUp(mainLoop);
+    });
+}
+
 - (void)reloadDecodeWorkers {
 #if defined(CUTMACHINE_UI_SMOKE_TEST)
     if (gUiSmokeTesting) ++gUiSmokeDecodeReloads;
 #endif
     if (!self.state->frameCache) return;
-    for (auto& worker : self.state->workers) worker.second->Stop();
-    self.state->workers.clear();
-    self.state->offlineSourceIds.clear();
     const std::filesystem::path projectPath = std::filesystem::absolute(
         std::filesystem::path(self.documentPath.UTF8String ?: ""));
     const std::filesystem::path base = projectPath.parent_path();
+    std::map<Ulid, std::unique_ptr<DecodeWorker>> retained;
+    std::set<Ulid> offline;
     for (const DocumentSource& source : self.state->document.sources) {
         const LibraryMedia* media =
             self.state->document.FindLibraryMedia(source.id);
@@ -10770,20 +11034,41 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 !existsError)
                 selected = proxy;
         }
+        const std::string selectedPath = selected.lexically_normal().string();
+        const std::string originalPath = original.lexically_normal().string();
+
+        const auto existing = self.state->workers.find(source.id);
+        if (existing != self.state->workers.end()) {
+            if (existing->second->Path() == selectedPath &&
+                DecodeWorkerMatchesSource(*existing->second, source)) {
+                retained.emplace(source.id, std::move(existing->second));
+                self.state->workers.erase(existing);
+                continue;
+            }
+            // Destroyed before its replacement is built: ~DecodeWorker
+            // unregisters the source from the frame cache, which would
+            // otherwise cancel the registration the new worker just made for
+            // the same ID.
+            existing->second->Stop();
+            self.state->workers.erase(existing);
+        }
+
         self.state->frameCache->ClearSource(source.id);
+#if defined(CUTMACHINE_UI_SMOKE_TEST)
+        if (gUiSmokeTesting) ++gUiSmokeDecodeOpens;
+#endif
         const bool usingProxy = selected != original;
         auto worker =
             std::make_unique<DecodeWorker>(source.id, *self.state->frameCache,
                                            *self.state->performanceMetrics);
-        if (!worker->Open(selected.lexically_normal().string(), 5)) {
+        if (!worker->Open(selectedPath, 5)) {
             if (selected != original) {
                 worker = std::make_unique<DecodeWorker>(
                     source.id, *self.state->frameCache,
                     *self.state->performanceMetrics);
             }
-            if (selected == original ||
-                !worker->Open(original.lexically_normal().string(), 5)) {
-                self.state->offlineSourceIds.insert(source.id);
+            if (selected == original || !worker->Open(originalPath, 5)) {
+                offline.insert(source.id);
                 continue;
             }
         }
@@ -10791,8 +11076,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             worker = std::make_unique<DecodeWorker>(
                 source.id, *self.state->frameCache,
                 *self.state->performanceMetrics);
-            if (!worker->Open(original.lexically_normal().string(), 5)) {
-                self.state->offlineSourceIds.insert(source.id);
+            if (!worker->Open(originalPath, 5)) {
+                offline.insert(source.id);
                 continue;
             }
         }
@@ -10800,12 +11085,18 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             std::fprintf(stderr,
                          "Source %s is incompatible with project metadata\n",
                          source.id.c_str());
-            self.state->offlineSourceIds.insert(source.id);
+            offline.insert(source.id);
             continue;
         }
         worker->Start();
-        self.state->workers.emplace(source.id, std::move(worker));
+        retained.emplace(source.id, std::move(worker));
     }
+    // Whatever is still here belongs to a source the document no longer has.
+    for (auto& worker : self.state->workers)
+        if (worker.second) worker.second->Stop();
+    self.state->workers.clear();
+    self.state->workers = std::move(retained);
+    self.state->offlineSourceIds = std::move(offline);
     self.state->rendered.clear();
     self.state->sourceRendered = {};
     [self requestResolvedPosition:self.state->requestedPosition];
@@ -11607,6 +11898,8 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
 
     std::vector<AVFrame*> frames(self.state->requested.size(), nullptr);
     std::vector<RenderedSlot> candidates(self.state->requested.size());
+    std::vector<playback::LayerReadiness> readiness(
+        self.state->requested.size());
     bool missing = false;
     for (size_t slot = 0; slot < self.state->requested.size(); ++slot) {
         const ResolvedSlot& requested = self.state->requested[slot];
@@ -11618,6 +11911,9 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
             requested.sourceId, requested.frame, cachedFrame);
         candidates[slot] = {true, requested.sourceId, cachedFrame,
                             requested.opacity, requested.clipId};
+        const bool decodable = self.state->workers.find(requested.sourceId) !=
+                               self.state->workers.end();
+        readiness[slot] = {true, frames[slot] != nullptr, decodable};
         if (!frames[slot] || cachedFrame != requested.frame) {
             missing = true;
         }
@@ -11625,6 +11921,13 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
     if (isDisplayDeadline && missing) {
         self.state->performanceMetrics->RecordDrop();
     }
+    // PERF-2026-09. A layer still waiting on its decoder must not composite:
+    // Renderer.mm skips a null frame, so drawing now would punch a hole where
+    // the edit says an image is and flash the track underneath. Keep the
+    // previous image until the decode lands -- see PlaybackPresentation.h.
+    const playback::HoldDecision holdProgram = playback::DecideProgramHold(
+        readiness, self.state->programPresented, self.state->programHeldTicks);
+    self.state->programHeldTicks = holdProgram.held_ticks;
     const bool programChanged = candidates != self.state->rendered;
     const auto activeSubtitles =
         ActiveSubtitles(self.state->document, self.state->requestedPosition);
@@ -11667,8 +11970,13 @@ static void SendKeyThroughApplication(NSView* view, NSString* characters,
                 programData.video_rotation_degrees[slot] =
                     media->second.rotation_degrees;
         }
-        if (self.state->programRenderer->RenderFrames(frames, programData)) {
+        // Building the display list while holding costs a few vectors and is
+        // thrown away; what must not happen is the present itself, which is
+        // where the hole would reach the screen.
+        if (!holdProgram.hold &&
+            self.state->programRenderer->RenderFrames(frames, programData)) {
             self.state->rendered = candidates;
+            self.state->programPresented = true;
         }
         TimelineRenderData timelineData = [self timelineRenderData];
         const std::vector<AVFrame*> noFrames;
@@ -11881,6 +12189,43 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
     // seven that blame the media panel.
     UiSmokeCheck(self.window.isKeyWindow,
                  "editor window becomes key before any input check");
+
+    // PERF-2026-09. The decoders no longer open before the window exists --
+    // that is what made opening a project on an external drive show nothing
+    // for seconds. They are opened behind the window instead, so the state
+    // every check below reads is only settled once that has landed. Waiting
+    // here rather than in each check keeps the wait honest: if the
+    // background open never completes, this is the assertion that says so.
+    if (self.state->openingDecodeWorkers) {
+        NSDate* workerDeadline = [NSDate dateWithTimeIntervalSinceNow:10.0];
+        while (self.state->openingDecodeWorkers &&
+               workerDeadline.timeIntervalSinceNow > 0) {
+            NSEvent* event = [NSApp
+                nextEventMatchingMask:NSEventMaskAny
+                            untilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]
+                               inMode:NSDefaultRunLoopMode
+                              dequeue:YES];
+            if (event) [NSApp sendEvent:event];
+        }
+    }
+    UiSmokeCheck(gUiSmokeWorkersAtWindowShow == 0,
+                 "no decoder is opened before the window is on screen");
+
+    // PERF-2026-09. Media whose technical metadata the project already holds
+    // must be read from the project, not re-probed off the drive: that probe
+    // was about 110 ms per rush before the window could appear, and it was a
+    // second answer to a question Export.cc and Operations.cc already
+    // resolve from the library. 90 degrees is the fixture's stored value and
+    // is not what the file itself reports.
+    const auto storedMetadata =
+        self.state->mediaMetadata.find(gUiSmokeStoredMetadataMediaId);
+    UiSmokeCheck(storedMetadata != self.state->mediaMetadata.end() &&
+                     storedMetadata->second.rotation_degrees == 90,
+                 "media with complete metadata is read from the project "
+                 "rather than probed off the drive");
+    UiSmokeCheck(!self.state->openingDecodeWorkers &&
+                     !self.state->workers.empty(),
+                 "the decoders opened behind the window are installed");
 
     NSButton* toggle = self.sourceMonitorToggleButton;
     const NSPoint togglePoint =
@@ -12460,6 +12805,23 @@ static CGFloat FirstDividerPosition(NSSplitView* splitView) {
                                               "Rush renommé par clic",
                          "Physical icon rename persists through the project "
                          "edit log");
+            // PERF-2026-09. Reloading the decoders used to stop and reopen
+            // every one of them, an avformat_open_input plus
+            // avformat_find_stream_info per rush -- hundreds of milliseconds
+            // each on the external drives this project is cut from, paid on
+            // the main thread after every project mutation. A second reload
+            // that changes no media must now open nothing at all, and keep
+            // every decoded frame it had cached.
+            const int opensBeforeIdleReload = gUiSmokeDecodeOpens;
+            const size_t workersBeforeIdleReload = self.state->workers.size();
+            [self reloadDecodeWorkers];
+            UiSmokeCheck(workersBeforeIdleReload > 0 &&
+                             self.state->workers.size() ==
+                                 workersBeforeIdleReload &&
+                             gUiSmokeDecodeOpens == opensBeforeIdleReload,
+                         "Reloading decoders without a media change reopens "
+                         "no media");
+
             const int reloadsBeforeRenameHistory = gUiSmokeDecodeReloads;
             [self menuUndo:nil];
             const ProjectBinMetadata* undoneRename =
