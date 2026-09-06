@@ -807,3 +807,142 @@ B9 mérite d'être pris tôt malgré sa taille : il supprime un risque de
 destruction silencieuse.
 
 **B4 et B12** en dernier, une fois B1 en place.
+
+---
+
+## Montage autonome avec Claude Code via MCP — IA-2026-09
+
+L'usage prioritaire est Claude Code connecté au serveur MCP du projet. La
+qualité recherchée est celle du film : un propos compréhensible, fidèle à la
+personne, des raccords propres, un livrable contrôlé et peu de reprises
+manuelles. Les performances du panneau de chat ne mesurent pas cet usage.
+
+Le premier terrain d'évaluation reste l'interview, déjà documentée ici.
+L'audit des 15 opérations isolées dans `AUDIT.md` valide leur pilotage ; il ne
+mesure pas la réussite d'un montage entier. Aucun gain éditorial n'est acquis
+sans comparaison de films complets.
+
+| Ticket | État | Résultat attendu |
+|---|---|---|
+| IA1 — Transcrire le mix entendu | fait | `transcribe_timeline` applique gains, fondus et limiteur de l'export ; les réglages audio invalident son cache |
+| IA2 — Procédure Claude Code actuelle | fait | Le skill `monter-une-itw` décrit une seule procédure cohérente avec les outils MCP présents |
+| IA3 — Sélection contextualisée et liée à une révision | à faire | Claude choisit des idées avec leur contexte ; une sélection périmée est refusée |
+| IA4 — Contrôle du montage composé | à faire | Claude inspecte le résultat aux raccords, avec le même rendu que l'export |
+| IA5 — Tâches longues et reprise MCP | à faire | Analyse suivie par ID, progression, annulation et reprise sans travail dupliqué |
+| IA6 — Évaluation de montages complets | à préparer avant IA3 | Mesurer l'autonomie et la qualité éditoriale à modèle, matière et brief constants |
+
+### IA1 — Transcrire le mix entendu
+
+Défaut reproduit : modifier le gain à −96 dB et ajouter un fondu ne changeait
+ni le graphe audio de transcription ni sa clé de cache. Un texte pouvait donc
+être utilisé comme contrôle alors que les mots correspondants avaient été
+atténués dans le montage livré.
+
+Les enveloppes audio et le limiteur FFmpeg sont désormais partagés entre
+`Export.cc` et `TimelineTranscription.cc` via `AudioMixFilters.h`. Le mix est
+assemblé en stéréo à 48 kHz avant la conversion mono/16 kHz nécessaire à
+Whisper. La clé de cache versionne ce pipeline et inclut gain, fondu d'entrée
+et fondu de sortie.
+
+Validation : PCM synthétique décodé sans modèle Whisper ; durée et trou
+initial conservés, gain mesuré, bords atténués, forte amplification limitée.
+Chaque invalidation et le retour à l'identité initiale après restauration du
+réglage sont testés séparément. Cela valide le signal soumis au modèle, pas
+la fidélité de ce que Whisper transcrit : une question faible peut rester
+inaudible pour le modèle tout en étant audible pour le spectateur.
+
+### IA2 — Procédure Claude Code actuelle
+
+Le guide `.claude/skills/monter-une-itw/SKILL.md` contenait des apprentissages
+utiles et des consignes héritées qui les contredisaient : 250 ms recommandées
+puis interdites, liaison A/V de `ripple_trim` décrite avant B5, refus décrits
+avant B2/B3. Ces passages sont corrigés ; les conventions de livraison et
+les observations propres aux tournages sont conservées.
+
+La boucle est explicite : lire la matière avec son contexte, choisir
+un propos complet, construire une timeline distincte, relire le texte monté,
+contrôler le mix et les raccords, puis corriger les écarts observés. Une mesure
+de cadence ou de silence n'est jamais une note de qualité narrative. Le guide
+précise les limites de chaque observation et les paramètres réellement
+présents dans le catalogue MCP.
+
+Validation locale IA1/IA2 du 6 septembre 2026 : compilation et 54 suites CTest
+réussies sur macOS, formatage clang-format 18 vérifié sur les fichiers C++
+concernés, métadonnées du skill validées par `quick_validate.py`. Aucun
+montage complet par Claude Code n'a été évalué pour cette livraison.
+
+### IA3 — Sélection contextualisée et liée à une révision
+
+Les spans actuels suivent les cartons de sous-titrage, autour de 42
+caractères (`InterviewShort.h`), et leurs alias `S1`, `S2` sont recalculés
+lors de la lecture (`InterviewShort.cc`). Ils ne constituent ni des idées
+complètes ni une identité persistante.
+
+Exposer des blocs de parole avec leur texte précédent/suivant, leurs spans
+constitutifs, la source et les réserves de transcription. Garder les bornes
+en `RationalTime`, calculées par le moteur. Le modèle choisit les blocs et
+juge les références, causalités et transitions ; il ne reconstruit pas les
+temps des mots. Ne pas transformer chaque pronom en refus déterministe.
+
+Associer chaque sélection à la timeline et à une révision du document et des
+transcripts utilisés. Si une insertion, une suppression ou un réalignement
+modifie le contexte, refuser la sélection avec une erreur `StaleSelection`
+explicite. Un ancien `S12` ne doit jamais désigner silencieusement un autre
+passage. Exposition moteur, CLI et MCP, puis surfaces graphiques concernées.
+
+Validation : source préservée, aucun temps calculé par le modèle, sélection
+ancienne refusée, plages exactes et undo canonique. Évaluation éditoriale sur
+les exemples « de réhabiliter » sans sujet et « également » sans antécédent.
+
+### IA4 — Contrôle du montage composé
+
+Les planches actuelles décodent un rush par cellule et appliquent le format
+et la transformation couleur globale (`TimelineSheets.cc`). Elles renseignent
+sur le contenu source ; elles ne prouvent pas le résultat multicouche, les
+effets de clip, les transitions et les légendes de l'export.
+
+Ajouter une commande moteur/CLI/MCP de rendu d'une fenêtre courte autour d'un
+raccord, issue du pipeline d'export : images composées, positions exactes,
+transcription du mix et mesures audio. Signaler les différences entre texte
+attendu et retranscrit comme des alertes à examiner. Corriger auparavant la
+prise en compte des effets couleur dans l'export.
+
+Validation : fixtures avec deux couches, opacité, fondu, légende, gain audio,
+question faible suivie d'une réponse forte et mot traversant une coupe.
+Comparer la fenêtre au même intervalle exporté. Sur les films réels, compter
+les mots coupés, questions résiduelles et raccords repris par le monteur.
+
+### IA5 — Tâches longues et reprise MCP
+
+Exposer les analyses via `MediaTaskManager` : lancement donnant un `task_id`,
+lecture du statut/progrès/résultat, annulation et reprise après déconnexion.
+Les analyses travaillent sur des snapshots identifiés ; leurs résultats ne
+s'installent pas sur un autre état. Les écritures restent sérialisées.
+
+Pour les mutations susceptibles d'être répétées après perte de réponse,
+ajouter révision attendue et clé d'idempotence. Un appel rejoué doit retrouver
+son résultat, pas créer une deuxième timeline. Faire respecter le verrou par
+tous les écrivains, et borner l'attente sur une connexion HTTP inactive.
+
+Validation : déconnexion pendant transcription puis reprise sans relancer le
+modèle, annulation bornée, réponse perdue après création sans doublon,
+résultat d'analyse périmé identifié explicitement.
+
+### IA6 — Évaluation de montages complets
+
+Constituer un petit corpus fixe à partir de projets de test autorisés, sans
+committer de rushes : brief, transcriptions, annotations des passages utiles,
+pièges connus et procédure reproductible. Inclure les causes gardées ou
+coupées, références pendantes, question non transcrite, horodatages décalés,
+plans montrant une bouche qui parle et chevauchements de pistes.
+
+Comparer à modèle et brief identiques : première version acceptée ou non,
+interventions humaines, erreurs d'outils, reprises, durée et coût observés.
+Faire juger les films sans indiquer la variante utilisée : compréhension,
+fidélité du sens, ouverture autonome, transitions, rythme et lisibilité.
+Conserver les désaccords éditoriaux au lieu de les masquer derrière une note
+automatique. Répéter les cas pour distinguer progrès et variance du modèle.
+
+Ordre : IA1/IA2 terminés, établir la référence IA6, puis IA3 et IA4. IA5 peut
+avancer en parallèle. Mesurer chaque changement avant d'en attribuer le gain
+à un nouveau modèle, à un prompt plus long ou à davantage d'appels d'outils.

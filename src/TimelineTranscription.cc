@@ -1,5 +1,6 @@
 #include "TimelineTranscription.h"
 
+#include "AudioMixFilters.h"
 #include "Timeline.h"
 
 #include <algorithm>
@@ -14,14 +15,7 @@ namespace {
 constexpr int kWhisperSampleRate = 16000;
 
 std::string Decimal(const RationalTime& time) {
-    std::ostringstream output;
-    output.imbue(std::locale::classic());
-    output << std::fixed << std::setprecision(12)
-           << static_cast<long double>(time.value) / time.rate;
-    std::string value = output.str();
-    while (value.size() > 2 && value.back() == '0') value.pop_back();
-    if (!value.empty() && value.back() == '.') value.push_back('0');
-    return value;
+    return audio_mix::Seconds(time);
 }
 
 std::filesystem::path ResolveMediaPath(const std::filesystem::path& base,
@@ -82,7 +76,9 @@ bool BuildTimelineAudioPlan(const Document& document,
                     [](const DocumentTrack* track) { return track->solo; });
 
     uint64_t fingerprint = 1469598103934665603ULL;
-    HashText(fingerprint, "timeline-audio-v1");
+    // IA1 -- invalidate transcripts made before the clip envelopes and the
+    // export limiter were included, even when every current knob is neutral.
+    HashText(fingerprint, "timeline-audio-v2");
     HashText(fingerprint, document.sequence.id);
     HashTime(fingerprint, plan.duration);
     std::vector<AudioInput> inputs;
@@ -116,6 +112,10 @@ bool BuildTimelineAudioPlan(const Document& document,
             HashTime(fingerprint, clip->source_in);
             HashTime(fingerprint, clip->duration);
             HashTime(fingerprint, clip->timeline_in);
+            HashText(fingerprint, std::to_string(clip->audio_gain_db.num));
+            HashText(fingerprint, std::to_string(clip->audio_gain_db.den));
+            HashTime(fingerprint, clip->audio_fade_in);
+            HashTime(fingerprint, clip->audio_fade_out);
             inputs.push_back({track, clip, source});
         }
     }
@@ -148,21 +148,24 @@ bool BuildTimelineAudioPlan(const Document& document,
     for (size_t index = 0; index < inputs.size(); ++index) {
         const DocumentClip& clip = *inputs[index].clip;
         const __int128 numerator =
-            static_cast<__int128>(clip.timeline_in.value) * kWhisperSampleRate;
+            static_cast<__int128>(clip.timeline_in.value) *
+            audio_mix::kSampleRate;
         const __int128 denominator = clip.timeline_in.rate;
         const int64_t delay =
             static_cast<int64_t>((numerator + denominator / 2) / denominator);
         graph << '[' << index
               << ":a:0]atrim=duration=" << Decimal(clip.duration)
-              << ",asetpts=PTS-STARTPTS,aresample=" << kWhisperSampleRate
-              << ",aformat=sample_fmts=fltp:channel_layouts=mono,adelay="
-              << delay << "S:all=1[a" << index << "];";
+              << ",asetpts=PTS-STARTPTS,aresample=" << audio_mix::kSampleRate
+              << ",aformat=sample_fmts=fltp:channel_layouts=stereo";
+        audio_mix::AppendClipEnvelope(graph, clip);
+        graph << ",adelay=" << delay << "S:all=1[a" << index << "];";
     }
     for (size_t index = 0; index < inputs.size(); ++index)
         graph << "[a" << index << ']';
-    graph << "amix=inputs=" << inputs.size()
-          << ":duration=longest:normalize=0,apad,atrim=duration="
-          << Decimal(plan.duration) << "[audio]";
+    // Match the default export's stereo mix and limiting before the final
+    // mono/16 kHz conversion Whisper needs; limiting after downmixing would
+    // change the balance of a loud channel against a quiet one.
+    audio_mix::AppendMixedOutput(graph, inputs.size(), plan.duration);
     arguments.insert(
         arguments.end(),
         {"-filter_complex", graph.str(), "-map", "[audio]", "-ac", "1", "-ar",
