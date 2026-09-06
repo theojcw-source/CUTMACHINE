@@ -21,6 +21,10 @@ public:
     DecodeWorker& operator=(const DecodeWorker&) = delete;
 
     bool Open(const std::string& path, int threadCount);
+    // The media this worker actually opened, proxy substitution included.
+    // Lets a caller tell a worker that is still correct from one that has to
+    // be rebuilt, instead of rebuilding every worker on every change.
+    const std::string& Path() const { return path_; }
     void Start();
     void Stop();
     void RequestFrame(int64_t frameIndex);
@@ -42,6 +46,7 @@ private:
     bool IsStopping();
 
     const FrameCache::SourceId sourceId_;
+    std::string path_;
     FrameCache& cache_;
     PerformanceMetrics& metrics_;
     MediaSource source_;

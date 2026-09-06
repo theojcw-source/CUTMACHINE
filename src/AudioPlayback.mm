@@ -11,13 +11,18 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -38,8 +43,11 @@ struct PCMSource {
     std::vector<float> right;
 };
 
+// `cancel` lets the decode thread abandon a rush in progress. Without it,
+// closing a project waited for the whole file: a 30-minute interview is
+// several seconds of decoding, and quitting looked like a hang.
 bool DecodeSource(const std::string& path, PCMSource& output,
-                  std::string& error) {
+                  std::string& error, const std::atomic_bool* cancel) {
     AVFormatContext* format = nullptr;
     int result = avformat_open_input(&format, path.c_str(), nullptr, nullptr);
     if (result < 0) {
@@ -142,6 +150,11 @@ bool DecodeSource(const std::string& path, PCMSource& output,
     };
 
     while (av_read_frame(format, packet.get()) >= 0) {
+        if (cancel && cancel->load()) {
+            av_packet_unref(packet.get());
+            error = "audio decode cancelled";
+            return false;
+        }
         if (packet->stream_index == streamIndex) {
             result = avcodec_send_packet(decoder.get(), packet.get());
             if (result < 0 && result != AVERROR(EAGAIN)) {
@@ -184,13 +197,39 @@ struct MixPlan {
     std::vector<MixClip> clips;
 };
 
+// PERF-2026-09. A MixClip minus the one thing that has to wait: the decoded
+// samples. RebuildTimeline resolves everything a clip contributes to the mix
+// from the Document alone and keeps it here, so the plan the realtime thread
+// reads can be rebuilt from the sources decoded so far -- as many times as
+// decoding finishes a new one -- without the Document being consulted again,
+// let alone retained.
+struct PlannedClip {
+    Ulid source_id;
+    int64_t timelineStart = 0;
+    int64_t sourceStart = 0;
+    int64_t length = 0;
+    float gain = 1.0f;
+    int64_t fadeInSamples = 0;
+    int64_t fadeOutSamples = 0;
+};
+
+size_t PcmBytes(const PCMSource& source) {
+    return (source.left.size() + source.right.size()) * sizeof(float);
+}
+
+// Retention on top of what is audible, not a cap on it: a source the active
+// timeline plays is never dropped, exactly as before. This budget only says
+// how much *already decoded* audio is worth keeping around once it stops
+// being audible, so that switching back to the timeline it belongs to is
+// silent-free and costs no disk. Roughly 45 minutes at 48 kHz stereo float.
+constexpr size_t kRetainedAudioBudgetBytes = 1024u * 1024u * 1024u;
+
 }  // namespace
 
 struct AudioPlayback::Impl {
     AVAudioEngine* engine = nil;
     AVAudioSourceNode* sourceNode = nil;
     std::filesystem::path baseDirectory;
-    std::map<Ulid, std::shared_ptr<const PCMSource>> sources;
     std::shared_ptr<const MixPlan> plan = std::make_shared<MixPlan>();
     std::atomic<int64_t> cursor{0};
     std::atomic<int> direction{0};
@@ -198,12 +237,88 @@ struct AudioPlayback::Impl {
     std::atomic<uint64_t> generation{0};
     std::atomic<int64_t> lastScrubSample{std::numeric_limits<int64_t>::min()};
     std::atomic<uint64_t> scrubTriggerCount{0};
+
+    // PERF-2026-09. Everything below belongs to the decode thread and the
+    // editor thread jointly; the realtime render block touches none of it and
+    // reads `plan` alone, so it never waits on this mutex.
+    mutable std::mutex mutex;
+    std::condition_variable wakeup;
+    std::condition_variable idle;
+    std::thread decoder;
+    // Read by the decode thread inside DecodeSource, so it cannot live under
+    // `mutex`: the point is to reach a decode that is already running.
+    std::atomic_bool cancel{false};
+    bool stopping = false;
+    bool decoding = false;
+    std::map<Ulid, std::shared_ptr<const PCMSource>> sources;
+    std::vector<PlannedClip> planned;
+    std::set<Ulid> audible;
+    // A source that cannot be decoded is remembered as such: retrying it on
+    // every rebuild would re-open an offline rush over and over.
+    std::set<Ulid> failed;
+    std::deque<std::pair<Ulid, std::filesystem::path>> queue;
+    std::map<Ulid, uint64_t> lastUsed;
+    uint64_t useTick = 0;
+
+    // Both callers already hold `mutex`.
+    void PublishPlanLocked() {
+        auto next = std::make_shared<MixPlan>();
+        next->clips.reserve(planned.size());
+        for (const PlannedClip& clip : planned) {
+            const auto source = sources.find(clip.source_id);
+            if (source == sources.end()) continue;
+            MixClip mixed;
+            mixed.source = source->second;
+            mixed.timelineStart = clip.timelineStart;
+            mixed.sourceStart = clip.sourceStart;
+            mixed.length = clip.length;
+            mixed.gain = clip.gain;
+            mixed.fadeInSamples = clip.fadeInSamples;
+            mixed.fadeOutSamples = clip.fadeOutSamples;
+            next->clips.push_back(std::move(mixed));
+        }
+        std::atomic_store(&plan, std::static_pointer_cast<const MixPlan>(next));
+    }
+
+    // Evicting a source the plan still names is harmless -- every MixClip
+    // holds its own shared_ptr, so the realtime thread keeps reading valid
+    // samples until the plan is replaced -- but it would be re-decoded on the
+    // next rebuild, so only sources the active timeline does not play are
+    // considered.
+    void EvictLocked() {
+        size_t total = 0;
+        for (const auto& source : sources) total += PcmBytes(*source.second);
+        while (total > kRetainedAudioBudgetBytes) {
+            auto oldest = sources.end();
+            uint64_t oldestTick = std::numeric_limits<uint64_t>::max();
+            for (auto item = sources.begin(); item != sources.end(); ++item) {
+                if (audible.count(item->first) != 0) continue;
+                const auto used = lastUsed.find(item->first);
+                const uint64_t tick = used == lastUsed.end() ? 0 : used->second;
+                if (tick < oldestTick) {
+                    oldestTick = tick;
+                    oldest = item;
+                }
+            }
+            if (oldest == sources.end()) break;
+            total -= PcmBytes(*oldest->second);
+            lastUsed.erase(oldest->first);
+            sources.erase(oldest);
+        }
+    }
 };
 
 AudioPlayback::AudioPlayback() : impl_(new Impl()) {}
 
 AudioPlayback::~AudioPlayback() {
     Stop();
+    impl_->cancel.store(true);
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->stopping = true;
+    }
+    impl_->wakeup.notify_all();
+    if (impl_->decoder.joinable()) impl_->decoder.join();
     if (impl_->engine && impl_->sourceNode)
         [impl_->engine detachNode:impl_->sourceNode];
     delete impl_;
@@ -211,8 +326,27 @@ AudioPlayback::~AudioPlayback() {
 
 bool AudioPlayback::Open(const Document& document,
                          const std::string& baseDirectory, std::string& error) {
-    impl_->sources.clear();
+    // Open re-initialises. Anything the previous document left decoding has
+    // to be abandoned before the cache is cleared, or its result would land
+    // in the new one after the fact.
+    impl_->cancel.store(true);
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->queue.clear();
+    }
+    WaitForDecodes(2000);
+    impl_->cancel.store(false);
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->sources.clear();
+        impl_->planned.clear();
+        impl_->audible.clear();
+        impl_->failed.clear();
+        impl_->queue.clear();
+        impl_->lastUsed.clear();
+    }
     impl_->baseDirectory = baseDirectory;
+    EnsureDecoderStarted();
     RebuildTimeline(document);
 
     impl_->engine = [[AVAudioEngine alloc] init];
@@ -317,54 +451,39 @@ bool AudioPlayback::Open(const Document& document,
     return true;
 }
 
+// PERF-2026-09. This used to decode, on the calling thread, the whole audio
+// of every source the timeline plays -- 48 kHz stereo float, so a 30-minute
+// interview rush is about 690 MB and several seconds of work. It runs after
+// every edit, every timeline switch and once per project open, all on the
+// thread AppKit draws from, which is precisely where the editor was seen to
+// freeze when a project or a timeline was opened.
+//
+// The plan the realtime thread reads has always skipped a clip whose source
+// is not decoded, so a partially decoded mix was already a state this design
+// tolerated -- it just never occurred, because decoding blocked until it
+// could not. Making the decode a background job turns that tolerated state
+// into the normal one: the mix comes up as sources land, a moment after the
+// picture, instead of the whole editor waiting for all of them.
 void AudioPlayback::RebuildTimeline(const Document& document) {
-    // Keep decoded PCM scoped to sources used by the active timeline. Sources
-    // can become audible after Open when a rush is dropped onto an audio
-    // track, so synchronizing the cache belongs to every rebuild.
-    std::set<Ulid> audibleSourceIds;
+    std::set<Ulid> audible;
     for (const DocumentTrack& track : document.sequence.tracks) {
         if (track.kind != "audio") continue;
         for (const DocumentClip& clip : track.clips)
-            audibleSourceIds.insert(clip.source_id);
-    }
-    for (auto source = impl_->sources.begin();
-         source != impl_->sources.end();) {
-        if (audibleSourceIds.count(source->first) == 0)
-            source = impl_->sources.erase(source);
-        else
-            ++source;
-    }
-    for (const DocumentSource& source : document.sources) {
-        if (audibleSourceIds.count(source.id) == 0 ||
-            impl_->sources.count(source.id) != 0)
-            continue;
-        std::filesystem::path path(source.path);
-        if (path.is_relative()) path = impl_->baseDirectory / path;
-        auto decoded = std::make_shared<PCMSource>();
-        std::string decodeError;
-        if (DecodeSource(path.lexically_normal().string(), *decoded,
-                         decodeError)) {
-            impl_->sources[source.id] = std::move(decoded);
-        } else if (decodeError != "no audio stream") {
-            std::fprintf(stderr, "Audio disabled for %s: %s\n",
-                         path.string().c_str(), decodeError.c_str());
-        }
+            audible.insert(clip.source_id);
     }
 
-    auto plan = std::make_shared<MixPlan>();
     const bool hasSolo = std::any_of(
         document.sequence.tracks.begin(), document.sequence.tracks.end(),
         [](const DocumentTrack& track) {
             return track.kind == "audio" && track.solo;
         });
+    std::vector<PlannedClip> planned;
     for (const DocumentTrack& track : document.sequence.tracks) {
         if (track.kind != "audio" || track.muted || (hasSolo && !track.solo))
             continue;
         for (const DocumentClip& clip : track.clips) {
-            const auto source = impl_->sources.find(clip.source_id);
-            if (source == impl_->sources.end()) continue;
-            MixClip mixed;
-            mixed.source = source->second;
+            PlannedClip mixed;
+            mixed.source_id = clip.source_id;
             mixed.timelineStart = clip.timeline_in.to_frames(kMixRate);
             mixed.sourceStart = clip.source_in.to_frames(kMixRate);
             mixed.length = clip.duration.to_frames(kMixRate);
@@ -373,11 +492,100 @@ void AudioPlayback::RebuildTimeline(const Document& document) {
             mixed.gain = std::pow(10.0f, gainDb / 20.0f);
             mixed.fadeInSamples = clip.audio_fade_in.to_frames(kMixRate);
             mixed.fadeOutSamples = clip.audio_fade_out.to_frames(kMixRate);
-            if (mixed.length > 0) plan->clips.push_back(std::move(mixed));
+            if (mixed.length > 0) planned.push_back(std::move(mixed));
         }
     }
-    std::atomic_store(&impl_->plan,
-                      std::static_pointer_cast<const MixPlan>(plan));
+
+    // Resolved before taking the lock: a relative source path is answered
+    // from the project directory, which the decode thread has no business
+    // knowing about.
+    std::map<Ulid, std::filesystem::path> paths;
+    for (const DocumentSource& source : document.sources) {
+        if (audible.count(source.id) == 0) continue;
+        std::filesystem::path path(source.path);
+        if (path.is_relative()) path = impl_->baseDirectory / path;
+        paths.emplace(source.id, path.lexically_normal());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->planned = std::move(planned);
+        impl_->audible = audible;
+        for (const Ulid& id : impl_->audible)
+            impl_->lastUsed[id] = ++impl_->useTick;
+        for (const auto& item : paths) {
+            if (impl_->sources.count(item.first) != 0 ||
+                impl_->failed.count(item.first) != 0)
+                continue;
+            const bool queued = std::any_of(
+                impl_->queue.begin(), impl_->queue.end(),
+                [&](const auto& entry) { return entry.first == item.first; });
+            if (!queued) impl_->queue.push_back(item);
+        }
+        impl_->EvictLocked();
+        impl_->PublishPlanLocked();
+    }
+    EnsureDecoderStarted();
+    impl_->wakeup.notify_one();
+}
+
+// Both entry points are called from the editor thread, which is the only
+// thread allowed to touch `decoder` itself.
+void AudioPlayback::EnsureDecoderStarted() {
+    if (!impl_->decoder.joinable())
+        impl_->decoder = std::thread(&AudioPlayback::DecodeLoop, this);
+}
+
+void AudioPlayback::DecodeLoop() {
+    while (true) {
+        Ulid sourceId;
+        std::filesystem::path path;
+        {
+            std::unique_lock<std::mutex> lock(impl_->mutex);
+            impl_->wakeup.wait(lock, [this] {
+                return impl_->stopping || !impl_->queue.empty();
+            });
+            if (impl_->stopping) return;
+            sourceId = impl_->queue.front().first;
+            path = impl_->queue.front().second;
+            impl_->queue.pop_front();
+            impl_->decoding = true;
+        }
+
+        auto decoded = std::make_shared<PCMSource>();
+        std::string decodeError;
+        const bool ok =
+            DecodeSource(path.string(), *decoded, decodeError, &impl_->cancel);
+        const bool cancelled = impl_->cancel.load();
+        if (!ok && !cancelled && decodeError != "no audio stream")
+            std::fprintf(stderr, "Audio disabled for %s: %s\n",
+                         path.string().c_str(), decodeError.c_str());
+
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->decoding = false;
+            if (ok) {
+                impl_->sources[sourceId] = std::move(decoded);
+                impl_->lastUsed[sourceId] = ++impl_->useTick;
+                impl_->EvictLocked();
+                impl_->PublishPlanLocked();
+            } else if (!cancelled) {
+                // A rush abandoned mid-decode is not a rush that cannot be
+                // decoded: remembering it as failed would keep it silent for
+                // the rest of the session.
+                impl_->failed.insert(sourceId);
+            }
+            if (impl_->queue.empty()) impl_->idle.notify_all();
+            if (impl_->stopping) return;
+        }
+    }
+}
+
+bool AudioPlayback::WaitForDecodes(int timeoutMilliseconds) {
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    return impl_->idle.wait_for(
+        lock, std::chrono::milliseconds(std::max(0, timeoutMilliseconds)),
+        [this] { return impl_->queue.empty() && !impl_->decoding; });
 }
 
 bool AudioPlayback::PlayFrom(RationalTime position, int direction,
@@ -442,6 +650,7 @@ void AudioPlayback::Stop() {
 }
 
 size_t AudioPlayback::DecodedSourceCount() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->sources.size();
 }
 

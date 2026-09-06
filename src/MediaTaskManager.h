@@ -69,10 +69,26 @@ public:
     std::vector<MediaTaskSnapshot> Snapshot() const;
     bool WaitForIdle(int timeoutMilliseconds);
 
+    // PERF-2026-09. Finished tasks used to be kept forever, and Snapshot()
+    // copies every one of them -- four std::strings apiece -- under the same
+    // mutex the workers take to report progress. The editor polls it on
+    // every display tick, so importing a few hundred rushes turned an idle
+    // window into a permanent 60 Hz copy of the whole session's history,
+    // slowing the workers down alongside. Only the most recent finished
+    // tasks are kept now; the oldest are dropped as new ones finish.
+    //
+    // The bound is generous on purpose: the editor reconciles finished tasks
+    // against its own pending lists once per display tick, so a task would
+    // have to be pushed out by this many newer *finished* tasks inside a
+    // single tick to be missed -- which two worker threads doing FFmpeg work
+    // cannot do.
+    static constexpr size_t kRetainedFinishedTasks = 256;
+
 private:
     struct Task;
     void WorkerLoop();
     bool IdleLocked() const;
+    void PruneFinishedLocked();
 
     mutable std::mutex mutex_;
     std::condition_variable condition_;

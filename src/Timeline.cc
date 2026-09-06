@@ -108,6 +108,68 @@ std::vector<ResolvedLayer> Timeline::ResolveTrackLayers(
                 : std::vector<ResolvedLayer>{};
 }
 
+std::vector<ResolvedFrame> Timeline::ResolveUpcoming(
+    RationalTime position, int direction, RationalTime lookahead) const {
+    if (position.rate <= 0)
+        throw std::invalid_argument("timeline position rate must be positive");
+    if (lookahead.rate <= 0)
+        throw std::invalid_argument("lookahead rate must be positive");
+    std::vector<ResolvedFrame> upcoming;
+    if (direction == 0 || lookahead.value <= 0) return upcoming;
+    for (const DocumentTrack& track : document_.sequence.tracks) {
+        // Only the tracks that actually feed the composite, which is what
+        // main.mm builds its video slots from: warming the decoder of a
+        // hidden or audio track would spend a seek on an image nothing is
+        // going to draw.
+        if (track.kind != "video" || !track.visible) continue;
+        const std::optional<ResolvedFrame> frame =
+            ResolveUpcomingInTrack(track, position, direction, lookahead);
+        if (frame) upcoming.push_back(*frame);
+    }
+    return upcoming;
+}
+
+std::optional<ResolvedFrame> Timeline::ResolveUpcomingInTrack(
+    const DocumentTrack& track, RationalTime position, int direction,
+    RationalTime lookahead) const {
+    // Clips are ordered and never overlap (Document::Validate), so the first
+    // one found in the direction of travel is the next one entered.
+    if (direction > 0) {
+        const RationalTime limit = position.add(lookahead);
+        for (const DocumentClip& clip : track.clips) {
+            if (clip.timeline_in <= position) continue;
+            if (clip.timeline_in > limit) break;
+            return ResolveClipAt(clip, clip.source_in);
+        }
+        return std::nullopt;
+    }
+    const RationalTime limit = position.sub(lookahead);
+    for (auto clip = track.clips.rbegin(); clip != track.clips.rend(); ++clip) {
+        const RationalTime end = clip->timeline_in.add(clip->duration);
+        if (end > position) continue;
+        if (end < limit) break;
+        // Played backward, a clip is entered by its last frame.
+        ResolvedFrame frame = ResolveClipAt(*clip, end);
+        frame.source_frame = LastSourceFrame(*clip);
+        return frame;
+    }
+    return std::nullopt;
+}
+
+int64_t Timeline::LastSourceFrame(const DocumentClip& clip) const {
+    const DocumentSource* source = document_.FindSource(clip.source_id);
+    if (!source)
+        throw std::logic_error("validated clip references an unknown source");
+    const RationalTime end = clip.source_in.add(clip.duration);
+    const int64_t frame = end.to_frames(source->rate.num, source->rate.den);
+    // Ranges are half-open here as everywhere else: an end landing exactly on
+    // a source frame boundary opens that frame rather than containing it, so
+    // the clip's last frame is the one before.
+    const RationalTime frameStart{
+        frame * static_cast<int64_t>(source->rate.den), source->rate.num};
+    return frameStart == end ? frame - 1 : frame;
+}
+
 std::optional<ResolvedFrame> Timeline::ResolveInTrack(
     const DocumentTrack& track, RationalTime position) const {
     // upper_bound finds the last clip whose start is <= position. Validation

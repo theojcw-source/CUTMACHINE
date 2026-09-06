@@ -68,6 +68,10 @@ int main() {
                                           {0, 25},
                                           true}}});
     playback.RebuildTimeline(document);
+    // PERF-2026-09. RebuildTimeline no longer decodes on the calling thread,
+    // so the mix a rebuild publishes holds only the sources decoded so far.
+    // Everything below asserts the settled mix, and waits for it explicitly.
+    const bool decodesSettled = playback.WaitForDecodes(10000);
     const bool decoded = playback.DecodedSourceCount() == 1;
     const bool planned = playback.PlannedClipCount() == 1;
     document.sequence.tracks[1].muted = true;
@@ -85,6 +89,24 @@ int main() {
     document.sequence.tracks[1].solo = false;
     playback.RebuildTimeline(document);
     const bool allUnmutedTracksMix = playback.PlannedClipCount() == 2;
+
+    // PERF-2026-09. Decoded audio outlives the timeline that made it
+    // audible. It used to be dropped the moment a rebuild stopped naming it,
+    // which is what made switching away from a timeline and back decode
+    // every rush again -- minutes of work on an external drive, for material
+    // that was already in memory. The second rebuild below therefore asserts
+    // a *full* mix with no wait at all: had the source been dropped, the
+    // plan would be empty until a re-decode landed.
+    const std::vector<DocumentTrack> audioTracks(
+        document.sequence.tracks.begin() + 1, document.sequence.tracks.end());
+    document.sequence.tracks.resize(1);
+    playback.RebuildTimeline(document);
+    const bool retainedWhenSilent =
+        playback.DecodedSourceCount() == 1 && playback.PlannedClipCount() == 0;
+    for (const DocumentTrack& track : audioTracks)
+        document.sequence.tracks.push_back(track);
+    playback.RebuildTimeline(document);
+    const bool retainedMixesWithoutDecoding = playback.PlannedClipCount() == 2;
     const bool started = opened && playback.PlayFrom({0, 25}, 2, error);
     const bool shuttleSpeedPreserved = playback.ShuttleSpeed() == 2;
     playback.Stop();
@@ -105,9 +127,10 @@ int main() {
         playback.ScrubTriggerCount() == 2;
     playback.Stop();
     std::filesystem::remove_all(root);
-    if (!opened || !unusedBeforeInsert || !decoded || !planned ||
-        !muteSuppressesTrack || !soloSuppressesOtherTracks ||
-        !allUnmutedTracksMix || !started || !shuttleSpeedPreserved ||
+    if (!opened || !unusedBeforeInsert || !decodesSettled || !decoded ||
+        !planned || !muteSuppressesTrack || !soloSuppressesOtherTracks ||
+        !allUnmutedTracksMix || !retainedWhenSilent ||
+        !retainedMixesWithoutDecoding || !started || !shuttleSpeedPreserved ||
         !scrubbed || !sameFrameSuppressed || !nextFrameTriggered) {
         std::cerr << "FAIL: audio decode/mix plan: " << error << '\n';
         return 1;

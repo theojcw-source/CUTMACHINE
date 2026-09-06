@@ -38,6 +38,7 @@ bool DecodeWorker::Open(const std::string& path, int threadCount) {
     if (!source_.Open(path, threadCount)) {
         return false;
     }
+    path_ = path;
     cache_.RegisterSource(sourceId_);
     registeredSource_ = true;
     return true;
