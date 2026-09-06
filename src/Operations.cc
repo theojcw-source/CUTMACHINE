@@ -492,14 +492,10 @@ bool ApplyRemove(Document& candidate, RemoveClipOperation& operation,
         inverse =
             ClearClipsOperation{{operation.clip_id}, std::move(beforeTracks)};
     } else {
-        inverse = InsertClipOperation{trackId,
-                                      removed.source_id,
-                                      removed.source_in,
-                                      removed.duration,
-                                      removed.timeline_in,
-                                      removed.id,
-                                      before,
-                                      operation.sync_track_ids};
+        inverse = InsertClipOperation{
+            trackId,          removed.source_id,       removed.source_in,
+            removed.duration, removed.timeline_in,     removed.id,
+            before,           operation.sync_track_ids};
     }
     return true;
 }
@@ -4460,8 +4456,7 @@ std::string SerializeOperation(const Operation& operation) {
                << "\",\"exact_timeline\":";
         WriteExactPositions(output, insert->exact_timeline_result);
         output << ",\"sync_track_ids\":[";
-        for (size_t index = 0; index < insert->sync_track_ids.size();
-             ++index) {
+        for (size_t index = 0; index < insert->sync_track_ids.size(); ++index) {
             if (index) output << ',';
             WriteString(output, insert->sync_track_ids[index]);
         }

@@ -282,12 +282,13 @@ int main() {
                                                {syncTrackId}};
         Check(Apply(log, document, synchronizedInsert, "synchronized insert"),
               "insert_clip accepts a synchronized track");
-        Check(document.FindClip("01K20000000000000000000005")->timeline_in ==
-                          RationalTime{25, 25} &&
-                      document.FindClip("01K20000000000000000000023")
-                              ->timeline_in == RationalTime{25, 25},
-              "insert_clip ripples every named track by the same exact "
-              "duration");
+        Check(
+            document.FindClip("01K20000000000000000000005")->timeline_in ==
+                    RationalTime{25, 25} &&
+                document.FindClip("01K20000000000000000000023")->timeline_in ==
+                    RationalTime{25, 25},
+            "insert_clip ripples every named track by the same exact "
+            "duration");
         const std::string json =
             SerializeOperation(log.AppliedEntries().back().op);
         Operation parsed = RemoveClipOperation{};

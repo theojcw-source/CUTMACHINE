@@ -2382,10 +2382,10 @@ int main() {
         InMemoryBackend aligned(doc);
         const McpToolCallOutcome synced = [&] {
             mcp_json::Value arguments;
-            Check(mcp_json::Value::Parse(
-                      insertArguments + R"(,"sync_track_ids":[")" + a1TrackId +
-                          R"("]})",
-                      arguments, parseFailure),
+            Check(mcp_json::Value::Parse(insertArguments +
+                                             R"(,"sync_track_ids":[")" +
+                                             a1TrackId + R"("]})",
+                                         arguments, parseFailure),
                   "synced insert_clip arguments parse: " + parseFailure);
             return registry.Call(aligned, "insert_clip", arguments);
         }();
@@ -2398,11 +2398,11 @@ int main() {
                                      resultError) &&
                   syncedResult.Find("warning") == nullptr,
               "explicit synchronization suppresses the omission warning");
-        Check(aligned.Log().Undo(
-                  const_cast<Document&>(aligned.CurrentDocument()), undoError,
-                  undoMessage) &&
-                  aligned.CurrentDocument().SaveToString() == before,
-              "synced insert undo restores V1/A1 byte-identically");
+        Check(
+            aligned.Log().Undo(const_cast<Document&>(aligned.CurrentDocument()),
+                               undoError, undoMessage) &&
+                aligned.CurrentDocument().SaveToString() == before,
+            "synced insert undo restores V1/A1 byte-identically");
     }
 
     if (failures != 0) {
