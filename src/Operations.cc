@@ -128,6 +128,8 @@ const DocumentTrack* LockedTrackTouchedBy(const Document& document,
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, InsertClipOperation>) {
                 addTrack(value.track_id);
+                for (const Ulid& trackId : value.sync_track_ids)
+                    addTrack(trackId);
                 addExactPositions(value.exact_timeline_result);
             } else if constexpr (std::is_same_v<T, RemoveClipOperation> ||
                                  std::is_same_v<T, TrimClipOperation> ||
@@ -342,11 +344,45 @@ bool ApplyInsert(Document& candidate, InsertClipOperation& operation,
         }
     }
 
-    const std::vector<ExactTimelinePosition> before =
+    // QC-2026-09 C1 -- an insert on one track never touches another by
+    // default (a cutaway densified on its own track must leave V1/A1 alone),
+    // but a track named explicitly here ripples in lockstep so an A/V-linked
+    // partner living on a different track doesn't silently fall out of
+    // sync_reference_delta. Mirrors ApplyRemove's sync_track_ids handling.
+    std::vector<Ulid> affectedTrackIds{operation.track_id};
+    const auto addAffectedTrack = [&](const Ulid& id) {
+        if (std::find(affectedTrackIds.begin(), affectedTrackIds.end(), id) ==
+            affectedTrackIds.end())
+            affectedTrackIds.push_back(id);
+    };
+    for (const Ulid& syncTrackId : operation.sync_track_ids) {
+        if (!candidate.FindTrack(syncTrackId)) {
+            Fail(EditError::UnknownTrack,
+                 "unknown insert sync track_id '" + syncTrackId + "'", error,
+                 message);
+            return false;
+        }
+        addAffectedTrack(syncTrackId);
+    }
+
+    std::vector<ExactTimelinePosition> before =
         PositionsAfter(*track, insertionIndex);
+    std::vector<Ulid> shiftedTrackIds{operation.track_id};
+    for (const Ulid& syncTrackId : operation.sync_track_ids) {
+        if (std::find(shiftedTrackIds.begin(), shiftedTrackIds.end(),
+                      syncTrackId) != shiftedTrackIds.end())
+            continue;
+        shiftedTrackIds.push_back(syncTrackId);
+        AppendPositionsAtOrAfter(*candidate.FindTrack(syncTrackId),
+                                 operation.timeline_in, before);
+    }
     for (size_t index = insertionIndex; index < track->clips.size(); ++index) {
         track->clips[index].timeline_in =
             track->clips[index].timeline_in.add(operation.duration);
+    }
+    for (size_t index = 1; index < shiftedTrackIds.size(); ++index) {
+        ShiftPositionsAtOrAfter(*candidate.FindTrack(shiftedTrackIds[index]),
+                                operation.timeline_in, operation.duration);
     }
     DocumentClip inserted{operation.clip_id, operation.source_id,
                           operation.source_in, operation.duration,
@@ -363,11 +399,11 @@ bool ApplyInsert(Document& candidate, InsertClipOperation& operation,
     if (!ValidateResult(candidate, error, message)) return false;
 
     if (operation.exact_timeline_result.empty()) {
-        DocumentTrack* updated = candidate.FindTrack(operation.track_id);
         operation.exact_timeline_result =
-            PositionsAfter(*updated, insertionIndex + 1);
+            CurrentPositionsFor(candidate, before);
     }
-    inverse = RemoveClipOperation{operation.clip_id, {}, before};
+    inverse = RemoveClipOperation{operation.clip_id, operation.sync_track_ids,
+                                  before};
     return true;
 }
 
@@ -456,13 +492,10 @@ bool ApplyRemove(Document& candidate, RemoveClipOperation& operation,
         inverse =
             ClearClipsOperation{{operation.clip_id}, std::move(beforeTracks)};
     } else {
-        inverse = InsertClipOperation{trackId,
-                                      removed.source_id,
-                                      removed.source_in,
-                                      removed.duration,
-                                      removed.timeline_in,
-                                      removed.id,
-                                      before};
+        inverse = InsertClipOperation{
+            trackId,          removed.source_id,       removed.source_in,
+            removed.duration, removed.timeline_in,     removed.id,
+            before,           operation.sync_track_ids};
     }
     return true;
 }
@@ -4422,7 +4455,12 @@ std::string SerializeOperation(const Operation& operation) {
         output << ",\"clip_id\":\"" << insert->clip_id
                << "\",\"exact_timeline\":";
         WriteExactPositions(output, insert->exact_timeline_result);
-        output << '}';
+        output << ",\"sync_track_ids\":[";
+        for (size_t index = 0; index < insert->sync_track_ids.size(); ++index) {
+            if (index) output << ',';
+            WriteString(output, insert->sync_track_ids[index]);
+        }
+        output << "]}";
     } else if (const auto* remove =
                    std::get_if<RemoveClipOperation>(&operation)) {
         output << "{\"type\":\"RemoveClip\",\"clip_id\":\"" << remove->clip_id
@@ -5063,6 +5101,17 @@ bool DeserializeOperation(const std::string& json, Operation& operation,
             value.clip_id = reader.String();
             reader.Expect(",\"exact_timeline\":");
             value.exact_timeline_result = ReadExactPositions(reader);
+            // QC-2026-09 C1 -- absent in project files written before this
+            // field existed; Consume (not Expect) keeps those loading.
+            if (reader.Consume(",\"sync_track_ids\":[")) {
+                if (!reader.Consume("]")) {
+                    while (true) {
+                        value.sync_track_ids.push_back(reader.String());
+                        if (reader.Consume("]")) break;
+                        reader.Expect(",");
+                    }
+                }
+            }
             reader.Expect("}");
             operation = std::move(value);
         } else if (type == "RemoveClip") {

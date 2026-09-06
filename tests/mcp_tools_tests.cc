@@ -2324,6 +2324,87 @@ int main() {
               "explicit synchronization suppresses the omission warning");
     }
 
+    // QC-2026-09 C1 -- insert_clip only used to ripple the track it targets;
+    // an A/V-linked partner living on another track was silently left
+    // behind. sync_track_ids closes that gap the same way remove_clip's
+    // does, with the same omission warning as ripple_trim above.
+    {
+        const Ulid sourceId = "01K30000000000000000000031";
+        Document doc;
+        doc.sources = {{sourceId, "rush.MP4", {25, 1}, {1000, 25}}};
+        DocumentClip v1{
+            "01K30000000000000000000032", sourceId, {0, 25}, {10, 25}, {0, 25}};
+        DocumentClip a1{
+            "01K30000000000000000000033", sourceId, {0, 25}, {10, 25}, {0, 25}};
+        const Ulid v1TrackId = "01K30000000000000000000034";
+        const Ulid a1TrackId = "01K30000000000000000000035";
+        doc.sequence.tracks = {
+            {v1TrackId, "video", 0, {v1}},
+            {a1TrackId, "audio", 1, {a1}},
+        };
+        const std::string insertArguments =
+            R"({"track_id":")" + v1TrackId + R"(","source_id":")" + sourceId +
+            R"(","source_in":{"value":100,"rate":25},)"
+            R"("duration":{"value":5,"rate":25},)"
+            R"("timeline_in":{"value":0,"rate":25})";
+
+        McpToolRegistry registry;
+        InMemoryBackend backend(doc);
+        const std::string before = backend.CurrentDocument().SaveToString();
+        std::string parseFailure;
+        const McpToolCallOutcome omitted = [&] {
+            mcp_json::Value arguments;
+            Check(mcp_json::Value::Parse(insertArguments + "}", arguments,
+                                         parseFailure),
+                  "insert_clip arguments parse: " + parseFailure);
+            return registry.Call(backend, "insert_clip", arguments);
+        }();
+        Check(omitted.ok, "insert_clip applies: " + omitted.message);
+        Check(backend.CurrentDocument().FindClip(a1.id)->timeline_in ==
+                  RationalTime{0, 25},
+              "unlisted A1 is not shifted without sync_track_ids");
+        mcp_json::Value omittedResult;
+        std::string resultError;
+        Check(mcp_json::Value::Parse(omitted.result_json, omittedResult,
+                                     resultError),
+              "insert_clip result is JSON: " + resultError);
+        Check(omittedResult.Find("warning") != nullptr &&
+                  omittedResult.Find("warning_track_ids") != nullptr,
+              "omitting sync_track_ids warns about downstream A1");
+        EditError undoError = EditError::None;
+        std::string undoMessage;
+        Check(
+            backend.Log().Undo(const_cast<Document&>(backend.CurrentDocument()),
+                               undoError, undoMessage) &&
+                backend.CurrentDocument().SaveToString() == before,
+            "insert undo restores V1/A1 byte-identically");
+
+        InMemoryBackend aligned(doc);
+        const McpToolCallOutcome synced = [&] {
+            mcp_json::Value arguments;
+            Check(mcp_json::Value::Parse(insertArguments +
+                                             R"(,"sync_track_ids":[")" +
+                                             a1TrackId + R"("]})",
+                                         arguments, parseFailure),
+                  "synced insert_clip arguments parse: " + parseFailure);
+            return registry.Call(aligned, "insert_clip", arguments);
+        }();
+        Check(synced.ok, "synced insert_clip applies: " + synced.message);
+        Check(aligned.CurrentDocument().FindClip(a1.id)->timeline_in ==
+                  RationalTime{5, 25},
+              "explicit sync_track_ids keeps A1 aligned with the ripple");
+        mcp_json::Value syncedResult;
+        Check(mcp_json::Value::Parse(synced.result_json, syncedResult,
+                                     resultError) &&
+                  syncedResult.Find("warning") == nullptr,
+              "explicit synchronization suppresses the omission warning");
+        Check(
+            aligned.Log().Undo(const_cast<Document&>(aligned.CurrentDocument()),
+                               undoError, undoMessage) &&
+                aligned.CurrentDocument().SaveToString() == before,
+            "synced insert undo restores V1/A1 byte-identically");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " assertion(s) failed\n";
         return 1;

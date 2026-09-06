@@ -535,9 +535,11 @@ bool DispatchInsertClip(McpBackend& backend, const IdResolver& resolver,
                         const Value& args, std::string& resultJson,
                         std::string& errorName, std::string& message) {
     static const std::vector<std::string> kAllowed = {
-        "track_id", "source_id", "source_in", "duration", "timeline_in"};
+        "track_id", "source_id",   "source_in",
+        "duration", "timeline_in", "sync_track_ids"};
     if (!CheckKnownKeys(args, kAllowed, "insert_clip", message))
         return Fail(errorName, message, message);
+    const bool syncTracksExplicit = args.Find("sync_track_ids") != nullptr;
     InsertClipOperation op;
     if (!ReadId(args, "track_id", "insert_clip", resolver, true, op.track_id,
                 message) ||
@@ -548,9 +550,52 @@ bool DispatchInsertClip(McpBackend& backend, const IdResolver& resolver,
         !ReadTime(args, "duration", "insert_clip", true, op.duration,
                   message) ||
         !ReadTime(args, "timeline_in", "insert_clip", true, op.timeline_in,
-                  message))
+                  message) ||
+        !ReadIdArray(args, "sync_track_ids", "insert_clip", resolver,
+                     op.sync_track_ids, message))
         return Fail(errorName, message, message);
-    return backend.ApplyOperation(op, resultJson, errorName, message);
+
+    // QC-2026-09 C1 -- an omitted sync_track_ids used to ripple only
+    // track_id and desync any A/V-linked partner living elsewhere without
+    // any signal at all. Surface it the same way ripple_trim does: apply as
+    // requested, then flag tracks that hold material at or after
+    // timeline_in and were not asked to follow.
+    std::vector<Ulid> warningTrackIds;
+    if (!syncTracksExplicit) {
+        Document document;
+        if (!backend.SnapshotDocument(document, message)) {
+            errorName = "IoError";
+            return false;
+        }
+        for (const DocumentTrack& track : document.sequence.tracks) {
+            if (track.id == op.track_id) continue;
+            if (std::any_of(track.clips.begin(), track.clips.end(),
+                            [&](const DocumentClip& clip) {
+                                return clip.timeline_in >= op.timeline_in;
+                            }))
+                warningTrackIds.push_back(track.id);
+        }
+    }
+
+    std::string appliedJson;
+    if (!backend.ApplyOperation(op, appliedJson, errorName, message))
+        return false;
+    Value result;
+    std::string parseError;
+    if (!Value::Parse(appliedJson, result, parseError) || !result.IsObject())
+        result = Value::MakeObject();
+    if (!warningTrackIds.empty()) {
+        result.Set("warning",
+                   Value::MakeString(
+                       "sync_track_ids omis : des plans en aval sur d'autres "
+                       "pistes n'ont pas ete decales"));
+        Value tracks = Value::MakeArray();
+        for (const Ulid& trackId : warningTrackIds)
+            tracks.Push(Value::MakeString(trackId));
+        result.Set("warning_track_ids", std::move(tracks));
+    }
+    resultJson = result.Dump();
+    return true;
 }
 
 bool DispatchRemoveClip(McpBackend& backend, const IdResolver& resolver,
@@ -3136,13 +3181,23 @@ McpToolRegistry::McpToolRegistry() {
 
     add("insert_clip",
         "Insert a clip from a source into a track at an exact timeline "
-        "position, rippling later clips on that track forward.",
+        "position, rippling later clips on that track forward. Without "
+        "sync_track_ids this ripples only that one track: an A/V-linked "
+        "partner living on another track is left behind and drifts out of "
+        "sync -- the response then carries a warning naming the tracks left "
+        "unshifted.",
         SchemaBuilder()
             .Field("track_id", IdSchema("Destination track."), true)
             .Field("source_id", IdSchema("Source media to read from."), true)
             .Field("source_in", kTimeSchemaText, true)
             .Field("duration", kTimeSchemaText, true)
             .Field("timeline_in", kTimeSchemaText, true)
+            .Field("sync_track_ids",
+                   IdArraySchema("Additional tracks whose downstream clips "
+                                 "must follow the same ripple -- e.g. the "
+                                 "track holding the A/V-linked partner of "
+                                 "what is being pushed forward."),
+                   false)
             .Build("insert_clip arguments"),
         DispatchInsertClip);
 

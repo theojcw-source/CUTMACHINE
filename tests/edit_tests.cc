@@ -235,6 +235,77 @@ int main() {
               "remove restores every following position");
     });
 
+    // QC-2026-09 C1 -- an insert used to ripple only track_id; an
+    // A/V-linked partner living on another track was silently left behind
+    // and drifted out of sync_reference_delta. Mirrors A5's RemoveClip
+    // coverage above.
+    Test("insert_clip ripples a synchronized track and undoes exactly", [] {
+        const Ulid syncTrackId = "01K20000000000000000000022";
+        Document document = EditDocument();
+        DocumentTrack synced{syncTrackId,
+                             "audio",
+                             1,
+                             {{"01K20000000000000000000023",
+                               document.sources[0].id,
+                               {400, 25},
+                               {10, 25},
+                               {20, 25}}}};
+        document.sequence.tracks.push_back(synced);
+        const std::string before = document.SaveToString();
+        EditLog log;
+
+        InsertClipOperation unsynced{document.sequence.tracks[0].id,
+                                     document.sources[1].id,
+                                     {50, 25},
+                                     {5, 25},
+                                     {10, 25},
+                                     {},
+                                     {}};
+        Check(Apply(log, document, unsynced, "unsynchronized insert"),
+              "insert_clip applies without sync_track_ids");
+        Check(document.FindClip("01K20000000000000000000023")->timeline_in ==
+                  RationalTime{20, 25},
+              "without sync_track_ids the other track is untouched");
+        EditError error = EditError::None;
+        std::string message;
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "unsynchronized insert undo restores exact bytes");
+
+        InsertClipOperation synchronizedInsert{document.sequence.tracks[0].id,
+                                               document.sources[1].id,
+                                               {50, 25},
+                                               {5, 25},
+                                               {10, 25},
+                                               {},
+                                               {},
+                                               {syncTrackId}};
+        Check(Apply(log, document, synchronizedInsert, "synchronized insert"),
+              "insert_clip accepts a synchronized track");
+        Check(
+            document.FindClip("01K20000000000000000000005")->timeline_in ==
+                    RationalTime{25, 25} &&
+                document.FindClip("01K20000000000000000000023")->timeline_in ==
+                    RationalTime{25, 25},
+            "insert_clip ripples every named track by the same exact "
+            "duration");
+        const std::string json =
+            SerializeOperation(log.AppliedEntries().back().op);
+        Operation parsed = RemoveClipOperation{};
+        Check(DeserializeOperation(json, parsed, error, message) &&
+                  std::get<InsertClipOperation>(parsed).sync_track_ids ==
+                      std::vector<Ulid>{syncTrackId} &&
+                  SerializeOperation(parsed) == json,
+              "InsertClip sync_track_ids round-trip canonically");
+        Check(log.Undo(document, error, message) &&
+                  document.SaveToString() == before,
+              "InsertClip synchronized undo restores exact bytes");
+
+        document.sequence.tracks[1].locked = true;
+        ExpectRejected(document, synchronizedInsert, EditError::LockedTrack,
+                       "insert_clip refuses a locked sync track");
+    });
+
     Test("arbitrary multi-clip move is atomic, serializable and reversible",
          [] {
              Document document = EditDocument();
@@ -633,6 +704,10 @@ int main() {
         outside.source_in = {999, 25};
         ExpectRejected(base, outside, EditError::SourceOutOfBounds,
                        "insert source bounds");
+        InsertClipOperation unknownSyncTrack = validInsert;
+        unknownSyncTrack.sync_track_ids = {"01K29999999999999999999996"};
+        ExpectRejected(base, unknownSyncTrack, EditError::UnknownTrack,
+                       "unknown insert sync track_id");
         ExpectRejected(base,
                        RemoveClipOperation{"01K29999999999999999999993", {}},
                        EditError::UnknownClip, "unknown remove clip_id");

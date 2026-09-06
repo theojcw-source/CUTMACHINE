@@ -62,6 +62,13 @@ struct InsertClipOperation {
     // redo/inverse identity.
     Ulid clip_id;
     std::vector<ExactTimelinePosition> exact_timeline_result;
+
+    // QC-2026-09 C1 -- tracks holding the A/V-linked partner of a clip pushed
+    // downstream by this ripple still need the same shift, or the pair drifts
+    // out of sync_reference_delta silently. Mirrors RemoveClipOperation. Kept
+    // last so every existing positional InsertClipOperation{...} call site
+    // (none of which mention it) keeps defaulting to "no other track moves".
+    std::vector<Ulid> sync_track_ids;
 };
 
 struct RemoveClipOperation {
