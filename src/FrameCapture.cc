@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 extern char** environ;
 
